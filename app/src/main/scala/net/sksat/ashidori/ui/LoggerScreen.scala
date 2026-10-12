@@ -133,7 +133,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         s"$c ${n}機（${bands.toSeq.sorted.mkString("/")}）"
       }
       val body =
-        f"""記録時間 ${fmtDuration(st.durationMs)}・${st.epochs}%,d エポック・測定値 ${st.measurements}%,d 件
+        f"""記録 ${st.sessions} 回・計 ${fmtDuration(st.durationMs)}・${st.epochs}%,d エポック・測定値 ${st.measurements}%,d 件
            |平均 C/N0 ${st.meanCn0}%.1f dB-Hz
            |搬送波位相（ADR）有効 ${st.adrValidRatio * 100}%.0f%%
            |測位 ${st.fixes} 回・最良精度 ${if st.bestAccuracyM.isNaN then "-" else f"±${st.bestAccuracyM}%.1fm"}

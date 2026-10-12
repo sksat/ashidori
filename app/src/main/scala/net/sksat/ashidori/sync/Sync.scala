@@ -116,7 +116,12 @@ object Uploader:
   def uploadRawLogs(): Int =
     val db = AshidoriApp.db
     var sent = resumePending("gnss")
-    for (rowid, path) <- db.pendingGnssFiles() do
+    // Several sessions share a day's file: send each file once, after its
+    // day is over (it is still being appended to until then).
+    val today = GnssRecorder.fileName(java.time.LocalDate.now(AshidoriApp.zone))
+    for (path, rows) <- db.pendingGnssFiles().groupBy(_._2).toSeq.sortBy(_._2.map(_._1).min)
+        if File(path).getName != today
+    do
       val f = File(path)
       val pending =
         if !f.exists then Vector.empty
@@ -128,7 +133,7 @@ object Uploader:
               "data" -> java.util.Base64.getEncoder.encodeToString(chunk))))
           }
       // All chunks are sealed to disk before the file counts as handed over.
-      db.markGnssUploaded(rowid)
+      rows.foreach((rowid, _) => db.markGnssUploaded(rowid))
       pending.foreach { p =>
         send("gnss", p)
         sent += 1

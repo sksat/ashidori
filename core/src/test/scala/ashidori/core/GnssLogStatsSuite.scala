@@ -30,3 +30,17 @@ class GnssLogStatsSuite extends munit.FunSuite:
     assertEquals(s.fixes, 1)
     assertEqualsDouble(s.bestAccuracyM, 4.5, 1e-6)
   }
+
+  test("daily file: durations are summed per session, not first-to-last") {
+    val log = GnssLogFormat.header("t", "15", "SHARP", "SH-M26").linesIterator.toSeq ++ Seq(
+      "# Session 2026-10-12T00:00:00Z reason=periodic",
+      raw(1_000, 1, 1, 3, 40, 0, 1.57542e9),
+      raw(61_000, 2, 1, 3, 40, 0, 1.57542e9),
+      "# Session 2026-10-12T00:30:00Z reason=periodic",
+      raw(1_801_000, 3, 1, 3, 40, 0, 1.57542e9),
+      raw(1_861_000, 4, 1, 3, 40, 0, 1.57542e9)
+    )
+    val s = GnssLogStats.summarize(log.iterator)
+    assertEquals(s.sessions, 2)
+    assertEquals(s.durationMs, 120_000L)
+  }

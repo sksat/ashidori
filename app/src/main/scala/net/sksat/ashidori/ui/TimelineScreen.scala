@@ -151,9 +151,18 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   /** While today's day view is open, redraw as new fixes arrive (≤ every 20 s). */
   override def onShow(): Unit =
+    // First open: show where we last were right away, before the day loads.
+    if fittedDate.isEmpty then
+      LoggerState.lastFix match
+        case Some(f) => map.focus(f.latLng, 15)
+        case None =>
+          AshidoriApp.io.execute { () =>
+            AshidoriApp.db.lastFix().foreach(f => act.runOnUiThread(() => if fittedDate.isEmpty then map.focus(f.latLng, 15)))
+          }
     load()
     unobserve()
     unobserve = LoggerState.observe { () =>
+      updateLiveTail()
       val now = System.currentTimeMillis()
       if span == Span.Day && anchor == LocalDate.now(AshidoriApp.zone) && now - lastLive > 20_000 &&
         LoggerState.lastFix.exists(f => f.time > lastLive)
@@ -163,6 +172,18 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     }
 
   override def onHide(): Unit = unobserve()
+
+  /** Time of the last point drawn by the latest full render. */
+  private var drawnUntil = Long.MaxValue
+
+  /** Between full redraws, extend the line from the drawn route to the
+    * current position right away, so it does not lag behind the dot.
+    */
+  private def updateLiveTail(): Unit =
+    if span == Span.Day && anchor == LocalDate.now(AshidoriApp.zone) && drawnUntil != Long.MaxValue then
+      val tail = LoggerState.recentFixes.filter(f => f.time >= drawnUntil && (!f.hasAccuracy || f.accuracy < 100))
+      map.setLive(if tail.size >= 2 then tail else Nil)
+    else map.setLive(Nil)
 
   private def installSwipe(): Unit =
     val detector = GestureDetector(act, new GestureDetector.SimpleOnGestureListener:
@@ -236,6 +257,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   private def render(tl: DayTimeline): Unit =
     val fit = !fittedDate.contains(tl.date)
+    // The live tail starts where this render's route ends.
+    drawnUntil = tl.segments.collect { case t: Trip => t.path.lastOption.map(_.time) }.flatten.maxOption
+      .orElse(tl.segments.lastOption.map(_.end)).getOrElse(Long.MaxValue)
+    updateLiveTail()
     fittedDate = Some(tl.date)
     current = Some(tl)
     summary.removeAllViews()

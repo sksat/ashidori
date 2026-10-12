@@ -22,8 +22,12 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
   val file: File =
     val dir = File(ctx.getExternalFilesDir(null), "gnss")
     dir.mkdirs()
-    File(dir, s"ashidori_gnss_${LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.txt")
-  private val out = BufferedWriter(FileWriter(file), 64 * 1024)
+    // One file per day: detail sessions are short and frequent, so a file
+    // per session left dozens of fragments. Sessions are appended and
+    // separated by a comment line (GnssLogger tools skip comments).
+    File(dir, GnssRecorder.fileName(java.time.LocalDate.now(AshidoriApp.zone)))
+  private val existed = file.exists && file.length > 0
+  private val out = BufferedWriter(FileWriter(file, true), 64 * 1024)
   private val io = AshidoriApp.io
   private val exec: Executor = r => handler.post(r)
   @volatile private var closed = false
@@ -36,9 +40,10 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
         out.write('\n')
     }
 
-  io.execute(() =>
-    out.write(GnssLogFormat.header(BuildInfo.versionName, Build.VERSION.RELEASE, Build.MANUFACTURER, Build.MODEL))
-  )
+  io.execute { () =>
+    if !existed then out.write(GnssLogFormat.header(BuildInfo.versionName, Build.VERSION.RELEASE, Build.MANUFACTURER, Build.MODEL))
+    out.write(s"# Session ${java.time.Instant.ofEpochMilli(startedAt)} reason=$reason fullTracking=$fullTracking\n")
+  }
 
   private val measurementCb = new GnssMeasurementsEvent.Callback:
     override def onGnssMeasurementsReceived(ev: GnssMeasurementsEvent): Unit =
@@ -166,3 +171,7 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       out.close()
     }
     file
+
+object GnssRecorder:
+  def fileName(day: java.time.LocalDate): String =
+    s"ashidori_gnss_${day.format(DateTimeFormatter.ofPattern("yyyyMMdd"))}.txt"

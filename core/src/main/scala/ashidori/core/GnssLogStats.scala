@@ -2,7 +2,10 @@ package ashidori.core
 
 /** Summary of one raw GNSS log (GnssLogger text format). */
 final case class GnssLogStats(
+    /** recorded time, summed over sessions */
     durationMs: Long,
+    /** detail sessions in the file (a daily file holds several) */
+    sessions: Int,
     /** measurement epochs (distinct TimeNanos) */
     epochs: Int,
     measurements: Int,
@@ -44,10 +47,19 @@ object GnssLogStats:
     var best = Double.PositiveInfinity
     var tMin = Long.MaxValue
     var tMax = Long.MinValue
+    var total = 0L
+    var sessions = 0
+    def closeSession(): Unit =
+      if tMax >= tMin then total += tMax - tMin
+      tMin = Long.MaxValue
+      tMax = Long.MinValue
     def num(a: Array[String], i: Option[Int]): Double =
       i.filter(_ < a.length).flatMap(k => a(k).toDoubleOption).getOrElse(Double.NaN)
     for line <- lines do
-      if line.startsWith("# Raw,") then rawCols = line.drop(2).split(',').zipWithIndex.toMap
+      if line.startsWith("# Session") then
+        closeSession()
+        sessions += 1
+      else if line.startsWith("# Raw,") then rawCols = line.drop(2).split(',').zipWithIndex.toMap
       else if line.startsWith("# Fix,") then fixCols = line.drop(2).split(',').zipWithIndex.toMap
       else if line.startsWith("Raw,") && rawCols.nonEmpty then
         val a = line.split(",", -1)
@@ -69,8 +81,10 @@ object GnssLogStats:
         fixes += 1
         val acc = num(a, fixCols.get("AccuracyMeters"))
         if !acc.isNaN then best = math.min(best, acc)
+    closeSession()
     GnssLogStats(
-      if tMax >= tMin then tMax - tMin else 0,
+      total,
+      math.max(sessions, if n > 0 then 1 else 0),
       epochs.size,
       n,
       sats.view.mapValues(s => (s.map(_._1).size, s.map(_._2).toSet)).toMap,

@@ -100,7 +100,17 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   private def loadStyle(m: MapLibreMap, ms: MapStyle): Unit =
     map = None
     m.setStyle(ms.builder, (style: Style) => {
-      for id <- Seq("track", "highlight", "visits", "checkins") do style.addSource(GeoJsonSource(id))
+      for id <- Seq("track", "highlight", "visits", "checkins", "live") do style.addSource(GeoJsonSource(id))
+      // From the end of the drawn route to where we are now, updated per fix.
+      style.addLayer(
+        LineLayer("live-line", "live").withProperties(
+          PropertyFactory.lineColor(TrackMap.DefaultLine),
+          PropertyFactory.lineWidth(4f),
+          PropertyFactory.lineOpacity(0.9f),
+          PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
+        )
+      )
       style.addLayer(
         LineLayer("track-line", "track").withProperties(
           // Each path carries its transport mode color.
@@ -249,6 +259,12 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       style.getSourceAs[GeoJsonSource]("checkins").setGeoJson(markers("checkin", checkIns))
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
       if fit then fitTo(paths.flatMap(_.points).map(_.latLng) ++ visits.map(_.at) ++ checkIns.map(_.at))
+    }
+
+  /** Replaces the live tail (empty to clear). */
+  def setLive(points: Seq[Fix]): Unit =
+    withStyle { (_, style) =>
+      Option(style.getSourceAs[GeoJsonSource]("live")).foreach(_.setGeoJson(lines(Seq(MapPath(points)))))
     }
 
   def highlight(path: Seq[Fix]): Unit =
