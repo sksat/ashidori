@@ -51,7 +51,7 @@ object ParquetReader:
             case 0 => page
             case 2 => GZIPInputStream(ByteArrayInputStream(page)).readAllBytes()
             case x => throw IllegalArgumentException(s"unsupported codec $x")
-          decodePage(body, count, c.tpe, out(c.name), base + filled)
+          decodePage(body, count, c.tpe, dph(2).asInstanceOf[Long].toInt, out(c.name), base + filled)
           filled += count
       base += n
     Table(columns, total, out)
@@ -64,11 +64,38 @@ object ParquetReader:
       read(bytes)
     finally f.close()
 
-  private def decodePage(body: Array[Byte], count: Int, t: ColType, into: Array[Any], at: Int): Unit =
+  private def decodePage(body: Array[Byte], count: Int, t: ColType, encoding: Int, into: Array[Any], at: Int): Unit =
     val bb = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN)
     val levelsLen = bb.getInt()
     val defined = rleDecode(body, 4, levelsLen, count)
-    bb.position(4 + levelsLen)
+    val start = 4 + levelsLen
+    val present = defined.count(identity)
+    encoding match
+      case ParquetWriter.DeltaBinaryPacked =>
+        val vs = deltaDecode(body, start, present)
+        var k = 0
+        for i <- 0 until count do
+          into(at + i) =
+            if !defined(i) then null
+            else
+              val v = vs(k)
+              k += 1
+              if t == ColType.Int32 then v.toInt else v
+        return
+      case ParquetWriter.ByteStreamSplit =>
+        val width = if t == ColType.Float32 then 4 else 8
+        var k = 0
+        for i <- 0 until count do
+          into(at + i) =
+            if !defined(i) then null
+            else
+              var bits = 0L
+              for j <- 0 until width do bits |= (body(start + j * present + k) & 0xffL) << (8 * j)
+              k += 1
+              if width == 4 then java.lang.Float.intBitsToFloat(bits.toInt) else java.lang.Double.longBitsToDouble(bits)
+        return
+      case _ => ()
+    bb.position(start)
     for i <- 0 until count do
       into(at + i) =
         if !defined(i) then null
@@ -83,6 +110,53 @@ object ParquetReader:
               val s = String(body, bb.position(), len, UTF_8)
               bb.position(bb.position() + len)
               s
+
+  private def deltaDecode(b: Array[Byte], start: Int, expected: Int): Array[Long] =
+    var p = start
+    def varint(): Long =
+      var r = 0L
+      var shift = 0
+      var more = true
+      while more do
+        val x = b(p) & 0xff
+        p += 1
+        r |= (x & 0x7f).toLong << shift
+        shift += 7
+        more = (x & 0x80) != 0
+      r
+    def zigzag(): Long =
+      val v = varint()
+      (v >>> 1) ^ -(v & 1)
+    val blockSize = varint().toInt
+    val miniblocks = varint().toInt
+    val total = varint().toInt
+    val out = new Array[Long](total)
+    if total == 0 then return out
+    out(0) = zigzag()
+    var n = 1
+    val perMini = blockSize / miniblocks
+    while n < total do
+      val minDelta = zigzag()
+      val widths = (0 until miniblocks).map(_ => b(p + 0) & 0xff).toArray
+      for m <- 0 until miniblocks do widths(m) = b(p + m) & 0xff
+      p += miniblocks
+      var m = 0
+      while m < miniblocks && n < total do
+        val w = widths(m)
+        var bitPos = 0L
+        val base = p
+        for _ <- 0 until perMini do
+          var v = 0L
+          for bit <- 0 until w do
+            val pos = bitPos + bit
+            if ((b(base + (pos >> 3).toInt) >> (pos & 7).toInt) & 1) == 1 then v |= 1L << bit
+          bitPos += w
+          if n < total then
+            out(n) = out(n - 1) + minDelta + v
+            n += 1
+        p += perMini * w / 8
+        m += 1
+    out
 
   /** RLE/bit-packed hybrid, bit width 1. */
   private def rleDecode(b: Array[Byte], start: Int, len: Int, count: Int): Array[Boolean] =

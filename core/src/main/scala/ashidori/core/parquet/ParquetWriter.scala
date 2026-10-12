@@ -29,7 +29,10 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
   private val sink = CountingStream(out)
   sink.write(Magic)
 
-  private val values = schema.map(_ => ByteArrayOutputStream())
+  // Present values per column until the page is encoded.
+  private val strings = schema.map(_ => ByteArrayOutputStream())
+  private val longs = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Long])
+  private val doubles = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Double])
   private val defined = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Boolean])
   private var rowsInGroup = 0
   private var totalRows = 0L
@@ -44,20 +47,26 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
         case f: Float if f.isNaN   => false
         case _                     => true
       defined(i) += present
-      if present then plain(values(i), c.tpe, v)
+      if present then
+        c.tpe match
+          case ColType.Int32 | ColType.Int64     => longs(i) += long(v)
+          case ColType.Float32 | ColType.Float64 => doubles(i) += double(v)
+          case ColType.Str =>
+            val bytes = v.toString.getBytes(UTF_8)
+            le(strings(i), bytes.length.toLong, 4)
+            strings(i).write(bytes)
     rowsInGroup += 1
     if rowsInGroup >= rowGroupRows then flushGroup()
 
-  private def plain(b: ByteArrayOutputStream, t: ColType, v: Any): Unit =
-    t match
-      case ColType.Int32   => le(b, long(v).toInt.toLong, 4)
-      case ColType.Int64   => le(b, long(v), 8)
-      case ColType.Float32 => le(b, java.lang.Float.floatToIntBits(double(v).toFloat).toLong, 4)
-      case ColType.Float64 => le(b, java.lang.Double.doubleToLongBits(double(v)), 8)
-      case ColType.Str =>
-        val bytes = v.toString.getBytes(UTF_8)
-        le(b, bytes.length.toLong, 4)
-        b.write(bytes)
+  /** Encoded values of column i and the encoding id used. */
+  private def encodeValues(i: Int): (Array[Byte], Int) =
+    schema(i).tpe match
+      case ColType.Int32 => (deltaBinaryPacked(longs(i), 32), DeltaBinaryPacked)
+      case ColType.Int64 => (deltaBinaryPacked(longs(i), 64), DeltaBinaryPacked)
+      case ColType.Float32 =>
+        (byteStreamSplit(doubles(i).map(d => java.lang.Float.floatToIntBits(d.toFloat).toLong & 0xffffffffL), 4), ByteStreamSplit)
+      case ColType.Float64 => (byteStreamSplit(doubles(i).map(java.lang.Double.doubleToLongBits), 8), ByteStreamSplit)
+      case ColType.Str     => (strings(i).toByteArray, Plain)
 
   private def long(v: Any): Long = v match
     case i: Int     => i.toLong
@@ -84,7 +93,8 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
         val body = ByteArrayOutputStream()
         le(body, levels.length.toLong, 4)
         body.write(levels)
-        values(i).writeTo(body)
+        val (encoded, encoding) = encodeValues(i)
+        body.write(encoded)
         val raw = body.toByteArray
         val zipped =
           val z = ByteArrayOutputStream()
@@ -99,7 +109,7 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
           header.i32(3, zipped.length)
           header.structField(5) {
             header.i32(1, rowsInGroup)
-            header.i32(2, 0) // PLAIN
+            header.i32(2, encoding)
             header.i32(3, 3) // RLE
             header.i32(4, 3) // RLE
           }
@@ -108,12 +118,14 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
         val hdr = header.bytes
         sink.write(hdr)
         sink.write(zipped)
-        ChunkMeta(c, offset, hdr.length + raw.length, hdr.length + zipped.length, rowsInGroup)
+        ChunkMeta(c, offset, hdr.length + raw.length, hdr.length + zipped.length, rowsInGroup, encoding)
       }
       rowGroups += RowGroupMeta(chunks, rowsInGroup)
       totalRows += rowsInGroup
       rowsInGroup = 0
-      values.foreach(_.reset())
+      strings.foreach(_.reset())
+      longs.foreach(_.clear())
+      doubles.foreach(_.clear())
       defined.foreach(_.clear())
 
   /** Writes the footer; does not close the underlying stream. */
@@ -147,8 +159,8 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
                   t.structField(3) {
                     t.i32(1, ch.column.tpe.physical)
                     t.listField(2, Thrift.I32, 2) {
-                      t.rawI32(0) // PLAIN
-                      t.rawI32(3) // RLE
+                      t.rawI32(ch.encoding)
+                      t.rawI32(3) // RLE (definition levels)
                     }
                     t.listField(3, Thrift.Binary, 1)(t.rawString(ch.column.name))
                     t.i32(4, 2) // GZIP
@@ -176,7 +188,61 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
 object ParquetWriter:
   private val Magic = "PAR1".getBytes(UTF_8)
 
-  private final case class ChunkMeta(column: Column, offset: Long, uncompressed: Int, compressed: Int, rows: Int)
+  private final case class ChunkMeta(column: Column, offset: Long, uncompressed: Int, compressed: Int, rows: Int, encoding: Int)
+
+  val Plain = 0
+  val DeltaBinaryPacked = 5
+  val ByteStreamSplit = 9
+
+  /** BYTE_STREAM_SPLIT: byte k of every value, then byte k+1, ... Groups the
+    * slowly-changing high bytes of time series so GZIP compresses them well.
+    */
+  def byteStreamSplit(bits: collection.IndexedSeq[Long], width: Int): Array[Byte] =
+    val n = bits.size
+    val out = new Array[Byte](n * width)
+    for i <- 0 until n; k <- 0 until width do out(k * n + i) = ((bits(i) >>> (8 * k)) & 0xff).toByte
+    out
+
+  /** DELTA_BINARY_PACKED (blocks of 128 values, 4 miniblocks of 32): stores
+    * the first value and bit-packed deltas, ideal for timestamps and ids.
+    */
+  def deltaBinaryPacked(values: collection.IndexedSeq[Long], typeBits: Int): Array[Byte] =
+    val b = ByteArrayOutputStream()
+    val blockSize = 128
+    val miniblocks = 4
+    val perMini = blockSize / miniblocks
+    Thrift.varint(b, blockSize.toLong)
+    Thrift.varint(b, miniblocks.toLong)
+    Thrift.varint(b, values.size.toLong)
+    Thrift.varint(b, Thrift.zigzag(if values.isEmpty then 0L else values(0)))
+    def wrap(d: Long) = if typeBits == 32 then d.toInt.toLong else d
+    val deltas = (1 until values.size).map(i => wrap(values(i) - values(i - 1)))
+    for block <- deltas.grouped(blockSize) do
+      val minDelta = block.min
+      Thrift.varint(b, Thrift.zigzag(minDelta))
+      val minis = block.grouped(perMini).toVector
+      val adjusted = minis.map(_.map(d => wrap(d - minDelta) & (if typeBits == 32 then 0xffffffffL else -1L)))
+      val widths = (0 until miniblocks).map { m =>
+        adjusted.lift(m).map(ms => ms.map(v => 64 - java.lang.Long.numberOfLeadingZeros(v)).max).getOrElse(0)
+      }
+      widths.foreach(w => b.write(w))
+      for (ms, m) <- adjusted.zipWithIndex do
+        val w = widths(m)
+        // Bit-pack 32 values (pad the last miniblock with zeros), LSB first.
+        val padded = ms ++ Seq.fill(perMini - ms.size)(0L)
+        var acc = BigInt(0)
+        var nbits = 0
+        val bytes = ByteArrayOutputStream()
+        for v <- padded do
+          acc |= BigInt(v) << nbits
+          nbits += w
+          while nbits >= 8 do
+            bytes.write((acc & 0xff).toInt)
+            acc >>= 8
+            nbits -= 8
+        if nbits > 0 then bytes.write((acc & 0xff).toInt)
+        b.write(bytes.toByteArray)
+    b.toByteArray
   private final case class RowGroupMeta(chunks: Seq[ChunkMeta], rows: Int)
 
   private def le(b: ByteArrayOutputStream, v: Long, bytes: Int): Unit =
