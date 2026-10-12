@@ -119,7 +119,35 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     for f <- fs do
       val t = text(Instant.ofEpochMilli(f.lastModified()).atZone(AshidoriApp.zone).format(timeFmt), 14f)
       t.setLayoutParams(weighted())
-      files.addView(hbox(t, caption(f"${f.length / 1024.0 / 1024.0}%.1f MB "), outlined("共有")(act.shareFile(f))))
+      val row = hbox(t, caption(f"${f.length / 1024.0 / 1024.0}%.1f MB "), outlined("共有")(act.shareFile(f)))
+      row.setMinimumHeight(dp(48))
+      row.setBackgroundResource(android.R.drawable.list_selector_background)
+      row.setOnClickListener(_ => showStats(f))
+      files.addView(row)
+
+  /** What a raw log contains, summarized from the file itself. */
+  private def showStats(f: File): Unit =
+    AshidoriApp.io.execute { () =>
+      val st = scala.util.Using.resource(scala.io.Source.fromFile(f, "UTF-8"))(src => GnssLogStats.summarize(src.getLines()))
+      val consts = st.constellations.toSeq.sortBy(-_._2._1).map { case (c, (n, bands)) =>
+        s"$c ${n}機（${bands.toSeq.sorted.mkString("/")}）"
+      }
+      val body =
+        f"""記録時間 ${fmtDuration(st.durationMs)}・${st.epochs}%,d エポック・測定値 ${st.measurements}%,d 件
+           |平均 C/N0 ${st.meanCn0}%.1f dB-Hz
+           |搬送波位相（ADR）有効 ${st.adrValidRatio * 100}%.0f%%
+           |測位 ${st.fixes} 回・最良精度 ${if st.bestAccuracyM.isNaN then "-" else f"±${st.bestAccuracyM}%.1fm"}
+           |
+           |${consts.mkString("\n")}""".stripMargin
+      act.runOnUiThread { () =>
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+          .setTitle(f.getName)
+          .setMessage(body)
+          .setPositiveButton("閉じる", null)
+          .setNeutralButton("共有", (_, _) => act.shareFile(f))
+          .show()
+      }
+    }
 
   def refresh(): Unit =
     val running = LoggerState.running
