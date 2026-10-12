@@ -172,6 +172,22 @@ class MainActivity extends AppCompatActivity:
     // Debug builds: `am start ... --ez ashidori.sim true` seeds a simulated day
     // (yesterday and today) for UI checks on emulators.
     val debuggable = (getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    // Debug builds: `--es ashidori.syncUrl http://localhost:8787 --es ashidori.syncCode CODE`
+    // pairs with a local dev server, creates a key and syncs, for end-to-end
+    // tests. Secrets are logged only because this is a debug-only test hook.
+    if debuggable then
+      for url <- Option(getIntent.getStringExtra("ashidori.syncUrl")); code <- Option(getIntent.getStringExtra("ashidori.syncCode")) do
+        AshidoriApp.io.execute { () =>
+          try
+            val (id, token) = net.sksat.ashidori.sync.SyncClient(url, None).register(code, "emulator")
+            net.sksat.ashidori.sync.SyncConfig.savePairing(url, id, token)
+            val key = ashidori.core.sync.Crypto.newMasterKey()
+            net.sksat.ashidori.sync.SyncConfig.setMasterKey(key)
+            Log.i(s"debug sync paired device=$id token=$token recovery=${ashidori.core.sync.RecoveryCode.encode(key)}")
+            val sent = net.sksat.ashidori.sync.Uploader.uploadSmall()
+            Log.i(s"debug sync uploaded batches=$sent")
+          catch case e: Exception => Log.e("debug sync failed", e)
+        }
     if debuggable && getIntent.getBooleanExtra("ashidori.sim", false) then
       AshidoriApp.io.execute { () =>
         val today = LocalDate.now(AshidoriApp.zone)

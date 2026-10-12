@@ -64,7 +64,10 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     val go = button("この端末を登録") {
       val u = url.getText.toString.trim.stripSuffix("/")
       val c = code.getText.toString.trim.toUpperCase
-      if !u.startsWith("https://") then toast("https:// で始まる URL を入力してください")
+      // Debug builds may talk to a local `wrangler dev` over http.
+      val debuggable = (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+      if !u.startsWith("https://") && !(debuggable && u.startsWith("http://")) then
+        toast("https:// で始まる URL を入力してください")
       else
         async(SyncClient(u, None).register(c, SyncScheduler.deviceName)) {
           _.fold(e => toast(e.getMessage), { (id, token) =>
