@@ -122,12 +122,13 @@ class MainActivity extends AppCompatActivity:
     nav = BottomNavigationView(this)
     // Always show labels: icon-only tabs made the timeline hard to find.
     nav.setLabelVisibilityMode(com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_LABELED)
-    for (id, title, icon) <- Seq(
-        (MainActivity.TabTimeline, "タイムライン", R.drawable.ic_timeline),
+    // The timeline is the home and sits in the middle, within thumb reach.
+    for ((id, title, icon), order) <- Seq(
         (MainActivity.TabInsights, "インサイト", R.drawable.ic_insights),
+        (MainActivity.TabTimeline, "タイムライン", R.drawable.ic_timeline),
         (MainActivity.TabLogger, "測位", R.drawable.ic_logger)
-      )
-    do nav.getMenu.add(0, id, id, title).setIcon(icon)
+      ).zipWithIndex
+    do nav.getMenu.add(0, id, order, title).setIcon(icon)
 
     tabs = Map(
       MainActivity.TabTimeline -> TimelineScreen(this, savedInstanceState),
