@@ -14,8 +14,8 @@ android {
         // Android 13: OPPO Reno5 A's last OS. Scala 3.8+ lazy vals need VarHandle (API 33+).
         minSdk = 33
         targetSdk = 37
-        versionCode = 9
-        versionName = "0.9.0"
+        versionCode = 10
+        versionName = "0.10.0"
         // Pixel 8a is arm64; x86_64 is for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
