@@ -54,8 +54,8 @@ class MainActivity extends ComponentActivity:
     screens = Map(
       1 -> TimelineScreen(this),
       2 -> mapScreen,
-      3 -> PlaceholderScreen(this, "チェックイン", "近くの施設（OpenStreetMap）を選んでチェックインする機能は次のバージョンで追加します。"),
-      4 -> PlaceholderScreen(this, "インサイト", "月ごとの移動手段別の距離、訪れた場所や都市の一覧は次のバージョンで追加します。"),
+      3 -> CheckInScreen(this),
+      4 -> InsightsScreen(this),
       5 -> LoggerScreen(this)
     )
     diagnostics = DiagnosticsScreen(this)
