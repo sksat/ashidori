@@ -105,17 +105,37 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
           )
         catch case _: SecurityException => status.setText("位置情報の権限がありません")
 
+  /** Places and past check-in venues near `p`, from the local DB. Works offline. */
+  private def localCandidates(p: LatLng): Vector[(Venue, Double)] =
+    val db = AshidoriApp.db
+    val fromPlaces = db.places().filter(_.name.nonEmpty).map(pl => Venue(pl.externalId, pl.name, "よく行く場所", pl.lat, pl.lon))
+    val fromCheckIns = db.checkIns(0, Long.MaxValue).map(c => Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon))
+    (fromPlaces ++ fromCheckIns)
+      .map(v => v -> v.latLng.distanceTo(p))
+      .filter(_._2 <= 400)
+      .sortBy(_._2)
+      .distinctBy(_._1.name)
+
   private def fetch(p: LatLng): Unit =
     here = Some(p)
-    if !Settings.onlineVenues then
-      status.setText("施設の検索はオフです。名前を入力してチェックインできます。")
-      render()
+    // Local candidates first, so check-in works without a network.
+    AshidoriApp.io.execute { () =>
+      val local = localCandidates(p)
+      act.runOnUiThread { () =>
+        venues = (local ++ venues).distinctBy(_._1.name)
+        render()
+      }
+    }
+    if !Settings.onlineVenues then status.setText("施設の検索はオフです。名前を入力してチェックインできます。")
     else
       status.setText("近くの施設を探しています…")
       VenueSearch.nearby(p) { r =>
         r.fold(
-          e => status.setText(s"施設を取得できませんでした（${e.getMessage}）。名前を入力してチェックインできます。"),
-          vs => { venues = vs; status.setText("") }
+          _ => status.setText("オフラインのため、よく行く場所と過去のチェックイン先から表示しています。名前を入力してもチェックインできます。"),
+          vs => {
+            venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
+            status.setText("")
+          }
         )
         render()
       }

@@ -27,6 +27,7 @@ final case class MapMarker(at: LatLng, key: String, label: String = "")
   */
 final class TrackMap(act: MainActivity, saved: Bundle):
   MapLibre.getInstance(act)
+  TrackMap.enlargeCache(act)
   val mapView: MapView = MapView(act)
   mapView.onCreate(saved)
   act.registerMap(this)
@@ -223,6 +224,21 @@ final class TrackMap(act: MainActivity, saved: Bundle):
   def onDestroy(): Unit = mapView.onDestroy()
 
 object TrackMap:
+  private var cacheSet = false
+
+  /** Keep viewed tiles for offline use: places you have looked at stay
+    * visible without a network (default ambient cache is ~50 MB).
+    */
+  def enlargeCache(ctx: android.content.Context): Unit =
+    if !cacheSet then
+      cacheSet = true
+      org.maplibre.android.offline.OfflineManager.getInstance(ctx).setMaximumAmbientCacheSize(
+        300L * 1024 * 1024,
+        new org.maplibre.android.offline.OfflineManager.FileSourceCallback:
+          override def onSuccess(): Unit = ()
+          override def onError(message: String): Unit = Log.w(s"tile cache: $message")
+      )
+
   def toLocation(f: Fix): Location =
     val l = Location(f.provider)
     l.setLatitude(f.lat)
