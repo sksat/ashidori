@@ -24,7 +24,8 @@ import ashidori.core.*
 final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine)
 
 /** A marker on the map; `key` comes back in click callbacks. */
-final case class MapMarker(at: LatLng, key: String, label: String = "")
+/** `weight` scales the circle (e.g. number of visits). */
+final case class MapMarker(at: LatLng, key: String, label: String = "", weight: Double = 1)
 
 /** MapLibre map with layers for tracks, visits, check-ins and one highlighted
   * path. Data set before the style finishes loading is applied afterwards.
@@ -121,7 +122,12 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       style.addLayer(
         CircleLayer("visit-circles", "visits").withProperties(
           PropertyFactory.circleColor("#006B5B"),
-          PropertyFactory.circleRadius(7f),
+          PropertyFactory.circleOpacity(0.85f),
+          // More visits, bigger circle.
+          PropertyFactory.circleRadius(
+            Expression.interpolate(Expression.linear(), Expression.get("weight"),
+              Expression.stop(1, 7f), Expression.stop(10, 12f), Expression.stop(60, 20f))
+          ),
           PropertyFactory.circleStrokeColor("#ffffff"),
           PropertyFactory.circleStrokeWidth(2f)
         )
@@ -185,6 +191,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       props.addProperty("key", mk.key)
       props.addProperty("layer", layer)
       props.addProperty("label", mk.label)
+      props.addProperty("weight", mk.weight)
       Feature.fromGeometry(Point.fromLngLat(mk.at.lon, mk.at.lat), props)
     }.asJava)
 

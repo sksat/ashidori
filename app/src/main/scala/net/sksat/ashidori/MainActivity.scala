@@ -38,7 +38,6 @@ class MainActivity extends AppCompatActivity:
   private val maps = mutable.ArrayBuffer.empty[TrackMap]
 
   private var toolbar: MaterialToolbar = null
-  private var statusChip: Chip = null
   private var content: FrameLayout = null
   private var screenHost: FrameLayout = null
   private var fab: ExtendedFloatingActionButton = null
@@ -98,15 +97,16 @@ class MainActivity extends AppCompatActivity:
     super.onCreate(savedInstanceState)
 
     toolbar = MaterialToolbar(this)
-    statusChip = Chip(this)
-    statusChip.setOnClickListener(_ => push(LoggerScreen(this)))
-    val lp = Toolbar.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END)
-    lp.setMarginEnd(dp(4))
-    toolbar.addView(statusChip, lp)
+    val searchItem = toolbar.getMenu.add(Menu.NONE, 2, Menu.NONE, "検索")
+    searchItem.setIcon(R.drawable.ic_search)
+    searchItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
     val settingsItem = toolbar.getMenu.add(Menu.NONE, 1, Menu.NONE, "設定")
     settingsItem.setIcon(R.drawable.ic_settings)
     settingsItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
-    toolbar.setOnMenuItemClickListener(_ => { push(SettingsScreen(this)); true })
+    toolbar.setOnMenuItemClickListener { item =>
+      if item.getItemId == 2 then push(SearchScreen(this)) else push(SettingsScreen(this))
+      true
+    }
     toolbar.setNavigationOnClickListener(_ => pop())
 
     screenHost = FrameLayout(this)
@@ -124,15 +124,15 @@ class MainActivity extends AppCompatActivity:
     nav.setLabelVisibilityMode(com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_LABELED)
     for (id, title, icon) <- Seq(
         (MainActivity.TabTimeline, "タイムライン", R.drawable.ic_timeline),
-        (MainActivity.TabMap, "マップ", R.drawable.ic_map),
-        (MainActivity.TabInsights, "インサイト", R.drawable.ic_insights)
+        (MainActivity.TabInsights, "インサイト", R.drawable.ic_insights),
+        (MainActivity.TabLogger, "測位", R.drawable.ic_logger)
       )
     do nav.getMenu.add(0, id, id, title).setIcon(icon)
 
     tabs = Map(
       MainActivity.TabTimeline -> TimelineScreen(this, savedInstanceState),
-      MainActivity.TabMap -> MapScreen(this, savedInstanceState),
-      MainActivity.TabInsights -> InsightsScreen(this)
+      MainActivity.TabInsights -> TimelineScreen(this, savedInstanceState, Seq(Span.Week, Span.Month, Span.Year)),
+      MainActivity.TabLogger -> LoggerScreen(this)
     )
     nav.setOnItemSelectedListener { item =>
       tabId = item.getItemId
@@ -217,9 +217,9 @@ class MainActivity extends AppCompatActivity:
     handleIntent(intent)
 
   private def handleIntent(intent: Intent): Unit =
-    if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded &&
-      !current.exists(_.isInstanceOf[LoggerScreen])
-    then push(LoggerScreen(this))
+    if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded then
+      stack.clear()
+      nav.setSelectedItemId(MainActivity.TabLogger)
 
   private def finishOnboarding(): Unit =
     Settings.onboarded = true
@@ -230,21 +230,9 @@ class MainActivity extends AppCompatActivity:
     show(tabs(MainActivity.TabTimeline))
 
   private def updateStatusChip(): Unit =
-    val running = LoggerState.running
-    // The only status display: is it recording, and how well is position
-    // known right now. Mode and details live on the recording screen.
-    val now = System.currentTimeMillis()
-    val sats = LoggerState.satellites
-    val acc = LoggerState.lastFix.filter(f => now - f.time < 2 * 60_000 && f.hasAccuracy)
-      .map(f => f" ±${f.accuracy}%.0fm").getOrElse("")
-    statusChip.setText(
-      if !running then "○ 停止中"
-      else if sats.nonEmpty then
-        s"● 記録中・衛星${sats.filter(_.usedInFix).map(s => (s.constellation, s.svid)).distinct.size}機$acc"
-      else if LoggerState.motion == MotionState.Stationary then "● 記録中・静止中"
-      else s"● 記録中$acc"
-    )
-    statusChip.setContentDescription(if running then "記録中。タップで記録の詳細" else "記録停止中。タップで記録の詳細")
+    val badge = nav.getOrCreateBadge(MainActivity.TabLogger)
+    badge.setVisible(!LoggerState.running)
+    badge.setBackgroundColor(color(attr.error))
 
   // --- navigation ----------------------------------------------------------------------
 
@@ -275,9 +263,9 @@ class MainActivity extends AppCompatActivity:
     val onboarding = s.isInstanceOf[OnboardingScreen]
     toolbar.setVisibility(if onboarding then View.GONE else View.VISIBLE)
     nav.setVisibility(if pushed then View.GONE else View.VISIBLE)
-    fab.setVisibility(if !pushed && tabId != MainActivity.TabInsights then View.VISIBLE else View.GONE)
-    statusChip.setVisibility(if pushed then View.GONE else View.VISIBLE)
+    fab.setVisibility(if !pushed && tabId == MainActivity.TabTimeline then View.VISIBLE else View.GONE)
     toolbar.getMenu.findItem(1).setVisible(!pushed)
+    toolbar.getMenu.findItem(2).setVisible(!pushed)
     if pushed then
       toolbar.setNavigationIcon(R.drawable.ic_arrow_back)
       toolbar.setNavigationContentDescription("戻る")
@@ -288,6 +276,10 @@ class MainActivity extends AppCompatActivity:
     s.onShow()
 
   def registerMap(m: TrackMap): Unit = maps += m
+
+  /** Check-in is about "now": the timeline hides it for week/month/year. */
+  def setCheckInVisible(v: Boolean): Unit =
+    fab.setVisibility(if v && stack.isEmpty && tabId == MainActivity.TabTimeline then View.VISIBLE else View.GONE)
 
   override def onStart(): Unit =
     super.onStart()
@@ -329,8 +321,8 @@ object MainActivity:
   /** Intent extra: open the recording screen (from the notification). */
   val ExtraOpenLogger = "ashidori.openLogger"
   val TabTimeline = 1
-  val TabMap = 2
-  val TabInsights = 3
+  val TabInsights = 2
+  val TabLogger = 4
   val RequiredPermissions: Seq[String] = Seq(
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.POST_NOTIFICATIONS,

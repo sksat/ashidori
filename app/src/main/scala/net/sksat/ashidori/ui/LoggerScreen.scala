@@ -29,7 +29,7 @@ object ModeInfo:
 /** Recording status and controls, opened from the status chip in the top bar. */
 final class LoggerScreen(act: MainActivity) extends Screen:
   private given Ctx = act
-  override val title = "記録"
+  override val title = "測位"
   private val timeFmt = DateTimeFormatter.ofPattern("M/d HH:mm")
 
   private val status = text("", 20f, bold = true)

@@ -20,7 +20,9 @@ final class PlaceSheet(
     place: Place,
     visit: Option[Visit],
     onChanged: () => Unit,
-    onOpenDay: Option[java.time.LocalDate => Unit] = None
+    onOpenDay: Option[java.time.LocalDate => Unit] = None,
+    /** past visits to show as history (newest first) */
+    visits: Seq[Visit] = Nil
 ):
   private given Ctx = act
   private val dialog = BottomSheetDialog(act)
@@ -33,6 +35,21 @@ final class PlaceSheet(
   private val nameInput = EditText(act)
   private val kinds = ChipGroup(act)
   private val history = vbox()
+  private val visitList =
+    val dayFmt = DateTimeFormatter.ofPattern("yyyy/M/d (E) HH:mm", java.util.Locale.JAPANESE)
+    val v = vbox()
+    for vis <- visits.take(30) do
+      val row = vbox(text(Instant.ofEpochMilli(vis.start).atZone(AshidoriApp.zone).format(dayFmt), 15f), caption(fmtDuration(vis.durationMs)))
+      row.setMinimumHeight(dp(48))
+      row.setBackgroundResource(android.R.drawable.list_selector_background)
+      onOpenDay.foreach { open =>
+        row.setOnClickListener { _ =>
+          dialog.dismiss()
+          open(Stats.localDate(vis.start, AshidoriApp.zone))
+        }
+      }
+      v.addView(row)
+    v
 
   def show(): Unit =
     visit.foreach(v => sub.setText(s"${fmt(v.start)} – ${fmt(v.end)}・${fmtDuration(v.durationMs)}"))
@@ -70,6 +87,8 @@ final class PlaceSheet(
         spacer(8),
         actions,
         spacer(12),
+        text(if visits.nonEmpty then s"訪問履歴（${visits.size}回）" else "", 15f, bold = true),
+        visitList,
         text("この場所でのチェックイン", 15f, bold = true),
         history
       ),

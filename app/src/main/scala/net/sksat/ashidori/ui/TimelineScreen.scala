@@ -34,13 +34,21 @@ final class RailView(c: Context, val visit: Boolean, col: Int, top: Boolean, bot
 /** Day view: map of the day on top, the day's visits and trips below.
   * Swipe left/right or use the arrows to change day; tap the date for a calendar.
   */
-final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
+final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = Seq(Span.Day)) extends Screen:
   private given Ctx = act
   private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
 
   private val map = TrackMap(act, saved, controlsOnTop = true)
+  /** Day (the detailed timeline) or a longer period summary. */
+  private var span = if spans.contains(Span.Month) then Span.Month else spans.head
+  /** The day tab follows the app-wide selected date (search, places and
+    * insights jump to it); the period tab keeps its own position.
+    */
+  private var ownAnchor = LocalDate.now(AshidoriApp.zone)
+  private def anchor: LocalDate = if spans.size > 1 then ownAnchor else act.selectedDate
+  private def anchor_=(d: LocalDate): Unit = if spans.size > 1 then ownAnchor = d else act.selectedDate = d
 
   private val dateLabel = text("", 18f, bold = true)
   private val summary = hbox()
@@ -52,17 +60,30 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     b.setMinWidth(dp(48))
     b
 
+  private val chipsId = View.generateViewId()
   private val header =
     val prev = arrow("◀")(shift(-1))
     val next = arrow("▶")(shift(1))
-    prev.setContentDescription("前の日")
-    next.setContentDescription("次の日")
+    prev.setContentDescription("前へ")
+    next.setContentDescription("次へ")
     dateLabel.setGravity(Gravity.CENTER)
     dateLabel.setLayoutParams(weighted())
     dateLabel.setMinHeight(dp(48))
     dateLabel.setContentDescription("日付を選ぶ")
     dateLabel.setOnClickListener(_ => pickDate())
-    padded(hbox(prev, dateLabel, next), 12, 4)
+    val chips = com.google.android.material.chip.ChipGroup(act)
+    chips.setId(chipsId)
+    chips.setSingleSelection(true)
+    chips.setSelectionRequired(true)
+    for sp <- spans do
+      val c = com.google.android.material.chip.Chip(act, null, com.google.android.material.R.attr.chipStyle)
+      c.setText(sp.label)
+      c.setCheckable(true)
+      c.setChecked(sp == span)
+      c.setOnCheckedChangeListener((_, on) => if on && span != sp then { span = sp; load() })
+      chips.addView(c)
+    if spans.size > 1 then vbox(padded(chips, 16, 0), padded(hbox(prev, dateLabel, next), 12, 0))
+    else padded(hbox(prev, dateLabel, next), 12, 0)
 
   /** The day's list lives in a bottom sheet over a full-height map, like
     * Google Maps: drag it down to see more map, up to read the list.
@@ -84,7 +105,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     val bg = android.graphics.drawable.GradientDrawable()
     bg.setCornerRadii(Array(dp(24), dp(24), dp(24), dp(24), 0, 0, 0, 0).map(_.toFloat))
     bg.setColor(color(attr.surface))
-    val v = vbox(handle, scroller)
+    val v = vbox(handle, header, scroller)
     v.setBackground(bg)
     v.setElevation(dp(6).toFloat)
     scroller.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -99,7 +120,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     coord.addView(sheet, slp)
     behavior.setFitToContents(false)
     behavior.setHalfExpandedRatio(0.5f)
-    behavior.setPeekHeight(dp(120))
+    // Lowered sheet still shows the span chips and the date row.
+    behavior.setPeekHeight(dp(150))
     behavior.setHideable(false)
     behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_HALF_EXPANDED)
     coord.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -110,19 +132,19 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
         map.bottomInset = math.max(0, coord.getHeight - v.getTop)
       override def onSlide(v: View, offset: Float): Unit = ()
     )
-    val v = vbox(header, coord)
     installSwipe()
-    v
+    coord
 
   /** Lower the sheet so the map shows what was just tapped. */
   private def revealMap(): Unit =
     behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_COLLAPSED)
 
-  map.onMarkerClick = (layer, key) =>
+  private val dayMarkerClick: (String, String) => Unit = (layer, key) =>
     if layer == "visit" then
       current.foreach { tl =>
         tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).foreach(openVisit(_, tl))
       }
+  map.onMarkerClick = dayMarkerClick
 
   override def onShow(): Unit = load()
 
@@ -136,32 +158,53 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     )
     scroller.setOnTouchListener((_, e) => { detector.onTouchEvent(e); false })
 
-  private def shift(days: Int): Unit =
+  private def shift(n: Int): Unit =
     val today = LocalDate.now(AshidoriApp.zone)
-    val d = act.selectedDate.plusDays(days)
-    if !d.isAfter(today) then
-      act.selectedDate = d
+    val d = span.shift(anchor, n)
+    if !span.range(d)._1.isAfter(today) then
+      anchor = if d.isAfter(today) then today else d
       load()
 
   private def pickDate(): Unit =
     val picker = MaterialDatePicker.Builder.datePicker()
       .setTitleText("日付を選ぶ")
-      .setSelection(act.selectedDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
+      .setSelection(anchor.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
       .setCalendarConstraints(CalendarConstraints.Builder().setValidator(DateValidatorPointBackward.now()).build())
       .build()
     picker.addOnPositiveButtonClickListener(sel => {
-      act.selectedDate = Instant.ofEpochMilli(sel).atZone(ZoneOffset.UTC).toLocalDate
+      anchor = Instant.ofEpochMilli(sel).atZone(ZoneOffset.UTC).toLocalDate
       load()
     })
     picker.show(act.getSupportFragmentManager, "date")
 
+  private lazy val period = PeriodView(act, map, summary, list, d => act.openDay(d))
+
+  /** Jump from a period to one of its days. */
+  def showDay(d: LocalDate): Unit =
+    span = Span.Day
+    anchor = d
+    syncChips()
+    load()
+
+  private def syncChips(): Unit =
+    val g = header.findViewById[com.google.android.material.chip.ChipGroup](chipsId)
+    for i <- 0 until g.getChildCount do
+      val c = g.getChildAt(i).asInstanceOf[com.google.android.material.chip.Chip]
+      c.setChecked(c.getText.toString == span.label)
+
   def load(): Unit =
-    val date = act.selectedDate
+    val date = anchor
     val today = LocalDate.now(AshidoriApp.zone)
-    dateLabel.setText((if date == today then "今日 " else if date == today.minusDays(1) then "昨日 " else "") + date.format(dateFmt))
+    dateLabel.setText(span.title(date, today))
+    act.setCheckInVisible(span == Span.Day)
+    if span != Span.Day then
+      current = None
+      period.load(span, date)
+      return
+    map.onMarkerClick = dayMarkerClick
     AshidoriApp.io.execute { () =>
       val tl = TimelineRepo.day(date)
-      act.runOnUiThread(() => if act.selectedDate == date then render(tl))
+      act.runOnUiThread(() => if anchor == date then render(tl))
     }
 
   private def time(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)

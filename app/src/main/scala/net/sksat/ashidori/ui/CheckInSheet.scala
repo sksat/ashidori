@@ -152,6 +152,11 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       case Some(p) => fetch(p)
       case None    => locate()
 
+  /** Opens straight at the compose step for a venue picked elsewhere. */
+  def showFor(v: Venue): Unit =
+    show()
+    select(v)
+
   /** Show candidates at once from the best position we already have, then
     * refine with a fresh fix if that moves us noticeably.
     */
