@@ -36,6 +36,7 @@ final class RailView(c: Context, val visit: Boolean, col: Int, top: Boolean, bot
   */
 final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = Seq(Span.Day)) extends Screen:
   private given Ctx = act
+  override def title: String = "まとめ"
   private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
@@ -217,6 +218,12 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     picker.show(act.getSupportFragmentManager, "date")
 
   private lazy val period = PeriodView(act, map, summary, list, d => act.openDay(d))
+
+  /** Open a period (from a summary card in the feed). */
+  def showPeriod(sp: Span, d: LocalDate): Unit =
+    span = sp
+    ownAnchor = d
+    syncChips()
 
   /** Jump from a period to one of its days. */
   def showDay(d: LocalDate): Unit =

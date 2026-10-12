@@ -30,6 +30,9 @@ object ModeClassifier:
   def classify(f: LegFeatures): (TransportMode, Double) =
     if f.durationMs <= 0 then (Unknown, 0.0)
     else if f.medianSpeed > 45 || (f.p90Speed > 70 && f.avgSpeed > 30) then (Flying, 0.85)
+    // Mostly without GNSS: a subway ride is short; a long gap (phone off,
+    // no signal for hours) says nothing about how we moved.
+    else if f.gapRatio > 0.5 && (f.durationMs > 2 * 3_600_000L || f.distanceM > 80_000) then (Unknown, 0.2)
     else if f.gapRatio > 0.5 && f.avgSpeed >= 4 && f.avgSpeed <= 35 then (Subway, 0.55)
     else if f.medianSpeed < 0.4 && f.stopRatio > 0.8 && (!f.hasMotion || f.cadence < 10) then
       (Still, 0.6)

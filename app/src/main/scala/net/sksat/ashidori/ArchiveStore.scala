@@ -154,14 +154,31 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     n
 
   /** Runs everything that is due: migration, daily archive, monthly merge. */
-  def maintain(db: Db, legacyDir: File): Unit =
+  @volatile private var maintaining = false
+
+  /** Archives finished days one at a time. `next` schedules the following
+    * step; passing the I/O executor lets UI reads run in between instead of
+    * waiting for a long first-time migration.
+    */
+  def maintain(db: Db, legacyDir: File, next: (() => Unit) => Unit = f => f()): Unit =
+    if maintaining then return
+    maintaining = true
     val today = LocalDate.now(zone)
     Try(migrateLegacyLogs(db, legacyDir)).failed.foreach(e => Log.w("legacy log migration failed", e))
-    db.oldestHot().map(day).filter(_.isBefore(today)).foreach { first =>
-      for d <- Iterator.iterate(first)(_.plusDays(1)).takeWhile(_.isBefore(today)) do
+    val days = db.oldestHot().map(day).filter(_.isBefore(today)).toList
+      .flatMap(first => Iterator.iterate(first)(_.plusDays(1)).takeWhile(_.isBefore(today)).toList)
+    def step(rest: List[LocalDate]): Unit = rest match
+      case d :: tail =>
         Try(compactDay(db, d)).failed.foreach(e => Log.w(s"archiving $d failed; kept in SQLite", e))
-    }
-    Try(mergeMonths(today)).failed.foreach(e => Log.w("monthly merge failed", e))
+        next(() => step(tail))
+      case Nil =>
+        try Try(mergeMonths(today)).failed.foreach(e => Log.w("monthly merge failed", e))
+        finally maintaining = false
+    try step(days)
+    catch
+      case e: Throwable =>
+        maintaining = false
+        throw e
 
   /** Total archive size in bytes (for the data screen). */
   def sizeBytes: Long =

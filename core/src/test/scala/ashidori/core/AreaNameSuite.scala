@@ -12,3 +12,9 @@ class AreaNameSuite extends munit.FunSuite:
   test("gives up when only the prefecture remains") {
     assertEquals(AreaName.fromAddressLine("日本、東京都"), None)
   }
+
+  test("feature and road names after the area are dropped") {
+    assertEquals(AreaName.fromAddressLine("日本、〒144-0041 東京都大田区羽田空港 羽田空港 (HND)"), Some("大田区羽田空港"))
+    assertEquals(AreaName.fromAddressLine("日本、〒066-0012 北海道千歳市美々 道路"), Some("千歳市美々"))
+    assertEquals(AreaName.fromAddressLine("日本、〒144-0041 東京都大田区羽田空港羽田空港"), Some("大田区羽田空港"))
+  }

@@ -97,22 +97,16 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
       val byPlace = visits.flatMap(v => v.placeId.map(_ -> v)).groupMap(_._1)(_._2)
       val ranked = byPlace.toVector.flatMap((id, vs) => places.get(id).map(p => (p, vs.sortBy(-_.start).toVector)))
         .sortBy((_, vs) => (-vs.size, -vs.map(_.durationMs).sum))
-      // Long periods: draw sampled raw fixes (cheap); a week: legs in mode colors.
+      // Legs in mode colors for every span; coarser for longer periods.
+      val tolerance = span match
+        case Span.Week  => 8.0
+        case Span.Month => 25.0
+        case _          => 80.0
       val paths =
-        if span == Span.Week then
-          tls.flatMap(_.segments.collect { case t: Trip => t }).flatMap { t =>
-            t.legs.filter(_.mode != TransportMode.Still).map(l =>
-              MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 8), l.mode.color))
-          }
-        else
-          val from = a.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
-          val to = b.plusDays(1).atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
-          val fx = db.fixesSampled(from, to, if span == Span.Month then 60_000L else 300_000L)
-          fx.foldLeft(Vector.empty[Vector[Fix]]) { (acc, f) =>
-            acc.lastOption match
-              case Some(cur) if f.time - cur.last.time < 20 * 60_000 && Geo.distance(cur.last, f) < 5_000 => acc.init :+ (cur :+ f)
-              case _ => acc :+ Vector(f)
-          }.filter(_.size >= 2).map(p => MapPath(p))
+        tls.flatMap(_.segments.collect { case t: Trip => t }).flatMap { t =>
+          t.legs.filter(_.mode != TransportMode.Still).map(l =>
+            MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), tolerance), l.mode.color, l.isUncertain))
+        }.filter(_.points.size >= 2)
       val regions = resolveRegions(ranked.map(_._1).take(60), db.placeRegions())
       act.runOnUiThread(() => if token == my then render(tls, ranked, paths, regions))
     }

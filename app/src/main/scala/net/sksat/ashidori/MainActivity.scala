@@ -124,15 +124,15 @@ class MainActivity extends AppCompatActivity:
     nav.setLabelVisibilityMode(com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_LABELED)
     // The timeline is the home and sits in the middle, within thumb reach.
     for ((id, title, icon), order) <- Seq(
-        (MainActivity.TabInsights, "インサイト", R.drawable.ic_insights),
-        (MainActivity.TabTimeline, "タイムライン", R.drawable.ic_timeline),
+        (MainActivity.TabFeed, "タイムライン", R.drawable.ic_timeline),
+        (MainActivity.TabTimeline, "マップ", R.drawable.ic_map),
         (MainActivity.TabLogger, "ステータス", R.drawable.ic_logger)
       ).zipWithIndex
     do nav.getMenu.add(0, id, order, title).setIcon(icon)
 
     tabs = Map(
       MainActivity.TabTimeline -> TimelineScreen(this, savedInstanceState),
-      MainActivity.TabInsights -> TimelineScreen(this, savedInstanceState, Seq(Span.Week, Span.Month, Span.Year)),
+      MainActivity.TabFeed -> FeedScreen(this),
       MainActivity.TabLogger -> LoggerScreen(this)
     )
     nav.setOnItemSelectedListener { item =>
@@ -192,8 +192,15 @@ class MainActivity extends AppCompatActivity:
     if debuggable && getIntent.getBooleanExtra("ashidori.sim", false) then
       AshidoriApp.io.execute { () =>
         val today = LocalDate.now(AshidoriApp.zone)
-        for d <- Seq(today.minusDays(1), today) do
-          val out = ashidori.core.sim.TrajectorySimulator.run(ashidori.core.sim.Scenarios.commute(d))
+        // `--ei ashidori.simDays N` seeds N days back: weekdays commute, weekends out, a trip now and then.
+        val n = getIntent.getIntExtra("ashidori.simDays", 2)
+        for i <- (n - 1) to 0 by -1; d = today.minusDays(i) if i % 9 != 4 do
+          import ashidori.core.sim.Scenarios
+          val sc =
+            if i % 23 == 6 then Scenarios.flight(d, i)
+            else if d.getDayOfWeek.getValue >= 6 then Scenarios.weekend(d, i)
+            else Scenarios.commute(d, i)
+          val out = ashidori.core.sim.TrajectorySimulator.run(sc)
           val now = System.currentTimeMillis()
           AshidoriApp.db.insertFixes(out.fixes.filter(_.time < now).map(_.copy(provider = "sim")))
           AshidoriApp.db.insertMotion(out.motion.filter(_.start < now), "sim")
@@ -248,7 +255,13 @@ class MainActivity extends AppCompatActivity:
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
 
-  /** Jump to a day in the timeline (from places, insights, map). */
+  /** Week / month / year summary, pushed over the current tab. */
+  private lazy val periodScreen = TimelineScreen(this, null, Seq(Span.Week, Span.Month, Span.Year))
+  def openPeriod(span: Span, d: LocalDate): Unit =
+    periodScreen.showPeriod(span, d)
+    push(periodScreen)
+
+  /** Jump to a day on the map tab (from the feed, places, search). */
   def openDay(d: LocalDate): Unit =
     selectedDate = d
     stack.clear()
@@ -322,7 +335,7 @@ object MainActivity:
   /** Intent extra: open the recording screen (from the notification). */
   val ExtraOpenLogger = "ashidori.openLogger"
   val TabTimeline = 1
-  val TabInsights = 2
+  val TabFeed = 2
   val TabLogger = 4
   val RequiredPermissions: Seq[String] = Seq(
     Manifest.permission.ACCESS_FINE_LOCATION,

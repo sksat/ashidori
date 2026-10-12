@@ -100,7 +100,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
         }
         page(
           "記録モードを選ぶ",
-          Seq("位置を記録する間隔と、電池の使い方の組み合わせです。あとから「記録」画面でいつでも変えられ、必要なときだけ「全力ログ」にすることもできます。"),
+          Seq("位置を記録する間隔と、電池の使い方の組み合わせです。あとから「ステータス」画面でいつでも変えられ、必要なときだけ「全力ログ」にすることもできます。"),
           "次へ" -> (() => {
             opts.find(_._2.isChecked).foreach((m, _) => Settings.mode = m)
             next()
@@ -154,7 +154,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
     if done(s) then next()
     else
       val note = s match
-        case Step.Location   => "位置情報がないと記録できません。あとで「記録」画面から許可できます。"
+        case Step.Location   => "位置情報がないと記録できません。あとで「ステータス」画面から許可できます。"
         case Step.Background => "アプリを開いている間だけ記録します。あとで設定から変更できます。"
         case Step.Activity   => "歩数と移動手段の判定の精度が下がります。"
         case _               => "あとで設定から変更できます。"

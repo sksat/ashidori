@@ -28,7 +28,7 @@ object AshidoriApp:
 
   /** Due archive work; call on [[io]]. */
   def maintainArchive(): Unit =
-    try archive.maintain(db, java.io.File(instance.getExternalFilesDir(null), "gnss"))
+    try archive.maintain(db, java.io.File(instance.getExternalFilesDir(null), "gnss"), step => io.execute(() => step()))
     catch case e: Exception => Log.w("archive maintenance failed", e)
   /** Single background thread for DB and file I/O so the UI never blocks. */
   lazy val io: ExecutorService = Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-io"))

@@ -6,7 +6,8 @@ object AreaName:
   private val Postal = """^〒?\s*\d{3}-?\d{4}\s*""".r
   private val Prefecture = """^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)""".r
   /** First block/lot number (ASCII or full-width digits, or kanji numerals before 丁目). */
-  private val Numbers = """([0-9０-９]|[一二三四五六七八九十]+丁目).*$""".r
+  private val Repeated = """^(.*?)(.{2,})\2$""".r
+  private val Numbers ="""([0-9０-９]|[一二三四五六七八九十]+丁目).*$""".r
 
   /** "日本、〒154-0024 東京都世田谷区三軒茶屋２丁目１１−２" → "世田谷区三軒茶屋".
     * Returns None when nothing useful is left (e.g. a bare prefecture).
@@ -17,4 +18,9 @@ object AreaName:
     s = Postal.replaceFirstIn(s, "")
     s = Prefecture.replaceFirstIn(s, "")
     s = Numbers.replaceFirstIn(s, "").trim.stripSuffix("、").trim
+    // Geocoders append feature or road names after a space
+    // ("大田区羽田空港 羽田空港 (HND)", "千歳市美々 道路"): keep the area.
+    s = s.split("""[\s　]+""").headOption.getOrElse("")
+    // ...or glue the feature name on: "大田区羽田空港羽田空港" → "大田区羽田空港".
+    s = Repeated.replaceFirstIn(s, "$1$2")
     Option(s).filter(_.length >= 2)

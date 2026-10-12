@@ -299,6 +299,15 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def firstFixTime(): Option[Long] =
     query("SELECT MIN(time) FROM fixes")(c => if c.isNull(0) then None else Some(c.getLong(0))).head
 
+  /** First day with any position, archived or not. */
+  def firstDataDate(): Option[java.time.LocalDate] =
+    val archived = AshidoriApp.archive.archivedFiles(Archive.Fixes).headOption.map { f =>
+      val n = f.getName.stripSuffix(".parquet")
+      if n.length == 7 then java.time.YearMonth.parse(n).atDay(1) else java.time.LocalDate.parse(n)
+    }
+    val hot = firstFixTime().map(t => java.time.Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).toLocalDate)
+    (archived.toSeq ++ hot).minOption
+
   /** Days (epoch-day numbers in the given offset) that have any fix, for calendar dots. */
   def daysWithData(from: Long, to: Long, offsetMs: Long): Set[Long] =
     query(s"SELECT DISTINCT (time+$offsetMs)/86400000 FROM fixes WHERE time>=? AND time<?", from, to)(_.getLong(0)).toSet
