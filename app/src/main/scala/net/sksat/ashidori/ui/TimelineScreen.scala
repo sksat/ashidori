@@ -369,8 +369,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       val label = text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f)
       label.setLayoutParams(weighted())
       val detail = caption(
-        s"${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" + (if l.steps > 0 then f"・${l.steps}%,d歩" else "") +
-          (if l.isUncertain then "・位置はおおよそ" else "")
+        // Rough legs (GNSS gaps, poor fixes): "約" on the distance; the map draws them dashed.
+        s"${if l.isUncertain then "約" else ""}${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" +
+          (if l.steps > 0 then f"・${l.steps}%,d歩" else "")
       )
       val row = hbox(label, detail)
       row.setMinimumHeight(dp(48))

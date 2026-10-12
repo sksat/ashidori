@@ -215,7 +215,7 @@ class LoggerService extends Service:
       r.start()
       recorder = Some(r)
       LoggerState.onMain {
-        LoggerState.detailFile = Some(r.file.getName)
+        LoggerState.detailFile = Some(r.label)
         LoggerState.detailStartedAt = r.startedAt
       }
     else if !p.rawGnss then stopRecorder()
@@ -258,9 +258,9 @@ class LoggerService extends Service:
 
   private def stopRecorder(): Unit =
     recorder.foreach { r =>
-      val f = r.stop()
+      r.stop()
       val end = System.currentTimeMillis()
-      AshidoriApp.io.execute(() => db.insertGnssSession(r.startedAt, end, f.getAbsolutePath, r.reason))
+      AshidoriApp.io.execute(() => db.insertGnssSession(r.startedAt, end, "", r.reason))
     }
     recorder = None
     LoggerState.onMain { LoggerState.detailFile = None }
@@ -371,7 +371,6 @@ class LoggerService extends Service:
     override def onSensorChanged(e: SensorEvent): Unit =
       e.sensor.getType match
         case Sensor.TYPE_ACCELEROMETER =>
-          recorder.foreach(r => if accelReg >= 50 then r.onAccel(e))
           val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
           accumulator.add(wall, e.values(0), e.values(1), e.values(2)).foreach(onWindow)
         case Sensor.TYPE_ROTATION_VECTOR =>

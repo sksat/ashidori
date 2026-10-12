@@ -15,6 +15,8 @@ class AshidoriApp extends Application:
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)
     )
     LoggerWatchdog.schedule(this)
+    // Archive finished days (and migrate pre-Parquet data) in the background.
+    AshidoriApp.io.execute(() => AshidoriApp.maintainArchive())
 
 object AshidoriApp:
   val ChannelLogging = "logging"
@@ -22,6 +24,12 @@ object AshidoriApp:
 
   def app: AshidoriApp = instance
   lazy val db: Db = Db(instance)
+  lazy val archive: ArchiveStore = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
+
+  /** Due archive work; call on [[io]]. */
+  def maintainArchive(): Unit =
+    try archive.maintain(db, java.io.File(instance.getExternalFilesDir(null), "gnss"))
+    catch case e: Exception => Log.w("archive maintenance failed", e)
   /** Single background thread for DB and file I/O so the UI never blocks. */
   lazy val io: ExecutorService = Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-io"))
   def zone: ZoneId = ZoneId.systemDefault()

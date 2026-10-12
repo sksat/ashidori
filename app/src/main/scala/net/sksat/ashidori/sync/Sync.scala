@@ -100,44 +100,52 @@ object Uploader:
   private def client: SyncClient = SyncClient(SyncConfig.serverUrl, SyncConfig.token)
 
   /** Upload the small streams. Returns the number of batches sent. */
+  /** Editable data (places, check-ins, corrections) plus the archived
+    * signal tables that are small (positions, motion, battery, GNSS status).
+    * Logged signals are sent as the day's encrypted Parquet files once the
+    * day is archived, not row by row.
+    */
   def uploadSmall(): Int =
     val db = AshidoriApp.db
     var sent = 0
-    for stream <- Seq("fixes", "motion", "battery") do
-      sent += drain(stream, () => db.rowsAfter(stream, db.syncValue(s"rowid:$stream"), MaxRows), rows =>
-        db.setSyncValue(s"rowid:$stream", rows.map(_._1).max))
     for stream <- Seq("places", "checkins", "overrides") do
       val table = if stream == "overrides" then "mode_overrides" else stream
       sent += drain(stream, () => db.rowsUpdatedAfter(table, db.syncValue(s"updated:$stream"), MaxRows), rows =>
         db.setSyncValue(s"updated:$stream", rows.map(_._2("updatedAt").num.toLong).max))
-    sent
+    sent + uploadArchive(Seq(ashidori.core.Archive.Fixes, ashidori.core.Archive.Motion, ashidori.core.Archive.Battery, ashidori.core.Archive.GnssStatus))
 
-  /** Upload finished raw GNSS log files, chunked. */
-  def uploadRawLogs(): Int =
+  /** Raw GNSS / IMU archives: large, so only on unmetered networks. */
+  def uploadRawLogs(): Int = uploadArchive(ashidori.core.Archive.RawTables)
+
+  /** Sends archived files not sent yet, as `archive` batches of ≤3 MiB chunks.
+    * A month file is skipped when every day it merged was already sent.
+    */
+  private def uploadArchive(tables: Seq[ashidori.core.Archive.TableDef]): Int =
     val db = AshidoriApp.db
-    var sent = resumePending("gnss")
-    // Several sessions share a day's file: send each file once, after its
-    // day is over (it is still being appended to until then).
-    val today = GnssRecorder.fileName(java.time.LocalDate.now(AshidoriApp.zone))
-    for (path, rows) <- db.pendingGnssFiles().groupBy(_._2).toSeq.sortBy(_._2.map(_._1).min)
-        if File(path).getName != today
-    do
-      val f = File(path)
-      val pending =
-        if !f.exists then Vector.empty
-        else
-          val bytes = Files.readAllBytes(f.toPath)
-          val chunks = bytes.grouped(3 * 1024 * 1024).toVector
-          chunks.zipWithIndex.map { (chunk, i) =>
-            prepare("gnss", Vector(ujson.Obj("file" -> f.getName, "part" -> i, "parts" -> chunks.size,
-              "data" -> java.util.Base64.getEncoder.encodeToString(chunk))))
-          }
-      // All chunks are sealed to disk before the file counts as handed over.
-      rows.foreach((rowid, _) => db.markGnssUploaded(rowid))
-      pending.foreach { p =>
-        send("gnss", p)
-        sent += 1
-      }
+    var sent = resumePending("archive")
+    def key(t: ashidori.core.Archive.TableDef, name: String) = s"up:${t.name}/$name"
+    for t <- tables; f <- AshidoriApp.archive.archivedFiles(t) do
+      val name = f.getName
+      val isMonth = name.length == "YYYY-MM.parquet".length
+      val alreadyCovered =
+        db.syncValue(key(t, name)) != 0 ||
+          (isMonth && {
+            val month = java.time.YearMonth.parse(name.take(7))
+            (1 to month.lengthOfMonth).forall(d => db.syncValue(key(t, s"${month.atDay(d)}.parquet")) != 0)
+          })
+      if !alreadyCovered then
+        val bytes = Files.readAllBytes(f.toPath)
+        val chunks = bytes.grouped(3 * 1024 * 1024).toVector
+        val pending = chunks.zipWithIndex.map { (chunk, i) =>
+          prepare("archive", Vector(ujson.Obj("file" -> s"${t.name}/$name", "part" -> i, "parts" -> chunks.size,
+            "data" -> java.util.Base64.getEncoder.encodeToString(chunk))))
+        }
+        // Sealed to disk: the file now counts as handed over.
+        db.setSyncValue(key(t, name), 1)
+        pending.foreach { p =>
+          send("archive", p)
+          sent += 1
+        }
     sent
 
   /** Repeatedly fetch rows and upload them until the stream is drained. */

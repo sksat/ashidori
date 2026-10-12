@@ -11,39 +11,56 @@ import java.util.concurrent.Executor
 import ashidori.core.GnssLogFormat
 import ashidori.core.GnssLogFormat.row
 
-/** Records raw GNSS data (measurements, navigation messages, status, NMEA,
-  * fixes) to a GnssLogger-compatible text file while a detail session runs.
+/** Records raw signals while a detail session runs: GNSS measurements,
+  * navigation messages, satellite status, NMEA, fixes, and IMU (accelerometer,
+  * gyroscope, magnetometer). Lines use the GnssLogger text format and go to
+  * SQLite (`raw_lines`) in batches; finished days are archived to Parquet.
   *
-  * Callbacks arrive on the logger thread; formatted lines are handed to the
-  * shared I/O thread so file writes never block sensor delivery.
+  * Callbacks arrive on the logger thread; batches are written on the I/O
+  * thread so storage never blocks sensor delivery.
   */
 final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fullTracking: Boolean, val reason: String):
   val startedAt: Long = System.currentTimeMillis()
-  val file: File =
-    val dir = File(ctx.getExternalFilesDir(null), "gnss")
-    dir.mkdirs()
-    // One file per day: detail sessions are short and frequent, so a file
-    // per session left dozens of fragments. Sessions are appended and
-    // separated by a comment line (GnssLogger tools skip comments).
-    File(dir, GnssRecorder.fileName(java.time.LocalDate.now(AshidoriApp.zone)))
-  private val existed = file.exists && file.length > 0
-  private val out = BufferedWriter(FileWriter(file, true), 64 * 1024)
+  /** Shown in the UI while recording. */
+  val label: String = s"${java.time.Instant.ofEpochMilli(startedAt).atZone(AshidoriApp.zone).toLocalTime.withNano(0)} から"
   private val io = AshidoriApp.io
   private val exec: Executor = r => handler.post(r)
   @volatile private var closed = false
   var measurementEvents = 0L
 
-  private def write(line: String): Unit =
-    io.execute { () =>
-      if !closed then
-        out.write(line)
-        out.write('\n')
-    }
+  private val buffer = scala.collection.mutable.ArrayBuffer.empty[(Long, String)]
+  private var lastTime = startedAt
+  private var lastFlush = startedAt
 
-  io.execute { () =>
-    if !existed then out.write(GnssLogFormat.header(BuildInfo.versionName, Build.VERSION.RELEASE, Build.MANUFACTURER, Build.MODEL))
-    out.write(s"# Session ${java.time.Instant.ofEpochMilli(startedAt)} reason=$reason fullTracking=$fullTracking\n")
-  }
+  /** Lines without a time of their own (navigation messages) take the last one. */
+  private def write(line: String): Unit =
+    if !closed then
+      ashidori.core.GnssLogMerge.timeOf(line).foreach(lastTime = _)
+      buffer += ((lastTime, line))
+      val now = System.currentTimeMillis()
+      if buffer.size >= 2000 || now - lastFlush > 3_000 then flush()
+
+  private def flush(): Unit =
+    if buffer.nonEmpty then
+      val batch = buffer.toVector
+      buffer.clear()
+      lastFlush = System.currentTimeMillis()
+      io.execute(() => AshidoriApp.db.insertRawLines(batch))
+
+  // IMU at 50 Hz (100 Hz when logging everything), alongside GNSS.
+  private val sm = ctx.getSystemService(classOf[android.hardware.SensorManager])
+  private val imuSensors = Seq(
+    android.hardware.Sensor.TYPE_ACCELEROMETER -> "Accel",
+    android.hardware.Sensor.TYPE_GYROSCOPE -> "Gyro",
+    android.hardware.Sensor.TYPE_MAGNETIC_FIELD -> "Mag"
+  ).flatMap((t, name) => Option(sm.getDefaultSensor(t)).map(_ -> name))
+  private val imuListener = new android.hardware.SensorEventListener:
+    override def onAccuracyChanged(s: android.hardware.Sensor, a: Int): Unit = ()
+    override def onSensorChanged(e: SensorEvent): Unit =
+      imuSensors.find(_._1 == e.sensor).foreach { (_, name) =>
+        val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
+        write(row(name, wall, e.timestamp, e.values(0), e.values(1), e.values(2)))
+      }
 
   private val measurementCb = new GnssMeasurementsEvent.Callback:
     override def onGnssMeasurementsReceived(ev: GnssMeasurementsEvent): Unit =
@@ -109,6 +126,8 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       lm.registerGnssMeasurementsCallback(req, exec, measurementCb)
       lm.registerGnssNavigationMessageCallback(exec, navCb)
       lm.addNmeaListener(exec, nmea)
+      val periodUs = if fullTracking then 10_000 else 20_000
+      imuSensors.foreach((sensor, _) => sm.registerListener(imuListener, sensor, periodUs, handler))
     catch case e: SecurityException => Log.w("gnss recorder: no permission", e)
 
   def onStatus(st: GnssStatus): Unit =
@@ -157,21 +176,11 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       )
     )
 
-  def onAccel(e: SensorEvent): Unit =
-    val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
-    write(row("Accel", wall, e.timestamp, e.values(0), e.values(1), e.values(2)))
-
-  /** Stops callbacks and closes the file. Returns the file. */
-  def stop(): File =
+  /** Stops callbacks and writes what is buffered. */
+  def stop(): Unit =
     lm.unregisterGnssMeasurementsCallback(measurementCb)
     lm.unregisterGnssNavigationMessageCallback(navCb)
     lm.removeNmeaListener(nmea)
-    io.execute { () =>
-      closed = true
-      out.close()
-    }
-    file
-
-object GnssRecorder:
-  def fileName(day: java.time.LocalDate): String =
-    s"ashidori_gnss_${day.format(DateTimeFormatter.ofPattern("yyyyMMdd"))}.txt"
+    sm.unregisterListener(imuListener)
+    flush()
+    closed = true

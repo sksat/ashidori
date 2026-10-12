@@ -40,6 +40,14 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       "CREATE TABLE sync_state(name TEXT PRIMARY KEY, value INTEGER)"
     ).foreach(db.execSQL)
     createGnssStatus(db)
+    createRawLines(db)
+
+  /** Detail-session signals (GNSS raw/status/nav/NMEA, IMU) as GnssLogger-format
+    * lines until their day is archived to Parquet.
+    */
+  private def createRawLines(db: SQLiteDatabase): Unit =
+    db.execSQL("CREATE TABLE IF NOT EXISTS raw_lines(time INTEGER NOT NULL, line TEXT NOT NULL)")
+    db.execSQL("CREATE INDEX IF NOT EXISTS raw_lines_time ON raw_lines(time)")
 
   /** Periodic GnssStatus summaries: GNSS history view and indoor detection. */
   private def createGnssStatus(db: SQLiteDatabase): Unit =
@@ -59,6 +67,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       }
       Seq("city", "country", "area").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE places ADD COLUMN $c TEXT"))
     if oldV < 3 then createGnssStatus(db)
+    if oldV < 4 then createRawLines(db)
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -132,25 +141,40 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   private def dbl(c: Cursor, i: Int): Double = if c.isNull(i) then Double.NaN else c.getDouble(i)
   private def flt(c: Cursor, i: Int): Float = if c.isNull(i) then Float.NaN else c.getFloat(i)
 
+  /** Positions in [from, to): archived days from Parquet, recent ones from SQLite. */
   def fixes(from: Long, to: Long): Vector[Fix] =
+    (AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf) ++ hotFixes(from, to)).sortBy(_.time)
+
+  def hotFixes(from: Long, to: Long): Vector[Fix] =
     query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? ORDER BY time", from, to) { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }
 
-  def lastFix(): Option[Fix] =
+  def lastFix(): Option[Fix] = hotLastFix().orElse(AshidoriApp.archive.lastRow(Archive.Fixes).map(Archive.fixOf))
+
+  private def hotLastFix(): Option[Fix] =
     query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes ORDER BY time DESC LIMIT 1") { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }.headOption
 
   def motion(from: Long, to: Long): Vector[MotionWindow] =
+    (AshidoriApp.archive.read(Archive.Motion, from, to).map(Archive.motionOf) ++ hotMotion(from, to)).sortBy(_.start)
+
+  private def hotMotion(from: Long, to: Long): Vector[MotionWindow] =
     query("SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? ORDER BY start", from, to) { c =>
       MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4))
     }
 
   def steps(from: Long, to: Long): Int =
-    query("SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?", from, to)(_.getInt(0)).head
+    AshidoriApp.archive.read(Archive.Motion, from, to).map(r => Option(r(4)).map(_.asInstanceOf[Int]).getOrElse(0)).sum +
+      query("SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?", from, to)(_.getInt(0)).head
 
   def battery(from: Long): Vector[DrainEstimator.Sample] =
+    AshidoriApp.archive.read(Archive.Battery, from, Long.MaxValue).map { r =>
+      DrainEstimator.Sample(r(0).asInstanceOf[Long], r(1).asInstanceOf[Int], r(2) == 1, r(3) == 1)
+    } ++ hotBattery(from)
+
+  private def hotBattery(from: Long): Vector[DrainEstimator.Sample] =
     query("SELECT time,pct,charging,screen_on FROM battery WHERE time>=? ORDER BY time", from) { c =>
       DrainEstimator.Sample(c.getLong(0), c.getInt(1), c.getInt(2) != 0, c.getInt(3) != 0)
     }
@@ -260,6 +284,12 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
 
   /** One fix per time bucket, for drawing long periods cheaply. */
   def fixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
+    val archived = AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf)
+      .filter(f => !f.hasAccuracy || f.accuracy < 100)
+      .groupBy(_.time / bucketMs).values.map(_.minBy(_.time)).toVector
+    (archived ++ hotFixesSampled(from, to, bucketMs)).sortBy(_.time)
+
+  private def hotFixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
     query(
       s"SELECT MIN(time), lat, lon FROM fixes WHERE time>=? AND time<? AND (acc IS NULL OR acc<100) GROUP BY time/$bucketMs ORDER BY 1",
       from,
@@ -287,10 +317,64 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     w.insert("gnss_status", null, cv)
 
   def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
+    AshidoriApp.archive.read(Archive.GnssStatus, from, Long.MaxValue).map { r =>
+      def i(k: Int) = Option(r(k)).map(_.asInstanceOf[Int]).getOrElse(0)
+      (GnssSnapshot(r(0).asInstanceOf[Long], i(1), i(2), Option(r(3)).map(_.asInstanceOf[Double]).getOrElse(0.0), i(4)),
+        scala.util.Try(Environment.valueOf(r(5).toString)).getOrElse(Environment.Unknown),
+        Option(r(6)).map(_.asInstanceOf[Float]).getOrElse(Float.NaN))
+    } ++ hotGnssStatus(from)
+
+  private def hotGnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
     query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? ORDER BY time", from) { c =>
       (GnssSnapshot(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4)),
         scala.util.Try(Environment.valueOf(c.getString(5))).getOrElse(Environment.Unknown), flt(c, 6))
     }
+
+  // --- raw lines and archiving ----------------------------------------------------
+
+  def insertRawLines(lines: Iterable[(Long, String)]): Unit = tx { db =>
+    val st = db.compileStatement("INSERT INTO raw_lines(time, line) VALUES(?, ?)")
+    for (t, l) <- lines do
+      st.bindLong(1, t)
+      st.bindString(2, l)
+      st.executeInsert()
+  }
+
+  /** Raw lines of [from, to) in insertion order. */
+  def rawLines(from: Long, to: Long): Vector[String] =
+    query("SELECT line FROM raw_lines WHERE time>=? AND time<? ORDER BY rowid", from, to)(_.getString(0))
+
+  /** Earliest time still held in SQLite for an archived table (None if empty). */
+  def oldestHot(): Option[Long] =
+    Seq("SELECT MIN(time) FROM fixes", "SELECT MIN(start) FROM motion", "SELECT MIN(time) FROM battery",
+      "SELECT MIN(time) FROM gnss_status", "SELECT MIN(time) FROM raw_lines")
+      .flatMap(q => query(q)(c => if c.isNull(0) then None else Some(c.getLong(0))).head)
+      .minOption
+
+  /** Rows of one archived table in [from, to), typed as in [[Archive]]. */
+  def hotRows(t: Archive.TableDef, from: Long, to: Long): Vector[Seq[Any]] =
+    t match
+      case Archive.Fixes  => hotFixes(from, to).map(Archive.fixRow)
+      case Archive.Motion => hotMotion(from, to).map(Archive.motionRow)
+      case Archive.Battery =>
+        query("SELECT time,pct,charging,screen_on,mode FROM battery WHERE time>=? AND time<? ORDER BY time", from, to) { c =>
+          Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getInt(3), c.getString(4))
+        }
+      case Archive.GnssStatus =>
+        query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? AND time<? ORDER BY time", from, to) { c =>
+          Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4), c.getString(5), flt(c, 6))
+        }
+      case _ => Vector.empty
+
+  /** Removes [from, to) from every archived SQLite table, once the archive holds it. */
+  def deleteHot(from: Long, to: Long): Unit = tx { db =>
+    val a = Array(from.toString, to.toString)
+    db.delete("fixes", "time>=? AND time<?", a)
+    db.delete("motion", "start>=? AND start<?", a)
+    db.delete("battery", "time>=? AND time<?", a)
+    db.delete("gnss_status", "time>=? AND time<?", a)
+    db.delete("raw_lines", "time>=? AND time<?", a)
+  }
 
   // --- sync ---------------------------------------------------------------------
 
@@ -347,7 +431,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   }
 
 object Db:
-  val Version = 3
+  val Version = 4
 
   /** Column -> JSON field mapping per synced table (docs/sync-protocol.md). */
   val SyncColumns: Map[String, Seq[(String, String)]] = Map(

@@ -14,6 +14,7 @@ class LoggerWatchdog(ctx: Context, params: WorkerParameters) extends Worker(ctx,
     if Settings.loggingEnabled && !LoggerState.running then
       try LoggerService.send(getApplicationContext, LoggerService.ActionStart)
       catch case e: Exception => Log.w("watchdog could not restart logging", e)
+    AshidoriApp.io.execute(() => AshidoriApp.maintainArchive())
     ListenableWorker.Result.success()
 
 object LoggerWatchdog:
