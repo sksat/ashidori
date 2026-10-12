@@ -29,7 +29,7 @@ final class PlaceSheet(
 
   private val title = text(place.displayName, 20f, bold = true)
   private val sub = caption("")
-  private val candidates = vbox(caption("近くの施設を探しています…"))
+  private val candidates = vbox(caption("近くの施設を検索中…"))
   private val nameInput = EditText(act)
   private val kinds = ChipGroup(act)
   private val history = vbox()
@@ -108,7 +108,7 @@ final class PlaceSheet(
         if !Settings.onlineVenues then
           if past.isEmpty then candidates.addView(caption("候補はありません。名前を入力してください。"))
         else
-          val loading = caption("近くの施設を探しています…")
+          val loading = caption("近くの施設を検索中…")
           candidates.addView(loading)
           VenueSearch.nearby(place.latLng, 120) { r =>
             candidates.removeView(loading)

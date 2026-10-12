@@ -78,6 +78,44 @@ class SamplingPolicySuite extends munit.FunSuite:
     assertEqualsDouble(DrainEstimator.screenOffDrain(s, 3 * h, 4 * h), 2.0, 0.01)
   }
 
+  test("indoors on foot: network positioning with short GNSS probes, no detail log") {
+    val base = in(motion = MotionState.OnFoot).copy(environment = Environment.Indoor)
+    val off = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeEveryMs * 10 + 60_000))
+    assertEquals(off.source, LocationSource.Network)
+    assert(!off.rawGnss)
+    val probe = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeEveryMs * 10 + 5_000))
+    assertEquals(probe.source, LocationSource.Gnss)
+    // Riding a train underground is not "indoors on foot".
+    assertEquals(SamplingPolicy.plan(base.copy(motion = MotionState.Vehicle, now = 99_000_000L + 60_000)).source, LocationSource.Gnss)
+  }
+
+  test("indoor detector needs sustained weak signals and recovers outdoors") {
+    val d = IndoorDetector(enterIndoorMs = 30_000, exitIndoorMs = 10_000)
+    def weak(t: Long) = GnssSnapshot(t, 8, 2, 18, 0)
+    def strong(t: Long) = GnssSnapshot(t, 25, 14, 38, 4)
+    assertEquals(d.update(strong(0)), Environment.Outdoor)
+    assertEquals(d.update(weak(1_000)), Environment.Outdoor)
+    assertEquals(d.update(weak(20_000)), Environment.Outdoor)
+    assertEquals(d.update(weak(31_000)), Environment.Indoor)
+    assertEquals(d.update(strong(32_000)), Environment.Indoor)
+    assertEquals(d.update(strong(43_000)), Environment.Outdoor)
+  }
+
+  test("indoor detector treats a long time without a fix as indoor") {
+    val d = IndoorDetector(noFixIndoorMs = 60_000, enterIndoorMs = 0)
+    d.onGnssStarted(0)
+    // Many satellites seen but none usable for a minute: still no fix.
+    assertEquals(d.update(GnssSnapshot(70_000, 10, 0, 22, 0)), Environment.Indoor)
+  }
+
+  test("snapshot summarises signals") {
+    val s = GnssSnapshot.of(0, Seq((1, 3, 40f, true, false), (1, 3, 35f, true, true), (6, 11, 30f, false, false), (3, 7, 20f, false, false), (5, 2, 10f, false, false)))
+    assertEquals(s.visible, 4)
+    assertEquals(s.used, 1)
+    assertEqualsDouble(s.top4Cn0, (40 + 35 + 30 + 20) / 4.0, 1e-9)
+    assertEquals(s.l5, 1)
+  }
+
   test("drain estimator copes with zero or one sample") {
     import DrainEstimator.Sample
     assert(DrainEstimator.screenOffDrain(Nil, 0).isNaN)

@@ -44,7 +44,9 @@ final case class PolicyInput(
     /** start time of the last raw GNSS detail session */
     lastDetailStart: Long,
     /** explicit "detail log now" request is active until this time */
-    burstUntil: Long = 0L
+    burstUntil: Long = 0L,
+    /** indoor/outdoor estimate from satellite visibility */
+    environment: Environment = Environment.Unknown
 )
 
 final case class SamplingPlan(
@@ -93,6 +95,8 @@ object SamplingPolicy:
   )
 
   private val Min = 60_000L
+  val IndoorProbeEveryMs: Long = 3 * Min
+  val IndoorProbeMs: Long = 20_000L
   val profiles: Map[LoggingMode, Profile] = Map(
     LoggingMode.Eco -> Profile(30_000, 15_000, None, 6 * 60 * Min, 12 * 60 * Min, 30_000, 10, 120_000, 1.0),
     LoggingMode.Balanced -> Profile(10_000, 5_000, Some(15 * Min), 30 * Min, 3 * 60 * Min, 60_000, 20, 30_000, 2.0),
@@ -138,8 +142,18 @@ object SamplingPolicy:
     if burst then reasons += "手動の詳細ログ中"
 
     // 3. Location source and interval from the motion state.
+    // Indoors (and not riding something) GNSS mostly burns power for no fix:
+    // use Wi-Fi/cell positioning and briefly try GNSS every few minutes to
+    // notice stepping outside.
+    val indoorWalk = in.environment == Environment.Indoor && in.motion != MotionState.Vehicle &&
+      in.motion != MotionState.Stationary
+    val probing = (in.now % SamplingPolicy.IndoorProbeEveryMs) < SamplingPolicy.IndoorProbeMs
+    if indoorWalk && mode != LoggingMode.Max && !burst then reasons += "屋内のため Wi-Fi・基地局で測位"
     val (source, baseInterval) =
       if mode == LoggingMode.Max || burst then (LocationSource.Gnss, 1_000L)
+      else if indoorWalk then
+        if probing then (LocationSource.Gnss, 1_000L)
+        else (LocationSource.Network, math.max(prof.footMs * 3, 15_000L))
       else
         in.motion match
           case MotionState.Stationary =>
@@ -159,7 +173,7 @@ object SamplingPolicy:
     val sinceDetail = in.now - in.lastDetailStart
     val rawGnss =
       burst || mode == LoggingMode.Max ||
-        (throttle < 2.0 && !(p.batteryPct <= 15 && !p.charging) &&
+        (throttle < 2.0 && !(p.batteryPct <= 15 && !p.charging) && in.environment != Environment.Indoor &&
           (sinceDetail < prof.detailDurationMs || sinceDetail >= detailEvery))
     // A detail session needs the GNSS engine running.
     val finalSource = if rawGnss then LocationSource.Gnss else source

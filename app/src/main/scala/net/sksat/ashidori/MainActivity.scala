@@ -215,11 +215,18 @@ class MainActivity extends AppCompatActivity:
 
   private def updateStatusChip(): Unit =
     val running = LoggerState.running
+    // The only status display: is it recording, and how well is position
+    // known right now. Mode and details live on the recording screen.
+    val now = System.currentTimeMillis()
+    val sats = LoggerState.satellites
+    val acc = LoggerState.lastFix.filter(f => now - f.time < 2 * 60_000 && f.hasAccuracy)
+      .map(f => f" ±${f.accuracy}%.0fm").getOrElse("")
     statusChip.setText(
-      // The chosen mode, not the momentary effective one (charging bumps it up),
-      // so the chip matches what the user picked; the logger screen explains.
-      if running then s"● 記録中・${Settings.mode.label}"
-      else "○ 停止中"
+      if !running then "○ 停止中"
+      else if sats.nonEmpty then
+        s"● 記録中・衛星${sats.filter(_.usedInFix).map(s => (s.constellation, s.svid)).distinct.size}機$acc"
+      else if LoggerState.motion == MotionState.Stationary then "● 記録中・静止中"
+      else s"● 記録中$acc"
     )
     statusChip.setContentDescription(if running then "記録中。タップで記録の詳細" else "記録停止中。タップで記録の詳細")
 

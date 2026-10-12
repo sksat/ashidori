@@ -39,6 +39,13 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       // updated_at watermark for editable tables.
       "CREATE TABLE sync_state(name TEXT PRIMARY KEY, value INTEGER)"
     ).foreach(db.execSQL)
+    createGnssStatus(db)
+
+  /** Periodic GnssStatus summaries: GNSS history view and indoor detection. */
+  private def createGnssStatus(db: SQLiteDatabase): Unit =
+    db.execSQL("""CREATE TABLE IF NOT EXISTS gnss_status(time INTEGER NOT NULL, visible INTEGER, used INTEGER,
+      |top4 REAL, l5 INTEGER, env TEXT, acc REAL)""".stripMargin)
+    db.execSQL("CREATE INDEX IF NOT EXISTS gnss_status_time ON gnss_status(time)")
 
   /** v0.1 (version 1) shipped to devices; never drop user data here. */
   override def onUpgrade(db: SQLiteDatabase, oldV: Int, newV: Int): Unit =
@@ -51,6 +58,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
         names.result()
       }
       Seq("city", "country", "area").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE places ADD COLUMN $c TEXT"))
+    if oldV < 3 then createGnssStatus(db)
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -265,6 +273,25 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def daysWithData(from: Long, to: Long, offsetMs: Long): Set[Long] =
     query(s"SELECT DISTINCT (time+$offsetMs)/86400000 FROM fixes WHERE time>=? AND time<?", from, to)(_.getLong(0)).toSet
 
+  // --- GNSS status history ------------------------------------------------------
+
+  def insertGnssStatus(s: GnssSnapshot, env: Environment, acc: Float): Unit =
+    val cv = ContentValues()
+    cv.put("time", java.lang.Long.valueOf(s.time))
+    cv.put("visible", java.lang.Integer.valueOf(s.visible))
+    cv.put("used", java.lang.Integer.valueOf(s.used))
+    cv.put("top4", java.lang.Double.valueOf(s.top4Cn0))
+    cv.put("l5", java.lang.Integer.valueOf(s.l5))
+    cv.put("env", env.toString)
+    nanToNull(cv, "acc", acc)
+    w.insert("gnss_status", null, cv)
+
+  def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
+    query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? ORDER BY time", from) { c =>
+      (GnssSnapshot(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4)),
+        scala.util.Try(Environment.valueOf(c.getString(5))).getOrElse(Environment.Unknown), flt(c, 6))
+    }
+
   // --- sync ---------------------------------------------------------------------
 
   def syncValue(name: String): Long =
@@ -320,7 +347,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   }
 
 object Db:
-  val Version = 2
+  val Version = 3
 
   /** Column -> JSON field mapping per synced table (docs/sync-protocol.md). */
   val SyncColumns: Map[String, Seq[(String, String)]] = Map(

@@ -28,6 +28,7 @@ object LoggerState:
   var running: Boolean = false
   var plan: Option[SamplingPlan] = None
   var motion: MotionState = MotionState.Unknown
+  var environment: Environment = Environment.Unknown
   var lastFix: Option[Fix] = None
   var lastWindow: Option[MotionWindow] = None
   var satellites: Vector[SatSignal] = Vector.empty

@@ -17,8 +17,8 @@ import Ui.*
 
 /** Why a venue search returned nothing. */
 enum VenueError(val message: String) extends Exception(message):
-  case Offline extends VenueError("オフラインのため、よく行く場所と過去のチェックイン先から表示しています。")
-  case ServerBusy extends VenueError("施設のサーバ（OpenStreetMap）が混み合っています。少し待つか、名前を入力してチェックインしてください。")
+  case Offline extends VenueError("オフライン: よく行く場所と過去のチェックイン先を表示しています。")
+  case ServerBusy extends VenueError("施設の検索サーバ（OpenStreetMap）が応答しません。時間をおくか、名前を入力してチェックインしてください。")
 
 /** Venue search on OpenStreetMap, shared by the check-in sheet and the place
   * sheet. Results are cached per ~200 m cell for a day and prefetched when the
@@ -202,7 +202,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     }
     if !Settings.onlineVenues then status.setText("施設の検索はオフです。名前を入力してチェックインできます。")
     else
-      status.setText("近くの施設を探しています…")
+      status.setText("近くの施設を検索中…")
       VenueSearch.nearby(p) { r =>
         r.fold(
           e => status.setText(e match

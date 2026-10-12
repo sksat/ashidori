@@ -41,7 +41,6 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   private var current: Option[DayTimeline] = None
 
   private val map = TrackMap(act, saved, controlsOnTop = true)
-  private val gnss = GnssChip(act)
 
   private val dateLabel = text("", 18f, bold = true)
   private val summary = hbox()
@@ -95,10 +94,6 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   val view: View =
     val coord = androidx.coordinatorlayout.widget.CoordinatorLayout(act)
     coord.addView(map.view, androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-    val glp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-    glp.gravity = Gravity.TOP | Gravity.END
-    glp.setMargins(0, dp(8), dp(12), 0)
-    coord.addView(gnss.view, glp)
     val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
     slp.setBehavior(behavior)
     coord.addView(sheet, slp)
@@ -129,10 +124,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
         tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).foreach(openVisit(_, tl))
       }
 
-  override def onShow(): Unit =
-    gnss.bind()
-    load()
-  override def onHide(): Unit = gnss.unbind()
+  override def onShow(): Unit = load()
 
   private def installSwipe(): Unit =
     val detector = GestureDetector(act, new GestureDetector.SimpleOnGestureListener:
@@ -165,8 +157,6 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
 
   def load(): Unit =
     val date = act.selectedDate
-    // Live satellite status only makes sense for today.
-    gnss.view.setVisibility(if date == LocalDate.now(AshidoriApp.zone) then View.VISIBLE else View.GONE)
     val today = LocalDate.now(AshidoriApp.zone)
     dateLabel.setText((if date == today then "今日 " else if date == today.minusDays(1) then "昨日 " else "") + date.format(dateFmt))
     AshidoriApp.io.execute { () =>
@@ -216,7 +206,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
       )
     else
       card(
-        text("記録が止まっています", 16f, bold = true),
+        text("記録停止中", 16f, bold = true),
         caption("記録を始めると、訪れた場所と移動がここに自動で並びます。"),
         spacer(8),
         button("記録を始める")(act.startLogging())

@@ -83,7 +83,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val fixText = mono("")
   private val motionText = text("", 14f)
   private val batteryText = text("", 14f)
-  private val gnss = GnssChip(act)
+  private val gnssLink = outlined("衛星測位の詳細 ›")(act.push(GnssScreen(act)))
 
   val view: View =
     scroll(
@@ -98,7 +98,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
           burst,
           files
         ),
-        card(text("現在地と衛星", 16f, bold = true), gnss.view, fixText, motionText, batteryText),
+        card(text("現在地", 16f, bold = true), fixText, motionText, batteryText, gnssLink),
         padded(stop, 16, 8),
         spacer(24)
       )
@@ -106,14 +106,11 @@ final class LoggerScreen(act: MainActivity) extends Screen:
 
   private var unobserve: () => Unit = () => ()
   override def onShow(): Unit =
-    gnss.bind()
     unobserve = LoggerState.observe(() => refresh())
     modeButtons.find(_._1 == Settings.mode).foreach(_._2.setChecked(true))
     refresh()
     loadFiles()
-  override def onHide(): Unit =
-    gnss.unbind()
-    unobserve()
+  override def onHide(): Unit = unobserve()
 
   private def loadFiles(): Unit =
     val dir = File(act.getExternalFilesDir(null), "gnss")

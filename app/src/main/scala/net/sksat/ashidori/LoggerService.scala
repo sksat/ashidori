@@ -34,6 +34,8 @@ class LoggerService extends Service:
   private lazy val db = AshidoriApp.db
 
   private val estimator = MotionStateEstimator()
+  private val indoor = IndoorDetector()
+  private var lastStatusSaved = 0L
   private val accumulator = MotionAccumulator(10_000)
   private val pendingFixes = ArrayBuffer.empty[Fix]
   private val pendingMotion = ArrayBuffer.empty[MotionWindow]
@@ -140,7 +142,8 @@ class LoggerService extends Service:
       speed,
       now,
       Settings.lastDetailStart,
-      Settings.burstUntil
+      Settings.burstUntil,
+      indoor.current
     )
     val p = SamplingPolicy.plan(input)
     if p.rawGnss && recorder.isEmpty then
@@ -186,6 +189,7 @@ class LoggerService extends Service:
 
     // Satellite status for the sky plot while the GNSS engine is on anyway.
     val wantStatus = p.source == LocationSource.Gnss
+    if wantStatus then indoor.onGnssStarted(System.currentTimeMillis()) else indoor.onGnssStopped()
     if wantStatus != statusRegistered then
       try
         if wantStatus then lm.registerGnssStatusCallback(exec, statusCallback)
@@ -278,6 +282,7 @@ class LoggerService extends Service:
       )
       pendingFixes += f
       recorder.foreach(_.onFix(l))
+      if f.provider == LocationManager.GPS_PROVIDER then indoor.onFix(f.time)
       if f.hasSpeed then
         lastSpeed = f.speed
         lastSpeedAt = f.time
@@ -306,6 +311,17 @@ class LoggerService extends Service:
         )
       }.toVector
       LoggerState.onMain { LoggerState.satellites = sats }
+      // Indoor/outdoor from what the receiver sees; re-plan when it flips.
+      val now = System.currentTimeMillis()
+      val snap = GnssSnapshot.of(now, sats.map(x => (x.constellation, x.svid, x.cn0, x.usedInFix, x.band == "L5")))
+      val before = indoor.current
+      val env = indoor.update(snap)
+      LoggerState.onMain { LoggerState.environment = env }
+      if now - lastStatusSaved >= 10_000 then
+        lastStatusSaved = now
+        val acc = LoggerState.lastFix.filter(f => now - f.time < 30_000).map(_.accuracy).getOrElse(Float.NaN)
+        AshidoriApp.io.execute(() => db.insertGnssStatus(snap, env, acc))
+      if env != before then evaluate(force = true)
       LoggerState.changed()
 
   private val sensorListener = new SensorEventListener:
