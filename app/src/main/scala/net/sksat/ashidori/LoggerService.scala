@@ -35,6 +35,12 @@ class LoggerService extends Service:
 
   private val estimator = MotionStateEstimator()
   private val indoor = IndoorDetector()
+  /** Dead reckoning while walking indoors (GNSS unusable). */
+  private val pdr = Pdr()
+  private var pdrSensors = false
+  private var heading = Double.NaN
+  /** Outdoor walk used to learn the stride: (start fix, steps since). */
+  private var strideRef: Option[(Fix, Int)] = None
   private var lastStatusSaved = 0L
   private val accumulator = MotionAccumulator(10_000)
   private val pendingFixes = ArrayBuffer.empty[Fix]
@@ -226,8 +232,29 @@ class LoggerService extends Service:
       if p.accelHz == 0 then accumulator.flush().foreach(onWindow)
       accelReg = p.accelHz
 
+    updatePdr()
     if p.accelHz == 0 && estimator.current == MotionState.Stationary then armSigMotion()
     else disarmSigMotion()
+
+  /** Step detector + rotation vector only while walking indoors: the gyro
+    * on some phones cannot batch, so this keeps the CPU awake.
+    */
+  private def updatePdr(): Unit =
+    val want = indoor.current == Environment.Indoor &&
+      (estimator.current == MotionState.OnFoot || estimator.current == MotionState.Unknown)
+    if want != pdrSensors then
+      val step = Option(sm.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)).orElse(Option(sm.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)))
+      val rot = Option(sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR))
+      if want && step.isDefined && rot.isDefined then
+        sm.registerListener(sensorListener, step.get, SensorManager.SENSOR_DELAY_NORMAL, handler)
+        sm.registerListener(sensorListener, rot.get, SensorManager.SENSOR_DELAY_UI, handler)
+        LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 5 * 60_000).foreach(pdr.reset)
+        pdrSensors = true
+      else if !want then
+        step.foreach(sm.unregisterListener(sensorListener, _))
+        rot.foreach(sm.unregisterListener(sensorListener, _))
+        pdr.stop()
+        pdrSensors = false
 
   private def stopRecorder(): Unit =
     recorder.foreach { r =>
@@ -284,6 +311,20 @@ class LoggerService extends Service:
       LoggerState.recentFixes = (LoggerState.recentFixes :+ f).takeRight(600)
       recorder.foreach(_.onFix(l))
       if f.provider == LocationManager.GPS_PROVIDER then indoor.onFix(f.time)
+      // A good GNSS fix re-anchors dead reckoning; a coarse one bounds its drift.
+      if f.provider == LocationManager.GPS_PROVIDER && f.hasAccuracy && f.accuracy < 20 then pdr.reset(f)
+      else if f.provider != LocationManager.GPS_PROVIDER then pdr.onNetworkFix(f)
+      // Learn the stride on good outdoor walks.
+      if f.provider == LocationManager.GPS_PROVIDER && f.hasAccuracy && f.accuracy < 15 &&
+        estimator.current == MotionState.OnFoot && indoor.current != Environment.Indoor
+      then
+        strideRef match
+          case Some((a, steps)) if f.time - a.time > 120_000 =>
+            pdr.calibrate(Geo.distance(a, f), steps)
+            strideRef = Some((f, 0))
+          case None => strideRef = Some((f, 0))
+          case _    => ()
+      else if estimator.current != MotionState.OnFoot then strideRef = None
       if f.hasSpeed then
         lastSpeed = f.speed
         lastSpeedAt = f.time
@@ -333,12 +374,26 @@ class LoggerService extends Service:
           recorder.foreach(r => if accelReg >= 50 then r.onAccel(e))
           val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
           accumulator.add(wall, e.values(0), e.values(1), e.values(2)).foreach(onWindow)
+        case Sensor.TYPE_ROTATION_VECTOR =>
+          val r = new Array[Float](9)
+          val o = new Array[Float](3)
+          SensorManager.getRotationMatrixFromVector(r, e.values)
+          SensorManager.getOrientation(r, o)
+          heading = (math.toDegrees(o(0).toDouble) + 360) % 360
+        case Sensor.TYPE_STEP_DETECTOR =>
+          if !heading.isNaN then
+            val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
+            pdr.onStep(wall, heading).foreach { f =>
+              pendingFixes += f
+              LoggerState.recentFixes = (LoggerState.recentFixes :+ f).takeRight(600)
+            }
         case Sensor.TYPE_STEP_COUNTER =>
           val total = e.values(0)
           if lastStepCount >= 0 && total >= lastStepCount then
             val d = (total - lastStepCount).toInt
             if d > 0 then
               accumulator.addSteps(d)
+              strideRef = strideRef.map((a, n) => (a, n + d))
               LoggerState.onMain { LoggerState.stepsSession += d }
               // Steps while "stationary" (accelerometer off) mean we are moving.
               if accelReg == 0 && estimator.current == MotionState.Stationary && d >= 10 then
