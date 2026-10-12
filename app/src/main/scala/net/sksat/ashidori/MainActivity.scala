@@ -126,7 +126,7 @@ class MainActivity extends AppCompatActivity:
     for ((id, title, icon), order) <- Seq(
         (MainActivity.TabInsights, "インサイト", R.drawable.ic_insights),
         (MainActivity.TabTimeline, "タイムライン", R.drawable.ic_timeline),
-        (MainActivity.TabLogger, "測位", R.drawable.ic_logger)
+        (MainActivity.TabLogger, "ステータス", R.drawable.ic_logger)
       ).zipWithIndex
     do nav.getMenu.add(0, id, order, title).setIcon(icon)
 

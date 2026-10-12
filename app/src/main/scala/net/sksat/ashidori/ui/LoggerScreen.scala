@@ -29,7 +29,7 @@ object ModeInfo:
 /** Recording status and controls, opened from the status chip in the top bar. */
 final class LoggerScreen(act: MainActivity) extends Screen:
   private given Ctx = act
-  override val title = "測位"
+  override val title = "ステータス"
   private val timeFmt = DateTimeFormatter.ofPattern("M/d HH:mm")
 
   private val status = text("", 20f, bold = true)
@@ -80,28 +80,25 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   }
   private val files = vbox()
 
-  private val fixText = mono("")
-  private val motionText = text("", 14f)
-  private val batteryText = text("", 14f)
-  private val gnssLink = outlined("衛星測位の詳細 ›")(act.push(GnssScreen(act)))
+  private val panel = PositioningPanel(act)
 
   val view: View =
     scroll(
-      vbox(
-        card(status, planText, reasons, spacer(8), start),
+      vbox((Seq(
+        card(status, planText, reasons, spacer(8), start)
+      ) ++ panel.views ++ Seq(
         card(text("記録モード", 16f, bold = true), modes),
         card(
-          text("詳細 GNSS ログ", 16f, bold = true),
-          caption("衛星の生データ（GnssLogger 形式）を記録します。"),
+          text("詳細ログ（GNSS・IMU）", 16f, bold = true),
+          caption("衛星の生データと加速度・ジャイロ・地磁気を記録します。"),
           detailText,
           spacer(4),
           burst,
           files
         ),
-        card(text("現在地", 16f, bold = true), fixText, motionText, batteryText, gnssLink),
         padded(stop, 16, 8),
         spacer(24)
-      )
+      ))*)
     )
 
   private var unobserve: () => Unit = () => ()
@@ -109,6 +106,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     unobserve = LoggerState.observe(() => refresh())
     modeButtons.find(_._1 == Settings.mode).foreach(_._2.setChecked(true))
     refresh()
+    panel.loadHistory()
     loadFiles()
   override def onHide(): Unit = unobserve()
 
@@ -157,11 +155,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     stop.setVisibility(if running then View.VISIBLE else View.GONE)
     LoggerState.plan match
       case Some(p) if running =>
-        planText.setText(
-          s"${LoggerState.motion.label}・${p.describe}" +
-            (if p.effectiveMode != Settings.mode then s"（いまは${p.effectiveMode.label}で動作）" else "")
+        planText.setText(PositioningPanel.planSentence(p))
+        // Why the effective mode differs from the chosen one, if it does.
+        reasons.setText(
+          if p.effectiveMode != Settings.mode then s"${p.effectiveMode.label}で動作中（${p.reasons.mkString("・")}）"
+          else p.reasons.mkString("・")
         )
-        reasons.setText(p.reasons.mkString("・"))
       case _ =>
         planText.setText(if running then "" else "記録を始めると、ここに現在の動作が表示されます")
         reasons.setText("")
@@ -174,15 +173,4 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         if last == 0 then "まだ記録していません" else s"前回: ${fmtDuration(now - last)}前"
     )
 
-    fixText.setText(LoggerState.lastFix match
-      case Some(f) =>
-        f"${f.lat}%.6f, ${f.lon}%.6f ±${f.accuracy}%.0fm\n" +
-          f"${f.provider} ${if f.hasSpeed then f.speed * 3.6 else Double.NaN}%.1f km/h ${(now - f.time) / 1000}秒前"
-      case None => "測位なし"
-    )
-    motionText.setText(LoggerState.lastWindow match
-      case Some(w) => f"動き: ${LoggerState.motion.label}・加速度σ ${w.accelStd}%.2f・歩数 ${LoggerState.stepsSession}"
-      case None    => s"動き: ${LoggerState.motion.label}・歩数 ${LoggerState.stepsSession}"
-    )
-    val d = LoggerState.drainPctPerHour
-    batteryText.setText(s"電池 ${LoggerState.battery}%" + (if d.isNaN then "" else f"・画面オフ時の消費 $d%.1f%%/時"))
+    panel.refresh()
