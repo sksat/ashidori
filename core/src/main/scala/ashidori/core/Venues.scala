@@ -11,11 +11,17 @@ object Overpass:
   /** Category keys in priority order. */
   private val CategoryKeys = Seq("amenity", "shop", "tourism", "leisure", "railway", "public_transport", "office", "historic", "aeroway", "building")
 
+  /** One statement with a key regex: a union of one statement per key made
+    * the public server time out (504 after ~9 s); this returns in ~5 s.
+    */
   def query(lat: Double, lon: Double, radiusM: Int = 200): String =
-    val keys = CategoryKeys.filterNot(_ == "building").map(k => s"""nwr["name"]["$k"](around:$radiusM,$lat,$lon);""").mkString
-    s"""[out:json][timeout:15];($keys);out center 80;"""
+    val keys = CategoryKeys.filterNot(_ == "building").mkString("|")
+    s"""[out:json][timeout:10];nwr["name"][~"^($keys)$$"~"."](around:$radiusM,$lat,$lon);out center 80;"""
 
-  def parse(json: String, lat: Double, lon: Double): Vector[(Venue, Double)] =
+  /** `maxDistM` drops large areas (parks, reserves) that touch the search
+    * circle but whose center is far away.
+    */
+  def parse(json: String, lat: Double, lon: Double, maxDistM: Double = 600): Vector[(Venue, Double)] =
     val root = ujson.read(json)
     root("elements").arr.toVector.flatMap { e =>
       val tags = e.obj.get("tags").map(_.obj).getOrElse(collection.mutable.LinkedHashMap.empty[String, ujson.Value])
@@ -31,7 +37,7 @@ object Overpass:
       yield
         val v = Venue(s"${e("type").str}/${e("id").num.toLong}", n, cat, vlat, vlon)
         v -> Geo.distance(lat, lon, vlat, vlon)
-    }.distinctBy(_._1.name).sortBy(_._2)
+    }.filter(_._2 <= maxDistM).distinctBy(_._1.name).sortBy(_._2)
 
   private val Labels = Map(
     "restaurant" -> "レストラン", "cafe" -> "カフェ", "fast_food" -> "ファストフード", "bar" -> "バー", "pub" -> "居酒屋",

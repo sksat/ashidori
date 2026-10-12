@@ -41,6 +41,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   private var current: Option[DayTimeline] = None
 
   private val map = TrackMap(act, saved)
+  private val gnss = GnssChip(act)
 
   private val dateLabel = text("", 18f, bold = true)
   private val summary = hbox()
@@ -94,6 +95,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   val view: View =
     val coord = androidx.coordinatorlayout.widget.CoordinatorLayout(act)
     coord.addView(map.view, androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    val glp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    glp.gravity = Gravity.TOP | Gravity.END
+    glp.setMargins(0, dp(8), dp(12), 0)
+    coord.addView(gnss.view, glp)
     val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
     slp.setBehavior(behavior)
     coord.addView(sheet, slp)
@@ -124,7 +129,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
         tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).foreach(openVisit(_, tl))
       }
 
-  override def onShow(): Unit = load()
+  override def onShow(): Unit =
+    gnss.bind()
+    load()
+  override def onHide(): Unit = gnss.unbind()
 
   private def installSwipe(): Unit =
     val detector = GestureDetector(act, new GestureDetector.SimpleOnGestureListener:
@@ -157,6 +165,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
 
   def load(): Unit =
     val date = act.selectedDate
+    // Live satellite status only makes sense for today.
+    gnss.view.setVisibility(if date == LocalDate.now(AshidoriApp.zone) then View.VISIBLE else View.GONE)
     val today = LocalDate.now(AshidoriApp.zone)
     dateLabel.setText((if date == today then "今日 " else if date == today.minusDays(1) then "昨日 " else "") + date.format(dateFmt))
     AshidoriApp.io.execute { () =>
@@ -182,7 +192,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
 
     val trips = tl.segments.collect { case t: Trip => t }
     map.setData(
-      trips.map(t => Geo.simplify(t.path, 4)),
+      // One line per leg, colored by transport mode.
+      trips.flatMap(t => t.legs.filter(_.mode != TransportMode.Still).map { l =>
+        MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 4), l.mode.color)
+      }),
       tl.segments.collect { case v: Visit => MapMarker(v.latLng, v.start.toString) },
       tl.checkIns.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName))
     )
@@ -217,7 +230,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
 
   private def visitRow(v: Visit, tl: DayTimeline, top: Boolean, bottom: Boolean): View =
     val place = v.placeId.flatMap(tl.places.get)
-    val name = place.map(_.displayName).getOrElse("不明な場所")
+    val name = place.map { p =>
+      tl.suggestions.get(p.id).filter(_ => !p.named).map(n => s"$n？").getOrElse(p.displayName)
+    }.getOrElse("不明な場所")
     val chips = hbox()
     place.filter(_.kind != PlaceKind.Other).foreach { p =>
       chips.addView(chip(p.kind.label, color(attr.secondaryContainer), color(attr.onSurface)))
@@ -225,8 +240,25 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     tl.checkIns.filter(c => c.time >= v.start - 60_000 && c.time <= v.end + 60_000).foreach { c =>
       chips.addView(chip(s"✓ ${c.venueName}", color(attr.primaryContainer), color(attr.onPrimaryContainer)))
     }
-    if place.forall(_.name.isEmpty) || v.confidence < 0.6 then
-      chips.addView(chip("場所を確認", color(attr.surfaceContainerHigh), color(attr.primary)))
+    val suggestion = place.flatMap(p => tl.suggestions.get(p.id))
+    suggestion match
+      case Some(name) =>
+        // A past check-in nearby: offer it as the name, confirm with one tap.
+        val c = chip(s"「$name」にする", color(attr.primaryContainer), color(attr.onPrimaryContainer))
+        c.setMinHeight(dp(36))
+        c.setOnClickListener { _ =>
+          place.foreach { p =>
+            AshidoriApp.io.execute { () =>
+              AshidoriApp.db.updatePlace(p.copy(name = name))
+              TimelineRepo.invalidate()
+              act.runOnUiThread(() => load())
+            }
+          }
+        }
+        chips.addView(c)
+      case None =>
+        if place.forall(!_.named) || v.confidence < 0.6 then
+          chips.addView(chip("場所を確認", color(attr.surfaceContainerHigh), color(attr.primary)))
     val body = vbox(
       text(name, 16f, bold = true),
       caption(
@@ -270,7 +302,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
     }
     val body = vbox((caption(s"${time(t.start)} – ${time(t.end)}・${fmtDuration(t.durationMs)}") +: rows)*)
     padded(body, 8, 6)
-    withRail(RailView(act, false, color(attr.outlineVariant), top, bottom), body)
+    // The rail takes the color of the main transport mode, like the map line.
+    withRail(RailView(act, false, android.graphics.Color.parseColor(t.mainMode.color), top, bottom), body)
 
   private def pickMode(l: Leg): Unit =
     val modes = TransportMode.values.filter(m => m != TransportMode.Still && m != TransportMode.Unknown)

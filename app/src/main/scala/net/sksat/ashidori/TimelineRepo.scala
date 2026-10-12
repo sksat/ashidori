@@ -8,7 +8,9 @@ final case class DayTimeline(
     segments: Vector[Segment],
     summary: DaySummary,
     places: Map[Long, Place],
-    checkIns: Vector[CheckIn]
+    checkIns: Vector[CheckIn],
+    /** placeId -> venue name of a past check-in close to an unnamed place */
+    suggestions: Map[Long, String] = Map.empty
 ):
   def path: Vector[Fix] = segments.collect { case t: Trip => t.path }.flatten
 
@@ -62,7 +64,18 @@ object TimelineRepo:
     }
     val segs = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
     val steps = db.steps(dayStart, dayEnd)
-    DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd))
+    DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places))
+
+  /** For unnamed visited places, the nearest earlier check-in venue (≤100 m). */
+  private def suggest(segs: Seq[Segment], places: Map[Long, Place]): Map[Long, String] =
+    val unnamed = segs.collect { case v: Visit => v.placeId }.flatten.distinct.flatMap(places.get).filterNot(_.named)
+    if unnamed.isEmpty then Map.empty
+    else
+      val past = AshidoriApp.db.checkIns(0, Long.MaxValue)
+      unnamed.flatMap { p =>
+        past.map(c => c -> Geo.distance(p.lat, p.lon, c.lat, c.lon)).filter(_._2 <= 100).minByOption(_._2)
+          .map((c, _) => p.id -> c.venueName)
+      }.toMap
 
   /** Gives unnamed visited places an approximate area name via the platform
     * geocoder (a few per call, cached in the DB).

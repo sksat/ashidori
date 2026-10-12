@@ -60,6 +60,20 @@ enum TransportMode(val key: String, val label: String, val emoji: String):
   case Ferry extends TransportMode("IN_FERRY", "船", "⛴️")
   case Unknown extends TransportMode("UNKNOWN_ACTIVITY_TYPE", "移動", "➡️")
 
+  /** Display color (map lines, timeline rail), readable on light and dark maps. */
+  def color: String = this match
+    case Walking => "#2E9D57"
+    case Running => "#E8710A"
+    case Cycling => "#00A3A3"
+    case Car     => "#5B6CD9"
+    case Bus     => "#D9822B"
+    case Train   => "#1A73E8"
+    case Subway  => "#9334E6"
+    case Flying  => "#00838F"
+    case Ferry   => "#0277BD"
+    case Still   => "#80868B"
+    case Unknown => "#80868B"
+
   def isVehicle: Boolean = this match
     case Car | Bus | Train | Subway | Flying | Ferry => true
     case _                                          => false

@@ -88,7 +88,13 @@ class MainActivity extends AppCompatActivity:
   // --- lifecycle -------------------------------------------------------------------------
 
   override def onCreate(savedInstanceState: Bundle): Unit =
-    DynamicColors.applyToActivityIfAvailable(this)
+    // The UI is Japanese: pin the app language so kanji use Japanese glyphs
+    // even when the system language is something else (otherwise CJK text
+    // falls back to a Chinese font). Respect a choice made in system settings.
+    val locales = getSystemService(classOf[android.app.LocaleManager])
+    if locales.getApplicationLocales.isEmpty then
+      locales.setApplicationLocales(android.os.LocaleList.forLanguageTags("ja-JP"))
+    // Brand colors (themes.xml) rather than wallpaper-derived dynamic color.
     super.onCreate(savedInstanceState)
 
     toolbar = MaterialToolbar(this)
@@ -188,6 +194,16 @@ class MainActivity extends AppCompatActivity:
       // Resume logging after an app update or a force stop.
       if Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
         LoggerService.send(this, LoggerService.ActionStart)
+      handleIntent(getIntent)
+
+  override def onNewIntent(intent: Intent): Unit =
+    super.onNewIntent(intent)
+    handleIntent(intent)
+
+  private def handleIntent(intent: Intent): Unit =
+    if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded &&
+      !current.exists(_.isInstanceOf[LoggerScreen])
+    then push(LoggerScreen(this))
 
   private def finishOnboarding(): Unit =
     Settings.onboarded = true
@@ -257,6 +273,9 @@ class MainActivity extends AppCompatActivity:
     super.onResume()
     maps.foreach(_.onResume())
     current.foreach(_.onShow())
+    // Warm the venue cache from the logger's latest position (no extra GNSS).
+    LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 10 * 60_000)
+      .foreach(f => VenueSearch.prefetch(f.latLng))
   override def onPause(): Unit =
     maps.foreach(_.onPause())
     super.onPause()
@@ -284,6 +303,8 @@ class MainActivity extends AppCompatActivity:
     startActivity(Intent.createChooser(send, f.getName))
 
 object MainActivity:
+  /** Intent extra: open the recording screen (from the notification). */
+  val ExtraOpenLogger = "ashidori.openLogger"
   val TabTimeline = 1
   val TabMap = 2
   val TabInsights = 3

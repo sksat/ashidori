@@ -77,7 +77,7 @@ final class PlaceSheet(
       12
     )
     dialog.setContentView(scroll(root))
-    dialog.getBehavior.setState(BottomSheetBehavior.STATE_EXPANDED)
+    Ui.fullHeight(dialog)
     dialog.show()
     loadCandidates()
     loadHistory()
@@ -86,25 +86,45 @@ final class PlaceSheet(
 
   private def fmt(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
 
+  private def candidateRow(v: Venue, sub: String): View =
+    val t = text(v.name, 15f)
+    t.setLayoutParams(weighted())
+    val r = hbox(t, caption(sub))
+    r.setMinimumHeight(dp(48))
+    r.setBackgroundResource(android.R.drawable.list_selector_background)
+    r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id)))
+    r
+
+  /** Past check-ins nearby first (works offline), then OpenStreetMap venues. */
   private def loadCandidates(): Unit =
-    if !Settings.onlineVenues then candidates.removeAllViews()
-    else
-      VenueSearch.nearby(place.latLng, 120) { r =>
+    AshidoriApp.io.execute { () =>
+      val past = AshidoriApp.db.checkIns(0, Long.MaxValue)
+        .map(c => Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon))
+        .map(v => v -> v.latLng.distanceTo(place.latLng))
+        .filter(_._2 <= 150).sortBy(_._2).distinctBy(_._1.name)
+      act.runOnUiThread { () =>
         candidates.removeAllViews()
-        r.fold(
-          _ => candidates.addView(caption("候補を取得できませんでした")),
-          vs =>
-            if vs.isEmpty then candidates.addView(caption("近くに候補がありません"))
-            for (v, d) <- vs.take(6) do
-              val t = text(v.name, 15f)
-              t.setLayoutParams(weighted())
-              val r = hbox(t, caption(s"${v.category}・${d.round}m"))
-              r.setMinimumHeight(dp(48))
-              r.setBackgroundResource(android.R.drawable.list_selector_background)
-              r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id)))
-              candidates.addView(r)
-        )
+        for (v, d) <- past.take(4) do candidates.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
+        if !Settings.onlineVenues then
+          if past.isEmpty then candidates.addView(caption("候補はありません。名前を入力してください。"))
+        else
+          val loading = caption("近くの施設を探しています…")
+          candidates.addView(loading)
+          VenueSearch.nearby(place.latLng, 120) { r =>
+            candidates.removeView(loading)
+            r.fold(
+              e => candidates.addView(caption(e match
+                case v: VenueError => v.message
+                case _             => "候補を取得できませんでした"
+              )),
+              vs =>
+                val fresh = vs.filterNot(x => past.exists(_._1.name == x._1.name))
+                if fresh.isEmpty && past.isEmpty then candidates.addView(caption("近くに候補がありません"))
+                for (v, d) <- fresh.take(6) do candidates.addView(candidateRow(v, s"${v.category}・${d.round}m"))
+            )
+          }
       }
+    }
 
   private def loadHistory(): Unit =
     AshidoriApp.io.execute { () =>

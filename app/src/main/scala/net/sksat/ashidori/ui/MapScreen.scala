@@ -25,6 +25,7 @@ final class MapScreen(act: MainActivity, saved: Bundle) extends Screen:
   private var period = Period.Month
   private var places: Map[Long, Place] = Map.empty
   private val status = chip("", color(attr.surface), color(attr.onSurface))
+  private val gnss = GnssChip(act)
 
   private def chipRow(single: Boolean)(items: (String, Boolean, Boolean => Unit)*): View =
     val g = ChipGroup(act)
@@ -58,7 +59,10 @@ final class MapScreen(act: MainActivity, saved: Bundle) extends Screen:
     statusLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL
     statusLp.topMargin = dp(8)
     status.setLayoutParams(statusLp)
-    val mapFrame = frame(map.view, status)
+    val gl = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.END)
+    gl.setMargins(0, 0, dp(12), dp(84))
+    gnss.view.setLayoutParams(gl)
+    val mapFrame = frame(map.view, status, gnss.view)
     mapFrame.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
     vbox(controls, mapFrame)
 
@@ -68,7 +72,10 @@ final class MapScreen(act: MainActivity, saved: Bundle) extends Screen:
         places.get(key.toLong).foreach(p => PlaceSheet(act, p, None, () => load(), Some(act.openDay)).show())
       case _ => ()
 
-  override def onShow(): Unit = load()
+  override def onShow(): Unit =
+    gnss.bind()
+    load()
+  override def onHide(): Unit = gnss.unbind()
 
   private def load(): Unit =
     val p = period
@@ -95,7 +102,7 @@ final class MapScreen(act: MainActivity, saved: Bundle) extends Screen:
       act.runOnUiThread { () =>
         places = ps.map(pl => pl.id -> pl).toMap
         map.setData(
-          paths,
+          paths.map(p => MapPath(p)),
           ps.map(pl => MapMarker(pl.latLng, pl.id.toString, pl.displayName)),
           cs.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName))
         )

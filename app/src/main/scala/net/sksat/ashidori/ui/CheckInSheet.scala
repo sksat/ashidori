@@ -15,27 +15,73 @@ import net.sksat.ashidori.*
 import ashidori.core.*
 import Ui.*
 
-/** Venue search on OpenStreetMap, shared by the check-in sheet and the place sheet. */
+/** Why a venue search returned nothing. */
+enum VenueError(val message: String) extends Exception(message):
+  case Offline extends VenueError("オフラインのため、よく行く場所と過去のチェックイン先から表示しています。")
+  case ServerBusy extends VenueError("施設のサーバ（OpenStreetMap）が混み合っています。少し待つか、名前を入力してチェックインしてください。")
+
+/** Venue search on OpenStreetMap, shared by the check-in sheet and the place
+  * sheet. Results are cached per ~200 m cell for a day and prefetched when the
+  * app opens or the user settles somewhere, so the check-in sheet is instant.
+  */
 object VenueSearch:
   private val net = Executors.newSingleThreadExecutor()
+  /** Public Overpass instances; the main one is often overloaded. */
+  private val Endpoints = Seq(Overpass.Endpoint, "https://overpass.kumi.systems/api/interpreter", "https://overpass.private.coffee/api/interpreter")
+  private val CacheMs = 24 * 3_600_000L
+  private val cache = java.util.concurrent.ConcurrentHashMap[(Long, Long, Int), (Long, Vector[Venue])]()
 
-  def nearby(p: LatLng, radiusM: Int = 200)(done: Try[Vector[(Venue, Double)]] => Unit): Unit =
-    net.execute { () =>
-      val r = Try {
-        val conn = URL(Overpass.Endpoint).openConnection().asInstanceOf[HttpURLConnection]
+  private def cell(p: LatLng, radiusM: Int) = ((p.lat / 0.002).round, (p.lon / 0.0025).round, radiusM)
+
+  /** Cached result for this spot, if fresh. */
+  def cached(p: LatLng, radiusM: Int = 200): Option[Vector[(Venue, Double)]] =
+    Option(cache.get(cell(p, radiusM))).filter(e => System.currentTimeMillis() - e._1 < CacheMs).map { (_, vs) =>
+      vs.map(v => v -> v.latLng.distanceTo(p)).sortBy(_._2)
+    }
+
+  private def online: Boolean =
+    val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
+    Option(cm.getNetworkCapabilities(cm.getActiveNetwork))
+      .exists(_.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+
+  private def query(p: LatLng, radiusM: Int): Vector[(Venue, Double)] =
+    val body = ("data=" + URLEncoder.encode(Overpass.query(p.lat, p.lon, radiusM), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)
+    // The main instance gets most of the time budget; mirrors are a quick
+    // fallback (they are often unresponsive), so the whole search fails
+    // within ~20 s instead of ~40 s.
+    val attempts = Endpoints.iterator.zipWithIndex.map { (url, i) =>
+      Try {
+        val conn = URL(url).openConnection().asInstanceOf[HttpURLConnection]
         conn.setRequestMethod("POST")
         conn.setDoOutput(true)
-        conn.setConnectTimeout(10_000)
-        conn.setReadTimeout(20_000)
+        conn.setConnectTimeout(if i == 0 then 6_000 else 3_000)
+        conn.setReadTimeout(if i == 0 then 12_000 else 4_000)
         conn.setRequestProperty("User-Agent", s"ashidori/${BuildInfo.versionName} (Android)")
-        val body = "data=" + URLEncoder.encode(Overpass.query(p.lat, p.lon, radiusM), StandardCharsets.UTF_8)
-        Using.resource(conn.getOutputStream)(_.write(body.getBytes(StandardCharsets.UTF_8)))
+        Using.resource(conn.getOutputStream)(_.write(body))
         if conn.getResponseCode != 200 then throw RuntimeException(s"HTTP ${conn.getResponseCode}")
         val json = Using.resource(conn.getInputStream)(in => String(in.readAllBytes(), StandardCharsets.UTF_8))
         Overpass.parse(json, p.lat, p.lon)
       }
-      AshidoriApp.app.getMainExecutor.execute(() => done(r))
     }
+    attempts.find(_.isSuccess).map(_.get).getOrElse(throw (if online then VenueError.ServerBusy else VenueError.Offline))
+
+  def nearby(p: LatLng, radiusM: Int = 200)(done: Try[Vector[(Venue, Double)]] => Unit): Unit =
+    cached(p, radiusM) match
+      case Some(hit) => done(scala.util.Success(hit))
+      case None =>
+        net.execute { () =>
+          val r = Try {
+            if !online then throw VenueError.Offline
+            val vs = query(p, radiusM)
+            cache.put(cell(p, radiusM), (System.currentTimeMillis(), vs.map(_._1)))
+            vs
+          }
+          AshidoriApp.app.getMainExecutor.execute(() => done(r))
+        }
+
+  /** Warm the cache for a position in the background (no UI). */
+  def prefetch(p: LatLng): Unit =
+    if Settings.onlineVenues && cached(p).isEmpty then nearby(p)(_ => ())
 
 /** Swarm-style check-in as a bottom sheet: search on top, nearby venues,
   * then a short compose step. `at` checks in to a past visit instead of the
@@ -61,27 +107,40 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   priv.setText("非公開にする（エクスポートや共有に含めない）")
   priv.setMinHeight(dp(48))
   private var selected: Option[Venue] = None
+  private var composeHost: View = null
   private val commitButton =
     val b = button("チェックインする")(commit())
     b.setMinHeight(dp(56))
     b.setTextSize(16f)
     b
   private val compose = vbox(chosen, comment, priv, spacer(8), commitButton, outlined("施設を選び直す")(showPick()))
-  private val pick = vbox(
-    text(if at.isDefined then "この滞在にチェックイン" else "チェックイン", 20f, bold = true),
-    spacer(4),
-    search,
-    status,
-    list,
-    spacer(8),
-    caption("近くの施設は OpenStreetMap から取得します。取得の際、位置がそのサーバに送られます。")
-  )
+  /** Search sits at the bottom, within thumb reach; the list scrolls above it. */
+  private val listScroll =
+    val sc = scroll(list)
+    sc.setLayoutParams(android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+    sc
+  private val pick =
+    search.setMinHeight(dp(56))
+    search.setTextSize(17f)
+    val v = vbox(
+      text(if at.isDefined then "この滞在にチェックイン" else "チェックイン", 20f, bold = true),
+      status,
+      listScroll,
+      caption("近くの施設は OpenStreetMap から取得します（位置がそのサーバに送られます）。"),
+      search
+    )
+    v.setLayoutParams(android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+    v
 
   def show(): Unit =
-    val root = padded(vbox(pick, compose), 20, 12)
-    compose.setVisibility(View.GONE)
-    dialog.setContentView(scroll(root))
-    dialog.getBehavior.setState(BottomSheetBehavior.STATE_EXPANDED)
+    val composeScroll = scroll(compose)
+    val root = padded(vbox(pick, composeScroll), 20, 12)
+    composeScroll.setVisibility(View.GONE)
+    composeHost = composeScroll
+    dialog.setContentView(root, android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+    // Keep the bottom search field above the keyboard.
+    dialog.getWindow.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+    Ui.fullHeight(dialog)
     dialog.show()
     search.addTextChangedListener(new TextWatcher:
       def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()
@@ -92,18 +151,32 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       case Some(p) => fetch(p)
       case None    => locate()
 
+  /** Show candidates at once from the best position we already have, then
+    * refine with a fresh fix if that moves us noticeably.
+    */
   private def locate(): Unit =
-    status.setText("現在地を取得中…")
-    LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 2 * 60_000) match
-      case Some(f) => fetch(f.latLng)
-      case None =>
-        try
-          act.getSystemService(classOf[LocationManager]).getCurrentLocation(
-            LocationManager.FUSED_PROVIDER, null, act.getMainExecutor, (l: Location) =>
-              if l != null then fetch(LatLng(l.getLatitude, l.getLongitude))
-              else status.setText("現在地を取得できませんでした。名前を入力してチェックインできます。")
-          )
-        catch case _: SecurityException => status.setText("位置情報の権限がありません")
+    val lm = act.getSystemService(classOf[LocationManager])
+    val now = System.currentTimeMillis()
+    val known: Option[LatLng] =
+      LoggerState.lastFix.filter(f => now - f.time < 30 * 60_000).map(_.latLng)
+        .orElse(
+          scala.util.Try(Option(lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER))).toOption.flatten
+            .filter(l => now - l.getTime < 30 * 60_000)
+            .map(l => LatLng(l.getLatitude, l.getLongitude))
+        )
+    known match
+      case Some(p) => fetch(p)
+      case None    => status.setText("現在地を取得中…")
+    val fresh = LoggerState.lastFix.exists(f => now - f.time < 60_000)
+    if !fresh then
+      try
+        lm.getCurrentLocation(LocationManager.FUSED_PROVIDER, null, act.getMainExecutor, (l: Location) =>
+          if l != null then
+            val p = LatLng(l.getLatitude, l.getLongitude)
+            if known.forall(_.distanceTo(p) > 100) then fetch(p)
+          else if known.isEmpty then status.setText("現在地を取得できませんでした。名前を入力してチェックインできます。")
+        )
+      catch case _: SecurityException => status.setText("位置情報の権限がありません")
 
   /** Places and past check-in venues near `p`, from the local DB. Works offline. */
   private def localCandidates(p: LatLng): Vector[(Venue, Double)] =
@@ -131,7 +204,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       status.setText("近くの施設を探しています…")
       VenueSearch.nearby(p) { r =>
         r.fold(
-          _ => status.setText("オフラインのため、よく行く場所と過去のチェックイン先から表示しています。名前を入力してもチェックインできます。"),
+          e => status.setText(e match
+            case v: VenueError => v.message
+            case _             => "施設を取得できませんでした。名前を入力してチェックインできます。"
+          ),
           vs => {
             venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
             status.setText("")
@@ -162,10 +238,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     selected = Some(v)
     chosen.setText(v.name + (if v.category.nonEmpty then s"（${v.category}）" else ""))
     pick.setVisibility(View.GONE)
-    compose.setVisibility(View.VISIBLE)
+    composeHost.setVisibility(View.VISIBLE)
 
   private def showPick(): Unit =
-    compose.setVisibility(View.GONE)
+    composeHost.setVisibility(View.GONE)
     pick.setVisibility(View.VISIBLE)
 
   private def commit(): Unit =

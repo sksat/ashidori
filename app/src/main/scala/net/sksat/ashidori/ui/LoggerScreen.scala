@@ -35,11 +35,22 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val status = text("", 20f, bold = true)
   private val planText = caption("")
   private val reasons = caption("")
-  private val toggle = button("記録を始める") {
-    if LoggerState.running then
-      Settings.loggingEnabled = false
-      LoggerService.send(act, LoggerService.ActionStop)
-    else act.startLogging()
+  /** Shown only while stopped. Recording is meant to stay on; the user
+    * normally just changes the mode.
+    */
+  private val start = button("記録を始める")(act.startLogging())
+  private val stop = outlined("記録を停止…") {
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("記録を停止しますか")
+      .setMessage("停止している間の移動や滞在は残りません。電池を節約したいだけなら「省電力」モードがおすすめです。")
+      .setNegativeButton("やめる", null)
+      // Checking the radio button runs the normal mode-change path.
+      .setNeutralButton("省電力にする", (_, _) => modeButtons.find(_._1 == LoggingMode.Eco).foreach(_._2.setChecked(true)))
+      .setPositiveButton("停止する", (_, _) => {
+        Settings.loggingEnabled = false
+        LoggerService.send(act, LoggerService.ActionStop)
+      })
+      .show()
   }
 
   private val modes = RadioGroup(act)
@@ -72,23 +83,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val fixText = mono("")
   private val motionText = text("", 14f)
   private val batteryText = text("", 14f)
-  private val sky = SkyPlotView(act)
-  private val bars = Cn0BarsView(act)
-  private val satSummary = caption("")
-  private val gnssBody = vbox(sky, bars, satSummary, spacer(8), fixText, motionText, batteryText)
-  gnssBody.setVisibility(View.GONE)
-  private val gnssToggle = outlined("GNSS 詳細を表示 ▼") {
-    val show = gnssBody.getVisibility != View.VISIBLE
-    gnssBody.setVisibility(if show then View.VISIBLE else View.GONE)
-    gnssToggleLabel(show)
-  }
-  private def gnssToggleLabel(open: Boolean): Unit =
-    gnssToggle.setText(if open then "GNSS 詳細を隠す ▲" else "GNSS 詳細を表示 ▼")
+  private val gnss = GnssChip(act)
 
   val view: View =
     scroll(
       vbox(
-        card(status, planText, reasons, spacer(8), toggle),
+        card(status, planText, reasons, spacer(8), start),
         card(text("記録モード", 16f, bold = true), modes),
         card(
           text("詳細 GNSS ログ", 16f, bold = true),
@@ -98,18 +98,22 @@ final class LoggerScreen(act: MainActivity) extends Screen:
           burst,
           files
         ),
-        card(gnssToggle, gnssBody),
+        card(text("現在地と衛星", 16f, bold = true), gnss.view, fixText, motionText, batteryText),
+        padded(stop, 16, 8),
         spacer(24)
       )
     )
 
   private var unobserve: () => Unit = () => ()
   override def onShow(): Unit =
+    gnss.bind()
     unobserve = LoggerState.observe(() => refresh())
     modeButtons.find(_._1 == Settings.mode).foreach(_._2.setChecked(true))
     refresh()
     loadFiles()
-  override def onHide(): Unit = unobserve()
+  override def onHide(): Unit =
+    gnss.unbind()
+    unobserve()
 
   private def loadFiles(): Unit =
     val dir = File(act.getExternalFilesDir(null), "gnss")
@@ -124,7 +128,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     val running = LoggerState.running
     status.setText(if running then "● 記録中" else "○ 停止中")
     status.setTextColor(color(if running then attr.primary else attr.onSurfaceVariant))
-    toggle.setText(if running then "記録を止める" else "記録を始める")
+    start.setVisibility(if running then View.GONE else View.VISIBLE)
+    stop.setVisibility(if running then View.VISIBLE else View.GONE)
     LoggerState.plan match
       case Some(p) if running =>
         planText.setText(
@@ -144,16 +149,6 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         if last == 0 then "まだ記録していません" else s"前回: ${fmtDuration(now - last)}前"
     )
 
-    val sats = LoggerState.satellites
-    sky.update(sats)
-    bars.update(sats)
-    satSummary.setText(
-      if sats.isEmpty then "GNSS は停止中です（静止中または記録停止中）"
-      else
-        val byConst = sats.groupBy(_.constellation).toSeq.sortBy(-_._2.size)
-          .map((c, ss) => s"${Constellations.name(c)} ${ss.map(_.svid).distinct.size}").mkString("・")
-        s"信号 ${sats.size}（測位に使用 ${sats.count(_.usedInFix)}・L5 ${sats.count(_.band == "L5")}）\n$byConst"
-    )
     fixText.setText(LoggerState.lastFix match
       case Some(f) =>
         f"${f.lat}%.6f, ${f.lon}%.6f ±${f.accuracy}%.0fm\n" +

@@ -1,4 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Ashidori" parent="Theme.Material3.DayNight.NoActionBar" />
+    <!-- ashidori brand: deep teal ("足取り" = where one's steps went), with a blue
+         tertiary for data/GNSS accents. Material 3 roles, light scheme. -->
+    <style name="Theme.Ashidori" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">#006B5B</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorPrimaryContainer">#9EF2DD</item>
+        <item name="colorOnPrimaryContainer">#00201A</item>
+        <item name="colorSecondary">#4A635C</item>
+        <item name="colorOnSecondary">#FFFFFF</item>
+        <item name="colorSecondaryContainer">#CCE8DF</item>
+        <item name="colorOnSecondaryContainer">#06201A</item>
+        <item name="colorTertiary">#2F6290</item>
+        <item name="colorOnTertiary">#FFFFFF</item>
+        <item name="colorTertiaryContainer">#CFE4FF</item>
+        <item name="colorOnTertiaryContainer">#001D33</item>
+        <item name="colorError">#BA1A1A</item>
+        <item name="colorOnError">#FFFFFF</item>
+        <item name="android:colorBackground">#F5FBF8</item>
+        <item name="colorOnBackground">#171D1B</item>
+        <item name="colorSurface">#F5FBF8</item>
+        <item name="colorOnSurface">#171D1B</item>
+        <item name="colorSurfaceVariant">#DBE5E0</item>
+        <item name="colorOnSurfaceVariant">#3F4946</item>
+        <item name="colorSurfaceContainerLowest">#FFFFFF</item>
+        <item name="colorSurfaceContainerLow">#EFF5F2</item>
+        <item name="colorSurfaceContainer">#E9EFEC</item>
+        <item name="colorSurfaceContainerHigh">#E3EAE6</item>
+        <item name="colorSurfaceContainerHighest">#DEE4E1</item>
+        <item name="colorOutline">#6F7975</item>
+        <item name="colorOutlineVariant">#BFC9C4</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
 </resources>

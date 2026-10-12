@@ -336,7 +336,13 @@ class LoggerService extends Service:
     val now = System.currentTimeMillis()
     estimator.update(w, if now - lastSpeedAt < 60_000 then lastSpeed else Double.NaN)
     LoggerState.onMain { LoggerState.lastWindow = Some(w) }
-    if estimator.current != before then evaluate(force = true) else evaluate()
+    if estimator.current != before then
+      // Settled somewhere: look up nearby venues now so a check-in is instant.
+      if estimator.current == MotionState.Stationary then
+        LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 10 * 60_000)
+          .foreach(f => ui.VenueSearch.prefetch(f.latLng))
+      evaluate(force = true)
+    else evaluate()
 
   // --- persistence ----------------------------------------------------------------------
 
@@ -368,8 +374,18 @@ class LoggerService extends Service:
       .setOngoing(true)
       .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
       .addAction(Notification.Action.Builder(null, "詳細ログ5分", pi(ActionBurst, 1)).build())
-      .addAction(Notification.Action.Builder(null, "停止", pi(ActionStop, 2)).build())
+      // No stop button here: recording is meant to run until stopped on
+      // purpose in the app (with a confirmation), so a stray tap can't end it.
+      .addAction(Notification.Action.Builder(null, "記録の設定", openLogger).build())
       .build()
+
+  private def openLogger: PendingIntent =
+    PendingIntent.getActivity(
+      this,
+      3,
+      Intent(this, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+      PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
+    )
 
   private def updateNotification(p: SamplingPlan): Unit =
     val nm = getSystemService(classOf[android.app.NotificationManager])

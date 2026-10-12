@@ -130,6 +130,19 @@ object Ui:
     b.setBackgroundTintList(ColorStateList.valueOf(bg))
     b.setTextColor(fg)
 
+  /** Opens a bottom sheet expanded to (nearly) the full screen height. */
+  def fullHeight(d: com.google.android.material.bottomsheet.BottomSheetDialog): Unit =
+    val b = d.getBehavior
+    b.setSkipCollapsed(true)
+    b.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED)
+    d.setOnShowListener { _ =>
+      Option(d.findViewById[View](com.google.android.material.R.id.design_bottom_sheet)).foreach { sheet =>
+        val lp = sheet.getLayoutParams
+        lp.height = (sheet.getResources.getDisplayMetrics.heightPixels * 0.92).toInt
+        sheet.setLayoutParams(lp)
+      }
+    }
+
   def fmtDuration(ms: Long): String =
     val m = ms / 60000
     if m < 60 then s"${m}分" else s"${m / 60}時間${m % 60}分"

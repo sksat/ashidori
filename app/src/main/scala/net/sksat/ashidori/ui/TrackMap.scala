@@ -12,12 +12,16 @@ import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.{LatLng as MLatLng, LatLngBounds}
 import org.maplibre.android.maps.{MapLibreMap, MapView, Style}
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.{CircleLayer, LineLayer, Property, PropertyFactory}
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.{Feature, FeatureCollection, LineString, Point}
 import scala.jdk.CollectionConverters.*
 import net.sksat.ashidori.*
 import ashidori.core.*
+
+/** A line on the map with its color (CSS hex). */
+final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine)
 
 /** A marker on the map; `key` comes back in click callbacks. */
 final case class MapMarker(at: LatLng, key: String, label: String = "")
@@ -67,7 +71,8 @@ final class TrackMap(act: MainActivity, saved: Bundle):
       for id <- Seq("track", "highlight", "visits", "checkins") do style.addSource(GeoJsonSource(id))
       style.addLayer(
         LineLayer("track-line", "track").withProperties(
-          PropertyFactory.lineColor("#1a73e8"),
+          // Each path carries its transport mode color.
+          PropertyFactory.lineColor(Expression.toColor(Expression.coalesce(Expression.get("color"), Expression.literal(TrackMap.DefaultLine)))),
           PropertyFactory.lineWidth(3.5f),
           PropertyFactory.lineOpacity(0.8f),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
@@ -84,7 +89,7 @@ final class TrackMap(act: MainActivity, saved: Bundle):
       )
       style.addLayer(
         CircleLayer("visit-circles", "visits").withProperties(
-          PropertyFactory.circleColor("#1e8e3e"),
+          PropertyFactory.circleColor("#006B5B"),
           PropertyFactory.circleRadius(7f),
           PropertyFactory.circleStrokeColor("#ffffff"),
           PropertyFactory.circleStrokeWidth(2f)
@@ -127,24 +132,26 @@ final class TrackMap(act: MainActivity, saved: Bundle):
       Feature.fromGeometry(Point.fromLngLat(mk.at.lon, mk.at.lat), props)
     }.asJava)
 
-  private def lines(paths: Seq[Seq[Fix]]): FeatureCollection =
-    FeatureCollection.fromFeatures(paths.filter(_.size >= 2).map { p =>
-      Feature.fromGeometry(LineString.fromLngLats(p.map(f => Point.fromLngLat(f.lon, f.lat)).asJava))
+  private def lines(paths: Seq[MapPath]): FeatureCollection =
+    FeatureCollection.fromFeatures(paths.filter(_.points.size >= 2).map { p =>
+      val props = JsonObject()
+      props.addProperty("color", p.color)
+      Feature.fromGeometry(LineString.fromLngLats(p.points.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
     }.asJava)
 
   /** Replaces all data. `fit` moves the camera to show everything. */
-  def setData(paths: Seq[Seq[Fix]], visits: Seq[MapMarker], checkIns: Seq[MapMarker], fit: Boolean = true): Unit =
+  def setData(paths: Seq[MapPath], visits: Seq[MapMarker], checkIns: Seq[MapMarker], fit: Boolean = true): Unit =
     withStyle { (m, style) =>
       style.getSourceAs[GeoJsonSource]("track").setGeoJson(lines(paths))
       style.getSourceAs[GeoJsonSource]("visits").setGeoJson(markers("visit", visits))
       style.getSourceAs[GeoJsonSource]("checkins").setGeoJson(markers("checkin", checkIns))
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
-      if fit then fitTo(paths.flatten.map(_.latLng) ++ visits.map(_.at) ++ checkIns.map(_.at))
+      if fit then fitTo(paths.flatMap(_.points).map(_.latLng) ++ visits.map(_.at) ++ checkIns.map(_.at))
     }
 
   def highlight(path: Seq[Fix]): Unit =
     withStyle { (m, style) =>
-      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(lines(Seq(path)))
+      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(lines(Seq(MapPath(path))))
       fitTo(path.map(_.latLng))
     }
 
@@ -224,6 +231,7 @@ final class TrackMap(act: MainActivity, saved: Bundle):
   def onDestroy(): Unit = mapView.onDestroy()
 
 object TrackMap:
+  val DefaultLine = "#006B5B"
   private var cacheSet = false
 
   /** Keep viewed tiles for offline use: places you have looked at stay

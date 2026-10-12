@@ -14,6 +14,7 @@ class AshidoriApp extends Application:
     nm.createNotificationChannel(
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)
     )
+    LoggerWatchdog.schedule(this)
 
 object AshidoriApp:
   val ChannelLogging = "logging"

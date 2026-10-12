@@ -15,8 +15,17 @@ class VenuesSuite extends munit.FunSuite:
     assert(vs.head._2 < vs(1)._2)
   }
 
+  test("drops large areas whose center is far away") {
+    val json = """{"elements":[{"type":"way","id":9,"center":{"lat":35.69,"lon":139.70},"tags":{"name":"Big Park","leisure":"nature_reserve"}}]}"""
+    assertEquals(Overpass.parse(json, 35.658, 139.7016).size, 0)
+  }
+
   test("query mentions the location and radius") {
     val q = Overpass.query(35.0, 139.0, 150)
     assert(q.contains("around:150,35.0,139.0"))
+    // A single key-regex statement (fast) rather than a union of statements.
+    assert(q.contains("""nwr["name"][~"^(amenity|shop|"""), q)
+    assert(q.contains("""aeroway)$"~"."]"""), q)
+    assert(!q.contains(");("), q)
     assert(q.startsWith("[out:json]"))
   }

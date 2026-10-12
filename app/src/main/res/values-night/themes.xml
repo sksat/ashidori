@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ashidori brand, dark scheme (same roles as values/themes.xml). -->
+    <style name="Theme.Ashidori" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#82D5C1</item>
+        <item name="colorOnPrimary">#00382E</item>
+        <item name="colorPrimaryContainer">#005144</item>
+        <item name="colorOnPrimaryContainer">#9EF2DD</item>
+        <item name="colorSecondary">#B1CCC3</item>
+        <item name="colorOnSecondary">#1C352F</item>
+        <item name="colorSecondaryContainer">#334B45</item>
+        <item name="colorOnSecondaryContainer">#CCE8DF</item>
+        <item name="colorTertiary">#9ACBFF</item>
+        <item name="colorOnTertiary">#003354</item>
+        <item name="colorTertiaryContainer">#104A76</item>
+        <item name="colorOnTertiaryContainer">#CFE4FF</item>
+        <item name="colorError">#FFB4AB</item>
+        <item name="colorOnError">#690005</item>
+        <item name="android:colorBackground">#0E1513</item>
+        <item name="colorOnBackground">#DEE4E1</item>
+        <item name="colorSurface">#0E1513</item>
+        <item name="colorOnSurface">#DEE4E1</item>
+        <item name="colorSurfaceVariant">#3F4946</item>
+        <item name="colorOnSurfaceVariant">#BFC9C4</item>
+        <item name="colorSurfaceContainerLowest">#090F0E</item>
+        <item name="colorSurfaceContainerLow">#171D1B</item>
+        <item name="colorSurfaceContainer">#1A211F</item>
+        <item name="colorSurfaceContainerHigh">#252B29</item>
+        <item name="colorSurfaceContainerHighest">#303634</item>
+        <item name="colorOutline">#89938F</item>
+        <item name="colorOutlineVariant">#3F4946</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
