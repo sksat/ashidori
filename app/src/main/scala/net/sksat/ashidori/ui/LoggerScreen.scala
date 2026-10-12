@@ -109,42 +109,72 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         })
         .show()
     }
-    tint(b, color(attr.error), android.graphics.Color.WHITE)
+    // A clear recorder red, same as the REC lamp.
+    tint(b, 0xffe53935.toInt, android.graphics.Color.WHITE)
     b
-  private val header = hbox(recBadge, stop)
+  private val header = { recBadge.setLayoutParams(matchWrap); recBadge }
+  // Stop sits at the bottom of the card, away from the settings button at the top.
+  private val stopRow =
+    val r = hbox(stop)
+    r.setPadding(0, dp(8), 0, 0)
+    r
 
-  // --- mode: one tile per mode, in its own color; the chosen one filled ---
-  private val modeTiles: Map[LoggingMode, LinearLayout] = LoggingMode.values.toSeq.map { m =>
-    val sym = text(ModeInfo.symbol(m), 22f)
-    val label = text(m.label, 13f, bold = true)
-    Seq(sym, label).foreach(_.setGravity(android.view.Gravity.CENTER))
-    val tile = vbox(sym, label)
-    tile.setGravity(android.view.Gravity.CENTER)
-    tile.setPadding(dp(4), dp(10), dp(4), dp(10))
-    val lp = LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-    lp.setMargins(dp(3), 0, dp(3), 0)
-    tile.setLayoutParams(lp)
-    tile.setClickable(true)
-    tile.setFocusable(true)
-    tile.setContentDescription(s"${m.label}モード")
-    tile.setOnClickListener(_ => selectMode(m))
-    m -> tile
-  }.toMap
-  private val modeRow = hbox(LoggingMode.values.toSeq.map(modeTiles)*)
+  // --- mode: a slider from battery-saving to log-everything ---
+  private val modes = LoggingMode.values.toSeq
+  /** The chosen mode, large, in its color. */
+  private val modeTitle = text("", 22f, bold = true)
+  private val modeSlider =
+    val sl = com.google.android.material.slider.Slider(act)
+    sl.setValueFrom(0f)
+    sl.setValueTo((modes.size - 1).toFloat)
+    sl.setStepSize(1f)
+    sl.setLabelBehavior(com.google.android.material.slider.LabelFormatter.LABEL_GONE)
+    sl.setContentDescription("記録モード")
+    sl.addOnChangeListener((_, v, fromUser) => if fromUser then selectMode(modes(v.round)))
+    sl.setLayoutParams(matchWrap)
+    sl
+  /** Stop names under the slider's ticks; tapping one selects it. */
+  private val stopLabels = modes.map { m =>
+    val t = text(m.label, 12f)
+    t.setPadding(dp(4), dp(6), dp(4), dp(6))
+    t.setOnClickListener(_ => selectMode(m))
+    t
+  }
+  private val labelFrame =
+    val f = android.widget.FrameLayout(act)
+    stopLabels.foreach(t => f.addView(t, android.widget.FrameLayout.LayoutParams(
+      android.view.ViewGroup.LayoutParams.WRAP_CONTENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT)))
+    f.setLayoutParams(matchWrap)
+    f
+  // Put each name under its tick once the slider knows its track width.
+  modeSlider.addOnLayoutChangeListener((_, l, _, r, _, _, _, _, _) =>
+    val pad = modeSlider.getTrackSidePadding
+    val track = (r - l) - 2 * pad
+    for (t, i) <- stopLabels.zipWithIndex do
+      t.post { () =>
+        val cx = pad + track * i / (modes.size - 1).toFloat
+        t.setTranslationX(math.max(0f, math.min((r - l - t.getWidth).toFloat, cx - t.getWidth / 2f)))
+      }
+  )
+  private val modeRow = vbox(modeTitle, modeSlider, labelFrame)
   private val modeInfo = caption("")
-  modeInfo.setPadding(0, dp(8), 0, 0)
+  modeInfo.setPadding(0, dp(4), 0, 0)
 
   private def paintModes(): Unit =
     val chosen = Settings.mode
-    for (m, tile) <- modeTiles do
-      val c = ModeInfo.color(m)
-      val on = m == chosen
-      val bg = android.graphics.drawable.GradientDrawable()
-      bg.setCornerRadius(dp(14).toFloat)
-      bg.setColor(if on then c else (c & 0x00ffffff) | 0x1f000000)
-      tile.setBackground(bg)
-      tile.setSelected(on)
-      tile.getChildAt(1).asInstanceOf[TextView].setTextColor(if on then android.graphics.Color.WHITE else c)
+    val c = ModeInfo.color(chosen)
+    val tint = android.content.res.ColorStateList.valueOf(c)
+    modeSlider.setValue(modes.indexOf(chosen).toFloat)
+    modeSlider.setTrackActiveTintList(tint)
+    modeSlider.setThumbTintList(tint)
+    modeSlider.setHaloTintList(android.content.res.ColorStateList.valueOf((c & 0x00ffffff) | 0x33000000))
+    modeSlider.setTickActiveTintList(android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE))
+    modeSlider.setTrackInactiveTintList(android.content.res.ColorStateList.valueOf(color(attr.surfaceContainerHigh)))
+    modeTitle.setText(s"${ModeInfo.symbol(chosen)} ${chosen.label}")
+    modeTitle.setTextColor(c)
+    for (t, m) <- stopLabels.zip(modes) do
+      t.setTextColor(if m == chosen then c else color(attr.onSurfaceVariant))
+      t.setTypeface(null, if m == chosen then android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
     modeInfo.setText(s"${ModeInfo.summary(chosen)}・${ModeInfo.battery(chosen)}")
 
   private def selectMode(m: LoggingMode): Unit =
@@ -182,7 +212,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     scroll(
       vbox((Seq(
         settingsRow,
-        card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, notes, spacer(4), start),
+        card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, notes, spacer(4), start, stopRow),
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
         card(
@@ -205,6 +235,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     paintModes()
     refresh()
     panel.loadHistory()
+    sensorPanel.loadHistory()
     loadFiles()
   override def onHide(): Unit =
     unobserve()

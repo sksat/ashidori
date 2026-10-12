@@ -27,19 +27,26 @@ object DayMap:
   /** Running snapshotters must stay referenced until they call back. */
   private val running = mutable.Set.empty[MapSnapshotter]
 
-  def view(act: MainActivity, tl: DayTimeline, heightDp: Int = 180): Option[View] =
+  def view(act: MainActivity, tl: DayTimeline): Option[View] = view(act, Seq(tl), tl.date.toString)
+
+  /** One map for several days (a week or a month card): coarser lines and
+    * one dot per place. `insetDp` is the horizontal space around the map.
+    */
+  def view(act: MainActivity, tls: Seq[DayTimeline], id: String, heightDp: Int = 180, toleranceM: Double = 8,
+           insetDp: Int = 32, marginDp: Int = 16): Option[View] =
     given Ctx = act
-    val trips = tl.segments.collect { case t: Trip => t }
-    val visits = tl.segments.collect { case v: Visit => v }
+    val trips = tls.flatMap(_.segments.collect { case t: Trip => t })
+    val visits = tls.flatMap(_.segments.collect { case v: Visit => v })
     val paths = trips.flatMap(t => t.legs.filter(_.mode != TransportMode.Still).map { l =>
-      MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 8), l.mode.color, l.isUncertain)
+      MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), toleranceM), l.mode.color, l.isUncertain)
     }).filter(_.points.size >= 2)
-    val stays = visits.map(_.latLng)
+    // Repeated stays at one place draw one dot.
+    val stays = visits.map(v => v.placeId.map(Left(_)).getOrElse(Right(v.latLng)) -> v.latLng).distinctBy(_._1).map(_._2)
     val pts = paths.flatMap(_.points).map(_.latLng) ++ stays
     if pts.isEmpty then return None
 
     val dm = act.getResources.getDisplayMetrics
-    val wPx = dm.widthPixels - dp(32)
+    val wPx = dm.widthPixels - dp(insetDp)
     val hPx = dp(heightDp)
     val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays)
     val img = ImageView(act)
@@ -54,11 +61,11 @@ object DayMap:
     frame.setBackground(bg)
     frame.setClipToOutline(true)
     val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hPx)
-    lp.setMargins(dp(16), dp(4), dp(16), dp(8))
+    lp.setMargins(dp(marginDp), dp(4), dp(marginDp), dp(8))
     frame.setLayoutParams(lp)
 
     // Same route, same picture: edits (mode changes) change the key.
-    val key = s"${style.key}/${tl.date}/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
+    val key = s"${style.key}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
     // The snapshot draws the base map's attribution itself.
     def show(b: Bitmap): Unit = img.setImageBitmap(b)
     Option(cache.get(key)) match

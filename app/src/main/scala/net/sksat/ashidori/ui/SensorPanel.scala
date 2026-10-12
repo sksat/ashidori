@@ -28,14 +28,40 @@ final class SensorPanel(act: MainActivity):
   private val (_, raw) = row("生データ")
   private val rows = vbox(Seq(accel, shake, steps, pdr, raw).map(_.getParent.asInstanceOf[View])*)
 
+  private val history = MotionHistoryView(act)
+  private def swatch(col: Int, label: String): View =
+    val v = View(act)
+    v.setBackgroundColor(col)
+    v.setLayoutParams(LinearLayout.LayoutParams(dp(10), dp(10)))
+    val t = caption(label)
+    t.setPadding(dp(4), 0, dp(12), 0)
+    hbox(v, t)
+
   val view: View = card(
-    text("IMU・センサー", 16f, bold = true),
+    text("IMU", 16f, bold = true),
+    caption("加速度・ジャイロ・地磁気・歩数計"),
+    spacer(6),
+    hbox(
+      swatch(0xff2e9d57.toInt, "歩行"),
+      swatch(color(attr.tertiary), "その他の動き"),
+      swatch(color(attr.surfaceContainerHigh), "静止（センサー停止）")
+    ),
+    history,
+    spacer(6),
     rows,
     spacer(4),
     outlined("この端末のセンサー")(showSensors())
   )
 
   private def hz(n: Int) = s"${n}Hz"
+
+  /** Last hour of motion summaries for the chart. */
+  def loadHistory(): Unit =
+    val now = System.currentTimeMillis()
+    AshidoriApp.io.execute { () =>
+      val d = AshidoriApp.db.motion(now - 3_600_000L, now)
+      act.runOnUiThread(() => history.update(d, now - 3_600_000L, now))
+    }
 
   def refresh(): Unit =
     val s = LoggerState.sensors

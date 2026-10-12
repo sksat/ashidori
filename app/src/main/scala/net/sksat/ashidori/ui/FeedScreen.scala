@@ -336,11 +336,15 @@ final class FeedScreen(act: MainActivity) extends Screen:
         (Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), tolerance).map(_.latLng),
           android.graphics.Color.parseColor(l.mode.color))
       })
-      val sketch = RouteSketchView(act, legs, visits.map(_.latLng).distinct.take(200))
-      val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170))
-      lp.setMargins(0, dp(10), 0, dp(8))
-      sketch.setLayoutParams(lp)
-      box.addView(sketch)
+      // A real map like the days; the plain sketch stays when offline.
+      DayMap.view(act, tls, s"${sp}-$a", heightDp = 190, toleranceM = tolerance, insetDp = 56, marginDp = 0) match
+        case Some(m) => box.addView(m)
+        case None =>
+          val sketch = RouteSketchView(act, legs, visits.map(_.latLng).distinct.take(200))
+          val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170))
+          lp.setMargins(0, dp(10), 0, dp(8))
+          sketch.setLayoutParams(lp)
+          box.addView(sketch)
       val byMode = tls.flatMap(_.summary.distanceByMode).groupMapReduce(_._1)(_._2)(_ + _)
       val steps = tls.map(_.summary.steps).sum
       val places = visits.flatMap(_.placeId).distinct.size
