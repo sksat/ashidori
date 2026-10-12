@@ -162,6 +162,8 @@ object TimelineBuilder:
       dist: Double,
       speed: Double,
       gap: Boolean,
+      /** either end has accuracy worse than 50 m */
+      poor: Boolean,
       cadence: Double,
       accelStd: Double,
       coarse: Coarse
@@ -182,7 +184,8 @@ object TimelineBuilder:
       // Position noise makes zig-zags; integrate Doppler speed where we can.
       val dist = if !gap && a.hasSpeed && b.hasSpeed && dt < 30_000 then math.min(d, speed * dt / 1000.0) else d
       val m = motion.summary(a.time, b.time)
-      Interval(a.time, b.time, dist, speed, gap, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
+      val poor = (a.hasAccuracy && a.accuracy > 50) || (b.hasAccuracy && b.accuracy > 50)
+      Interval(a.time, b.time, dist, speed, gap, poor, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
     }
 
   private def makeLeg(iv: IndexedSeq[Interval], motion: MotionIndex): Leg =
@@ -213,7 +216,8 @@ object TimelineBuilder:
       if dur > 0 then gapTime.toDouble / dur else 0.0
     )
     val (mode, conf) = ModeClassifier.classify(f)
-    Leg(start, end, mode, dist, m.steps, conf, mx, med)
+    val roughTime = iv.filter(i => i.gap || i.poor).map(_.dt).sum
+    Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0)
 
   private def weightedQuantile(sorted: IndexedSeq[(Double, Long)], q: Double): Double =
     val total = sorted.map(_._2).sum.toDouble

@@ -30,6 +30,10 @@ object LoggerState:
   var motion: MotionState = MotionState.Unknown
   var environment: Environment = Environment.Unknown
   var lastFix: Option[Fix] = None
+  /** Latest fixes, including ones not yet written to the DB (writes are
+    * batched for battery), so today's timeline can show them live.
+    */
+  @volatile var recentFixes: Vector[Fix] = Vector.empty
   var lastWindow: Option[MotionWindow] = None
   var satellites: Vector[SatSignal] = Vector.empty
   var detailFile: Option[String] = None

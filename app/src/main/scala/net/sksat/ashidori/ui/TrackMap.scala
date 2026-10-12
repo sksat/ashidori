@@ -21,7 +21,7 @@ import net.sksat.ashidori.*
 import ashidori.core.*
 
 /** A line on the map with its color (CSS hex). */
-final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine)
+final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine, dashed: Boolean = false)
 
 /** A marker on the map; `key` comes back in click callbacks. */
 /** `weight` scales the circle (e.g. number of visits). */
@@ -109,7 +109,16 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
           PropertyFactory.lineOpacity(0.9f),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
           PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-        )
+        ).withFilter(Expression.eq(Expression.get("dashed"), Expression.literal(false)))
+      )
+      // Where the position was only roughly known (GNSS gap, poor accuracy).
+      style.addLayer(
+        LineLayer("track-dashed", "track").withProperties(
+          PropertyFactory.lineColor(Expression.toColor(Expression.coalesce(Expression.get("color"), Expression.literal(TrackMap.DefaultLine)))),
+          PropertyFactory.lineWidth(3f),
+          PropertyFactory.lineOpacity(0.7f),
+          PropertyFactory.lineDasharray(Array[java.lang.Float](2f, 2f))
+        ).withFilter(Expression.eq(Expression.get("dashed"), Expression.literal(true)))
       )
       style.addLayer(
         LineLayer("highlight-line", "highlight").withProperties(
@@ -163,21 +172,49 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       loadStyle(m, ms)
     }
 
+  /** Picker as a 2-column grid of thumbnails rendered at the current view. */
   private def pickBaseMap(): Unit =
     val dialog = com.google.android.material.bottomsheet.BottomSheetDialog(act)
     given Ui.Ctx = act
-    val rows = MapStyle.values.toSeq.map { ms =>
-      val row = Ui.vbox(Ui.text((if ms == MapStyle.current then "● " else "○ ") + ms.label, 16f, bold = ms == MapStyle.current), Ui.caption(ms.note))
-      row.setMinimumHeight(Ui.dp(56))
-      row.setBackgroundResource(android.R.drawable.list_selector_background)
-      row.setOnClickListener { _ =>
+    val camera = map.map(_._1.getCameraPosition)
+    val snapshotters = scala.collection.mutable.ArrayBuffer.empty[org.maplibre.android.snapshotter.MapSnapshotter]
+    val thumbW = (act.getResources.getDisplayMetrics.widthPixels - Ui.dp(64)) / 2
+    val thumbH = (thumbW * 0.7).toInt
+    val cards = MapStyle.values.toSeq.map { ms =>
+      val img = android.widget.ImageView(act)
+      img.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP)
+      img.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
+      img.setLayoutParams(android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbH))
+      img.setContentDescription(ms.label)
+      val selected = ms == MapStyle.current
+      val card = com.google.android.material.card.MaterialCardView(act)
+      card.setRadius(Ui.dp(12).toFloat)
+      card.setStrokeWidth(Ui.dp(if selected then 3 else 1))
+      card.setStrokeColor(Ui.color(if selected then Ui.attr.primary else Ui.attr.outlineVariant))
+      card.setCardElevation(0)
+      card.addView(Ui.vbox(img, Ui.padded(Ui.vbox(Ui.text(ms.label, 15f, bold = true), Ui.caption(ms.note)), 10, 6)))
+      val lp = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+      lp.setMargins(Ui.dp(6), Ui.dp(6), Ui.dp(6), Ui.dp(6))
+      card.setLayoutParams(lp)
+      card.setOnClickListener { _ =>
         dialog.dismiss()
         MapStyle.current = ms
         TrackMap.all.foreach(_.setBaseMap(ms))
       }
-      row
+      camera.foreach { cam =>
+        val opts = org.maplibre.android.snapshotter.MapSnapshotter.Options(thumbW, thumbH)
+          .withStyleBuilder(ms.builder)
+          .withCameraPosition(cam)
+          .withLogo(false)
+        val snap = org.maplibre.android.snapshotter.MapSnapshotter(act, opts)
+        snapshotters += snap
+        snap.start(s => img.setImageBitmap(s.getBitmap))
+      }
+      card
     }
-    dialog.setContentView(Ui.padded(Ui.vbox((Ui.text("地図の種類", 20f, bold = true) +: rows)*), 20, 12))
+    val grid = Ui.vbox(cards.grouped(2).map(row => Ui.hbox(row*)).toSeq*)
+    dialog.setOnDismissListener(_ => snapshotters.foreach(_.cancel()))
+    dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(Ui.text("地図の種類", 20f, bold = true), Ui.spacer(8), grid), 14, 12)))
     dialog.show()
 
   private def withStyle(f: (MapLibreMap, Style) => Unit): Unit =
@@ -199,6 +236,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     FeatureCollection.fromFeatures(paths.filter(_.points.size >= 2).map { p =>
       val props = JsonObject()
       props.addProperty("color", p.color)
+      props.addProperty("dashed", p.dashed)
       Feature.fromGeometry(LineString.fromLngLats(p.points.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
     }.asJava)
 
@@ -224,7 +262,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
 
   def setLayerVisible(layer: String, visible: Boolean): Unit =
     val ids = layer match
-      case "track"    => Seq("track-line")
+      case "track"    => Seq("track-line", "track-dashed")
       case "visit"    => Seq("visit-circles")
       case "checkin"  => Seq("checkin-circles")
       case other      => Seq(other)

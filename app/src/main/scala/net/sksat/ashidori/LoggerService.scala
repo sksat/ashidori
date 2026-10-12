@@ -281,6 +281,7 @@ class LoggerService extends Service:
         -1
       )
       pendingFixes += f
+      LoggerState.recentFixes = (LoggerState.recentFixes :+ f).takeRight(600)
       recorder.foreach(_.onFix(l))
       if f.provider == LocationManager.GPS_PROVIDER then indoor.onFix(f.time)
       if f.hasSpeed then

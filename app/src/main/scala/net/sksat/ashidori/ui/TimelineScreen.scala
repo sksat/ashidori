@@ -146,7 +146,23 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       }
   map.onMarkerClick = dayMarkerClick
 
-  override def onShow(): Unit = load()
+  private var unobserve: () => Unit = () => ()
+  private var lastLive = 0L
+
+  /** While today's day view is open, redraw as new fixes arrive (≤ every 20 s). */
+  override def onShow(): Unit =
+    load()
+    unobserve()
+    unobserve = LoggerState.observe { () =>
+      val now = System.currentTimeMillis()
+      if span == Span.Day && anchor == LocalDate.now(AshidoriApp.zone) && now - lastLive > 20_000 &&
+        LoggerState.lastFix.exists(f => f.time > lastLive)
+      then
+        lastLive = now
+        load()
+    }
+
+  override def onHide(): Unit = unobserve()
 
   private def installSwipe(): Unit =
     val detector = GestureDetector(act, new GestureDetector.SimpleOnGestureListener:
@@ -215,7 +231,12 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     v.setLayoutParams(weighted())
     v
 
+  /** Fit the camera only when a different day is shown, not on live refreshes. */
+  private var fittedDate: Option[LocalDate] = None
+
   private def render(tl: DayTimeline): Unit =
+    val fit = !fittedDate.contains(tl.date)
+    fittedDate = Some(tl.date)
     current = Some(tl)
     summary.removeAllViews()
     summary.addView(stat(f"${tl.summary.steps}%,d", "歩数"))
@@ -227,10 +248,11 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     map.setData(
       // One line per leg, colored by transport mode.
       trips.flatMap(t => t.legs.filter(_.mode != TransportMode.Still).map { l =>
-        MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 4), l.mode.color)
+        MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 4), l.mode.color, l.isUncertain)
       }),
       tl.segments.collect { case v: Visit => MapMarker(v.latLng, v.start.toString) },
-      tl.checkIns.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName))
+      tl.checkIns.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName)),
+      fit
     )
 
     list.removeAllViews()
@@ -320,7 +342,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       val label = text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f)
       label.setLayoutParams(weighted())
       val detail = caption(
-        s"${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" + (if l.steps > 0 then f"・${l.steps}%,d歩" else "")
+        s"${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" + (if l.steps > 0 then f"・${l.steps}%,d歩" else "") +
+          (if l.isUncertain then "・位置はおおよそ" else "")
       )
       val row = hbox(label, detail)
       row.setMinimumHeight(dp(48))

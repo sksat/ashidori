@@ -162,8 +162,13 @@ final case class Leg(
     steps: Int,
     confidence: Double,
     maxSpeed: Double,
-    medianSpeed: Double
-) extends Segment
+    medianSpeed: Double,
+    /** fraction of the leg's time without a good position (GNSS gap or
+      * poor accuracy): the drawn path there is only an approximation
+      */
+    uncertain: Double = 0
+) extends Segment:
+  def isUncertain: Boolean = uncertain >= 0.3
 
 final case class Trip(start: Long, end: Long, path: Vector[Fix], legs: Vector[Leg]) extends Segment:
   def distanceM: Double = legs.map(_.distanceM).sum

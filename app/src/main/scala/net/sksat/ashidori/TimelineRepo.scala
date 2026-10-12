@@ -40,7 +40,13 @@ object TimelineRepo:
     val dayStart = date.atStartOfDay(zone).toInstant.toEpochMilli
     val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
     // Include context on both sides so visits crossing midnight are detected whole.
-    val fixes = db.fixes(dayStart - Margin, dayEnd + Margin)
+    val stored = db.fixes(dayStart - Margin, dayEnd + Margin)
+    // Today: add the logger's newest fixes that are not in the DB yet.
+    val lastStored = stored.lastOption.map(_.time).getOrElse(Long.MinValue)
+    val fixes =
+      if date == LocalDate.now(AshidoriApp.zone) then
+        stored ++ LoggerState.recentFixes.filter(f => f.time > lastStored && f.time < dayEnd + Margin)
+      else stored
     val motion = db.motion(dayStart - Margin, dayEnd + Margin)
     val built = TimelineBuilder.build(fixes, motion)
 

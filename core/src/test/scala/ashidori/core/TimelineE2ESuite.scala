@@ -51,6 +51,13 @@ class TimelineE2ESuite extends munit.FunSuite:
     assert(dist < 60_000, s"distance $dist")
   }
 
+  test("legs without good positions are marked uncertain") {
+    val (_, segments, _) = runScenario(Scenarios.commute())
+    val legs = segments.collect { case t: Trip => t.legs }.flatten
+    assert(legs.filter(_.mode == TransportMode.Subway).forall(_.isUncertain), legs.map(l => l.mode -> l.uncertain))
+    assert(legs.filter(_.mode == TransportMode.Walking).exists(!_.isUncertain))
+  }
+
   test("timeline alternates visits and trips in time order") {
     val (_, segments, _) = runScenario(Scenarios.commute())
     segments.sliding(2).foreach { case Seq(a, b) =>
