@@ -29,12 +29,13 @@ final case class MapMarker(at: LatLng, key: String, label: String = "")
 /** MapLibre map with layers for tracks, visits, check-ins and one highlighted
   * path. Data set before the style finishes loading is applied afterwards.
   */
-final class TrackMap(act: MainActivity, saved: Bundle):
+final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
   TrackMap.enlargeCache(act)
   val mapView: MapView = MapView(act)
   mapView.onCreate(saved)
   act.registerMap(this)
+  TrackMap.all += this
 
   private var map: Option[(MapLibreMap, Style)] = None
   private var pending: Option[() => Unit] = None
@@ -52,29 +53,59 @@ final class TrackMap(act: MainActivity, saved: Bundle):
     b.setOnClickListener(_ => goToMyLocation())
     b
 
+  /** Base map switcher (standard / simple / GSI / aerial photo). */
+  private val layers =
+    val b = FloatingActionButton(act)
+    b.setImageResource(net.sksat.ashidori.R.drawable.ic_layers)
+    b.setSize(FloatingActionButton.SIZE_MINI)
+    b.setContentDescription("地図の種類を変える")
+    b.setOnClickListener(_ => pickBaseMap())
+    b
+
   /** Map plus overlay controls; screens add this instead of `mapView`. */
   val view: FrameLayout =
     val f = FrameLayout(act)
     f.addView(mapView)
-    val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START)
-    lp.setMargins(Ui.dp(12)(using act), 0, 0, Ui.dp(12)(using act))
-    f.addView(locate, lp)
+    // Explicit wrap sizes: as default (match_parent) children of a wrapping
+    // column they collapsed to the 1 px width of the spacer.
+    val gap = Ui.dp(8)(using act)
+    val wrapLp = () => android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    layers.setLayoutParams(wrapLp())
+    val llp = wrapLp()
+    llp.topMargin = gap
+    locate.setLayoutParams(llp)
+    val controls = Ui.vbox(layers, locate)(using act)
+    // Top when something (the timeline's sheet) covers the bottom of the map.
+    val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.START)
+    lp.setMargins(Ui.dp(12)(using act), Ui.dp(8)(using act), 0, Ui.dp(12)(using act))
+    f.addView(controls, lp)
     f
 
   // Follow the logger's fixes; the map never turns GNSS on by itself.
   LoggerState.observe(() => LoggerState.lastFix.foreach(f => updateMyLocation(TrackMap.toLocation(f))))
 
+  private var clickInstalled = false
+  /** Re-applies the latest data after a base map change. */
+  private var lastData: Option[() => Unit] = None
+
   mapView.getMapAsync { m =>
     m.getUiSettings.setRotateGesturesEnabled(false)
     m.getUiSettings.setTiltGesturesEnabled(false)
-    m.setStyle(TrackMap.StyleUrl, (style: Style) => {
+    loadStyle(m, MapStyle.current)
+  }
+
+  /** Loads a base map and (re)adds our sources and layers on top of it. */
+  private def loadStyle(m: MapLibreMap, ms: MapStyle): Unit =
+    map = None
+    m.setStyle(ms.builder, (style: Style) => {
       for id <- Seq("track", "highlight", "visits", "checkins") do style.addSource(GeoJsonSource(id))
       style.addLayer(
         LineLayer("track-line", "track").withProperties(
           // Each path carries its transport mode color.
           PropertyFactory.lineColor(Expression.toColor(Expression.coalesce(Expression.get("color"), Expression.literal(TrackMap.DefaultLine)))),
-          PropertyFactory.lineWidth(3.5f),
-          PropertyFactory.lineOpacity(0.8f),
+          PropertyFactory.lineWidth(4f),
+          PropertyFactory.lineOpacity(0.9f),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
           PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
         )
@@ -103,20 +134,45 @@ final class TrackMap(act: MainActivity, saved: Bundle):
           PropertyFactory.circleStrokeWidth(2f)
         )
       )
-      m.addOnMapClickListener { p =>
-        val pt = m.getProjection.toScreenLocation(p)
-        val hits = m.queryRenderedFeatures(pt, "visit-circles", "checkin-circles").asScala
-        hits.headOption.exists { f =>
-          onMarkerClick(f.getStringProperty("layer"), f.getStringProperty("key"))
-          true
+      if !clickInstalled then
+        clickInstalled = true
+        m.addOnMapClickListener { p =>
+          val pt = m.getProjection.toScreenLocation(p)
+          val hits = m.queryRenderedFeatures(pt, "visit-circles", "checkin-circles").asScala
+          hits.headOption.exists { f =>
+            onMarkerClick(f.getStringProperty("layer"), f.getStringProperty("key"))
+            true
+          }
         }
-      }
       enableMyLocation(m, style)
       map = Some((m, style))
       pending.foreach(_())
       pending = None
     })
-  }
+
+  /** Switches the base map on this map, keeping what is drawn. */
+  def setBaseMap(ms: MapStyle): Unit =
+    map.map(_._1).foreach { m =>
+      pending = lastData.map(d => () => d())
+      loadStyle(m, ms)
+    }
+
+  private def pickBaseMap(): Unit =
+    val dialog = com.google.android.material.bottomsheet.BottomSheetDialog(act)
+    given Ui.Ctx = act
+    val rows = MapStyle.values.toSeq.map { ms =>
+      val row = Ui.vbox(Ui.text((if ms == MapStyle.current then "● " else "○ ") + ms.label, 16f, bold = ms == MapStyle.current), Ui.caption(ms.note))
+      row.setMinimumHeight(Ui.dp(56))
+      row.setBackgroundResource(android.R.drawable.list_selector_background)
+      row.setOnClickListener { _ =>
+        dialog.dismiss()
+        MapStyle.current = ms
+        TrackMap.all.foreach(_.setBaseMap(ms))
+      }
+      row
+    }
+    dialog.setContentView(Ui.padded(Ui.vbox((Ui.text("地図の種類", 20f, bold = true) +: rows)*), 20, 12))
+    dialog.show()
 
   private def withStyle(f: (MapLibreMap, Style) => Unit): Unit =
     map match
@@ -141,6 +197,7 @@ final class TrackMap(act: MainActivity, saved: Bundle):
 
   /** Replaces all data. `fit` moves the camera to show everything. */
   def setData(paths: Seq[MapPath], visits: Seq[MapMarker], checkIns: Seq[MapMarker], fit: Boolean = true): Unit =
+    lastData = Some(() => setData(paths, visits, checkIns, fit = false))
     withStyle { (m, style) =>
       style.getSourceAs[GeoJsonSource]("track").setGeoJson(lines(paths))
       style.getSourceAs[GeoJsonSource]("visits").setGeoJson(markers("visit", visits))
@@ -228,10 +285,14 @@ final class TrackMap(act: MainActivity, saved: Bundle):
   def onStop(): Unit = mapView.onStop()
   def onLowMemory(): Unit = mapView.onLowMemory()
   def onSaveInstanceState(b: Bundle): Unit = mapView.onSaveInstanceState(b)
-  def onDestroy(): Unit = mapView.onDestroy()
+  def onDestroy(): Unit =
+    TrackMap.all -= this
+    mapView.onDestroy()
 
 object TrackMap:
   val DefaultLine = "#006B5B"
+  /** Live maps, so a base map change applies everywhere. */
+  val all = scala.collection.mutable.ArrayBuffer.empty[TrackMap]
   private var cacheSet = false
 
   /** Keep viewed tiles for offline use: places you have looked at stay
@@ -257,5 +318,3 @@ object TrackMap:
     if !f.bearing.isNaN then l.setBearing(f.bearing)
     l
 
-  /** OpenFreeMap: free vector tiles, no API key. */
-  val StyleUrl = "https://tiles.openfreemap.org/styles/liberty"

@@ -114,33 +114,34 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     b.setTextSize(16f)
     b
   private val compose = vbox(chosen, comment, priv, spacer(8), commitButton, outlined("施設を選び直す")(showPick()))
-  /** Search sits at the bottom, within thumb reach; the list scrolls above it. */
-  private val listScroll =
-    val sc = scroll(list)
-    sc.setLayoutParams(android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-    sc
+  /** Google Maps-like: the sheet opens at ~60% height, so its top (the
+    * search field) sits mid-screen within thumb reach; candidates follow
+    * right below; drag up (or start typing) for the full height.
+    */
   private val pick =
     search.setMinHeight(dp(56))
     search.setTextSize(17f)
-    val v = vbox(
+    vbox(
       text(if at.isDefined then "この滞在にチェックイン" else "チェックイン", 20f, bold = true),
+      search,
       status,
-      listScroll,
-      caption("近くの施設は OpenStreetMap から取得します（位置がそのサーバに送られます）。"),
-      search
+      list,
+      spacer(12),
+      caption("近くの施設は OpenStreetMap から取得します（位置がそのサーバに送られます）。")
     )
-    v.setLayoutParams(android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
-    v
 
   def show(): Unit =
-    val composeScroll = scroll(compose)
-    val root = padded(vbox(pick, composeScroll), 20, 12)
-    composeScroll.setVisibility(View.GONE)
-    composeHost = composeScroll
-    dialog.setContentView(root, android.view.ViewGroup.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
-    // Keep the bottom search field above the keyboard.
+    val root = padded(vbox(pick, compose), 20, 12)
+    // Same opening height whether or not candidates have arrived yet.
+    root.setMinimumHeight((act.getResources.getDisplayMetrics.heightPixels * 0.6).toInt)
+    compose.setVisibility(View.GONE)
+    composeHost = compose
+    dialog.setContentView(scroll(root))
     dialog.getWindow.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-    Ui.fullHeight(dialog)
+    val b = dialog.getBehavior
+    b.setPeekHeight((act.getResources.getDisplayMetrics.heightPixels * 0.6).toInt)
+    b.setState(BottomSheetBehavior.STATE_COLLAPSED)
+    search.setOnFocusChangeListener((_, focused) => if focused then b.setState(BottomSheetBehavior.STATE_EXPANDED))
     dialog.show()
     search.addTextChangedListener(new TextWatcher:
       def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()

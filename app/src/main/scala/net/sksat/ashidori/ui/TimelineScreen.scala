@@ -40,7 +40,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
 
-  private val map = TrackMap(act, saved)
+  private val map = TrackMap(act, saved, controlsOnTop = true)
   private val gnss = GnssChip(act)
 
   private val dateLabel = text("", 18f, bold = true)
