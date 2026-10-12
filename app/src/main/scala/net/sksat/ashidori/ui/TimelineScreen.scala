@@ -92,7 +92,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     */
   private val scroller =
     val s = androidx.core.widget.NestedScrollView(act)
-    s.addView(vbox(summary, list, spacer(if spans == Seq(Span.Day) then 84 else 96)))
+    s.addView(vbox(summary, list, spacer(if spans == Seq(Span.Day) then 12 else 96)))
     s
   private val sheet =
     val handle = View(act)
@@ -138,11 +138,13 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     coord.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
     // Fit the day's route into the part of the map the sheet does not cover.
     coord.addOnLayoutChangeListener((_, _, top, _, bottom, _, _, _, _) =>
-      map.bottomInset = if dayOnly then math.max(0, bottom - top - sheet.getTop) else ((bottom - top) * 0.5).toInt)
+      map.bottomInset = if dayOnly then math.max(0, bottom - top - sheet.getTop) else ((bottom - top) * 0.5).toInt
+      liftFab())
     behavior.addBottomSheetCallback(new com.google.android.material.bottomsheet.BottomSheetBehavior.BottomSheetCallback:
       override def onStateChanged(v: View, state: Int): Unit =
         map.bottomInset = math.max(0, coord.getHeight - v.getTop)
-      override def onSlide(v: View, offset: Float): Unit = ()
+        liftFab()
+      override def onSlide(v: View, offset: Float): Unit = liftFab()
     )
     installSwipe()
     coord
@@ -163,7 +165,12 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private var lastLive = 0L
 
   /** While today's day view is open, redraw as new fixes arrive (≤ every 20 s). */
+  /** The check-in button rides on the top edge of the sheet, over the map. */
+  private def liftFab(): Unit =
+    if dayOnly && view.getHeight > 0 then act.setFabLift(math.max(0, view.getHeight - sheet.getTop))
+
   override def onShow(): Unit =
+    view.post(() => liftFab())
     // First open: show where we last were right away, before the day loads.
     if fittedDate.isEmpty then
       LoggerState.lastFix match
@@ -314,13 +321,13 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private def emptyState(date: LocalDate): View =
     if LoggerState.running then
       card(
-        text(if date == LocalDate.now(AshidoriApp.zone) then "記録を始めました" else "この日の記録はありません", 16f, bold = true),
-        caption("移動や滞在が検出されると、ここに表示されます。")
+        text(if date == LocalDate.now(AshidoriApp.zone) then "記録待ち" else "記録なし", 16f, bold = true),
+        caption("")
       )
     else
       card(
         text("記録停止中", 16f, bold = true),
-        caption("記録を始めると、訪れた場所と移動がここに自動で並びます。"),
+        caption(""),
         spacer(8),
-        button("記録を始める")(act.startLogging())
+        button("▶  記録を開始")(act.startLogging())
       )

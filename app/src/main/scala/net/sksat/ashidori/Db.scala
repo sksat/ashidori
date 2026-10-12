@@ -299,6 +299,12 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def firstFixTime(): Option[Long] =
     query("SELECT MIN(time) FROM fixes")(c => if c.isNull(0) then None else Some(c.getLong(0))).head
 
+  @volatile private var firstDay: Option[java.time.LocalDate] = None
+  /** [[firstDataDate]], remembered once known (it only moves on import). */
+  def firstDataDateCached: Option[java.time.LocalDate] =
+    if firstDay.isEmpty then firstDay = firstDataDate()
+    firstDay
+
   /** First day with any position, archived or not. */
   def firstDataDate(): Option[java.time.LocalDate] =
     val archived = AshidoriApp.archive.archivedFiles(Archive.Fixes).headOption.map { f =>

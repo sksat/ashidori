@@ -46,7 +46,13 @@ object Settings:
   def onboarded_=(b: Boolean): Unit = prefs.edit().putBoolean("onboarded", b).apply()
 
   def loggingEnabled: Boolean = prefs.getBoolean("enabled", false)
-  def loggingEnabled_=(b: Boolean): Unit = prefs.edit().putBoolean("enabled", b).apply()
+  def loggingEnabled_=(b: Boolean): Unit =
+    val e = prefs.edit().putBoolean("enabled", b)
+    if b && !loggingEnabled then e.putLong("enabledSince", System.currentTimeMillis())
+    e.apply()
+
+  /** When recording was last switched on (0 if unknown). */
+  def loggingSince: Long = prefs.getLong("enabledSince", 0L)
 
   def burstUntil: Long = prefs.getLong("burstUntil", 0L)
   def burstUntil_=(t: Long): Unit = prefs.edit().putLong("burstUntil", t).apply()

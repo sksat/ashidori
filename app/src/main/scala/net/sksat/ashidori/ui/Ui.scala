@@ -29,6 +29,9 @@ object Ui:
     val onPrimaryContainer: Int = com.google.android.material.R.attr.colorOnPrimaryContainer
     val secondaryContainer: Int = com.google.android.material.R.attr.colorSecondaryContainer
     val tertiary: Int = com.google.android.material.R.attr.colorTertiary
+    val tertiaryContainer: Int = com.google.android.material.R.attr.colorTertiaryContainer
+    val onTertiaryContainer: Int = com.google.android.material.R.attr.colorOnTertiaryContainer
+    val onSecondaryContainer: Int = com.google.android.material.R.attr.colorOnSecondaryContainer
     val error: Int = androidx.appcompat.R.attr.colorError
     val outlineVariant: Int = com.google.android.material.R.attr.colorOutlineVariant
 
@@ -145,7 +148,9 @@ object Ui:
 
   def fmtDuration(ms: Long): String =
     val m = ms / 60000
-    if m < 60 then s"${m}分" else s"${m / 60}時間${m % 60}分"
+    if ms < 60_000 then s"${math.max(0, ms / 1000)}秒"
+    else if m < 60 then s"${m}分"
+    else s"${m / 60}時間${m % 60}分"
 
   def fmtDistance(m: Double): String =
     if m < 1000 then f"${m}%.0f m" else f"${m / 1000}%.1f km"

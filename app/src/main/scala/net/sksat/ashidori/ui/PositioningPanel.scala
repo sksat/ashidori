@@ -20,7 +20,8 @@ final class PositioningPanel(act: MainActivity):
     t
   private val source = text("", 16f)
   private val age = caption("")
-  private val position = card(text("位置の精度", 16f, bold = true), hbox(accuracy, padded(vbox(source, age), 12, 0)))
+  /** Accuracy of the latest position, shown in the status card. */
+  val accuracyRow: View = hbox(accuracy, padded(vbox(source, age), 12, 0))
 
   // --- satellites ---
   private val satHeadline = text("", 16f, bold = true)
@@ -28,26 +29,38 @@ final class PositioningPanel(act: MainActivity):
   private val constellations = ChipGroup(act)
   private val sky = SkyPlotView(act)
   private val bars = Cn0BarsView(act)
-  private val wake = button("今すぐ衛星で測位する（5分）", tonal = true) {
+  private val wake = button("5分間 衛星で測位", tonal = true) {
     act.ensurePermissions { () =>
       Settings.burstUntil = System.currentTimeMillis() + LoggerService.BurstMs
       LoggerService.send(act, LoggerService.ActionBurst)
     }
   }
-  private val skyHelp = caption("中心が真上、外周が地平線。塗りつぶしは測位に使用中、外側の輪は L5 帯も受信。")
+  private val skyHelp = caption("中心＝真上・外周＝地平線　● 使用中　◎ L5 も受信")
   private val satellites = card(text("衛星", 16f, bold = true), satHeadline, satDetail, constellations, sky, skyHelp, bars, wake)
 
   // --- last hour ---
   private val history = GnssHistoryView(act)
   private val historyNote = caption("")
+  /** A color sample and what it means, for the chart's legend. */
+  private def swatch(col: Int, label: String, line: Boolean = false): View =
+    val v = View(act)
+    v.setBackgroundColor(col)
+    v.setLayoutParams(android.widget.LinearLayout.LayoutParams(dp(if line then 14 else 10), dp(if line then 3 else 10)))
+    val t = caption(label)
+    t.setPadding(dp(4), 0, dp(12), 0)
+    hbox(v, t)
   private val hour = card(
-    text("直近1時間", 16f, bold = true),
-    caption("棒: 測位に使った衛星の数　線: 強い信号4機の C/N0　灰色: 屋内と判定"),
+    text("受信状況（直近1時間）", 16f, bold = true),
+    hbox(
+      swatch(color(attr.primary), "使用衛星数"),
+      swatch(color(attr.tertiary), "信号強度", line = true),
+      swatch(color(attr.secondaryContainer), "屋内")
+    ),
     history,
     historyNote
   )
 
-  val views: Seq[View] = Seq(position, satellites, hour)
+  val views: Seq[View] = Seq(satellites, hour)
 
   private def sourceLabel(p: String): String = p match
     case "gps"                => "衛星（GNSS）"
@@ -83,13 +96,13 @@ final class PositioningPanel(act: MainActivity):
         accuracy.setAlpha(if stale then 0.4f else 1f)
         age.setText(
           when + (if !stale then ""
-            else if LoggerState.motion == MotionState.Stationary then "の位置（静止中は更新を控えています）"
-            else "の位置（新しい位置を待っています）") +
+            else if LoggerState.motion == MotionState.Stationary then "（静止中）"
+            else "（更新待ち）") +
             (if !stale && f.hasSpeed then f"・${f.speed * 3.6}%.0f km/h" else "")
         )
       case None =>
         accuracy.setText("—")
-        source.setText(if LoggerState.running then "位置を待っています" else "記録停止中")
+        source.setText(if LoggerState.running then "測位待ち" else "記録停止中")
         age.setText("")
 
     val sats = LoggerState.satellites
@@ -107,7 +120,7 @@ final class PositioningPanel(act: MainActivity):
       satHeadline.setText(s"測位に ${used} 機を使用（捕捉 ${seen} 機）")
       satDetail.setText(
         f"強い信号4機の平均 ${mean}%.0f dB-Hz" +
-          (if mean >= 35 then "・良好" else if mean >= 25 then "・やや弱い" else "・弱い（屋内・上空が遮られている）")
+          (if mean >= 35 then "・良好" else if mean >= 25 then "・やや弱い" else "・弱い")
       )
       constellations.removeAllViews()
       for (c, ss) <- sats.groupBy(_.constellation).toSeq.sortBy(-_._2.size) do
@@ -119,16 +132,16 @@ final class PositioningPanel(act: MainActivity):
         constellations.addView(ch)
     else if LoggerState.running && LoggerState.plan.exists(_.source == LocationSource.Gnss) then
       // GNSS is on but nothing tracked yet.
-      satHeadline.setText("衛星を探しています…")
-      satDetail.setText("屋外では通常数秒〜数十秒で捕捉します。屋内では捕捉できないことがあります。")
+      satHeadline.setText("衛星を捕捉中")
+      satDetail.setText("ⓘ 屋外では通常数十秒以内")
     else if LoggerState.running then
-      satHeadline.setText("衛星: 停止中")
+      satHeadline.setText("受信停止中")
       satDetail.setText(
-        if LoggerState.environment == Environment.Indoor then "ⓘ 屋内のため。動き出すと屋外か確認します"
-        else "ⓘ 静止中のため電池を節約。動き出すと再開します"
+        if LoggerState.environment == Environment.Indoor then "ⓘ 屋内のため（移動開始時に再確認）"
+        else "ⓘ 静止中のため（移動開始時に再開）"
       )
     else
-      satHeadline.setText("記録停止中")
+      satHeadline.setText("受信停止中")
       satDetail.setText("")
 
   def loadHistory(): Unit =
@@ -141,8 +154,8 @@ final class PositioningPanel(act: MainActivity):
           case Seq(a, b) if a._2 == Environment.Indoor && b._1.time - a._1.time < 120_000 => b._1.time - a._1.time
         }.sum
         historyNote.setText(
-          if d.isEmpty then "この1時間の衛星測位の記録はありません（静止中は停止します）"
-          else s"記録 ${d.size} 回・屋内と判定 約 ${indoorMs / 60_000} 分"
+          if d.isEmpty then "受信なし"
+          else s"屋内 約${indoorMs / 60_000}分"
         )
       }
     }
@@ -170,8 +183,8 @@ object PositioningPanel:
       if !p.reasons.contains("屋内") then Nil
       else
         val head =
-          if p.source == LocationSource.Gnss then "屋外に出たか衛星で確認中。"
-          else "屋内は衛星が届きにくいため Wi-Fi・基地局を使用。"
-        Seq(head + s"動き出したときと移動中${SamplingPolicy.IndoorProbeMovingEveryMs / 60_000}分ごとに屋外か確認" +
-          s"（静止中は${SamplingPolicy.IndoorProbeStillEveryMs / 60_000}分ごと）")
+          if p.source == LocationSource.Gnss then "屋外判定のため衛星で測位中"
+          else "屋内のため Wi-Fi・基地局で測位"
+        Seq(head + s"（屋外判定: 移動開始時・移動中${SamplingPolicy.IndoorProbeMovingEveryMs / 60_000}分ごと・" +
+          s"静止中${SamplingPolicy.IndoorProbeStillEveryMs / 60_000}分ごと）")
     mode ++ indoor

@@ -35,7 +35,7 @@ final class GnssHistoryView(c: Context) extends View(c):
     val h = getHeight - Ui.dp(16).toFloat
     def x(t: Long) = (t - from).toFloat / (to - from) * w
     // Indoor periods
-    shade.setColor(Ui.color(Ui.attr.surfaceContainerHigh))
+    shade.setColor(Ui.color(Ui.attr.secondaryContainer))
     for case Seq((a, ea, _), (b, _, _)) <- data.sliding(2) if ea == Environment.Indoor && b.time - a.time < 120_000 do
       canvas.drawRect(x(a.time), 0, x(b.time), h, shade)
     // Satellites used (0..30 scale)

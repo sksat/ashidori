@@ -54,12 +54,15 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
     android.hardware.Sensor.TYPE_GYROSCOPE -> "Gyro",
     android.hardware.Sensor.TYPE_MAGNETIC_FIELD -> "Mag"
   ).flatMap((t, name) => Option(sm.getDefaultSensor(t)).map(_ -> name))
+  /** Rate of the raw IMU rows; 0 when the phone has none of these sensors. */
+  val imuHz: Int = if imuSensors.isEmpty then 0 else if fullTracking then 100 else 50
   private val imuListener = new android.hardware.SensorEventListener:
     override def onAccuracyChanged(s: android.hardware.Sensor, a: Int): Unit = ()
     override def onSensorChanged(e: SensorEvent): Unit =
       imuSensors.find(_._1 == e.sensor).foreach { (_, name) =>
         val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
         write(row(name, wall, e.timestamp, e.values(0), e.values(1), e.values(2)))
+        LoggerState.imuSamples += 1
       }
 
   private val measurementCb = new GnssMeasurementsEvent.Callback:
@@ -126,7 +129,7 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       lm.registerGnssMeasurementsCallback(req, exec, measurementCb)
       lm.registerGnssNavigationMessageCallback(exec, navCb)
       lm.addNmeaListener(exec, nmea)
-      val periodUs = if fullTracking then 10_000 else 20_000
+      val periodUs = 1_000_000 / math.max(imuHz, 1)
       imuSensors.foreach((sensor, _) => sm.registerListener(imuListener, sensor, periodUs, handler))
     catch case e: SecurityException => Log.w("gnss recorder: no permission", e)
 

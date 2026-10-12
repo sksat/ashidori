@@ -241,6 +241,8 @@ class LoggerService extends Service:
     updatePdr()
     if p.accelHz == 0 && estimator.current == MotionState.Stationary then armSigMotion()
     else disarmSigMotion()
+    LoggerState.sensors = SensorState(accelReg, if accelReg > 0 then p.accelBatchMs else 0L, sigMotionArmed, pdrSensors,
+      recorder.map(_.imuHz).getOrElse(0))
 
   /** Step detector + rotation vector only while walking indoors: the gyro
     * on some phones cannot batch, so this keeps the CPU awake.

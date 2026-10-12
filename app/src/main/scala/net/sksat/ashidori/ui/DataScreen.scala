@@ -21,21 +21,81 @@ final class DataScreen(act: MainActivity) extends Screen:
   private given Ctx = act
   override val title = "エクスポート・インポート"
   private val status = caption("")
-  private var days = 30
+  private val today = LocalDate.now(AshidoriApp.zone)
+  /** Export range, both ends included. */
+  private var from = today.minusDays(6)
+  private var to = today
+  private val rangeLabel = text("", 18f, bold = true)
+  private val dayFmt = java.time.format.DateTimeFormatter.ofPattern("yyyy/M/d (E)", java.util.Locale.JAPANESE)
+
+  private def setRange(a: LocalDate, b: LocalDate): Unit =
+    from = if a.isAfter(b) then b else a
+    to = if a.isAfter(b) then a else b
+    val n = java.time.temporal.ChronoUnit.DAYS.between(from, to) + 1
+    rangeLabel.setText(
+      if from == to then from.format(dayFmt)
+      else s"${from.format(dayFmt)}\n〜 ${to.format(dayFmt)}（${n}日間）")
+
+  /** Quick ranges; the calendar picks anything else. */
+  private val presets: Seq[(String, () => (LocalDate, LocalDate))] =
+    val monday = today.`with`(java.time.DayOfWeek.MONDAY)
+    Seq(
+      "今日" -> (() => (today, today)),
+      "昨日" -> (() => (today.minusDays(1), today.minusDays(1))),
+      "今週" -> (() => (monday, today)),
+      "先週" -> (() => (monday.minusWeeks(1), monday.minusDays(1))),
+      "今月" -> (() => (today.withDayOfMonth(1), today)),
+      "先月" -> (() => (today.minusMonths(1).withDayOfMonth(1), today.withDayOfMonth(1).minusDays(1))),
+      "今年" -> (() => (today.withDayOfYear(1), today)),
+      "すべて" -> (() => (AshidoriApp.db.firstDataDateCached.getOrElse(today.minusYears(1)), today))
+    )
+  private val presetChips =
+    val g = com.google.android.material.chip.ChipGroup(act)
+    for (label, f) <- presets do
+      val c = com.google.android.material.chip.Chip(act)
+      c.setText(label)
+      c.setOnClickListener { _ =>
+        val (a, b) = f()
+        setRange(a, b)
+      }
+      g.addView(c)
+    g
+
+  private def pickRange(): Unit =
+    import com.google.android.material.datepicker.*
+    def utc(d: LocalDate): java.lang.Long = d.atStartOfDay(java.time.ZoneOffset.UTC).toInstant.toEpochMilli
+    val picker = MaterialDatePicker.Builder.dateRangePicker()
+      .setTitleText("書き出す期間")
+      .setSelection(androidx.core.util.Pair(utc(from), utc(to)))
+      .setCalendarConstraints(CalendarConstraints.Builder().setValidator(DateValidatorPointBackward.now()).build())
+      .build()
+    picker.addOnPositiveButtonClickListener { sel =>
+      def day(ms: java.lang.Long) = java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneOffset.UTC).toLocalDate
+      setRange(day(sel.first), day(sel.second))
+    }
+    picker.show(act.getSupportFragmentManager, "export-range")
+
+  private def formatButton(label: String, note: String)(f: => Unit): View =
+    val b = button(label, tonal = true)(f)
+    b.setLayoutParams(matchWrap)
+    vbox(b, padded(caption(note), 4, 0))
 
   val view: View =
     scroll(
       vbox(
         card(
           text("エクスポート", 16f, bold = true),
-          caption("直近の記録をファイルにして共有します。非公開のチェックインは含めません。"),
-          hbox(
-            outlined("7日")(setDays(7)),
-            outlined("30日")(setDays(30)),
-            outlined("1年")(setDays(365))
-          ),
-          button("Timeline.json（Google 互換）", tonal = true)(exportAs("json")),
-          button("GPX", tonal = true)(exportAs("gpx"))
+          caption("選んだ期間の記録をファイルにして共有します。非公開のチェックインは含めません。"),
+          spacer(8),
+          rangeLabel,
+          spacer(4),
+          outlined("カレンダーで選ぶ")(pickRange()),
+          presetChips,
+          spacer(8),
+          formatButton("Timeline.json", "Google マップのタイムライン互換。滞在と移動")(exportAs("json")),
+          formatButton("GPX", "経路と滞在地。地図アプリや GIS で開けます")(exportAs("gpx")),
+          formatButton("記録データ（Parquet・zip）", "位置・動き・電池・衛星の状態・詳細ログ（GNSS 生データ・IMU）を表ごとに")(exportAs("parquet")),
+          formatButton("GNSS ログ（GnssLogger 形式・zip）", "詳細ログを GnssLogger のテキスト形式で。解析ツール向け")(exportAs("gnsslog"))
         ),
         card(
           text("インポート", 16f, bold = true),
@@ -47,38 +107,50 @@ final class DataScreen(act: MainActivity) extends Screen:
       )
     )
 
-  override def onShow(): Unit = status.setText(s"エクスポートの期間: 直近 $days 日")
-
-  private def setDays(d: Int): Unit =
-    days = d
-    onShow()
+  setRange(from, to)
+  AshidoriApp.io.execute(() => AshidoriApp.db.firstDataDateCached)
 
   private def exportAs(kind: String): Unit =
-    val n = days
+    val (a, b) = (from, to)
     status.setText("書き出し中…")
+    def progress(msg: String): Unit = act.runOnUiThread(() => status.setText(msg))
     AshidoriApp.io.execute { () =>
       val r = Try {
-        val today = LocalDate.now(AshidoriApp.zone)
-        val tls = (0 until n).reverse.map(i => TimelineRepo.day(today.minusDays(i)))
-        val segs = tls.flatMap(_.segments)
-        val places = tls.flatMap(_.places).toMap
-        val content =
-          if kind == "json" then TimelineJson.exportTimeline(segs, places, AshidoriApp.zone)
-          else TimelineJson.exportGpx(segs, places, tls.flatMap(_.checkIns))
         val dir = File(act.getCacheDir, "export")
         dir.mkdirs()
-        val f = File(dir, if kind == "json" then s"ashidori-Timeline-$today.json" else s"ashidori-$today.gpx")
-        java.nio.file.Files.writeString(f.toPath, content)
-        f
+        Option(dir.listFiles()).toSeq.flatten.foreach(_.delete())
+        val range = if a == b then s"$a" else s"${a}_$b"
+        kind match
+          case "parquet" =>
+            val f = File(dir, s"ashidori-data-$range.zip")
+            if Exporter.parquetZip(a, b, f, progress) == 0 then throw IllegalStateException("この期間の記録はありません")
+            f
+          case "gnsslog" =>
+            val f = File(dir, s"ashidori-gnss-$range.zip")
+            if Exporter.gnssLogZip(a, b, f, progress) == 0 then throw IllegalStateException("この期間の詳細ログはありません")
+            f
+          case _ =>
+            val tls = Iterator.iterate(a)(_.plusDays(1)).takeWhile(!_.isAfter(b)).map(TimelineRepo.day).toVector
+            val segs = tls.flatMap(_.segments)
+            val places = tls.flatMap(_.places).toMap
+            val content =
+              if kind == "json" then TimelineJson.exportTimeline(segs, places, AshidoriApp.zone)
+              else TimelineJson.exportGpx(segs, places, tls.flatMap(_.checkIns))
+            val f = File(dir, if kind == "json" then s"ashidori-Timeline-$range.json" else s"ashidori-$range.gpx")
+            java.nio.file.Files.writeString(f.toPath, content)
+            f
       }
       act.runOnUiThread { () =>
         r.fold(
           e => status.setText(s"書き出せませんでした: ${e.getMessage}"),
           f => {
-            status.setText(s"${f.getName}（${f.length / 1024} KB）")
+            status.setText(s"${f.getName}（${if f.length >= (1L << 20) then f"${f.length / 1048576.0}%.1f MB" else s"${f.length / 1024} KB"}）")
             val uri = FileProvider.getUriForFile(act, s"${act.getPackageName}.files", f)
             val send = Intent(Intent.ACTION_SEND)
-              .setType(if kind == "json" then "application/json" else "application/gpx+xml")
+              .setType(kind match
+                case "json" => "application/json"
+                case "gpx"  => "application/gpx+xml"
+                case _      => "application/zip")
               .putExtra(Intent.EXTRA_STREAM, uri)
               .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             act.startActivity(Intent.createChooser(send, f.getName))

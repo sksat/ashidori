@@ -16,12 +16,12 @@ import Ui.*
   */
 final class SearchScreen(act: MainActivity) extends Screen:
   private given Ctx = act
-  override val title = "検索"
+  override val title = "記録を探す"
   private val Days = 180
   private val dayFmt = DateTimeFormatter.ofPattern("yyyy/M/d (E)", Locale.JAPANESE)
 
   private val input = EditText(act)
-  input.setHint("場所・チェックイン先・日付（10/5 など）")
+  input.setHint("場所の名前・地域・チェックイン先・日付")
   input.setSingleLine(true)
   input.setMinHeight(dp(56))
   input.setTextSize(17f)
@@ -81,6 +81,12 @@ final class SearchScreen(act: MainActivity) extends Screen:
   private def render(): Unit =
     val q = input.getText.toString.trim.toLowerCase
     results.removeAllViews()
+    if q.isEmpty then
+      results.addView(padded(vbox(
+        text("自分の記録から探します", 15f, bold = true),
+        caption("・場所の名前や地域（例: 渋谷）… その場所に行った日の一覧\n・チェックイン先（例: スターバックス）\n・日付（例: 10/5、2026/9/1）… その日を開く")
+      ), 16, 12))
+      return
     // A typed date jumps straight to that day.
     q match
       case DatePattern(y, m, d) =>

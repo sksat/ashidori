@@ -97,14 +97,11 @@ class MainActivity extends AppCompatActivity:
     super.onCreate(savedInstanceState)
 
     toolbar = MaterialToolbar(this)
-    val searchItem = toolbar.getMenu.add(Menu.NONE, 2, Menu.NONE, "検索")
-    searchItem.setIcon(R.drawable.ic_search)
-    searchItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
     val settingsItem = toolbar.getMenu.add(Menu.NONE, 1, Menu.NONE, "設定")
     settingsItem.setIcon(R.drawable.ic_settings)
     settingsItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
     toolbar.setOnMenuItemClickListener { item =>
-      if item.getItemId == 2 then push(SearchScreen(this)) else push(SettingsScreen(this))
+      push(SettingsScreen(this))
       true
     }
     toolbar.setNavigationOnClickListener(_ => pop())
@@ -113,6 +110,10 @@ class MainActivity extends AppCompatActivity:
     fab = ExtendedFloatingActionButton(this)
     fab.setText("チェックイン")
     fab.setIconResource(R.drawable.ic_checkin)
+    // Check-ins are purple everywhere (map dots, chips).
+    fab.setBackgroundTintList(android.content.res.ColorStateList.valueOf(color(attr.tertiaryContainer)))
+    fab.setTextColor(color(attr.onTertiaryContainer))
+    fab.setIconTint(android.content.res.ColorStateList.valueOf(color(attr.onTertiaryContainer)))
     fab.setOnClickListener(_ => CheckInSheet(this, None, () => current.foreach(_.onShow())).show())
     val fabLp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.END)
     fabLp.setMargins(0, 0, dp(16), dp(16))
@@ -255,6 +256,9 @@ class MainActivity extends AppCompatActivity:
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
 
+  def openSettings(): Unit = push(SettingsScreen(this))
+  def openSearch(): Unit = push(SearchScreen(this))
+
   /** A day on the タイムライン tab (日), from the map. */
   def openTimeline(d: LocalDate): Unit =
     stack.clear()
@@ -277,27 +281,36 @@ class MainActivity extends AppCompatActivity:
 
   private def show(s: Screen): Unit =
     current.filterNot(_ eq s).foreach(_.onHide())
+    setFabLift(0)
     screenHost.removeAllViews()
     Option(s.view.getParent).foreach(_.asInstanceOf[ViewGroup].removeView(s.view))
     screenHost.addView(s.view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     current = Some(s)
     val pushed = stack.nonEmpty
     val onboarding = s.isInstanceOf[OnboardingScreen]
-    toolbar.setVisibility(if onboarding then View.GONE else View.VISIBLE)
+    // The top bar is only for pushed pages (title and back); tab roots use the full height.
+    toolbar.setVisibility(if onboarding || !pushed then View.GONE else View.VISIBLE)
     nav.setVisibility(if pushed then View.GONE else View.VISIBLE)
     fab.setVisibility(if !pushed && tabId == MainActivity.TabTimeline then View.VISIBLE else View.GONE)
     toolbar.getMenu.findItem(1).setVisible(!pushed)
-    toolbar.getMenu.findItem(2).setVisible(!pushed)
     if pushed then
       toolbar.setNavigationIcon(R.drawable.ic_arrow_back)
       toolbar.setNavigationContentDescription("戻る")
       toolbar.setTitle(s.title)
     else
       toolbar.setNavigationIcon(null)
-      toolbar.setTitle("ashidori")
+      // Tab roots: the bottom bar already says where you are.
+      toolbar.setTitle("")
     s.onShow()
 
   def registerMap(m: TrackMap): Unit = maps += m
+
+  /** Raise the check-in button by `px` (the map tab keeps it above its sheet). */
+  def setFabLift(px: Int): Unit =
+    val lp = fab.getLayoutParams.asInstanceOf[FrameLayout.LayoutParams]
+    if lp.bottomMargin != dp(16) + px then
+      lp.bottomMargin = dp(16) + px
+      fab.setLayoutParams(lp)
 
   /** A pushed screen whose title depends on its state calls this when it changes. */
   def updateTitle(): Unit = if stack.nonEmpty then current.foreach(s => toolbar.setTitle(s.title))

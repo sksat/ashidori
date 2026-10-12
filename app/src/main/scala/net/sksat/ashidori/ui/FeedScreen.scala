@@ -111,7 +111,24 @@ final class FeedScreen(act: MainActivity) extends Screen:
     )
     s.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
     s
-  lazy val view: View = vbox(padded(toggle, 16, 8), padded(vbox(backToToday), 16, 0), scroller)
+  /** Search the history ("when did I go to …"), at thumb reach. */
+  private val searchFab =
+    val f = com.google.android.material.floatingactionbutton.FloatingActionButton(act)
+    f.setImageResource(R.drawable.ic_search)
+    f.setContentDescription("記録を探す")
+    f.setBackgroundTintList(android.content.res.ColorStateList.valueOf(color(attr.secondaryContainer)))
+    f.setImageTintList(android.content.res.ColorStateList.valueOf(color(attr.onSecondaryContainer)))
+    f.setOnClickListener(_ => act.openSearch())
+    f
+
+  lazy val view: View =
+    val content = vbox(padded(toggle, 16, 8), padded(vbox(backToToday), 16, 0), scroller)
+    val lp = android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      Gravity.BOTTOM | Gravity.END)
+    lp.setMargins(0, 0, dp(16), dp(16))
+    val f = frame(content)
+    f.addView(searchFab, lp)
+    f
 
   /** Open 日 at a given day (older days continue below it). */
   def showFrom(d: LocalDate): Unit =
@@ -137,7 +154,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
   /** Show 日 starting from this day instead of today (from the map). */
   private var startAt: Option[LocalDate] = None
   private val backToToday =
-    val b = outlined("今日に戻る") { startAt = None; reload() }
+    val b = outlined("今日へ") { startAt = None; reload() }
     b.setVisibility(View.GONE)
     b
 
@@ -153,6 +170,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
     done = false
     loading = false
     dayBoxes.clear()
+    DayMap.cancelPending()
     if unit != Span.Day then startAt = None
     backToToday.setVisibility(if startAt.isDefined then View.VISIBLE else View.GONE)
     cursor = startAt.getOrElse(unit.range(LocalDate.now(AshidoriApp.zone))._1)
@@ -217,11 +235,16 @@ final class FeedScreen(act: MainActivity) extends Screen:
     box.removeAllViews()
     if !first then box.addView(divider())
     box.addView(dayHeading(tl, today))
+    DayMap.view(act, tl).foreach { m =>
+      m.setOnClickListener(_ => act.openDay(tl.date))
+      m.setContentDescription("この日の地図。タップでマップを開く")
+      box.addView(m)
+    }
     // Newest first, like the rest of the feed.
     val rs = rows.rows(tl)
     rs.foreach(box.addView)
     if rs.isEmpty then
-      box.addView(padded(caption(if LoggerState.running then "移動や滞在が検出されるとここに表示されます" else "記録停止中"), 52, 8))
+      box.addView(padded(caption(if LoggerState.running then "記録待ち" else "記録停止中"), 52, 8))
 
   /** After an edit (place name, mode), rebuild just that day. */
   private def refreshDay(d: LocalDate): Unit =

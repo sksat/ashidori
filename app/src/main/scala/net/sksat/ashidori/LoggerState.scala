@@ -21,6 +21,20 @@ final case class SatSignal(
     else if carrierHz > 1.2e9 then "L2"
     else "L5"
 
+/** Which motion sensors the logger is using right now. */
+final case class SensorState(
+    /** accelerometer for motion detection; 0 = off */
+    accelHz: Int = 0,
+    /** how long samples wait in the sensor hub before delivery */
+    accelBatchMs: Long = 0,
+    /** waiting for the significant-motion interrupt */
+    motionTrigger: Boolean = false,
+    /** step detector + rotation vector for indoor dead reckoning */
+    pdr: Boolean = false,
+    /** raw accelerometer / gyroscope / magnetometer rate in a detail log; 0 = not recording */
+    imuHz: Int = 0
+)
+
 /** Live state published by the logger service and observed by the UI. All
   * reads/writes happen on the main thread.
   */
@@ -43,6 +57,9 @@ object LoggerState:
   var fixesToday: Int = 0
   var rawMeasurementsSeen: Long = 0
   var stepsSession: Int = 0
+  @volatile var sensors: SensorState = SensorState()
+  /** Raw IMU samples written by detail logs since the service started. */
+  @volatile var imuSamples: Long = 0
 
   private val listeners = mutable.LinkedHashSet.empty[() => Unit]
   private val main = Handler(Looper.getMainLooper)

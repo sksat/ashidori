@@ -207,10 +207,13 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       card.setLayoutParams(lp)
       card.setOnClickListener { _ =>
         dialog.dismiss()
-        MapStyle.current = ms
-        TrackMap.all.foreach(_.setBaseMap(ms))
+        if ms == MapStyle.Custom then editCustomTiles()
+        else
+          MapStyle.current = ms
+          TrackMap.all.foreach(_.setBaseMap(ms))
       }
-      camera.foreach { cam =>
+      if ms == MapStyle.Custom && MapStyle.custom._1.isEmpty then img.setImageDrawable(null)
+      else camera.foreach { cam =>
         val opts = org.maplibre.android.snapshotter.MapSnapshotter.Options(thumbW, thumbH)
           .withStyleBuilder(ms.builder)
           .withCameraPosition(cam)
@@ -225,6 +228,37 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     dialog.setOnDismissListener(_ => snapshotters.foreach(_.cancel()))
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(Ui.text("地図の種類", 20f, bold = true), Ui.spacer(8), grid), 14, 12)))
     dialog.show()
+
+  /** Any XYZ raster tile server: the URL template and a credit line. */
+  private def editCustomTiles(): Unit =
+    given Ui.Ctx = act
+    val (url0, credit0) = MapStyle.custom
+    val url = android.widget.EditText(act)
+    url.setHint("https://example.com/tiles/{z}/{x}/{y}.png")
+    url.setText(url0)
+    url.setSingleLine(true)
+    url.setInputType(android.text.InputType.TYPE_TEXT_VARIATION_URI)
+    val credit = android.widget.EditText(act)
+    credit.setHint("出典の表記（例: © 〇〇）")
+    credit.setText(credit0)
+    credit.setSingleLine(true)
+    val body = Ui.padded(Ui.vbox(
+      Ui.caption("{z} {x} {y} を含むラスタータイルの URL。API キーが必要なサービスは URL にキーを含めてください。利用規約と出典表記はサービスに従ってください。"),
+      url, credit
+    ), 20, 8)
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("カスタム地図")
+      .setView(body)
+      .setNegativeButton("やめる", null)
+      .setPositiveButton("使う", (_, _) => {
+        val u = url.getText.toString.trim
+        if u.contains("{z}") && u.contains("{x}") && u.contains("{y}") && u.startsWith("http") then
+          MapStyle.custom = (u, credit.getText.toString)
+          MapStyle.current = MapStyle.Custom
+          TrackMap.all.foreach(_.setBaseMap(MapStyle.Custom))
+        else android.widget.Toast.makeText(act, "{z} {x} {y} を含む http(s) の URL を入力してください", android.widget.Toast.LENGTH_LONG).show()
+      })
+      .show()
 
   private def withStyle(f: (MapLibreMap, Style) => Unit): Unit =
     map match
@@ -241,25 +275,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       Feature.fromGeometry(Point.fromLngLat(mk.at.lon, mk.at.lat), props)
     }.asJava)
 
-  private def lines(paths: Seq[MapPath]): FeatureCollection =
-    // A line that collapses to one point is invalid geometry, and MapLibre
-    // then drops the line layer's tile: zoomed out over a week or a month,
-    // short legs do exactly that. Merge points too close to tell apart at the
-    // scale of everything drawn, and skip lines left with a single point.
-    val all = paths.flatMap(_.points)
-    val minGap =
-      if all.isEmpty then 0.0
-      else
-        val diag = Geo.distance(all.map(_.lat).min, all.map(_.lon).min, all.map(_.lat).max, all.map(_.lon).max)
-        math.max(0.5, diag / 2000)
-    def thinned(ps: Seq[Fix]) =
-      ps.foldLeft(Vector.empty[Fix])((acc, f) => if acc.lastOption.exists(l => Geo.distance(l, f) < minGap) then acc else acc :+ f)
-    FeatureCollection.fromFeatures(paths.map(p => p -> thinned(p.points)).filter(_._2.size >= 2).map { (p, pts) =>
-      val props = JsonObject()
-      props.addProperty("color", p.color)
-      props.addProperty("dashed", p.dashed)
-      Feature.fromGeometry(LineString.fromLngLats(pts.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
-    }.asJava)
+  private def lines(paths: Seq[MapPath]): FeatureCollection = TrackMap.lineFeatures(paths)
 
   /** Replaces all data. `fit` moves the camera to show everything. */
   def setData(paths: Seq[MapPath], visits: Seq[MapMarker], checkIns: Seq[MapMarker], fit: Boolean = true): Unit =
@@ -381,6 +397,28 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
 
 object TrackMap:
   val DefaultLine = "#006B5B"
+
+  /** Paths as GeoJSON lines with `color` and `dashed` properties. */
+  def lineFeatures(paths: Seq[MapPath]): FeatureCollection =
+    // A line that collapses to one point is invalid geometry, and MapLibre
+    // then drops the line layer's tile: zoomed out over a week or a month,
+    // short legs do exactly that. Merge points too close to tell apart at the
+    // scale of everything drawn, and skip lines left with a single point.
+    val all = paths.flatMap(_.points)
+    val minGap =
+      if all.isEmpty then 0.0
+      else
+        val diag = Geo.distance(all.map(_.lat).min, all.map(_.lon).min, all.map(_.lat).max, all.map(_.lon).max)
+        math.max(0.5, diag / 2000)
+    def thinned(ps: Seq[Fix]) =
+      ps.foldLeft(Vector.empty[Fix])((acc, f) => if acc.lastOption.exists(l => Geo.distance(l, f) < minGap) then acc else acc :+ f)
+    FeatureCollection.fromFeatures(paths.map(p => p -> thinned(p.points)).filter(_._2.size >= 2).map { (p, pts) =>
+      val props = JsonObject()
+      props.addProperty("color", p.color)
+      props.addProperty("dashed", p.dashed)
+      Feature.fromGeometry(LineString.fromLngLats(pts.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
+    }.asJava)
+
   /** Live maps, so a base map change applies everywhere. */
   val all = scala.collection.mutable.ArrayBuffer.empty[TrackMap]
   private var cacheSet = false
