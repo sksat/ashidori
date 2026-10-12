@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ashidori-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+
+  // Batch metadata, devices, pairing codes and rate-limit counters.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ashidori",
+      // Replace with the id printed by `wrangler d1 create ashidori`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Encrypted batch blobs (opaque to the server).
+  "r2_buckets": [
+    {
+      "binding": "BLOBS",
+      "bucket_name": "ashidori-blobs"
+    }
+  ],
+
+  "vars": {
+    // Cloudflare Access team domain, e.g. "example.cloudflareaccess.com".
+    "CF_ACCESS_TEAM_DOMAIN": "",
+    // Application Audience (AUD) tag of the Access application that covers /admin/*.
+    "CF_ACCESS_AUD": "",
+    // Comma-separated list of origins allowed for CORS on /v1/* (future web viewer). Empty = no CORS.
+    "CORS_ALLOWED_ORIGINS": "",
+    // Only for local development: accept the ADMIN_DEV_TOKEN secret on /admin/*. Never "true" in production.
+    "ALLOW_DEV_ADMIN": "false"
+  }
+
+  // Secrets (not in this file):
+  //   ADMIN_DEV_TOKEN  - only used when ALLOW_DEV_ADMIN == "true" (local dev). Put it in .dev.vars.
+}
