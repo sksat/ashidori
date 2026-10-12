@@ -47,6 +47,9 @@ class LoggerService extends Service:
   private val pendingMotion = ArrayBuffer.empty[MotionWindow]
   private var lastFlush = 0L
   private var lastEval = 0L
+  /** When the current motion state began (indoor GNSS probes count from it). */
+  private var motionSince = System.currentTimeMillis()
+  private val replan: Runnable = () => evaluate(force = true)
   private var lastBatterySample = 0L
   private var drain = Double.NaN
 
@@ -149,13 +152,16 @@ class LoggerService extends Service:
       now,
       Settings.lastDetailStart,
       Settings.burstUntil,
-      indoor.current
+      indoor.current,
+      motionSince
     )
     val p = SamplingPolicy.plan(input)
     if p.rawGnss && recorder.isEmpty then
       val prof = SamplingPolicy.profiles(p.effectiveMode)
       if now - Settings.lastDetailStart >= prof.detailDurationMs then Settings.lastDetailStart = now
     applyPlan(p)
+    handler.removeCallbacks(replan)
+    if p.replanInMs > 0 then handler.postDelayed(replan, p.replanInMs + 500)
     val changed = !plan.contains(p)
     plan = Some(p)
     if changed then updateNotification(p)
@@ -272,6 +278,7 @@ class LoggerService extends Service:
       handler.post { () =>
         sigMotionArmed = false
         estimator.wake()
+        motionSince = System.currentTimeMillis()
         evaluate(force = true)
       }
 
@@ -397,6 +404,7 @@ class LoggerService extends Service:
               // Steps while "stationary" (accelerometer off) mean we are moving.
               if accelReg == 0 && estimator.current == MotionState.Stationary && d >= 10 then
                 estimator.wake()
+                motionSince = System.currentTimeMillis()
                 evaluate(force = true)
           lastStepCount = total
         case _ => ()
@@ -408,6 +416,7 @@ class LoggerService extends Service:
     estimator.update(w, if now - lastSpeedAt < 60_000 then lastSpeed else Double.NaN)
     LoggerState.onMain { LoggerState.lastWindow = Some(w) }
     if estimator.current != before then
+      motionSince = now
       // Settled somewhere: look up nearby venues now so a check-in is instant.
       if estimator.current == MotionState.Stationary then
         LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 10 * 60_000)

@@ -1,7 +1,8 @@
 package net.sksat.ashidori.ui
 
 import android.view.View
-import android.widget.{RadioButton, RadioGroup}
+import android.widget.{LinearLayout, TextView}
+import com.google.android.material.button.{MaterialButton, MaterialButtonToggleGroup}
 import java.io.File
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -33,8 +34,23 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val timeFmt = DateTimeFormatter.ofPattern("M/d HH:mm")
 
   private val status = text("", 20f, bold = true)
-  private val planText = caption("")
-  private val reasons = caption("")
+
+  // Current state as label/value rows, kept apart from the explanations below.
+  private def row(label: String): (View, TextView) =
+    val l = text(label, 14f, colorAttr = attr.onSurfaceVariant)
+    l.setLayoutParams(LinearLayout.LayoutParams(dp(72), android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
+    val v = text("", 15f)
+    v.setLayoutParams(weighted())
+    val h = hbox(l, v)
+    h.setPadding(0, dp(3), 0, dp(3))
+    (h, v)
+  private val (sourceRow, sourceValue) = row("測位")
+  private val (motionRow, motionValue) = row("動き")
+  private val (envRow, envValue) = row("場所")
+  private val (batteryRow, batteryValue) = row("電池")
+  private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow)
+  /** Why it is like this: supplementary, so quieter and marked with ⓘ. */
+  private val notes = vbox()
   /** Shown only while stopped. Recording is meant to stay on; the user
     * normally just changes the mode.
     */
@@ -45,7 +61,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       .setMessage("停止している間の移動や滞在は残りません。電池を節約したいだけなら「省電力」モードがおすすめです。")
       .setNegativeButton("やめる", null)
       // Checking the radio button runs the normal mode-change path.
-      .setNeutralButton("省電力にする", (_, _) => modeButtons.find(_._1 == LoggingMode.Eco).foreach(_._2.setChecked(true)))
+      .setNeutralButton("省電力にする", (_, _) => modeToggle.check(modeButtons(LoggingMode.Eco).getId))
       .setPositiveButton("停止する", (_, _) => {
         Settings.loggingEnabled = false
         LoggerService.send(act, LoggerService.ActionStop)
@@ -53,22 +69,33 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       .show()
   }
 
-  private val modes = RadioGroup(act)
-  private val modeButtons = LoggingMode.values.toSeq.map { m =>
-    val rb = RadioButton(act)
-    rb.setId(View.generateViewId())
-    rb.setText(s"${m.label}　${ModeInfo.battery(m)}\n${ModeInfo.summary(m)}")
-    rb.setMinHeight(dp(56))
-    rb.setPadding(dp(8), dp(6), 0, dp(6))
-    modes.addView(rb)
-    m -> rb
-  }
-  modes.setOnCheckedChangeListener { (_, id) =>
-    modeButtons.find(_._2.getId == id).foreach { (m, _) =>
-      if Settings.mode != m then
-        Settings.mode = m
-        if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
-    }
+  // Mode: a segmented control with exactly one mode selected.
+  private val modeToggle = MaterialButtonToggleGroup(act)
+  modeToggle.setSingleSelection(true)
+  modeToggle.setSelectionRequired(true)
+  private val modeButtons: Map[LoggingMode, MaterialButton] = LoggingMode.values.toSeq.map { m =>
+    val b = MaterialButton(act, null, com.google.android.material.R.attr.materialButtonOutlinedStyle)
+    b.setId(View.generateViewId())
+    b.setText(m.label)
+    b.setTextSize(13f)
+    b.setMinWidth(0)
+    b.setMinimumWidth(0)
+    b.setPadding(dp(2), 0, dp(2), 0)
+    b.setLayoutParams(weighted())
+    modeToggle.addView(b)
+    m -> b
+  }.toMap
+  modeToggle.setLayoutParams(matchWrap)
+  private val modeInfo = caption("")
+  modeInfo.setPadding(0, dp(4), 0, 0)
+  modeToggle.addOnButtonCheckedListener { (_, id, checked) =>
+    if checked then
+      modeButtons.find(_._2.getId == id).foreach { (m, _) =>
+        modeInfo.setText(s"${ModeInfo.summary(m)}・${ModeInfo.battery(m)}")
+        if Settings.mode != m then
+          Settings.mode = m
+          if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+      }
   }
 
   private val detailText = text("", 14f)
@@ -85,9 +112,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   val view: View =
     scroll(
       vbox((Seq(
-        card(status, planText, reasons, spacer(8), start)
+        card(status, spacer(10), modeToggle, modeInfo, spacer(10), stateRows, notes, start)
       ) ++ panel.views ++ Seq(
-        card(text("記録モード", 16f, bold = true), modes),
         card(
           text("詳細ログ（GNSS・IMU）", 16f, bold = true),
           caption("衛星の生データと加速度・ジャイロ・地磁気を記録します。"),
@@ -104,7 +130,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private var unobserve: () => Unit = () => ()
   override def onShow(): Unit =
     unobserve = LoggerState.observe(() => refresh())
-    modeButtons.find(_._1 == Settings.mode).foreach(_._2.setChecked(true))
+    modeToggle.check(modeButtons(Settings.mode).getId)
     refresh()
     panel.loadHistory()
     loadFiles()
@@ -153,17 +179,26 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     status.setTextColor(color(if running then attr.primary else attr.onSurfaceVariant))
     start.setVisibility(if running then View.GONE else View.VISIBLE)
     stop.setVisibility(if running then View.VISIBLE else View.GONE)
+    notes.removeAllViews()
+    def note(n: String): Unit =
+      val t = caption(s"ⓘ $n")
+      t.setPadding(0, dp(6), 0, 0)
+      notes.addView(t)
     LoggerState.plan match
       case Some(p) if running =>
-        planText.setText(PositioningPanel.planSentence(p))
-        // Why the effective mode differs from the chosen one, if it does.
-        reasons.setText(
-          if p.effectiveMode != Settings.mode then s"${p.effectiveMode.label}で動作中（${p.reasons.mkString("・")}）"
-          else p.reasons.mkString("・")
-        )
+        stateRows.setVisibility(View.VISIBLE)
+        sourceValue.setText(PositioningPanel.sourceState(p))
+        motionValue.setText(LoggerState.motion.label)
+        motionRow.setVisibility(if LoggerState.motion == MotionState.Unknown then View.GONE else View.VISIBLE)
+        envValue.setText(LoggerState.environment.label)
+        envRow.setVisibility(if LoggerState.environment == Environment.Unknown then View.GONE else View.VISIBLE)
+        val d = LoggerState.drainPctPerHour
+        batteryValue.setText(s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
+        batteryRow.setVisibility(if LoggerState.battery >= 0 then View.VISIBLE else View.GONE)
+        PositioningPanel.notes(p, Settings.mode).foreach(note)
       case _ =>
-        planText.setText(if running then "" else "記録を始めると、ここに現在の動作が表示されます")
-        reasons.setText("")
+        stateRows.setVisibility(View.GONE)
+        if !running then note("記録を始めると、ここに現在の状態が表示されます")
 
     val now = System.currentTimeMillis()
     detailText.setText(LoggerState.detailFile match

@@ -80,10 +80,10 @@ class SamplingPolicySuite extends munit.FunSuite:
 
   test("indoors on foot: network positioning with short GNSS probes, no detail log") {
     val base = in(motion = MotionState.OnFoot).copy(environment = Environment.Indoor)
-    val off = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeEveryMs * 10 + 60_000))
+    val off = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeMovingEveryMs * 10 + 60_000))
     assertEquals(off.source, LocationSource.Network)
     assert(!off.rawGnss)
-    val probe = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeEveryMs * 10 + 5_000))
+    val probe = SamplingPolicy.plan(base.copy(now = SamplingPolicy.IndoorProbeMovingEveryMs * 10 + 5_000))
     assertEquals(probe.source, LocationSource.Gnss)
     // Riding a train underground is not "indoors on foot".
     assertEquals(SamplingPolicy.plan(base.copy(motion = MotionState.Vehicle, now = 99_000_000L + 60_000)).source, LocationSource.Gnss)
@@ -140,4 +140,17 @@ class SamplingPolicySuite extends munit.FunSuite:
     val w = acc.flush().get
     assertEqualsDouble(w.accelStd.toDouble, 1.0, 0.05)
     assertEquals(w.steps, 3)
+  }
+
+  test("indoors: probe GNSS at once when movement starts, often while moving, rarely while still") {
+    val t0 = 50 * 60_000L
+    def at(motion: MotionState, dt: Long) =
+      SamplingPolicy.plan(PolicyInput(LoggingMode.Balanced, normal, motion, 1.0, t0 + dt, t0 + dt - 30_000,
+        environment = Environment.Indoor, motionSince = t0))
+    assertEquals(at(MotionState.OnFoot, 0).source, LocationSource.Gnss)
+    assertEquals(at(MotionState.OnFoot, 60_000).source, LocationSource.Network)
+    assertEquals(at(MotionState.OnFoot, SamplingPolicy.IndoorProbeMovingEveryMs + 1_000).source, LocationSource.Gnss)
+    assertEquals(at(MotionState.OnFoot, 60_000).replanInMs, SamplingPolicy.IndoorProbeMovingEveryMs - 60_000)
+    assertEquals(at(MotionState.Stationary, SamplingPolicy.IndoorProbeMovingEveryMs + 1_000).source, LocationSource.Network)
+    assertEquals(at(MotionState.Stationary, SamplingPolicy.IndoorProbeStillEveryMs + 1_000).source, LocationSource.Gnss)
   }

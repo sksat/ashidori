@@ -20,8 +20,7 @@ final class PositioningPanel(act: MainActivity):
     t
   private val source = text("", 16f)
   private val age = caption("")
-  private val chips = ChipGroup(act)
-  private val position = card(text("測位状況", 16f, bold = true), hbox(accuracy, padded(vbox(source, age), 12, 0)), chips)
+  private val position = card(text("位置の精度", 16f, bold = true), hbox(accuracy, padded(vbox(source, age), 12, 0)))
 
   // --- satellites ---
   private val satHeadline = text("", 16f, bold = true)
@@ -92,16 +91,6 @@ final class PositioningPanel(act: MainActivity):
         accuracy.setText("—")
         source.setText(if LoggerState.running then "位置を待っています" else "記録停止中")
         age.setText("")
-    chips.removeAllViews()
-    // Only what is known: an "unknown" chip says nothing useful.
-    if LoggerState.environment != Environment.Unknown then chips.addView(chip(LoggerState.environment.label))
-    LoggerState.motion match
-      case MotionState.Unknown    => ()
-      case MotionState.Stationary => chips.addView(chip("静止中"))
-      case m                      => chips.addView(chip(m.label))
-    if LoggerState.battery >= 0 then
-      val d = LoggerState.drainPctPerHour
-      chips.addView(chip(s"電池 ${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時")))
 
     val sats = LoggerState.satellites
     val on = sats.nonEmpty
@@ -133,10 +122,10 @@ final class PositioningPanel(act: MainActivity):
       satHeadline.setText("衛星を探しています…")
       satDetail.setText("屋外では通常数秒〜数十秒で捕捉します。屋内では捕捉できないことがあります。")
     else if LoggerState.running then
-      satHeadline.setText("衛星測位: 一時停止中")
+      satHeadline.setText("衛星: 停止中")
       satDetail.setText(
-        if LoggerState.environment == Environment.Indoor then "屋内のため Wi-Fi・基地局で測位しています。3分ごとに屋外かどうか確認します。"
-        else "静止中は電池節約のため衛星測位を止めています。移動を検知すると自動で再開します。"
+        if LoggerState.environment == Environment.Indoor then "ⓘ 屋内のため。動き出すと屋外か確認します"
+        else "ⓘ 静止中のため電池を節約。動き出すと再開します"
       )
     else
       satHeadline.setText("記録停止中")
@@ -162,10 +151,27 @@ object PositioningPanel:
   private def every(ms: Long): String =
     if ms < 60_000 then s"${(ms / 1000.0).toString.stripSuffix(".0")}秒ごと" else s"${ms / 60_000}分ごと"
 
-  /** What the logger is doing, in plain words. */
-  def planSentence(p: SamplingPlan): String =
+  /** How positions are obtained right now, as a state (not a sentence). */
+  def sourceState(p: SamplingPlan): String =
     val how = p.source match
-      case LocationSource.Gnss    => s"${every(p.intervalMs)}に測位"
-      case LocationSource.Network => s"Wi-Fi・基地局で${every(p.intervalMs)}に測位"
-      case LocationSource.Passive => "測位を休止中（他のアプリが取得した位置のみ記録）"
-    how + (if p.rawGnss then "・詳細ログ記録中" else "")
+      case LocationSource.Gnss    => s"衛星・${every(p.intervalMs)}"
+      case LocationSource.Network => s"Wi-Fi・基地局・${every(p.intervalMs)}"
+      case LocationSource.Passive => "休止（他アプリの位置のみ）"
+    how + (if p.rawGnss then " + 詳細ログ" else "")
+
+  /** Why the state is what it is: supplementary notes shown under it. */
+  def notes(p: SamplingPlan, chosen: LoggingMode): Seq[String] =
+    val other = p.reasons.filterNot(_ == "屋内")
+    val mode =
+      if p.effectiveMode != chosen then Seq(s"「${p.effectiveMode.label}」で動作中: ${other.mkString("・")}")
+      else if other.nonEmpty then Seq(other.mkString("・"))
+      else Nil
+    val indoor =
+      if !p.reasons.contains("屋内") then Nil
+      else
+        val head =
+          if p.source == LocationSource.Gnss then "屋外に出たか衛星で確認中。"
+          else "屋内は衛星が届きにくいため Wi-Fi・基地局を使用。"
+        Seq(head + s"動き出したときと移動中${SamplingPolicy.IndoorProbeMovingEveryMs / 60_000}分ごとに屋外か確認" +
+          s"（静止中は${SamplingPolicy.IndoorProbeStillEveryMs / 60_000}分ごと）")
+    mode ++ indoor

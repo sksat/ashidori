@@ -46,7 +46,9 @@ final case class PolicyInput(
     /** explicit "detail log now" request is active until this time */
     burstUntil: Long = 0L,
     /** indoor/outdoor estimate from satellite visibility */
-    environment: Environment = Environment.Unknown
+    environment: Environment = Environment.Unknown,
+    /** when the current motion state began */
+    motionSince: Long = 0L
 )
 
 final case class SamplingPlan(
@@ -62,7 +64,9 @@ final case class SamplingPlan(
     accelHz: Int,
     /** sensor FIFO batching latency */
     accelBatchMs: Long,
-    reasons: List[String]
+    reasons: List[String],
+    /** re-plan after this many ms (a GNSS probe starts or ends); 0 = no deadline */
+    replanInMs: Long = 0L
 ):
   def describe: String =
     val src = source match
@@ -95,7 +99,12 @@ object SamplingPolicy:
   )
 
   private val Min = 60_000L
-  val IndoorProbeEveryMs: Long = 3 * Min
+  /** Indoors, GNSS is tried briefly to notice stepping outside: right when
+    * movement starts, every couple of minutes while moving, rarely while
+    * still (you cannot walk out without moving first).
+    */
+  val IndoorProbeMovingEveryMs: Long = 2 * Min
+  val IndoorProbeStillEveryMs: Long = 30 * Min
   val IndoorProbeMs: Long = 20_000L
   val profiles: Map[LoggingMode, Profile] = Map(
     LoggingMode.Eco -> Profile(30_000, 15_000, None, 6 * 60 * Min, 12 * 60 * Min, 30_000, 10, 120_000, 1.0),
@@ -145,12 +154,18 @@ object SamplingPolicy:
     // Indoors (and not riding something) GNSS mostly burns power for no fix:
     // use Wi-Fi/cell positioning and briefly try GNSS every few minutes to
     // notice stepping outside.
-    val indoorWalk = in.environment == Environment.Indoor && in.motion != MotionState.Vehicle &&
-      in.motion != MotionState.Stationary
-    val probing = (in.now % SamplingPolicy.IndoorProbeEveryMs) < SamplingPolicy.IndoorProbeMs
-    if indoorWalk && mode != LoggingMode.Max && !burst then reasons += "屋内のため Wi-Fi・基地局で測位"
+    val indoor = in.environment == Environment.Indoor
+    val indoorWalk = indoor && in.motion != MotionState.Vehicle && in.motion != MotionState.Stationary
+    val indoorStill = indoor && in.motion == MotionState.Stationary && prof.stationaryMs.isDefined
+    // Probe phase counts from the motion change, so the first probe is immediate.
+    val probeEvery = if indoorStill then IndoorProbeStillEveryMs else IndoorProbeMovingEveryMs
+    val phase = math.floorMod(in.now - in.motionSince, probeEvery)
+    val probing = phase < IndoorProbeMs
+    val probeApplies = (indoorWalk || indoorStill) && mode != LoggingMode.Max && !burst
+    if probeApplies then reasons += "屋内"
     val (source, baseInterval) =
       if mode == LoggingMode.Max || burst then (LocationSource.Gnss, 1_000L)
+      else if indoorStill && probing then (LocationSource.Gnss, 1_000L)
       else if indoorWalk then
         if probing then (LocationSource.Gnss, 1_000L)
         else (LocationSource.Network, math.max(prof.footMs * 3, 15_000L))
@@ -193,7 +208,11 @@ object SamplingPolicy:
       case MotionState.Stationary => 20f
       case _                      => 0f
 
-    SamplingPlan(mode, finalSource, finalInterval, minDist, batch, rawGnss, accelHz, prof.batchMs.min(batch.max(1_000)), reasons.result())
+    val replan =
+      if probeApplies then if probing then IndoorProbeMs - phase else probeEvery - phase
+      else 0L
+    SamplingPlan(mode, finalSource, finalInterval, minDist, batch, rawGnss, accelHz, prof.batchMs.min(batch.max(1_000)),
+      reasons.result(), replan)
 
 /** Battery drain estimate from periodic samples, ignoring charging and screen-on time. */
 object DrainEstimator:
