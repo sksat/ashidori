@@ -12,18 +12,39 @@ final case class TimelineParams(
     gapMs: Long = 90_000L,
     /** legs shorter than this (both) are merged into neighbours */
     minLegDurationMs: Long = 2 * 60_000L,
-    minLegDistanceM: Double = 250.0
+    minLegDistanceM: Double = 250.0,
+    /** faster than this between fixes is a position jump, not movement (~1080 km/h) */
+    maxPlausibleSpeedMps: Double = 300.0
 )
 
 /** Turns raw fixes and motion windows into a sequence of visits and trips. */
 object TimelineBuilder:
 
   def build(
-      fixes: IndexedSeq[Fix],
+      rawFixes: IndexedSeq[Fix],
       motion: IndexedSeq[MotionWindow] = IndexedSeq.empty,
       p: TimelineParams = TimelineParams()
   ): Vector[Segment] =
-    if fixes.isEmpty then return Vector.empty
+    if rawFixes.isEmpty then return Vector.empty
+    val fixes = Geo.removeSpikes(rawFixes.sortBy(_.time))
+    // A jump faster than any airliner is not travel (a bad fix, a mock or
+    // imported location, a device reset): build each continuous run on its
+    // own so the jump never counts as distance.
+    splitAtJumps(fixes, p.maxPlausibleSpeedMps).flatMap(run => buildRun(run, motion, p))
+
+  /** Splits where consecutive fixes imply an impossible speed. */
+  def splitAtJumps(fixes: IndexedSeq[Fix], maxSpeed: Double): Vector[IndexedSeq[Fix]] =
+    if fixes.isEmpty then Vector.empty
+    else
+      val cuts = (1 until fixes.size).filter { i =>
+        val a = fixes(i - 1)
+        val b = fixes(i)
+        val d = Geo.distance(a, b)
+        d > 1_000 && d / math.max(1.0, (b.time - a.time) / 1000.0) > maxSpeed
+      }
+      ((0 +: cuts) :+ fixes.size).sliding(2).collect { case Seq(a, b) => fixes.slice(a, b) }.toVector
+
+  private def buildRun(fixes: IndexedSeq[Fix], motion: IndexedSeq[MotionWindow], p: TimelineParams): Vector[Segment] =
     val stays = StayPointDetector.detect(fixes, p.stay)
     val out = Vector.newBuilder[Segment]
     val motionIndex = MotionIndex(motion)

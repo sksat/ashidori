@@ -15,8 +15,24 @@ final case class DayTimeline(
 /** Builds timelines from stored raw signals. Must run off the main thread. */
 object TimelineRepo:
   private val Margin = 12 * 3_600_000L
+  /** Finished days do not change unless the user edits something. */
+  private val cache = java.util.concurrent.ConcurrentHashMap[LocalDate, DayTimeline]()
+
+  /** Call after edits (places, mode corrections, check-ins, imports). */
+  def invalidate(): Unit = cache.clear()
 
   def day(date: LocalDate): DayTimeline =
+    val today = LocalDate.now(AshidoriApp.zone)
+    // Yesterday can still change until the overnight visit ends.
+    if date.isBefore(today.minusDays(1)) then
+      Option(cache.get(date)).getOrElse {
+        val tl = compute(date)
+        cache.put(date, tl)
+        tl
+      }
+    else compute(date)
+
+  private def compute(date: LocalDate): DayTimeline =
     val zone = AshidoriApp.zone
     val db = AshidoriApp.db
     val dayStart = date.atStartOfDay(zone).toInstant.toEpochMilli
@@ -31,7 +47,8 @@ object TimelineRepo:
     var tmp = 0L
     val (_, created) = Places.assign(built.collect { case v: Visit => v }, known, () => { tmp -= 1; tmp })
     val idMap = created.map(p => p.id -> db.insertPlace(p)).toMap
-    val places = (known ++ created.map(p => p.copy(id = idMap(p.id)))).map(p => p.id -> p).toMap
+    val places0 = (known ++ created.map(p => p.copy(id = idMap(p.id)))).map(p => p.id -> p).toMap
+    val places = nameAreas(places0, built.collect { case v: Visit => v })
     val all = places.values.toVector
     val linked = built.map {
       case v: Visit => v.copy(placeId = Places.nearest(v, all).map(_.id))
@@ -46,6 +63,26 @@ object TimelineRepo:
     val segs = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
     val steps = db.steps(dayStart, dayEnd)
     DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd))
+
+  /** Gives unnamed visited places an approximate area name via the platform
+    * geocoder (a few per call, cached in the DB).
+    */
+  private def nameAreas(places: Map[Long, Place], visits: Seq[Visit]): Map[Long, Place] =
+    if !android.location.Geocoder.isPresent then places
+    else
+      val all = places.values.toVector
+      val todo = visits.flatMap(v => Places.nearest(v, all)).distinct.filter(p => !p.named && p.area.isEmpty).take(5)
+      val g = android.location.Geocoder(AshidoriApp.app, java.util.Locale.JAPANESE)
+      todo.foldLeft(places) { (acc, p) =>
+        @annotation.nowarn("cat=deprecation")
+        val found = scala.util.Try(g.getFromLocation(p.lat, p.lon, 1)).toOption.flatMap(l => Option(l))
+        val addr = found.flatMap(l => scala.jdk.CollectionConverters.ListHasAsScala(l).asScala.headOption)
+        addr.flatMap(a => Option(a.getAddressLine(0)).flatMap(AreaName.fromAddressLine).orElse(Option(a.getLocality))) match
+          case Some(area) =>
+            AshidoriApp.db.setPlaceArea(p.id, area)
+            acc + (p.id -> p.copy(area = area))
+          case None => acc
+      }
 
   /** A user correction applies to a leg if they overlap by more than half. */
   private def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =

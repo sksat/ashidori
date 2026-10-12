@@ -11,8 +11,8 @@ android {
 
     defaultConfig {
         applicationId = "net.sksat.ashidori"
-        // Pixel 8a ships with Android 14. Scala 3.8+ lazy vals need VarHandle (API 33+).
-        minSdk = 34
+        // Android 13: OPPO Reno5 A's last OS. Scala 3.8+ lazy vals need VarHandle (API 33+).
+        minSdk = 33
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0"
@@ -49,8 +49,10 @@ dependencies {
     implementation(project(":core"))
     implementation(libs.androidx.core)
     implementation(libs.androidx.activity)
+    implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.maplibre)
+    implementation(libs.work.runtime)
 }
 
 tasks.withType<ScalaCompile>().configureEach {

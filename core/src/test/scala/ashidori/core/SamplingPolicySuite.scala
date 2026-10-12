@@ -78,6 +78,12 @@ class SamplingPolicySuite extends munit.FunSuite:
     assertEqualsDouble(DrainEstimator.screenOffDrain(s, 3 * h, 4 * h), 2.0, 0.01)
   }
 
+  test("drain estimator copes with zero or one sample") {
+    import DrainEstimator.Sample
+    assert(DrainEstimator.screenOffDrain(Nil, 0).isNaN)
+    assert(DrainEstimator.screenOffDrain(Seq(Sample(0, 100, true, true)), 1000).isNaN)
+  }
+
   test("motion estimator needs sustained stillness before going stationary") {
     val est = MotionStateEstimator(stillAfterMs = 60_000)
     def w(t: Long, std: Float, steps: Int = 0) = MotionWindow(t, t + 10_000, std, 0f, steps)

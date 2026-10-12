@@ -32,6 +32,10 @@ object Settings:
   def mode: LoggingMode = LoggingMode.fromKey(prefs.getString("mode", LoggingMode.Balanced.key))
   def mode_=(m: LoggingMode): Unit = prefs.edit().putString("mode", m.key).apply()
 
+  /** First-run onboarding finished. */
+  def onboarded: Boolean = prefs.getBoolean("onboarded", false)
+  def onboarded_=(b: Boolean): Unit = prefs.edit().putBoolean("onboarded", b).apply()
+
   def loggingEnabled: Boolean = prefs.getBoolean("enabled", false)
   def loggingEnabled_=(b: Boolean): Unit = prefs.edit().putBoolean("enabled", b).apply()
 

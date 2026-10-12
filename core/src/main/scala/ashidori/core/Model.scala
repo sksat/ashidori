@@ -93,13 +93,18 @@ final case class Place(
     name: String,
     kind: PlaceKind = PlaceKind.Other,
     /** OSM element id like `node/123`, when the place came from venue search */
-    externalId: String = ""
+    externalId: String = "",
+    /** approximate area from reverse geocoding, e.g. "三軒茶屋" */
+    area: String = ""
 ):
   def latLng: LatLng = LatLng(lat, lon)
+  /** Best available label: the user's name, the kind, the area, or a placeholder. */
   def displayName: String =
     if name.nonEmpty then name
     else if kind.label.nonEmpty then kind.label
-    else f"$lat%.4f, $lon%.4f"
+    else if area.nonEmpty then s"${area}付近"
+    else "不明な場所"
+  def named: Boolean = name.nonEmpty || kind != PlaceKind.Other
 
 /** A Swarm-like explicit check-in. */
 final case class CheckIn(

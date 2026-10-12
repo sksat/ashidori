@@ -28,7 +28,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       "CREATE TABLE battery(time INTEGER NOT NULL, pct INTEGER, charging INTEGER, screen_on INTEGER, mode TEXT, plan TEXT)",
       "CREATE INDEX battery_time ON battery(time)",
       """CREATE TABLE places(id INTEGER PRIMARY KEY AUTOINCREMENT, lat REAL, lon REAL, radius REAL, name TEXT,
-        |kind TEXT, external_id TEXT, updated_at INTEGER)""".stripMargin,
+        |kind TEXT, external_id TEXT, city TEXT, country TEXT, area TEXT, updated_at INTEGER)""".stripMargin,
       """CREATE TABLE checkins(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER, lat REAL, lon REAL, venue TEXT,
         |category TEXT, external_id TEXT, place_id INTEGER, comment TEXT, private INTEGER, updated_at INTEGER)""".stripMargin,
       "CREATE INDEX checkins_time ON checkins(time)",
@@ -40,7 +40,17 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       "CREATE TABLE sync_state(name TEXT PRIMARY KEY, value INTEGER)"
     ).foreach(db.execSQL)
 
-  override def onUpgrade(db: SQLiteDatabase, oldV: Int, newV: Int): Unit = ()
+  /** v0.1 (version 1) shipped to devices; never drop user data here. */
+  override def onUpgrade(db: SQLiteDatabase, oldV: Int, newV: Int): Unit =
+    if oldV < 2 then
+      // Reverse-geocoded region and approximate area name of a place. Only
+      // add what is missing: pre-release builds already had some of them.
+      val existing = Using.resource(db.rawQuery("PRAGMA table_info(places)", null)) { c =>
+        val names = Set.newBuilder[String]
+        while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
+        names.result()
+      }
+      Seq("city", "country", "area").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE places ADD COLUMN $c TEXT"))
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -145,9 +155,10 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   // --- places -------------------------------------------------------------
 
   def places(): Vector[Place] =
-    query("SELECT id,lat,lon,radius,name,kind,external_id FROM places") { c =>
+    query("SELECT id,lat,lon,radius,name,kind,external_id,area FROM places") { c =>
       Place(c.getLong(0), c.getDouble(1), c.getDouble(2), c.getDouble(3), Option(c.getString(4)).getOrElse(""),
-        PlaceKind.fromKey(Option(c.getString(5)).getOrElse("")), Option(c.getString(6)).getOrElse(""))
+        PlaceKind.fromKey(Option(c.getString(5)).getOrElse("")), Option(c.getString(6)).getOrElse(""),
+        Option(c.getString(7)).getOrElse(""))
     }
 
   def insertPlace(p: Place): Long =
@@ -212,6 +223,91 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     db.insert("mode_overrides", null, cv)
   }
 
+  def deleteCheckIn(id: Long): Unit =
+    w.delete("checkins", "id=?", Array(id.toString))
+
+  def checkInsAtPlace(placeId: Long): Vector[CheckIn] =
+    checkIns(0, Long.MaxValue).filter(_.placeId.contains(placeId))
+
+  /** City / country from reverse geocoding, cached per place. */
+  def placeRegions(): Map[Long, (String, String)] =
+    query("SELECT id, city, country FROM places WHERE country IS NOT NULL") { c =>
+      c.getLong(0) -> (Option(c.getString(1)).getOrElse(""), c.getString(2))
+    }.toMap
+
+  def setPlaceRegion(id: Long, city: String, country: String): Unit =
+    val cv = ContentValues()
+    cv.put("city", city)
+    cv.put("country", country)
+    w.update("places", cv, "id=?", Array(id.toString))
+
+  /** Approximate area names ("三軒茶屋付近") for places the user has not named. */
+  def placeAreas(): Map[Long, String] =
+    query("SELECT id, area FROM places WHERE area IS NOT NULL")(c => c.getLong(0) -> c.getString(1)).toMap
+
+  def setPlaceArea(id: Long, area: String): Unit =
+    val cv = ContentValues()
+    cv.put("area", area)
+    w.update("places", cv, "id=?", Array(id.toString))
+
+  /** One fix per time bucket, for drawing long periods cheaply. */
+  def fixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
+    query(
+      s"SELECT MIN(time), lat, lon FROM fixes WHERE time>=? AND time<? AND (acc IS NULL OR acc<100) GROUP BY time/$bucketMs ORDER BY 1",
+      from,
+      to
+    )(c => Fix(c.getLong(0), c.getDouble(1), c.getDouble(2)))
+
+  def firstFixTime(): Option[Long] =
+    query("SELECT MIN(time) FROM fixes")(c => if c.isNull(0) then None else Some(c.getLong(0))).head
+
+  /** Days (epoch-day numbers in the given offset) that have any fix, for calendar dots. */
+  def daysWithData(from: Long, to: Long, offsetMs: Long): Set[Long] =
+    query(s"SELECT DISTINCT (time+$offsetMs)/86400000 FROM fixes WHERE time>=? AND time<?", from, to)(_.getLong(0)).toSet
+
+  // --- sync ---------------------------------------------------------------------
+
+  def syncValue(name: String): Long =
+    query("SELECT value FROM sync_state WHERE name=?", name)(_.getLong(0)).headOption.getOrElse(0L)
+
+  def setSyncValue(name: String, v: Long): Unit =
+    w.execSQL("INSERT OR REPLACE INTO sync_state(name, value) VALUES(?, ?)", Array[AnyRef](name, java.lang.Long.valueOf(v)))
+
+  private def rowJson(c: Cursor, cols: Seq[(String, String)], offset: Int): ujson.Obj =
+    val o = ujson.Obj()
+    for ((_, field), i) <- cols.zipWithIndex do
+      val k = i + offset
+      c.getType(k) match
+        case Cursor.FIELD_TYPE_NULL    => ()
+        case Cursor.FIELD_TYPE_INTEGER => o(field) = ujson.Num(c.getLong(k).toDouble)
+        case Cursor.FIELD_TYPE_FLOAT   => o(field) = ujson.Num(c.getDouble(k))
+        case _                         => o(field) = ujson.Str(c.getString(k))
+    o
+
+  /** Append-only tables: rows with rowid above the cursor, simulated data excluded. */
+  def rowsAfter(table: String, rowid: Long, limit: Int): Vector[(Long, ujson.Obj)] =
+    val cols = Db.SyncColumns(table)
+    val notSim = table match
+      case "fixes"  => " AND (provider IS NULL OR provider<>'sim')"
+      case "motion" => " AND (src IS NULL OR src<>'sim')"
+      case _        => ""
+    query(s"SELECT rowid, ${cols.map(_._1).mkString(",")} FROM $table WHERE rowid>?$notSim ORDER BY rowid LIMIT $limit", rowid) { c =>
+      (c.getLong(0), rowJson(c, cols, 1))
+    }
+
+  /** Editable tables: rows changed after the watermark. */
+  def rowsUpdatedAfter(table: String, updatedAt: Long, limit: Int): Vector[(Long, ujson.Obj)] =
+    val cols = Db.SyncColumns(table)
+    query(s"SELECT rowid, ${cols.map(_._1).mkString(",")} FROM $table WHERE updated_at>? ORDER BY updated_at LIMIT $limit", updatedAt) { c =>
+      (c.getLong(0), rowJson(c, cols, 1))
+    }
+
+  def pendingGnssFiles(): Vector[(Long, String)] =
+    query("SELECT rowid, file FROM gnss_sessions WHERE uploaded=0 ORDER BY rowid")(c => (c.getLong(0), c.getString(1)))
+
+  def markGnssUploaded(rowid: Long): Unit =
+    w.execSQL("UPDATE gnss_sessions SET uploaded=1 WHERE rowid=?", Array[AnyRef](java.lang.Long.valueOf(rowid)))
+
   /** Removes data inserted by the simulator (debug tool). */
   def deleteSimulated(): Int = tx { db =>
     db.delete("fixes", "provider='sim'", null) + db.delete("motion", "src='sim'", null)
@@ -224,4 +320,18 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   }
 
 object Db:
-  val Version = 1
+  val Version = 2
+
+  /** Column -> JSON field mapping per synced table (docs/sync-protocol.md). */
+  val SyncColumns: Map[String, Seq[(String, String)]] = Map(
+    "fixes" -> Seq("time" -> "t", "lat" -> "lat", "lon" -> "lon", "acc" -> "acc", "alt" -> "alt", "speed" -> "spd",
+      "bearing" -> "brg", "provider" -> "src"),
+    "motion" -> Seq("start" -> "s", "end" -> "e", "std" -> "std", "mean" -> "mean", "steps" -> "steps"),
+    "battery" -> Seq("time" -> "t", "pct" -> "pct", "charging" -> "chg", "screen_on" -> "scr"),
+    "places" -> Seq("id" -> "id", "lat" -> "lat", "lon" -> "lon", "radius" -> "r", "name" -> "name", "kind" -> "kind",
+      "external_id" -> "ext", "updated_at" -> "updatedAt"),
+    "checkins" -> Seq("id" -> "id", "time" -> "t", "lat" -> "lat", "lon" -> "lon", "venue" -> "venue", "category" -> "cat",
+      "external_id" -> "ext", "place_id" -> "place", "comment" -> "comment", "private" -> "private",
+      "updated_at" -> "updatedAt"),
+    "mode_overrides" -> Seq("start" -> "s", "end" -> "e", "mode" -> "mode", "updated_at" -> "updatedAt")
+  )

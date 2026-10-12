@@ -32,6 +32,25 @@ class TimelineE2ESuite extends munit.FunSuite:
     assert(reports.map(_.familyAccuracy).sum / reports.size >= 0.8)
   }
 
+  test("spike removal drops single outliers but keeps fast straight motion") {
+    val base = Fix(0, 35.0, 139.0)
+    def at(t: Long, dn: Double, de: Double) = base.copy(time = t, lat = 35.0 + dn / 111_320, lon = 139.0 + de / 91_000)
+    val walk = Vector(at(0, 0, 0), at(10, 10, 0), at(20, 300, 300), at(30, 20, 0), at(40, 30, 0))
+    assertEquals(Geo.removeSpikes(walk).size, 4)
+    val train = (0 until 5).map(i => at(i * 5L, i * 150.0, 0))
+    assertEquals(Geo.removeSpikes(train).size, 5)
+  }
+
+  test("a position jump across the world is not counted as travel") {
+    val out = TrajectorySimulator.run(Scenarios.commute())
+    // Fixes from another continent in the middle of the day (e.g. emulator default).
+    val mid = out.fixes(out.fixes.size / 2).time
+    val far = (0 until 20).map(i => Fix(mid + i * 1000L + 1, 37.42, -122.08, 10f))
+    val segs = TimelineBuilder.build((out.fixes ++ far).sortBy(_.time), out.motion)
+    val dist = segs.collect { case t: Trip => t.distanceM }.sum
+    assert(dist < 60_000, s"distance $dist")
+  }
+
   test("timeline alternates visits and trips in time order") {
     val (_, segments, _) = runScenario(Scenarios.commute())
     segments.sliding(2).foreach { case Seq(a, b) =>

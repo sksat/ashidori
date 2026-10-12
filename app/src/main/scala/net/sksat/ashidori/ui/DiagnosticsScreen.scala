@@ -23,24 +23,35 @@ import Ui.*
   */
 final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private given Ctx = act
+  override val title = "端末診断"
   private lazy val lm = act.getSystemService(classOf[LocationManager])
   private lazy val sm = act.getSystemService(classOf[SensorManager])
   private val sections = mutable.LinkedHashMap.empty[String, String]
   private val body = mono("")
   private val probeButton = button("GNSS 60秒テスト（屋外で）", tonal = true)(runProbe())
 
+  private val debuggable =
+    (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
   val view: View =
     scroll(
       vbox(
         card(
-          text("端末診断", 18f, bold = true),
-          caption("結果は「レポートをコピー」でまとめてコピーできます。"),
-          spacer(8),
-          button("レポートをコピー")(copy()),
-          probeButton,
-          outlined("シミュレーションの1日分を昨日に投入")(insertSim()),
-          outlined("シミュレーションデータを削除")(deleteSim()),
-          outlined("戻る")(act.closeDiagnostics())
+          (Seq(
+            text("端末診断", 18f, bold = true),
+            caption("結果は「レポートをコピー」でまとめてコピーできます。"),
+            spacer(8),
+            button("レポートをコピー")(copy()),
+            probeButton
+          ) ++ (
+            // Simulated data is a development aid; keep it out of normal builds.
+            if debuggable then
+              Seq(
+                outlined("シミュレーションの1日分を昨日に投入")(insertSim()),
+                outlined("シミュレーションデータを削除")(deleteSim())
+              )
+            else Nil
+          ))*
         ),
         card(body),
         spacer(24)
@@ -59,7 +70,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     AshidoriApp.io.execute(() =>
       val r = simE2E()
       act.runOnUiThread(() =>
-        sections("sim-e2e") = r
+        // Runs the timeline algorithm on synthetic data to check that the
+        // shrunk Scala code behaves on this device's runtime as on the JVM.
+        sections("アルゴリズム自己テスト（合成データ、実際の記録とは無関係）") = r
         render()
       )
     )
@@ -85,11 +98,12 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       s"hw=${lm.getGnssHardwareModelName} year=${lm.getGnssYearOfHardware}",
       s"providers=${lm.getAllProviders.asScala.mkString(",")} fused=${lm.hasProvider(LocationManager.FUSED_PROVIDER)}",
       s"measurements=${c.hasMeasurements} navMessages=${c.hasNavigationMessages} antennaInfo=${c.hasAntennaInfo}",
-      s"measurementCorrections=${c.hasMeasurementCorrections} satellitePvt=${c.hasSatellitePvt}",
-      s"correlationVectors=${c.hasMeasurementCorrelationVectors} lowPowerMode=${c.hasLowPowerMode}",
-      s"adr=${Try(c.hasAccumulatedDeltaRange).getOrElse("?")}"
+      s"measurementCorrections=${c.hasMeasurementCorrections} satellitePvt=${c.hasSatellitePvt} lowPowerMode=${c.hasLowPowerMode}"
     )
-    val types = Try(c.getGnssSignalTypes.asScala.toSeq).getOrElse(Nil)
+    // API 34+ only. NoSuchMethodError is fatal for scala.util.Try, so check the SDK level.
+    if Build.VERSION.SDK_INT >= 34 then
+      lines += s"correlationVectors=${c.hasMeasurementCorrelationVectors} adr=${c.hasAccumulatedDeltaRange}"
+    val types = if Build.VERSION.SDK_INT >= 34 then c.getGnssSignalTypes.asScala.toSeq else Nil
     lines += "signalTypes=" + types
       .map(t => s"${Constellations.name(t.getConstellationType)}:${bandOf(t.getCarrierFrequencyHz)}${t.getCodeType}")
       .distinct

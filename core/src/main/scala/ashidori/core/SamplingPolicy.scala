@@ -190,7 +190,7 @@ object DrainEstimator:
     val recent = samples.filter(_.time >= now - windowMs).sortBy(_.time)
     var dur = 0L
     var drop = 0.0
-    for Seq(a, b) <- recent.sliding(2) if a.time < b.time do
+    for case Seq(a, b) <- recent.sliding(2) if a.time < b.time do
       if !a.charging && !b.charging && !a.screenOn && !b.screenOn then
         dur += b.time - a.time
         drop += math.max(0, a.pct - b.pct)

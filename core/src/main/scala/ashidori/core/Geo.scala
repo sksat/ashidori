@@ -47,6 +47,27 @@ object Geo:
       slon += f.lon * w
     def result: LatLng = LatLng(slat / sw, slon / sw)
 
+  /** Drops single-fix excursions ("spikes"): a fix that jumps far from its
+    * neighbours while the neighbours themselves are close together. Fast
+    * straight movement is kept because there the neighbours are far apart too.
+    */
+  def removeSpikes(path: IndexedSeq[Fix], minJumpM: Double = 80.0): Vector[Fix] =
+    if path.size < 3 then path.toVector
+    else
+      val out = Vector.newBuilder[Fix]
+      out += path.head
+      for i <- 1 until path.size - 1 do
+        val a = path(i - 1)
+        val b = path(i)
+        val c = path(i + 1)
+        val ab = distance(a, b)
+        val bc = distance(b, c)
+        val ac = distance(a, c)
+        val spike = ab > minJumpM && bc > minJumpM && ac < math.min(ab, bc) * 0.5
+        if !spike then out += b
+      out += path.last
+      out.result()
+
   /** Douglas-Peucker simplification with tolerance in metres, for drawing long tracks. */
   def simplify(path: IndexedSeq[Fix], toleranceM: Double): Vector[Fix] =
     if path.size <= 2 then path.toVector

@@ -1,55 +1,164 @@
 package net.sksat.ashidori.ui
 
-import android.app.DatePickerDialog
-import android.view.{Gravity, View}
-import android.widget.{LinearLayout, TextView}
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import java.time.{Instant, LocalDate}
+import android.content.Context
+import android.graphics.{Canvas, Paint}
+import android.os.Bundle
+import android.view.{GestureDetector, Gravity, MotionEvent, View, ViewGroup}
+import android.widget.{FrameLayout, LinearLayout}
+import com.google.android.material.datepicker.{CalendarConstraints, DateValidatorPointBackward, MaterialDatePicker}
+import java.time.{Instant, LocalDate, ZoneOffset}
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import net.sksat.ashidori.*
 import ashidori.core.*
 import Ui.*
 
-/** Day view: summary, then alternating visit and trip cards. */
-final class TimelineScreen(act: MainActivity) extends Screen:
+/** Vertical rail connecting timeline entries: a dot for visits, a line for trips. */
+final class RailView(c: Context, val visit: Boolean, col: Int, top: Boolean, bottom: Boolean) extends View(c):
+  private given Context = c
+  private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+  setLayoutParams(LinearLayout.LayoutParams(Ui.dp(28), ViewGroup.LayoutParams.MATCH_PARENT))
+  override def onDraw(canvas: Canvas): Unit =
+    val cx = getWidth / 2f
+    p.setColor(col)
+    p.setStrokeWidth(Ui.dp(if visit then 2 else 4).toFloat)
+    val cy = Ui.dp(22).toFloat
+    if top then canvas.drawLine(cx, 0, cx, cy, p)
+    if bottom then canvas.drawLine(cx, cy, cx, getHeight.toFloat, p)
+    if visit then
+      p.setStyle(Paint.Style.FILL)
+      canvas.drawCircle(cx, cy, Ui.dp(7).toFloat, p)
+      p.setColor(Ui.color(Ui.attr.surface))
+      canvas.drawCircle(cx, cy, Ui.dp(3).toFloat, p)
+
+/** Day view: map of the day on top, the day's visits and trips below.
+  * Swipe left/right or use the arrows to change day; tap the date for a calendar.
+  */
+final class TimelineScreen(act: MainActivity, saved: Bundle) extends Screen:
   private given Ctx = act
-  private val timeFmt = DateTimeFormatter.ofPattern("HH:mm")
+  private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
+  private var current: Option[DayTimeline] = None
+
+  private val map = TrackMap(act, saved)
 
   private val dateLabel = text("", 18f, bold = true)
   private val summary = hbox()
   private val list = vbox()
+
+  private def arrow(label: String)(f: => Unit) =
+    val b = outlined(label)(f)
+    b.setStrokeWidth(0)
+    b.setMinWidth(dp(48))
+    b
+
   private val header =
-    val prev = outlined("◀")(shift(-1))
-    val next = outlined("▶")(shift(1))
+    val prev = arrow("◀")(shift(-1))
+    val next = arrow("▶")(shift(1))
+    prev.setContentDescription("前の日")
+    next.setContentDescription("次の日")
     dateLabel.setGravity(Gravity.CENTER)
     dateLabel.setLayoutParams(weighted())
+    dateLabel.setMinHeight(dp(48))
+    dateLabel.setContentDescription("日付を選ぶ")
     dateLabel.setOnClickListener(_ => pickDate())
-    padded(hbox(prev, dateLabel, next), 12, 8)
+    padded(hbox(prev, dateLabel, next), 12, 4)
 
-  val view: View = vbox(header, scroll(vbox(card(summary), list, spacer(24))))
+  /** The day's list lives in a bottom sheet over a full-height map, like
+    * Google Maps: drag it down to see more map, up to read the list.
+    */
+  private val scroller =
+    val s = androidx.core.widget.NestedScrollView(act)
+    s.addView(vbox(summary, list, spacer(96)))
+    s
+  private val sheet =
+    val handle = View(act)
+    val d = android.graphics.drawable.GradientDrawable()
+    d.setCornerRadius(dp(2).toFloat)
+    d.setColor(color(attr.outlineVariant))
+    handle.setBackground(d)
+    val hlp = LinearLayout.LayoutParams(dp(32), dp(4))
+    hlp.gravity = Gravity.CENTER_HORIZONTAL
+    hlp.setMargins(0, dp(10), 0, dp(6))
+    handle.setLayoutParams(hlp)
+    val bg = android.graphics.drawable.GradientDrawable()
+    bg.setCornerRadii(Array(dp(24), dp(24), dp(24), dp(24), 0, 0, 0, 0).map(_.toFloat))
+    bg.setColor(color(attr.surface))
+    val v = vbox(handle, scroller)
+    v.setBackground(bg)
+    v.setElevation(dp(6).toFloat)
+    scroller.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+    v
+  private val behavior = com.google.android.material.bottomsheet.BottomSheetBehavior[LinearLayout]()
+
+  val view: View =
+    val coord = androidx.coordinatorlayout.widget.CoordinatorLayout(act)
+    coord.addView(map.view, androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    slp.setBehavior(behavior)
+    coord.addView(sheet, slp)
+    behavior.setFitToContents(false)
+    behavior.setHalfExpandedRatio(0.5f)
+    behavior.setPeekHeight(dp(120))
+    behavior.setHideable(false)
+    behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_HALF_EXPANDED)
+    coord.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+    // Fit the day's route into the part of the map the sheet does not cover.
+    coord.addOnLayoutChangeListener((_, _, top, _, bottom, _, _, _, _) => map.bottomInset = ((bottom - top) * 0.5).toInt)
+    behavior.addBottomSheetCallback(new com.google.android.material.bottomsheet.BottomSheetBehavior.BottomSheetCallback:
+      override def onStateChanged(v: View, state: Int): Unit =
+        map.bottomInset = math.max(0, coord.getHeight - v.getTop)
+      override def onSlide(v: View, offset: Float): Unit = ()
+    )
+    val v = vbox(header, coord)
+    installSwipe()
+    v
+
+  /** Lower the sheet so the map shows what was just tapped. */
+  private def revealMap(): Unit =
+    behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_COLLAPSED)
+
+  map.onMarkerClick = (layer, key) =>
+    if layer == "visit" then
+      current.foreach { tl =>
+        tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).foreach(openVisit(_, tl))
+      }
 
   override def onShow(): Unit = load()
 
+  private def installSwipe(): Unit =
+    val detector = GestureDetector(act, new GestureDetector.SimpleOnGestureListener:
+      override def onFling(e1: MotionEvent, e2: MotionEvent, vx: Float, vy: Float): Boolean =
+        if e1 != null && math.abs(vx) > math.abs(vy) * 2 && math.abs(e2.getX - e1.getX) > dp(80) then
+          shift(if vx < 0 then 1 else -1)
+          true
+        else false
+    )
+    scroller.setOnTouchListener((_, e) => { detector.onTouchEvent(e); false })
+
   private def shift(days: Int): Unit =
-    act.selectedDate = act.selectedDate.plusDays(days)
-    load()
+    val today = LocalDate.now(AshidoriApp.zone)
+    val d = act.selectedDate.plusDays(days)
+    if !d.isAfter(today) then
+      act.selectedDate = d
+      load()
 
   private def pickDate(): Unit =
-    val d = act.selectedDate
-    DatePickerDialog(act, (_, y, m, dd) => {
-      act.selectedDate = LocalDate.of(y, m + 1, dd)
+    val picker = MaterialDatePicker.Builder.datePicker()
+      .setTitleText("日付を選ぶ")
+      .setSelection(act.selectedDate.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
+      .setCalendarConstraints(CalendarConstraints.Builder().setValidator(DateValidatorPointBackward.now()).build())
+      .build()
+    picker.addOnPositiveButtonClickListener(sel => {
+      act.selectedDate = Instant.ofEpochMilli(sel).atZone(ZoneOffset.UTC).toLocalDate
       load()
-    }, d.getYear, d.getMonthValue - 1, d.getDayOfMonth).show()
+    })
+    picker.show(act.getSupportFragmentManager, "date")
 
   def load(): Unit =
     val date = act.selectedDate
-    dateLabel.setText(
-      (if date == LocalDate.now(AshidoriApp.zone) then "今日 " else "") + date.format(dateFmt)
-    )
-    list.removeAllViews()
-    list.addView(padded(caption("読み込み中…"), 16, 8))
+    val today = LocalDate.now(AshidoriApp.zone)
+    dateLabel.setText((if date == today then "今日 " else if date == today.minusDays(1) then "昨日 " else "") + date.format(dateFmt))
     AshidoriApp.io.execute { () =>
       val tl = TimelineRepo.day(date)
       act.runOnUiThread(() => if act.selectedDate == date then render(tl))
@@ -58,69 +167,128 @@ final class TimelineScreen(act: MainActivity) extends Screen:
   private def time(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
 
   private def stat(value: String, label: String): View =
-    val v = vbox(text(value, 18f, bold = true), caption(label))
+    val v = vbox(text(value, 20f, bold = true), caption(label))
     v.setGravity(Gravity.CENTER)
     v.setLayoutParams(weighted())
     v
 
   private def render(tl: DayTimeline): Unit =
+    current = Some(tl)
     summary.removeAllViews()
     summary.addView(stat(f"${tl.summary.steps}%,d", "歩数"))
-    summary.addView(stat(fmtDistance(tl.summary.totalDistanceM), "移動距離"))
+    summary.addView(stat(fmtDistance(tl.summary.totalDistanceM), "移動"))
     summary.addView(stat(tl.summary.visits.toString, "滞在"))
-    list.removeAllViews()
-    if tl.segments.isEmpty then
-      list.addView(card(text("この日の記録はありません", 15f), caption("ロガー画面で記録を開始してください。")))
-    for s <- tl.segments do
-      s match
-        case v: Visit => list.addView(visitCard(v, tl))
-        case t: Trip  => list.addView(tripCard(t))
+    padded(summary, 8, 8)
 
-  private def visitCard(v: Visit, tl: DayTimeline): View =
+    val trips = tl.segments.collect { case t: Trip => t }
+    map.setData(
+      trips.map(t => Geo.simplify(t.path, 4)),
+      tl.segments.collect { case v: Visit => MapMarker(v.latLng, v.start.toString) },
+      tl.checkIns.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName))
+    )
+
+    list.removeAllViews()
+    if tl.segments.isEmpty then list.addView(emptyState(tl.date))
+    val n = tl.segments.size
+    for (s, i) <- tl.segments.zipWithIndex do
+      s match
+        case v: Visit => list.addView(visitRow(v, tl, i > 0, i < n - 1))
+        case t: Trip  => list.addView(tripRow(t, i > 0, i < n - 1))
+
+  private def emptyState(date: LocalDate): View =
+    if LoggerState.running then
+      card(
+        text(if date == LocalDate.now(AshidoriApp.zone) then "記録を始めました" else "この日の記録はありません", 16f, bold = true),
+        caption("移動や滞在が検出されると、ここに表示されます。")
+      )
+    else
+      card(
+        text("記録が止まっています", 16f, bold = true),
+        caption("記録を始めると、訪れた場所と移動がここに自動で並びます。"),
+        spacer(8),
+        button("記録を始める")(act.startLogging())
+      )
+
+  private def withRail(rail: RailView, content: View): View =
+    content.setLayoutParams(weighted())
+    val row = hbox(rail, content)
+    row.setGravity(Gravity.TOP)
+    padded(row, 8, 0)
+
+  private def visitRow(v: Visit, tl: DayTimeline, top: Boolean, bottom: Boolean): View =
     val place = v.placeId.flatMap(tl.places.get)
-    val name = place.map(_.displayName).getOrElse(f"${v.lat}%.4f, ${v.lon}%.4f")
-    val title = text(s"📍 $name", 16f, bold = true)
-    val sub = caption(s"${time(v.start)} – ${time(v.end)}・${fmtDuration(v.durationMs)}")
+    val name = place.map(_.displayName).getOrElse("不明な場所")
     val chips = hbox()
     place.filter(_.kind != PlaceKind.Other).foreach { p =>
       chips.addView(chip(p.kind.label, color(attr.secondaryContainer), color(attr.onSurface)))
     }
-    tl.checkIns.filter(c => c.time >= v.start && c.time <= v.end).foreach { c =>
+    tl.checkIns.filter(c => c.time >= v.start - 60_000 && c.time <= v.end + 60_000).foreach { c =>
       chips.addView(chip(s"✓ ${c.venueName}", color(attr.primaryContainer), color(attr.onPrimaryContainer)))
     }
-    if v.confidence < 0.6 then chips.addView(chip("この場所で合ってる?", color(attr.surfaceContainerHigh), color(attr.onSurfaceVariant)))
-    val c = card(title, sub, chips)
-    c.setOnClickListener(_ => act.renamePlace(place, () => load()))
-    c
+    if place.forall(_.name.isEmpty) || v.confidence < 0.6 then
+      chips.addView(chip("場所を確認", color(attr.surfaceContainerHigh), color(attr.primary)))
+    val body = vbox(
+      text(name, 16f, bold = true),
+      caption(
+        s"${time(v.start)} – ${time(v.end)}・${fmtDuration(v.durationMs)}" +
+          // Say so when the position is only roughly known.
+          (if v.radius > 80 then s"・範囲 約${(v.radius / 10).round * 10}m" else "")
+      ),
+      chips
+    )
+    padded(body, 8, 10)
+    body.setMinimumHeight(dp(56))
+    body.setBackgroundResource(android.R.drawable.list_selector_background)
+    body.setOnClickListener(_ => openVisit(v, tl))
+    withRail(RailView(act, true, color(attr.primary), top, bottom), body)
 
-  private def tripCard(t: Trip): View =
-    val rows = t.legs.filter(_.mode != TransportMode.Still).map { l =>
-      val label = text(s"${l.mode.emoji} ${l.mode.label}", 15f, bold = true)
+  private def openVisit(v: Visit, tl: DayTimeline): Unit =
+    revealMap()
+    map.focus(v.latLng)
+    v.placeId.flatMap(tl.places.get).foreach { p =>
+      PlaceSheet(act, p, Some(v), () => load()).show()
+    }
+
+  private def tripRow(t: Trip, top: Boolean, bottom: Boolean): View =
+    val legs = t.legs.filter(_.mode != TransportMode.Still)
+    val rows = legs.map { l =>
+      val label = text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f)
       label.setLayoutParams(weighted())
       val detail = caption(
-        s"${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" +
-          (if l.steps > 0 then f"・${l.steps}%,d歩" else "") +
-          (if l.confidence < 0.5 then "・?" else "")
+        s"${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" + (if l.steps > 0 then f"・${l.steps}%,d歩" else "")
       )
-      val row = padded(hbox(label, detail), 0, 4)
-      row.setOnClickListener(_ => pickMode(l))
+      val row = hbox(label, detail)
+      row.setMinimumHeight(dp(48))
+      row.setBackgroundResource(android.R.drawable.list_selector_background)
+      row.setContentDescription(s"${l.mode.label} ${fmtDistance(l.distanceM)}。タップで移動手段を変更")
+      row.setOnClickListener { _ =>
+        revealMap()
+        map.highlight(t.path.filter(f => f.time >= l.start && f.time <= l.end))
+        pickMode(l)
+      }
       row
     }
-    val head = caption(s"${time(t.start)} – ${time(t.end)}・${fmtDuration(t.durationMs)}・${fmtDistance(t.distanceM)}")
-    val c = card((head +: rows)*)
-    c.setCardBackgroundColor(color(attr.surface))
-    c.setStrokeWidth(dp(1))
-    c.setStrokeColor(color(attr.outlineVariant))
-    c
+    val body = vbox((caption(s"${time(t.start)} – ${time(t.end)}・${fmtDuration(t.durationMs)}") +: rows)*)
+    padded(body, 8, 6)
+    withRail(RailView(act, false, color(attr.outlineVariant), top, bottom), body)
 
   private def pickMode(l: Leg): Unit =
     val modes = TransportMode.values.filter(m => m != TransportMode.Still && m != TransportMode.Unknown)
-    MaterialAlertDialogBuilder(act)
-      .setTitle("移動手段を変更")
-      .setItems(modes.map(m => s"${m.emoji} ${m.label}": CharSequence), (_, i) => {
+    val dialog = com.google.android.material.bottomsheet.BottomSheetDialog(act)
+    val items = modes.map { m =>
+      val t = text(s"${m.emoji}  ${m.label}" + (if m == l.mode then "（現在）" else ""), 16f, bold = m == l.mode)
+      t.setMinHeight(dp(52))
+      t.setGravity(Gravity.CENTER_VERTICAL)
+      t.setBackgroundResource(android.R.drawable.list_selector_background)
+      t.setOnClickListener { _ =>
+        dialog.dismiss()
         AshidoriApp.io.execute { () =>
-          AshidoriApp.db.setModeOverride(l.start, l.end, modes(i))
+          AshidoriApp.db.setModeOverride(l.start, l.end, m)
+          TimelineRepo.invalidate()
           act.runOnUiThread(() => load())
         }
-      })
-      .show()
+      }
+      t
+    }
+    dialog.setContentView(scroll(padded(vbox((text("移動手段を変更", 20f, bold = true) +: items.toSeq)*), 20, 12)))
+    dialog.show()
