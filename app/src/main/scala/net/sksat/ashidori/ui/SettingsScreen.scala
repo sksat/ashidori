@@ -44,7 +44,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     list.addView(item("サーバ同期（エンドツーエンド暗号化）", syncState)(act.push(SyncSettingsScreen(act))))
 
     list.addView(section("データ"))
-    list.addView(item("エクスポート・インポート", "Timeline.json（Google 互換）、GPX")(act.push(DataScreen(act))))
+    list.addView(item("エクスポート・インポート", "期間指定: Timeline.json・GPX・Parquet・GNSS ログ")(act.push(DataScreen(act))))
 
     list.addView(section("開発者向け"))
     list.addView(item("端末診断", "GNSS とセンサーの能力、自己テスト、レポートのコピー")(act.push(DiagnosticsScreen(act))))
