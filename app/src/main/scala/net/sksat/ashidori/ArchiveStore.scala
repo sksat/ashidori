@@ -111,7 +111,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       val dest = file(Archive.dayFile(t, d))
       // Late data for an already archived day: merge with what is there.
       val existing = load(dest).toSeq.flatMap(_.rowIterator.map(_.toSeq))
-      val all = (existing ++ rows).sortBy(_(0) match
+      // Exact repeats (an import or a re-sent batch) are dropped.
+      val all = (existing ++ rows).distinct.sortBy(_(0) match
         case l: Long => l
         case _       => Long.MaxValue
       )

@@ -255,6 +255,14 @@ class MainActivity extends AppCompatActivity:
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
 
+  /** A day on the タイムライン tab (日), from the map. */
+  def openTimeline(d: LocalDate): Unit =
+    stack.clear()
+    tabs(MainActivity.TabFeed) match
+      case f: FeedScreen => f.showFrom(d)
+      case _             => ()
+    if tabId == MainActivity.TabFeed then show(tabs(tabId)) else nav.setSelectedItemId(MainActivity.TabFeed)
+
   /** Week / month / year summary, pushed over the current tab. */
   private lazy val periodScreen = TimelineScreen(this, null, Seq(Span.Week, Span.Month, Span.Year))
   def openPeriod(span: Span, d: LocalDate): Unit =
@@ -290,6 +298,9 @@ class MainActivity extends AppCompatActivity:
     s.onShow()
 
   def registerMap(m: TrackMap): Unit = maps += m
+
+  /** A pushed screen whose title depends on its state calls this when it changes. */
+  def updateTitle(): Unit = if stack.nonEmpty then current.foreach(s => toolbar.setTitle(s.title))
 
   /** Check-in is about "now": the timeline hides it for week/month/year. */
   def setCheckInVisible(v: Boolean): Unit =

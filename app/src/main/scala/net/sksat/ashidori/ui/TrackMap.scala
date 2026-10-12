@@ -123,9 +123,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       style.addLayer(
         LineLayer("track-dashed", "track").withProperties(
           PropertyFactory.lineColor(Expression.toColor(Expression.coalesce(Expression.get("color"), Expression.literal(TrackMap.DefaultLine)))),
+          // Faded rather than dashed: line-dasharray did not render with
+          // data-driven colors (seen on the emulator's GL).
           PropertyFactory.lineWidth(3f),
-          PropertyFactory.lineOpacity(0.7f),
-          PropertyFactory.lineDasharray(Array[java.lang.Float](2f, 2f))
+          PropertyFactory.lineOpacity(0.4f)
         ).withFilter(Expression.eq(Expression.get("dashed"), Expression.literal(true)))
       )
       style.addLayer(
@@ -241,11 +242,23 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     }.asJava)
 
   private def lines(paths: Seq[MapPath]): FeatureCollection =
-    FeatureCollection.fromFeatures(paths.filter(_.points.size >= 2).map { p =>
+    // A line that collapses to one point is invalid geometry, and MapLibre
+    // then drops the line layer's tile: zoomed out over a week or a month,
+    // short legs do exactly that. Merge points too close to tell apart at the
+    // scale of everything drawn, and skip lines left with a single point.
+    val all = paths.flatMap(_.points)
+    val minGap =
+      if all.isEmpty then 0.0
+      else
+        val diag = Geo.distance(all.map(_.lat).min, all.map(_.lon).min, all.map(_.lat).max, all.map(_.lon).max)
+        math.max(0.5, diag / 2000)
+    def thinned(ps: Seq[Fix]) =
+      ps.foldLeft(Vector.empty[Fix])((acc, f) => if acc.lastOption.exists(l => Geo.distance(l, f) < minGap) then acc else acc :+ f)
+    FeatureCollection.fromFeatures(paths.map(p => p -> thinned(p.points)).filter(_._2.size >= 2).map { (p, pts) =>
       val props = JsonObject()
       props.addProperty("color", p.color)
       props.addProperty("dashed", p.dashed)
-      Feature.fromGeometry(LineString.fromLngLats(p.points.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
+      Feature.fromGeometry(LineString.fromLngLats(pts.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
     }.asJava)
 
   /** Replaces all data. `fit` moves the camera to show everything. */
