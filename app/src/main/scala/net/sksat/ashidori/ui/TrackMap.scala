@@ -6,8 +6,6 @@ import android.view.{Gravity, ViewGroup}
 import android.widget.FrameLayout
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.gson.JsonObject
-import org.maplibre.android.location.{LocationComponentActivationOptions, LocationComponentOptions}
-import org.maplibre.android.location.modes.RenderMode
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.{LatLng as MLatLng, LatLngBounds}
@@ -303,28 +301,46 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
         }
     }
 
+  /** The current-position marker is drawn by us (not MapLibre's animated
+    * LocationComponent), so it moves in the same frame as the live route line.
+    */
   private def enableMyLocation(m: MapLibreMap, style: Style): Unit =
-    try
-      val lc = m.getLocationComponent
-      lc.activateLocationComponent(
-        LocationComponentActivationOptions.builder(act, style)
-          .useDefaultLocationEngine(false)
-          .locationComponentOptions(LocationComponentOptions.builder(act).accuracyAlpha(0.15f).build())
-          .build()
+    style.addSource(GeoJsonSource("me"))
+    // Accuracy circle: radius in metres converted to pixels for the zoom
+    // (exponential base 2, i.e. pixels double per zoom level).
+    style.addLayer(
+      CircleLayer("me-accuracy", "me").withProperties(
+        PropertyFactory.circleColor("#1a73e8"),
+        PropertyFactory.circleOpacity(0.15f),
+        PropertyFactory.circleRadius(
+          Expression.interpolate(Expression.exponential(2), Expression.zoom(),
+            Expression.stop(0, Expression.division(Expression.get("acc"), Expression.literal(78271.5))),
+            Expression.stop(22, Expression.division(Expression.get("acc"), Expression.literal(0.0187))))
+        )
       )
-      lc.setLocationComponentEnabled(true)
-      lc.setRenderMode(RenderMode.NORMAL)
-      myLocation.orElse(LoggerState.lastFix.map(TrackMap.toLocation)).foreach(lc.forceLocationUpdate)
-    catch case e: Exception => Log.w("location component unavailable", e)
+    )
+    style.addLayer(
+      CircleLayer("me-dot", "me").withProperties(
+        PropertyFactory.circleColor("#1a73e8"),
+        PropertyFactory.circleRadius(7f),
+        PropertyFactory.circleStrokeColor("#ffffff"),
+        PropertyFactory.circleStrokeWidth(2.5f)
+      )
+    )
+    myLocation.orElse(LoggerState.lastFix.map(TrackMap.toLocation)).foreach(l => drawMe(style, l))
+
+  private def drawMe(style: Style, l: Location): Unit =
+    val props = JsonObject()
+    // Metres per pixel shrink with cos(latitude); scale the radius to match.
+    val acc = if l.hasAccuracy then l.getAccuracy.toDouble else 0.0
+    props.addProperty("acc", acc / math.cos(math.toRadians(l.getLatitude)))
+    Option(style.getSourceAs[GeoJsonSource]("me")).foreach(
+      _.setGeoJson(Feature.fromGeometry(Point.fromLngLat(l.getLongitude, l.getLatitude), props))
+    )
 
   def updateMyLocation(l: Location): Unit =
     myLocation = Some(l)
-    map.foreach { (m, _) =>
-      try
-        val lc = m.getLocationComponent
-        if lc.isLocationComponentActivated then lc.forceLocationUpdate(l)
-      catch case _: Exception => ()
-    }
+    map.foreach((_, style) => drawMe(style, l))
 
   /** Centers on the latest position; asks for one fix if the logger has none. */
   def goToMyLocation(): Unit =

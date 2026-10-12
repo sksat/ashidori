@@ -42,6 +42,24 @@ class ParquetSuite extends munit.FunSuite:
     assertEquals(enc.toSeq.map(_ & 0xff), Seq(6, 1, 2, 0, 2, 1), "rle runs")
   }
 
+  test("reader round-trips what the writer wrote, across row groups and nulls") {
+    val bo = ByteArrayOutputStream()
+    writeTo(bo, 2345, 1000)
+    val t = ParquetReader.read(bo.toByteArray)
+    assertEquals(t.rows, 2345)
+    assertEquals(t.columns, schema)
+    val expected = rows(2345)
+    for (row, i) <- t.rowIterator.zipWithIndex do
+      val e = expected(i)
+      assertEquals(row(0), e(0))
+      assertEquals(row(1), e(1))
+      e(2) match
+        case f: Float if f.isNaN => assertEquals(row(2), null)
+        case f                   => assertEquals(row(2), f)
+      assertEquals(row(3), e(3))
+      assertEquals(row(4), e(4))
+  }
+
   test("write a file for external read-back when requested") {
     sys.env.get("ASHIDORI_PARQUET_OUT").foreach { path =>
       Using.resource(FileOutputStream(File(path)))(o => writeTo(o, 120_000, 50_000))

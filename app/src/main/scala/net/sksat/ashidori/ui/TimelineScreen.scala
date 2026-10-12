@@ -181,7 +181,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     */
   private def updateLiveTail(): Unit =
     if span == Span.Day && anchor == LocalDate.now(AshidoriApp.zone) && drawnUntil != Long.MaxValue then
-      val tail = LoggerState.recentFixes.filter(f => f.time >= drawnUntil && (!f.hasAccuracy || f.accuracy < 100))
+      // End exactly where the position marker is, so line and dot move together.
+      val end = LoggerState.lastFix.map(_.time).getOrElse(Long.MaxValue)
+      val tail = LoggerState.recentFixes.filter(f => f.time >= drawnUntil && f.time <= end && (!f.hasAccuracy || f.accuracy < 100))
       map.setLive(if tail.size >= 2 then tail else Nil)
     else map.setLive(Nil)
 
