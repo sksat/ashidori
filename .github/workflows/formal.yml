@@ -1,0 +1,51 @@
+name: formal
+
+# Formal models of the sync protocol (formal/README.md). Runs when the models,
+# the protocol document or the server they describe change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - "docs/sync-protocol.md"
+      - "server/src/**"
+      - "server/migrations/**"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "docs/sync-protocol.md"
+      - "server/src/**"
+      - "server/migrations/**"
+      - ".github/workflows/formal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ASHIDORI_FORMAL_CACHE: ${{ github.workspace }}/.formal-cache
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+      # Only the downloads are cached; run.sh verifies their checksums anyway.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: .formal-cache/dl
+          key: formal-tools-${{ hashFiles('formal/run.sh') }}
+      - run: formal/run.sh all
+      - if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: formal-logs
+          path: .formal-cache/logs/*.log
+          retention-days: 7

@@ -1,0 +1,53 @@
+theory AshidoriBatchPrivacy
+begin
+
+/*
+ * Indistinguishability of low-entropy payloads (diff-equivalence).
+ *
+ * Location payloads have little entropy (a home position, a venue name), so
+ * "the attacker cannot derive m" is not enough: the attacker could guess m.
+ * Here the attacker itself picks two candidate payloads m0 and m1 for every
+ * upload (chosen plaintext), and the left system seals m0, the right one m1.
+ * Diff-equivalence says the malicious server cannot tell which side it is
+ * talking to, i.e. it learns nothing about the payload beyond the public
+ * metadata (device id, stream, seq, nonce; sizes are not modelled, so the
+ * claim is only for payloads of equal length and equal upload pattern).
+ *
+ * Same attacker and assumptions as batch.spthy. With -D=REVEAL the attacker
+ * also obtains K, and the equivalence must fail (sanity check).
+ */
+
+functions: aead/4, adec/4, kdf/1
+equations: adec(aead(k, n, ad, m), k, n, ad) = m
+
+rule Create_User:
+    [ Fr(~K) ]
+  --[ NewKey($U, ~K) ]->
+    [ !UserKey($U, ~K) ]
+
+rule Register_Device:
+    [ !UserKey(U, K), In(dev), Fr(~tok) ]
+  --[ Registered(U, dev, K) ]->
+    [ !Device(U, dev, K), Out(~tok) ]
+
+// The attacker chooses the slot and the two candidate payloads.
+rule Seal:
+    [ !Device(U, dev, K), In(<stream, seq, m0, m1>), Fr(~n) ]
+  --[ Seal(K, dev, stream, seq) ]->
+    [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, <dev, stream, seq>, diff(m0, m1))>) ]
+
+// The receiving device's reaction (decrypts or not) is observable to the
+// server: a failed status is re-fetched, a good one is not.
+rule Accept:
+    [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, <dev, stream, seq>, m)>) ]
+  --[ Accept(K, dev, stream, seq) ]->
+    [ Out(<'accepted', dev, stream, seq>) ]
+
+#ifdef REVEAL
+rule Reveal_Key:
+    [ !UserKey(U, K) ]
+  --[ RevealK(K) ]->
+    [ Out(K) ]
+#endif
+
+end

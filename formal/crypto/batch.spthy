@@ -1,0 +1,123 @@
+theory AshidoriBatch
+begin
+
+/*
+ * Tier-2 secrecy of encrypted batches against a fully malicious server
+ * (docs/sync-protocol.md, "Keys and encryption", "What the server operator can see").
+ *
+ * Attacker: Dolev-Yao. It is the network, the Worker, D1 and R2 at once:
+ *   - it assigns device ids (In(dev) at registration), so it may give two
+ *     devices the same id;
+ *   - it learns every device token and every blob, and chooses which blob
+ *     (if any) a device downloads for which slot;
+ *   - it chooses stream names and seq numbers (In(<stream, seq>) at sealing):
+ *     this over-approximates the app, which never seals two blobs for one
+ *     slot, so the proofs also cover a compromised app that does.
+ * Trusted: honest apps, fresh randomness (~K, ~n, ~m) and the out-of-band
+ * transfer of K by the recovery code (modelled by the shared !UserKey fact,
+ * which the attacker never sees).
+ * Public metadata: device id, stream, seq and the nonce travel in clear next
+ * to the ciphertext. Sizes and times are not modelled; they are public.
+ *
+ * AES-256-GCM is an ideal AEAD: aead(k, n, ad, m) can be built only with k,
+ * opened only with k and the same nonce and AAD. The batch key is
+ * kdf(K) = HKDF-SHA256(K, "ashidori batch v1").
+ */
+
+functions: aead/4, adec/4, kdf/1
+equations: adec(aead(k, n, ad, m), k, n, ad) = m
+
+// The first device creates K. Further devices receive it by the recovery code.
+rule Create_User:
+    [ Fr(~K) ]
+  --[ NewKey($U, ~K) ]->
+    [ !UserKey($U, ~K) ]
+
+// Registration with the (malicious) server: the server picks the device id
+// and learns the token. The device gets K out of band.
+rule Register_Device:
+    [ !UserKey(U, K), In(dev), Fr(~tok), Fr(~inst) ]
+  --[ Registered(U, dev, K, ~inst) ]->
+    [ !Device(U, dev, K), Out(~tok) ]
+
+// A device seals a fresh secret payload ~m for the slot (dev, stream, seq),
+// AAD "{deviceId}/{stream}/{seq}", and uploads it.
+rule Seal:
+    [ !Device(U, dev, K), In(<stream, seq>), Fr(~n), Fr(~m) ]
+  --[ Seal(K, dev, stream, seq, ~m) ]->
+    [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, <dev, stream, seq>, ~m)>) ]
+
+// A device of the same user downloads the blob the server serves for the
+// slot (dev, stream, seq) it asked for, and opens it with that slot's AAD.
+// Decryption succeeds only for a ciphertext of this shape (AEAD integrity).
+rule Accept:
+    [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, <dev, stream, seq>, m)>) ]
+  --[ Accept(K, dev, stream, seq, m) ]->
+    [ ]
+
+// Sanity: the key leaks (a compromised device, a typed-in recovery code on a
+// hostile web page, ...).
+rule Reveal_Key:
+    [ !UserKey(U, K) ]
+  --[ RevealK(K) ]->
+    [ Out(K) ]
+
+// ---- Sanity: the honest run is possible ----
+
+lemma executable:
+  exists-trace
+  "Ex K d s q m #i #j. Seal(K, d, s, q, m) @ i & Accept(K, d, s, q, m) @ j & #i < #j
+     & not (Ex #r. RevealK(K) @ r)"
+
+// ---- Properties (expected: verified) ----
+
+lemma key_secrecy:
+  "All U K #i. NewKey(U, K) @ i ==>
+     not (Ex #j. K(K) @ j) | (Ex #r. RevealK(K) @ r)"
+
+lemma batch_key_secrecy:
+  "All U K #i. NewKey(U, K) @ i ==>
+     not (Ex #j. K(kdf(K)) @ j) | (Ex #r. RevealK(K) @ r)"
+
+lemma payload_secrecy:
+  "All K d s q m #i. Seal(K, d, s, q, m) @ i ==>
+     not (Ex #j. K(m) @ j) | (Ex #r. RevealK(K) @ r)"
+
+// Accept(device, stream, seq, m) implies an earlier Seal with the same K and AAD.
+lemma slot_binding:
+  "All K d s q m #i. Accept(K, d, s, q, m) @ i ==>
+     (Ex #j. Seal(K, d, s, q, m) @ j & #j < #i) | (Ex #r. RevealK(K) @ r)"
+
+// A ciphertext sealed for one slot is never accepted in another slot.
+lemma no_slot_move:
+  "All K d s q d2 s2 q2 m #i #j. Accept(K, d, s, q, m) @ i & Seal(K, d2, s2, q2, m) @ j ==>
+     (d = d2 & s = s2 & q = q2) | (Ex #r. RevealK(K) @ r)"
+
+// ---- Sanity with Reveal(K): the same claims without the guard (expected: falsified) ----
+
+lemma payload_secrecy_if_key_revealed:
+  "All K d s q m #i. Seal(K, d, s, q, m) @ i ==> not (Ex #j. K(m) @ j)"
+
+lemma slot_binding_if_key_revealed:
+  "All K d s q m #i. Accept(K, d, s, q, m) @ i ==> (Ex #j. Seal(K, d, s, q, m) @ j & #j < #i)"
+
+lemma no_slot_move_if_key_revealed:
+  "All K d s q d2 s2 q2 m #i #j. Accept(K, d, s, q, m) @ i & Seal(K, d2, s2, q2, m) @ j ==>
+     (d = d2 & s = s2 & q = q2)"
+
+// Observation: the AAD binds the device id that the server assigned. A
+// malicious server can give two devices of one user the same id; slot
+// binding then only says "sealed by some device of the user that was told
+// this id". (expected: verified, i.e. such a trace exists)
+lemma same_device_id_for_two_devices:
+  exists-trace
+  "Ex U d K i1 i2 #a #b. Registered(U, d, K, i1) @ a & Registered(U, d, K, i2) @ b & not (i1 = i2)
+     & not (Ex #r. RevealK(K) @ r)"
+
+// No forward secrecy: revealing K later exposes payloads sealed earlier.
+// Revoking device tokens does not help. (expected: verified, i.e. such a trace exists)
+lemma no_forward_secrecy:
+  exists-trace
+  "Ex K d s q m #i #r #j. Seal(K, d, s, q, m) @ i & RevealK(K) @ r & #i < #r & K(m) @ j"
+
+end
