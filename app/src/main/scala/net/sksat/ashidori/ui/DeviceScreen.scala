@@ -30,13 +30,23 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
   private var snapshotter: Option[MapSnapshotter] = None
 
   private var unobserve: () => Unit = () => ()
+  private var unwatch: () => Unit = () => ()
   override def onShow(): Unit =
     unobserve()
     unobserve = PeerStatus.observe(() => render())
+    unwatch()
+    // A change of 「位置情報を外部サービスに送らない」 cancels the map and
+    // renders it again under the new setting.
+    unwatch = Settings.gate.onChange(() => act.runOnUiThread(() => { stopMap(); render() }))
     render()
   override def onHide(): Unit =
     unobserve()
-    snapshotter.foreach(_.cancel())
+    unwatch()
+    unwatch = () => ()
+    stopMap()
+
+  private def stopMap(): Unit =
+    snapshotter.foreach { s => s.cancel(); MapStyle.untrack(s) }
     snapshotter = None
 
   // Label/value rows, as in the status card of the ステータス tab.
@@ -151,13 +161,14 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       .withRegion(bounds)
       .withStyleBuilder(builder)
       .withLogo(false)
-    snapshotter.foreach(_.cancel())
+    stopMap()
     MapStyle.applyNetworkPolicy(act)
     val snap = MapSnapshotter(act, opts)
     snapshotter = Some(snap)
+    MapStyle.track(snap)
     snap.start(
-      s => img.setImageBitmap(s.getBitmap),
-      (msg: String) => Log.w(s"device map: $msg")
+      s => { MapStyle.untrack(snap); img.setImageBitmap(s.getBitmap) },
+      (msg: String) => { MapStyle.untrack(snap); Log.w(s"device map: $msg") }
     )
     frame
 

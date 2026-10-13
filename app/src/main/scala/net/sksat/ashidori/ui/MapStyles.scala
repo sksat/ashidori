@@ -77,20 +77,36 @@ object MapStyle:
   def forView(detailed: Boolean): MapStyle =
     BaseMapPolicy.interactive(Settings.blockExternalLocation, current, lastOnline, Offline, detailed)
 
-  /** Base map of a still image (feed, period, other devices). */
-  def forSnapshot: MapStyle = BaseMapPolicy.snapshot(Settings.blockExternalLocation, current, Offline)
+  /** Base map of a still image (feed, period, other devices), with the
+    * setting as it is now (or `block`, as taken right before a job starts).
+    */
+  def forSnapshot: MapStyle = forSnapshot(Settings.blockExternalLocation)
+  def forSnapshot(block: Boolean): MapStyle = BaseMapPolicy.snapshot(block, current, Offline)
 
   /** Whether the picker may render this map's thumbnail at the current view. */
   def thumbnailAllowed(s: MapStyle): Boolean = BaseMapPolicy.thumbnail(Settings.blockExternalLocation, s, Offline)
 
   /** Lets MapLibre use the network only when the policy allows it: with
-    * the setting on and no detailed map open, it is told it is offline, so
-    * even an overlooked style URL cannot fetch tiles (cached tiles still show).
+    * the setting on and no view holding a detail grant of the current
+    * generation ([[SendGate.networkAllowed]]), it is told it is offline.
+    * This is a second line only: the switch is process-wide and does not
+    * cancel requests already scheduled. What keeps a map or snapshot from
+    * sending is that it uses the on-device style.
     */
   def applyNetworkPolicy(ctx: Context): Unit =
     MapLibre.getInstance(ctx)
-    val allowed = BaseMapPolicy.network(Settings.blockExternalLocation, TrackMap.all.exists(_.detailed))
-    MapLibre.setConnected(if allowed then null else java.lang.Boolean.FALSE)
+    MapLibre.setConnected(if Settings.gate.networkAllowed then null else java.lang.Boolean.FALSE)
+
+  /** Snapshotters rendering now outside the [[DayMap]] queue (picker
+    * thumbnails, the device screen): cancelled when the setting changes.
+    * Main thread only.
+    */
+  private val snapshotters = scala.collection.mutable.Set.empty[org.maplibre.android.snapshotter.MapSnapshotter]
+  def track(s: org.maplibre.android.snapshotter.MapSnapshotter): Unit = snapshotters += s
+  def untrack(s: org.maplibre.android.snapshotter.MapSnapshotter): Unit = snapshotters -= s
+  def cancelSnapshots(): Unit =
+    snapshotters.foreach(_.cancel())
+    snapshotters.clear()
 
   /** User-supplied XYZ raster tiles: URL template ({z}/{x}/{y}) and credit line. */
   def custom: (String, String) = (prefs.getString("customTileUrl", ""), prefs.getString("customTileCredit", ""))

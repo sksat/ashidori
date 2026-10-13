@@ -191,7 +191,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
         load()
     }
 
-  override def onHide(): Unit = unobserve()
+  override def onHide(): Unit =
+    unobserve()
+    // Leaving the screen ends the detailed (online) map of this view.
+    map.endDetail()
 
   /** Time of the last point drawn by the latest full render. */
   private var drawnUntil = Long.MaxValue
@@ -240,6 +243,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   /** Open a period (from a summary card in the feed). */
   def showPeriod(sp: Span, d: LocalDate): Unit =
+    // A reused period screen opens another period with the offline map.
+    map.endDetail()
     span = sp
     ownAnchor = d
     syncChips()

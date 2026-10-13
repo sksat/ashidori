@@ -143,6 +143,15 @@ final case class StatusCandidate(seq: Long, size: Long, sha256: String, failures
     */
   def exhausted: Boolean = failures >= StatusSyncState.MaxAttempts
 
+/** The seqs, `low` to `high`, at which a device's candidates were exhausted
+  * in the current pass of [[StatusSyncState.sweep]]. Rows within it were
+  * most likely tried in this pass already; candidates are tried newest first,
+  * so `low` moves down the listing as the pass goes on.
+  */
+final case class Sweep(low: Long, high: Long):
+  def covers(seq: Long): Boolean = seq >= low && seq <= high
+  def including(seq: Long): Sweep = Sweep(math.min(low, seq), math.max(high, seq))
+
 /** A `status` batch that was listed but could not be read: wrong key,
   * damaged, too large, not the listed blob or not a status record. Kept
   * until a status of the device at least as new is read, and shown on the
@@ -170,6 +179,17 @@ final case class Unresolved(seq: Long, attempts: Int, error: String)
   * (`rescan`: the position of a rescan in progress; `rescanAt`: when the
   * last one started; `rescanWanted`: one is wanted soon, after a suspicious
   * page, a refused listing, or when a device has no candidate left to try).
+  *
+  * Only a few candidates are kept, newest first, so more made-up rows than
+  * that above a genuine one would hide it for good: the exhausted ones fall
+  * out of the kept set, come back as new on the next rescan and take the
+  * places again. `sweep` breaks that cycle (see [[Sweep]]): a row whose seq
+  * lies within the seqs at which the device's candidates were exhausted in
+  * the current pass ranks below every other row, both for a kept place and
+  * as the target. Each rescan therefore moves the tried rows further down
+  * the listing until every listed seq has been tried; a row above the pass
+  * (a new status) ranks as usual. A pass ends at the end of a rescan that
+  * left the device no row outside it to try.
   */
 final case class StatusSyncState(
     cursor: Long,
@@ -178,7 +198,8 @@ final case class StatusSyncState(
     unresolved: Map[String, Unresolved],
     rescan: Option[Long] = None,
     rescanAt: Long = 0L,
-    rescanWanted: Boolean = false
+    rescanWanted: Boolean = false,
+    sweep: Map[String, Sweep] = Map.empty
 ):
   import StatusSyncState.*
 
@@ -193,7 +214,7 @@ final case class StatusSyncState(
       val c = b.candidate
       val have = m.getOrElse(b.deviceId, Vector.empty)
       if c.seq <= auth(b.deviceId) || have.exists(_.sameRow(c)) then m
-      else m.updated(b.deviceId, trim((have :+ c).sortBy(-_.seq)))
+      else m.updated(b.deviceId, trim((have :+ c).sortBy(-_.seq), sweep.get(b.deviceId)))
     })
 
   /** Takes in one page of the main walk (`limit`: the page size asked for).
@@ -229,14 +250,24 @@ final case class StatusSyncState(
     rescan.fold(this) { from =>
       val (to, _) = advance(from, items, limit)
       val st = take(items, self)
-      if more && to > from then st.copy(rescan = Some(to)) else st.copy(cursor = to, rescan = None)
+      if more && to > from then st.copy(rescan = Some(to))
+      else
+        // A pass ends when the rescan left a device no row outside it to
+        // try: every listed seq has been tried, and the next pass starts
+        // again from the newest.
+        st.copy(cursor = to, rescan = None, sweep = st.sweep.filter((d, w) => st.live(d).exists(c => !w.covers(c.seq))))
     }
 
+  /** Candidates of `device` not read yet that have not failed [[MaxAttempts]] times. */
+  private def live(device: String): Vector[StatusCandidate] =
+    candidates.getOrElse(device, Vector.empty).filter(c => c.seq > auth(device) && !c.exhausted)
+
   /** Batch to fetch per device: its newest candidate not read yet that has
-    * not failed [[MaxAttempts]] times.
+    * not failed [[MaxAttempts]] times, one outside the device's [[sweep]]
+    * before one within it.
     */
   def targets: Map[String, StatusCandidate] =
-    candidates.flatMap((d, cs) => cs.find(c => c.seq > auth(d) && !c.exhausted).map(d -> _))
+    candidates.keys.flatMap(d => live(d).sortBy(rank(sweep.get(d))).headOption.map(d -> _)).toMap
 
   /** Exhausted candidates due for another try at `now`: per device the one
     * due longest (then the newest), and at most `budget` in all, those due
@@ -256,6 +287,7 @@ final case class StatusSyncState(
     val a = math.max(seq, auth(device))
     copy(
       authenticated = authenticated.updated(device, a),
+      sweep = sweep.filter((d, w) => d != device || w.high > a),
       candidates = candidates.updatedWith(device)(_.map(_.filter(_.seq > a)).filter(_.nonEmpty)),
       unresolved = unresolved.filter((d, u) => d != device || u.seq > seq)
     )
@@ -269,10 +301,15 @@ final case class StatusSyncState(
     val have = candidates.getOrElse(device, Vector.empty)
     val failures = have.find(_.sameRow(c)).fold(c.failures)(_.failures) + 1
     val retryAt = if failures >= MaxAttempts then now + retryDelay(failures) else 0L
-    val cs = trim((have.filterNot(_.sameRow(c)) :+ c.copy(failures = failures, retryAt = retryAt)).sortBy(-_.seq))
+    val pass =
+      if failures != MaxAttempts then sweep
+      else sweep.updated(device, sweep.get(device).fold(Sweep(c.seq, c.seq))(_.including(c.seq)))
+    val cs = trim((have.filterNot(_.sameRow(c)) :+ c.copy(failures = failures, retryAt = retryAt)).sortBy(-_.seq),
+      pass.get(device))
     // The newest failure stays shown: an older one does not replace it.
     val shown = problem(device).filter(_.seq > c.seq)
     val st = copy(
+      sweep = pass,
       candidates = candidates.updated(device, cs),
       unresolved = unresolved.updated(device,
         shown.getOrElse(Unresolved(c.seq, failures, Option(error).getOrElse("").take(200))))
@@ -310,14 +347,18 @@ object StatusSyncState:
   val RescanMinGap: Long = 24L * 60 * 60 * 1000
   val empty: StatusSyncState = StatusSyncState(0L, Map.empty, Map.empty, Map.empty)
 
-  /** Of `cs` (newest first), keeps the newest [[MaxCandidates]] still to
-    * try and, separately, the newest [[MaxCandidates]] exhausted ones:
-    * exhausted rows the server keeps listing then neither crowd out the
-    * others nor come back as new on a rescan.
+  /** Of `cs` (newest first), keeps [[MaxCandidates]] still to try, the
+    * newest outside the device's sweep `w` first, and, separately, the
+    * newest [[MaxCandidates]] exhausted ones: exhausted rows the server
+    * keeps listing then neither crowd out the others nor come back as new on
+    * a rescan.
     */
-  private def trim(cs: Vector[StatusCandidate]): Vector[StatusCandidate] =
+  private def trim(cs: Vector[StatusCandidate], w: Option[Sweep]): Vector[StatusCandidate] =
     val (gone, live) = cs.partition(_.exhausted)
-    (live.take(MaxCandidates) ++ gone.take(MaxCandidates)).sortBy(-_.seq)
+    (live.sortBy(rank(w)).take(MaxCandidates) ++ gone.take(MaxCandidates)).sortBy(-_.seq)
+
+  /** Order of candidates still to try: outside the sweep first, then newest first. */
+  private def rank(w: Option[Sweep])(c: StatusCandidate): (Boolean, Long) = (w.exists(_.covers(c.seq)), -c.seq)
 
   /** Where a walk at `after` may move with this page, and whether the page
     * looked wrong. The cursor stops before the first row whose cursor is not
@@ -351,7 +392,8 @@ object StatusSyncState:
         k -> ujson.Obj("seq" -> ujson.Num(u.seq.toDouble), "attempts" -> u.attempts, "error" -> u.error))),
       "rescan" -> s.rescan.fold[ujson.Value](ujson.Null)(c => ujson.Num(c.toDouble)),
       "rescanAt" -> ujson.Num(s.rescanAt.toDouble),
-      "rescanWanted" -> s.rescanWanted
+      "rescanWanted" -> s.rescanWanted,
+      "sweep" -> ujson.Obj.from(s.sweep.map((d, w) => d -> ujson.Arr(ujson.Num(w.low.toDouble), ujson.Num(w.high.toDouble))))
     )
 
   /** A stored cursor or rescan position the API would refuse (e.g. taken
@@ -385,5 +427,8 @@ object StatusSyncState:
       unresolved,
       v.obj.get("rescan").flatMap(_.numOpt).map(position),
       v.obj.get("rescanAt").flatMap(_.numOpt).fold(0L)(_.toLong),
-      v.obj.get("rescanWanted").flatMap(_.boolOpt).getOrElse(false)
+      v.obj.get("rescanWanted").flatMap(_.boolOpt).getOrElse(false),
+      v.obj.get("sweep").flatMap(_.objOpt).fold(Map.empty[String, Sweep])(_.toMap.flatMap { (d, w) =>
+        w.arrOpt.collect { case a if a.size == 2 => d -> Sweep(a(0).num.toLong, a(1).num.toLong) }
+      })
     )

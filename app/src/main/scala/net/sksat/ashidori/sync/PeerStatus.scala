@@ -37,8 +37,8 @@ final case class Peer(id: String, name: String, revoked: Boolean, lastSeenAt: Lo
   */
 final case class PeerEntry(seq: Long, fetchedAt: Long, status: DeviceStatus, area: String)
 
-/** Status of the user's other devices: downloaded after each small-stream
-  * upload and kept in private preferences, tagged with the registration
+/** Status of the user's other devices: downloaded by each small-stream job,
+  * whether or not its upload succeeded, and kept in private preferences, tagged with the registration
   * ([[SyncConfig.registration]]); state of another registration reads as empty.
   *
   * Only the metadata listing is walked (from a stored cursor); of the blobs,
@@ -153,7 +153,9 @@ object PeerStatus:
     * candidate is retried later with a backoff, from its own budget
     * ([[StatusSyncState.retries]]). Now and then the listing is walked again
     * from cursor 0 ([[StatusSyncState.rescanIfDue]]), so a row the server made
-    * up cannot hide later ones for good.
+    * up cannot hide later ones for good; the kept candidates rotate through
+    * the listing ([[StatusSyncState.sweep]]), so more made-up rows than are
+    * kept cannot either.
     *
     * The three steps do not depend on each other: a failing main walk (e.g.
     * a cursor the server refuses) neither stops the rescan nor the fetches,

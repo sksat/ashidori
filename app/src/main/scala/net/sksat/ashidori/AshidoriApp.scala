@@ -16,6 +16,8 @@ class AshidoriApp extends Application:
     )
     LoggerWatchdog.schedule(this)
     Settings.migrate()
+    // An unpairing cut short by a crash is finished before anything syncs.
+    Thread(() => net.sksat.ashidori.sync.SyncConfig.resumeUnpair(this), "ashidori-unpair").start()
     // Copy the offline basemap out of the APK before the first map needs it.
     Thread(() => { Basemap.prepare(); () }, "ashidori-basemap").start()
     // Area names cached from the platform geocoder: recompute on the device.
@@ -69,12 +71,26 @@ object Settings:
     * app's own initiative: no platform geocoder, no automatic venue search
     * (OpenStreetMap), and maps and their snapshots drawn from the on-device
     * basemap only. An explicit user action may still send: a venue search,
-    * or the online map in one map view ("この範囲を詳しい地図で表示").
-    * Off: venues are searched automatically, the platform geocoder fills
-    * names the offline index lacks, and the chosen base map is used.
+    * the online map in one map view ("この範囲を詳しい地図で表示") while it
+    * is on screen, opening a position in another app (`geo:`), sharing an
+    * export. Off: venues are searched automatically, the platform geocoder
+    * fills names the offline index lacks, and the chosen base map is used.
+    *
+    * It does not cover the OS location services: fixes come from the
+    * fused / network providers as the device settings allow. Check-ins
+    * shared with followers are readable by the server operator and the
+    * followers, so they count as sending and need an explicit share action
+    * whatever this setting is.
+    *
+    * Work in flight follows a change at once ([[gate]]).
     */
-  def blockExternalLocation: Boolean = prefs.getBoolean("blockExternalLocation", true)
-  def blockExternalLocation_=(b: Boolean): Unit = prefs.edit().putBoolean("blockExternalLocation", b).apply()
+  def blockExternalLocation: Boolean = gate.block
+  def blockExternalLocation_=(b: Boolean): Unit =
+    prefs.edit().putBoolean("blockExternalLocation", b).apply()
+    gate.setBlock(b)
+
+  /** The setting's generation, grants and listeners (see [[SendGate]]). */
+  lazy val gate: SendGate = SendGate(prefs.getBoolean("blockExternalLocation", true))
 
   /** Upgrades stored settings; call once at start. */
   def migrate(): Unit =

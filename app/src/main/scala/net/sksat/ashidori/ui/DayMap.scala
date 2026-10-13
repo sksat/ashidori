@@ -19,13 +19,16 @@ import Ui.*
 /** A still map of one day for the timeline: the route in transport mode
   * colors and the stays, on the chosen base map. Rendered off-screen one at
   * a time and cached; without tiles (offline) the plain sketch stays.
+  *
+  * Jobs pick their base map right before they start, and a change of
+  * 「位置情報を外部サービスに送らない」 drops the queued ones and cancels the
+  * running one ([[SnapshotQueue]]). Main thread only.
   */
 object DayMap:
   private val cache = android.util.LruCache[String, Bitmap](40)
-  private val queue = mutable.Queue.empty[() => Unit]
-  private var busy = false
-  /** Running snapshotters must stay referenced until they call back. */
-  private val running = mutable.Set.empty[MapSnapshotter]
+  /** The running snapshotter is its handle: referenced until it calls back. */
+  private val queue = SnapshotQueue[MapSnapshotter](Settings.gate)
+  Settings.gate.onChange(() => AshidoriApp.app.getMainExecutor.execute(() => queue.invalidate().foreach(_.cancel())))
 
   def view(act: MainActivity, tl: DayTimeline): Option[View] = view(act, Seq(tl), tl.date.toString)
 
@@ -51,9 +54,6 @@ object DayMap:
     val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays)
     val img = ImageView(act)
     img.setScaleType(ImageView.ScaleType.CENTER_CROP)
-    // Rendered while scrolling, without the user asking for that area: the
-    // offline map while 「位置情報を外部サービスに送らない」 is on.
-    val style = MapStyle.forSnapshot
     val frame = FrameLayout(act)
     frame.addView(sketch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     frame.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -67,13 +67,18 @@ object DayMap:
     frame.setLayoutParams(lp)
 
     // Same route, same picture: edits (mode changes) change the key.
-    val key = s"${style.key}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
+    def key(style: MapStyle) =
+      s"${style.key}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
     // The snapshot draws the base map's attribution itself.
     def show(b: Bitmap): Unit = img.setImageBitmap(b)
-    Option(cache.get(key)) match
+    Option(cache.get(key(MapStyle.forSnapshot))) match
       case Some(b) => show(b)
       case None =>
-        enqueue { () =>
+        queue.enqueue { block =>
+          // Rendered while scrolling, without the user asking for that area:
+          // the offline map while 「位置情報を外部サービスに送らない」 is on,
+          // as the setting is now, not when the card was laid out.
+          val style = MapStyle.forSnapshot(block)
           val density = dm.density
           // Fit everything with a margin; at least ~400 m across.
           val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
@@ -108,35 +113,17 @@ object DayMap:
             .withLogo(false)
           MapStyle.applyNetworkPolicy(act)
           val snap = MapSnapshotter(act, opts)
-          running += snap
-          def done(): Unit =
-            running -= snap
-            next()
           snap.start(
             s => {
-              cache.put(key, s.getBitmap)
+              cache.put(key(style), s.getBitmap)
               show(s.getBitmap)
-              done()
+              queue.finished(snap)
             },
-            (_: String) => done() // offline or no tiles: keep the sketch
+            (_: String) => queue.finished(snap) // offline or no tiles: keep the sketch
           )
+          Some(snap)
         }
     Some(frame)
 
-  private def enqueue(job: () => Unit): Unit =
-    queue.enqueue(job)
-    if !busy then next()
-
-  private def next(): Unit =
-    if queue.isEmpty then busy = false
-    else
-      busy = true
-      val job = queue.dequeue()
-      try job()
-      catch
-        case e: Exception =>
-          Log.w("day map snapshot failed", e)
-          next()
-
   /** Drop queued work (e.g. the feed reloaded). */
-  def cancelPending(): Unit = queue.clear()
+  def cancelPending(): Unit = queue.clearQueued()

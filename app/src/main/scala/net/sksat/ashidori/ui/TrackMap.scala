@@ -29,7 +29,9 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
   * path. Data set before the style finishes loading is applied afterwards.
   *
   * With 「位置情報を外部サービスに送らない」 on, it shows the on-device map
-  * until the user asks for the online one in this view ([[detailed]]).
+  * until the user asks for the online one in this view ([[detailed]]): a
+  * grant to this view alone ([[SendGate.grant]]), which ends when the view
+  * leaves the screen ([[endDetail]]), switches back, or the setting changes.
   */
 final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
@@ -40,8 +42,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   TrackMap.all += this
   MapStyle.applyNetworkPolicy(act)
 
-  /** The user asked for the online map in this view; ends when it closes. */
-  private var detailedFlag = false
+  /** The user asked for the online map in this view, and it is still on
+    * screen and of the setting's current generation.
+    */
+  private def detailedFlag: Boolean = Settings.gate.granted(this)
   def detailed: Boolean = detailedFlag
   /** Base map loaded (or loading) on this map. */
   private var shown: Option[MapStyle] = None
@@ -97,10 +101,18 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
 
   /** Switches this view between the offline and the chosen online map. */
   def setDetailed(on: Boolean): Unit =
-    detailedFlag = on
+    if on then Settings.gate.grant(this) else Settings.gate.revoke(this)
     MapStyle.applyNetworkPolicy(act)
     updateDetailButton()
     refreshBaseMap()
+
+  /** The view left the screen (its screen was hidden or popped, or opens
+    * other data): the detail grant ends, and the online style with its
+    * requests is replaced by the on-device one. Shown again, it starts with
+    * the offline map.
+    */
+  def endDetail(): Unit =
+    if Settings.gate.granted(this) then setDetailed(false)
 
   /** Map plus overlay controls; screens add this instead of `mapView`. */
   val view: FrameLayout =
@@ -244,7 +256,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   private def choose(ms: MapStyle): Unit =
     MapStyle.current = ms
     if Settings.blockExternalLocation then
-      detailedFlag = ms.online
+      if ms.online then Settings.gate.grant(this) else Settings.gate.revoke(this)
       MapStyle.applyNetworkPolicy(act)
       // Other open maps keep the offline map; only their label changes.
       TrackMap.all.filterNot(_ == this).foreach(_.refreshBaseMap())
@@ -301,14 +313,21 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
           .withLogo(false)
         val snap = org.maplibre.android.snapshotter.MapSnapshotter(act, opts)
         snapshotters += snap
-        snap.start(s => img.setImageBitmap(s.getBitmap))
+        MapStyle.track(snap)
+        snap.start(s => { MapStyle.untrack(snap); img.setImageBitmap(s.getBitmap) },
+          (_: String) => MapStyle.untrack(snap))
       }
       card
     }
     val grid = Ui.vbox(cards.grouped(2).map(row => Ui.hbox(row*)).toSeq*)
-    dialog.setOnDismissListener(_ => snapshotters.foreach(_.cancel()))
+    // The thumbnails were chosen under the setting as it was: a change closes the picker.
+    val stop = Settings.gate.onChange(() => act.runOnUiThread(() => dialog.dismiss()))
+    dialog.setOnDismissListener { _ =>
+      stop()
+      snapshotters.foreach { s => s.cancel(); MapStyle.untrack(s) }
+    }
     val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
-    if block then head.addView(Ui.caption("簡易地図以外は、表示する範囲の地図をサーバから取得します。選んだ地図はこの画面を閉じるまで表示します。"))
+    if block then head.addView(Ui.caption("簡易地図以外は、表示する範囲の地図をサーバから取得します。選んだ地図はこの画面を離れるまで表示します。"))
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
     dialog.show()
 
@@ -474,6 +493,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   def onLowMemory(): Unit = mapView.onLowMemory()
   def onSaveInstanceState(b: Bundle): Unit = mapView.onSaveInstanceState(b)
   def onDestroy(): Unit =
+    Settings.gate.revoke(this)
     TrackMap.all -= this
     // A closed detailed view no longer allows the network.
     MapStyle.applyNetworkPolicy(act)
@@ -506,11 +526,13 @@ object TrackMap:
   /** Live maps, so a base map change applies everywhere. */
   val all = scala.collection.mutable.ArrayBuffer.empty[TrackMap]
 
-  /** After 「位置情報を外部サービスに送らない」 changes: every open map drops
-    * its detail request and shows what the new setting allows.
+  /** After 「位置情報を外部サービスに送らない」 changes (the setting already
+    * ended every detail grant, see [[SendGate.setBlock]]): snapshots rendered
+    * outside the day map queue are cancelled, and every open map shows what
+    * the new setting allows.
     */
   def privacyChanged(ctx: android.content.Context): Unit =
-    all.foreach(_.detailedFlag = false)
+    MapStyle.cancelSnapshots()
     MapStyle.applyNetworkPolicy(ctx)
     all.foreach(_.refreshBaseMap())
   private var cacheSet = false

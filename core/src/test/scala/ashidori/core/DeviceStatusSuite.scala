@@ -242,6 +242,26 @@ class DeviceStatusSuite extends munit.FunSuite:
     assertEquals(st.candidates("a").size, 2)
   }
 
+  test("a genuine status below more made-up rows than are kept is still read: the candidates rotate (F6)") {
+    // One well-formed page: the genuine seq 0 and made-up seqs 1 to 8 of device b.
+    val rows = (0 to 8).map(q => meta(q + 1, "b", "status", q, Array(q.toByte)))
+    def list(after: Long): Seq[BatchMeta] = rows.filter(_.cursor > after)
+    var st = StatusSyncState.empty
+    var now = 1_000 * hour
+    // Runs as PeerStatus.pull does, hourly for 60 days: main walk, rescan, then the fetches.
+    for _ <- 1 to 24 * 60 if !st.authenticated.contains("b") do
+      st = st.rescanIfDue(now)
+      st = st.listed(list(st.cursor), "me", 100)
+      while st.rescan.isDefined do st = st.rescanned(list(st.rescan.get), "me", 100, more = false)
+      for (d, c) <- st.targets ++ st.retries(now) do
+        st = if c.seq == 0 then st.succeeded(d, 0) else st.failed(d, c, "bad tag", now)
+      now += hour
+    assertEquals(st.authenticated.get("b"), Some(0L))
+    // The made-up rows stay shown as unreadable.
+    assert(st.problem("b").exists(_.seq > 0))
+    assertEquals(StatusSyncState.fromJson(ujson.read(ujson.write(StatusSyncState.toJson(st)))), st)
+  }
+
   test("a page whose cursors do not increase, or jump far at the end of the listing, does not move the cursor past them") {
     val big = StatusSyncState.MaxCursorJump
     // Not increasing: stop before the offending row, and want a rescan.

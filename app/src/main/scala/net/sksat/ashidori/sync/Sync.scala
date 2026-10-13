@@ -17,14 +17,19 @@ import ashidori.core.sync.*
   * once they are on disk ([[DurablePrefs]]): while one is being saved, or
   * after its save failed, it reads as absent, so neither the screen nor a
   * sync job counts the device as paired or ready on a value a restart would
-  * lose.
+  * lose. The key counts only for the registration it was set for, and an
+  * unpairing cut short is finished at start ([[PairingStore]]).
+  *
+  * The other settings here (network, charging, last result) need no such
+  * guarantee and stay in SharedPreferences ("sync"), which holds nothing else.
   */
 object SyncConfig:
-  private val durable = DurablePrefs("sync")
-  private def prefs = durable.raw
+  private val durable = DurablePrefs("sync", legacy = Some(Set(PairingStore.Url, PairingStore.DeviceId, PairingStore.NewAccount)))
+  private lazy val store = PairingStore(durable.store, SecureStore)
+  private def prefs = AshidoriApp.app.getSharedPreferences("sync", Context.MODE_PRIVATE)
 
-  def serverUrl: String = durable.getString("url").getOrElse("")
-  def deviceId: String = durable.getString("deviceId").getOrElse("")
+  def serverUrl: String = store.serverUrl
+  def deviceId: String = store.deviceId
   def mobileData: Boolean = prefs.getBoolean("mobileData", true)
   def mobileData_=(b: Boolean): Unit = prefs.edit().putBoolean("mobileData", b).apply()
   def rawOnlyWhileCharging: Boolean = prefs.getBoolean("rawCharging", false)
@@ -34,65 +39,68 @@ object SyncConfig:
   def lastError: String = prefs.getString("lastError", "")
   def lastError_=(s: String): Unit = prefs.edit().putString("lastError", s).apply()
 
-  def token: Option[String] = SecureStore.get("token").map(String(_, UTF_8))
-  def masterKey: Option[Array[Byte]] = SecureStore.get("master")
+  def token: Option[String] = store.token
+  def masterKey: Option[Array[Byte]] = store.masterKey
 
-  /** Sets the key of the registration `reg`, once. Refuses (false) when a key
-    * is already set or the registration changed since the key step began, so
-    * a confirmed key is never replaced. Returns true only once the key is on
-    * disk; a failed write throws, the key then reads as absent and sync stays
-    * off. Blocking: call off the main thread.
+  /** Sets the key of the registration `reg`, once (see [[PairingStore.confirmKey]]).
+    * Blocking: call off the main thread.
     */
-  def confirmKey(k: Array[Byte], reg: String): Boolean = synchronized {
-    if reg.isEmpty || reg != registration || masterKey.isDefined then false
-    else
-      SecureStore.put("master", k)
-      true
-  }
+  def confirmKey(k: Array[Byte], reg: String): Boolean = store.confirmKey(k, reg)
 
   /** This device created its user (self-registration), so no other device has a key yet. */
-  def newAccount: Boolean = durable.getBoolean("newAccount", false)
+  def newAccount: Boolean = store.newAccount
 
-  def paired: Boolean = serverUrl.nonEmpty && deviceId.nonEmpty && token.isDefined
-  def ready: Boolean = paired && masterKey.isDefined
+  def paired: Boolean = store.paired
+  def ready: Boolean = store.ready
+  /** An unpairing is under way (or was cut short and not finished yet). */
+  def unpairing: Boolean = store.unpairing
 
   /** Identifies the registration (server URL and device id). Sync progress
     * and peer state are keyed by it, so state of an earlier registration is
     * never used for a later one. Empty when not registered.
     */
-  def registration: String =
-    val (u, d) = (serverUrl, deviceId)
-    if u.isEmpty || d.isEmpty then "" else Crypto.sha256Hex(s"$u\n$d".getBytes(UTF_8)).take(16)
+  def registration: String = store.registration
 
   /** Stores the registration, each part checked to be on disk; throws
     * [[java.io.IOException]] otherwise. Blocking: call off the main thread.
     */
   def savePairing(url: String, deviceId: String, token: String, newAccount: Boolean = false): Unit =
-    // The token first: the URL and id make the registration count.
-    SecureStore.put("token", token.getBytes(UTF_8))
-    try durable.commit("url" -> url.stripSuffix("/"), "deviceId" -> deviceId, "newAccount" -> newAccount)
+    try store.savePairing(url, deviceId, token, newAccount)
     catch case e: java.io.IOException => throw java.io.IOException("登録情報を保存できませんでした", e)
 
   /** Unpairs this device. Blocking: call off the main thread.
     *
-    * Invalidates any registration attempt first (none of its results is saved
-    * afterwards), cancels the sync jobs and waits for a running one to end,
-    * then clears the registration, its secrets, all sync progress (seq
-    * counters, watermarks, handed-over archive files), unsent batches and
-    * peer state. A later registration therefore uploads everything afresh,
-    * sealed for its own device id.
+    * Marks the unpairing on disk first ([[PairingStore.forget]]); from then
+    * on the device counts as unpaired. Then invalidates any registration
+    * attempt (none of its results is saved afterwards), cancels the sync
+    * jobs and waits for a running one to end, then clears the registration,
+    * its secrets, all sync progress (seq counters, watermarks, handed-over
+    * archive files), unsent batches, peer state and the sync settings, and
+    * finally the mark. A later registration therefore uploads everything
+    * afresh, sealed for its own device id. A crash in between is finished
+    * by [[resumeUnpair]] at the next start.
     */
-  def forget(ctx: Context): Unit =
+  def forget(ctx: Context): Unit = store.forget(() => invalidate(ctx), f => SyncLock.run(f()), () => clearRest())
+
+  /** Finishes an unpairing a crash cut short, and binds a key stored by an
+    * earlier version to its registration. Call once at start, off the main thread.
+    */
+  def resumeUnpair(ctx: Context): Unit =
+    try
+      if store.resume(() => invalidate(ctx), f => SyncLock.run(f()), () => clearRest()) then Log.i("finished an interrupted unpairing")
+      store.adoptLegacyKey()
+    catch case e: Exception => Log.w("finishing the unpairing failed", e)
+
+  private def invalidate(ctx: Context): Unit =
     Registration.reset()
     SyncScheduler.cancelAll(ctx)
-    SyncLock.run {
-      durable.clear()
-      SecureStore.remove("token")
-      SecureStore.remove("master")
-      AshidoriApp.db.clearSync()
-      Uploader.deleteLegacyPending()
-      PeerStatus.clear()
-    }
+
+  private def clearRest(): Unit =
+    SecureStore.remove("pendingRegistration")
+    AshidoriApp.db.clearSync()
+    Uploader.deleteLegacyPending()
+    PeerStatus.clear()
+    if !prefs.edit().clear().commit() then throw java.io.IOException("同期の設定を消去できませんでした")
 
 /** Serializes all sync work (periodic small, sync now, raw logs, unpairing):
   * runs never interleave, so seq claims and outbox sends cannot race.
@@ -128,92 +136,45 @@ object SyncRun:
       if url.nonEmpty && dev.nonEmpty
     yield SyncRun(SyncConfig.registration, dev, Crypto.batchKey(key), SyncClient(url, Some(token)), stopped)
 
-/** A registration request whose token is already stored. Retrying it with
-  * the same token is idempotent on the server.
-  * `kind` is "account" (`POST /v1/accounts`) or "pair" (`POST /v1/devices/register`).
-  */
-final case class PendingRegistration(url: String, kind: String, code: String, name: String, token: String):
-  def host: String = Try(java.net.URI(url).getHost).toOption.flatMap(Option(_)).getOrElse(url)
-
-/** The server refused a registration for good (a 4xx other than 408/429). */
-final class RegistrationRejected(msg: String) extends RuntimeException(msg)
-
-/** What the registration screen shows: the stored request, and whether an
-  * attempt to send it is in flight.
-  */
-final case class RegistrationState(pending: Option[PendingRegistration], sending: Boolean)
-
-/** Outcomes of registration attempts, delivered on the main thread. Results
-  * carry the id of their attempt (0: not tied to one); a screen ignores those
-  * that are not [[Registration.isLatest]], e.g. of an attempt cancelled since.
-  */
-enum RegistrationEvent:
-  /** The state changed; redraw. */
-  case Changed
-  /** Attempt `attempt` paired this device. */
-  case Paired(attempt: Long, newAccount: Boolean)
-  /** Attempt `attempt` (or starting / cancelling one) failed. */
-  case Failed(attempt: Long, message: String)
-
-/** Device registration with a client-generated token: an app-wide state
-  * machine, independent of any screen instance.
-  *
-  * The token (32 random bytes, base64url) is stored, and checked to be on
-  * disk, before the request is sent. A lost response is retried with the
-  * same token and request; the server answers with the same device id. The
-  * pending request is discarded only when the server definitely refused it
-  * or the user cancelled it.
-  *
-  * Each send is an attempt with its own id. `current` is the attempt in
-  * flight: its id while it can still be cancelled, minus its id while its
-  * answer is being taken in, 0 when there is none. Taking in an answer first
-  * moves `current` from id to -id; cancelling moves it from id to 0. Both are
-  * one compare-and-set on the same value, so exactly one of them wins: once
-  * [[cancel]] returned true, nothing of that attempt is saved, and once the
-  * answer is being taken in, a cancel reports that it came too late.
-  *
-  * Threads: every storage step (storing the request, saving the pairing,
-  * cancelling, resetting) runs on the single `local` executor, in order, and
-  * never does network I/O. Requests go out on the `network` executor, whose
-  * answers are handed back to `local`. The main thread never blocks: the
-  * screen calls [[start]], [[retry]] and [[cancel]] and observes [[state]].
+/** Device registration ([[RegistrationMachine]]): the request and token in
+  * [[SecureStore]], the result in [[SyncConfig]], events on the main thread.
+  * The main thread never blocks: the screen calls [[start]], [[retry]] and
+  * [[cancel]] and observes [[state]].
   */
 object Registration:
   private val Key = "pendingRegistration"
-  private val ids = java.util.concurrent.atomic.AtomicLong(0)
-  private val current = java.util.concurrent.atomic.AtomicLong(0)
-  /** The newest attempt started, or a newer id after a cancel or reset. */
-  private val latest = java.util.concurrent.atomic.AtomicLong(0)
-  /** The stored request, cached once read. None: not read yet. */
-  private val cached = java.util.concurrent.atomic.AtomicReference[Option[Option[PendingRegistration]]](None)
-  /** Storage steps, in the order they were asked for. */
-  private val local = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-registration"))
-  /** Requests to the server; one per attempt, so a stuck one blocks nothing else. */
-  private val network = java.util.concurrent.Executors.newCachedThreadPool(r => Thread(r, "ashidori-registration-net"))
 
-  private def load(): Option[PendingRegistration] =
-    Try(SecureStore.get(Key)).toOption.flatten.flatMap { b =>
-      Try {
-        val js = ujson.read(String(b, UTF_8))
-        PendingRegistration(js("url").str, js("kind").str, js("code").str, js("name").str, js("token").str)
-      }.toOption
-    }
+  private object storage extends RegistrationStorage:
+    def load(): Option[PendingRegistration] = SecureStore.get(Key).flatMap(PendingRegistration.fromBytes)
+    def store(p: Option[PendingRegistration]): Unit = p match
+      case Some(r) => SecureStore.put(Key, r.toBytes)
+      case None    => SecureStore.remove(Key)
+    def busy: Boolean = SyncConfig.paired || SyncConfig.unpairing
+    def savePairing(p: PendingRegistration, deviceId: String): Unit =
+      SyncConfig.savePairing(p.url, deviceId, p.token, newAccount = p.kind == "account")
 
-  /** The stored request. Takes no lock (read from disk on first use). */
-  def pending: Option[PendingRegistration] =
-    cached.get.getOrElse {
-      val p = load()
-      // A writer that stored a newer value in the meantime wins.
-      cached.compareAndSet(None, Some(p))
-      cached.get.get
-    }
+  /** Sends `p`; network errors are retried a few times. Blocking, on the network executor. */
+  private def send(p: PendingRegistration): String =
+    val c = SyncClient(p.url, None)
+    def attempt(n: Int): String =
+      try if p.kind == "account" then c.createAccount(p.name, p.token) else c.register(p.code, p.name, p.token)
+      catch
+        case e: java.io.IOException if n < 3 =>
+          Log.w(s"registration attempt $n failed", e)
+          Thread.sleep(1000L * n * n)
+          attempt(n + 1)
+    attempt(1)
 
-  def state: RegistrationState = RegistrationState(pending, current.get != 0)
+  private val machine = RegistrationMachine(
+    storage, send, () => Crypto.randomToken(), emit,
+    java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-registration")),
+    // One thread per attempt, so a stuck one blocks nothing else.
+    java.util.concurrent.Executors.newCachedThreadPool(r => Thread(r, "ashidori-registration-net"))
+  )
 
-  /** Results of `attempt` are still wanted: no attempt started, and no cancel
-    * or reset happened, after it. Attempt 0 (not tied to one) always is.
-    */
-  def isLatest(attempt: Long): Boolean = attempt == 0 || attempt == latest.get
+  def pending: Option[PendingRegistration] = machine.pending
+  def state: RegistrationState = machine.state
+  def isLatest(attempt: Long): Boolean = machine.isLatest(attempt)
 
   // --- observers (main thread) ---
 
@@ -227,153 +188,14 @@ object Registration:
 
   private def emit(e: RegistrationEvent): Unit = main.post(() => listeners.toVector.foreach(_(e)))
 
-  // --- storage (on `local` only) ---
-
-  private def store(p: Option[PendingRegistration]): Unit =
-    p match
-      case Some(r) =>
-        SecureStore.put(Key, ujson.write(ujson.Obj("url" -> r.url, "kind" -> r.kind, "code" -> r.code, "name" -> r.name,
-          "token" -> r.token)).getBytes(UTF_8))
-      case None => SecureStore.remove(Key)
-    cached.set(Some(p))
-
-  /** Runs `f` on `local` and waits for it. Blocking: never on the main thread or on `local`. */
-  private def onLocal[A](f: => A): A =
-    try local.submit(() => f).get()
-    catch case e: java.util.concurrent.ExecutionException => throw e.getCause
-
-  /** Claims a new attempt id, unless one is in flight. Non-blocking. */
-  private def claim(): Option[Long] =
-    val id = ids.incrementAndGet()
-    if current.compareAndSet(0, id) then
-      latest.set(id)
-      Some(id)
-    else None
-
-  /** Ends attempt `id` if it is still the current one (not taken in, not cancelled). */
-  private def release(id: Long): Unit =
-    if current.compareAndSet(id, 0) then emit(RegistrationEvent.Changed)
-
-  /** Stores a new request with a fresh token, checked to be on disk. On `local`. */
-  private def begin(id: Long, url: String, kind: String, code: String, name: String): PendingRegistration =
-    if current.get != id then throw IllegalStateException("登録をやめました")
-    if SyncConfig.paired || pending.isDefined then throw IllegalStateException("登録の処理がすでに進んでいます")
-    val p = PendingRegistration(url.stripSuffix("/"), kind, code, name, Crypto.randomToken())
-    store(Some(p))
-    p
-
-  /** Sends `p`; network errors are retried a few times. Blocking, on `network`. */
-  private def send(p: PendingRegistration): String =
-    val c = SyncClient(p.url, None)
-    def attempt(n: Int): String =
-      try if p.kind == "account" then c.createAccount(p.name, p.token) else c.register(p.code, p.name, p.token)
-      catch
-        case e: java.io.IOException if n < 3 =>
-          Log.w(s"registration attempt $n failed", e)
-          Thread.sleep(1000L * n * n)
-          attempt(n + 1)
-    attempt(1)
-
-  /** Takes in the answer to attempt `id`, unless it was cancelled or reset
-    * meanwhile. On `local`. Returns the device id when this attempt paired
-    * the device, None when its answer was dropped.
-    */
-  private def finish(id: Long, p: PendingRegistration, answer: Try[String]): Option[String] =
-    // From here on the attempt cannot be cancelled; a cancel that came first wins.
-    if !current.compareAndSet(id, -id) then None
-    else
-      try
-        answer match
-          case scala.util.Success(deviceId) =>
-            SyncConfig.savePairing(p.url, deviceId, p.token, newAccount = p.kind == "account")
-            // Paired now; a request left over would only be cleared by unpairing.
-            Try(store(None)).failed.foreach(e => Log.w("pending registration not cleared", e))
-            Some(deviceId)
-          case scala.util.Failure(e: RegistrationRejected) =>
-            store(None)
-            throw e
-          case scala.util.Failure(e) => throw e
-      finally current.compareAndSet(-id, 0)
-
-  /** Sends attempt `id` of `p` on the network executor; its answer is taken in on `local`. */
-  private def run(id: Long, p: PendingRegistration): Unit =
-    network.execute { () =>
-      val answer = Try(send(p))
-      local.execute { () =>
-        Try(finish(id, p, answer)) match
-          case scala.util.Success(Some(_)) => emit(RegistrationEvent.Paired(id, p.kind == "account"))
-          case scala.util.Success(None)    => () // cancelled meanwhile: dropped
-          case scala.util.Failure(e)       => emit(RegistrationEvent.Failed(id, e.getMessage))
-        emit(RegistrationEvent.Changed)
-      }
-    }
-
-  /** Starts a registration: stores the request, then sends it. Non-blocking. */
-  def start(url: String, kind: String, code: String, name: String): Unit =
-    claim() match
-      case None => emit(RegistrationEvent.Failed(0, "登録の処理がすでに進んでいます"))
-      case Some(id) =>
-        emit(RegistrationEvent.Changed)
-        local.execute { () =>
-          Try(begin(id, url, kind, code, name)) match
-            case scala.util.Success(p) =>
-              emit(RegistrationEvent.Changed)
-              run(id, p)
-            case scala.util.Failure(e) =>
-              release(id)
-              emit(RegistrationEvent.Failed(id, e.getMessage))
-        }
-
-  /** Sends the stored request again, with the same token. Non-blocking. */
-  def retry(): Unit =
-    claim() match
-      case None => emit(RegistrationEvent.Failed(0, "登録の処理がすでに進んでいます"))
-      case Some(id) =>
-        emit(RegistrationEvent.Changed)
-        local.execute { () =>
-          pending match
-            case Some(p) if current.get == id => run(id, p)
-            case _ =>
-              release(id)
-              emit(RegistrationEvent.Failed(id, "登録の処理がありません"))
-        }
-
-  /** Gives up the request. Non-blocking. Returns false when the answer of the
-    * attempt in flight is already being taken in (too late to cancel it).
-    * Otherwise no result of that attempt is saved from now on, and the stored
-    * request is removed on `local`, after every step asked for before.
-    */
-  def cancel(): Boolean =
-    var v = current.get
-    while v > 0 && !current.compareAndSet(v, 0) do v = current.get
-    latest.set(ids.incrementAndGet())
-    emit(RegistrationEvent.Changed)
-    local.execute { () =>
-      Try(store(None)).failed.foreach(e => emit(RegistrationEvent.Failed(0, e.getMessage)))
-      emit(RegistrationEvent.Changed)
-    }
-    v >= 0
-
-  /** Forgets any request and invalidates any attempt (unpairing): once this
-    * returned, no result of an earlier attempt is saved. Blocking.
-    */
-  def reset(): Unit =
-    latest.set(ids.incrementAndGet())
-    // On `local` no answer is being taken in, so `current` is not negative there.
-    onLocal {
-      current.set(0)
-      store(None)
-    }
-    emit(RegistrationEvent.Changed)
-
+  def start(url: String, kind: String, code: String, name: String): Unit = machine.start(url, kind, code, name)
+  def retry(): Unit = machine.retry()
+  /** False, changing nothing, when it came too late (see [[RegistrationMachine.cancel]]). */
+  def cancel(): Boolean = machine.cancel()
+  def reset(): Unit = machine.reset()
   /** Registers on the calling thread and returns the device id (debug hook). Blocking. */
   def registerBlocking(url: String, kind: String, code: String, name: String): String =
-    val id = claim().getOrElse(throw IllegalStateException("登録の処理がすでに進んでいます"))
-    try
-      val p = onLocal(begin(id, url, kind, code, name))
-      val answer = Try(send(p))
-      onLocal(finish(id, p, answer)).getOrElse(throw IllegalStateException("登録をやめました"))
-    finally release(id)
+    machine.registerBlocking(url, kind, code, name)
 
 
 /** The server refused an upload because the user's storage quota is full.
@@ -718,7 +540,16 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
   override def doWork(): ListenableWorker.Result =
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
-        Try(Uploader.uploadSmall(run)).fold(
+        val up = Try(Uploader.uploadSmall(run))
+        // Other devices' status, whatever became of the upload (a full quota
+        // does not stop it): best effort, never fails the job, and still
+        // under the sync lock. Only a stopped job skips it.
+        if !up.failed.toOption.exists(_.isInstanceOf[SyncRun.Stopped]) then
+          try PeerStatus.pull(run)
+          catch
+            case _: SyncRun.Stopped => ()
+            case e: Exception => Log.w("peer status failed", e)
+        up.fold(
           e => {
             if !e.isInstanceOf[SyncRun.Stopped] then
               Log.w("sync failed", e)
@@ -728,9 +559,6 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
           _ => {
             SyncConfig.lastSync = System.currentTimeMillis()
             SyncConfig.lastError = ""
-            // Other devices' status: best effort, never fails the upload.
-            try PeerStatus.pull(run)
-            catch case e: Exception => Log.w("peer status failed", e)
             ListenableWorker.Result.success()
           }
         )

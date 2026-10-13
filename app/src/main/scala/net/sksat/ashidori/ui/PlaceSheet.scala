@@ -129,18 +129,18 @@ final class PlaceSheet(
           candidates.addView(caption("過去のチェックイン先のみを表示しています。検索すると、位置情報が OpenStreetMap のサーバに送られます。"))
           lazy val once: View = outlined("周辺の施設を検索（位置情報を送信）") {
             candidates.removeView(once)
-            searchOnline(past)
+            searchOnline(past, explicit = true)
           }
           candidates.addView(once)
-        else searchOnline(past)
+        else searchOnline(past, explicit = false)
       }
     }
 
   /** OpenStreetMap venues near the place: sends its position to the server. */
-  private def searchOnline(past: Seq[(Venue, Double)]): Unit =
+  private def searchOnline(past: Seq[(Venue, Double)], explicit: Boolean): Unit =
     val loading = caption("近くの施設を検索中…")
     candidates.addView(loading)
-    VenueSearch.nearby(place.latLng, 120) { r =>
+    VenueSearch.nearby(place.latLng, 120, explicit = explicit) { r =>
       candidates.removeView(loading)
       r.fold(
         e => candidates.addView(caption(e match

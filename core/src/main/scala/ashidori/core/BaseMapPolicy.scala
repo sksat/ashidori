@@ -5,7 +5,7 @@ package ashidori.core
   * Online tiles reveal the area being viewed, so while the setting is on
   * every map and snapshot uses the on-device basemap. The user's chosen
   * online map is shown only in an interactive map where they explicitly
-  * asked for it ("detailed"), and only until that map is closed. Snapshots
+  * asked for it ("detailed"), and only while it is on screen (see [[SendGate]]). Snapshots
   * (feed, period, other devices) and picker thumbnails never go online then.
   * With the setting off, the user's choice applies everywhere.
   *

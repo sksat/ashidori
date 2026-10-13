@@ -17,7 +17,7 @@ import scala.collection.mutable
 import scala.util.Try
 import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
-import ashidori.core.sync.{Crypto, RecoveryCode}
+import ashidori.core.sync.{Crypto, RecoveryCode, RegistrationEvent, RegistrationState}
 import Ui.*
 
 /** Server sync setup, one step at a time from the persisted state:

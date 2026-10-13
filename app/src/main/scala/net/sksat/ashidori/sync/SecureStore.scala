@@ -7,11 +7,11 @@ import javax.crypto.{Cipher, KeyGenerator, SecretKey}
 import javax.crypto.spec.GCMParameterSpec
 
 /** Small secrets (device token, E2EE master key) wrapped with a
-  * non-exportable Android Keystore key and kept in private preferences.
+  * non-exportable Android Keystore key and kept in a [[DurablePrefs]] file.
   * A secret is readable only once it is on disk ([[DurablePrefs]]): while it
   * is being written, or after its write failed, [[get]] does not return it.
   */
-object SecureStore:
+object SecureStore extends ashidori.core.sync.SecretStore:
   private val Alias = "ashidori-wrap-v1"
   private val prefs = DurablePrefs("secure")
 
