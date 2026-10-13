@@ -41,7 +41,7 @@ GitHub Actions（[`.github/workflows/server.yml`](../.github/workflows/server.ym
 | --- | --- |
 | D1 データベース | `ashidori` |
 | R2 バケット | `ashidori-blobs` |
-| Worker | `ashidori-sync`（初回デプロイで作成される） |
+| Worker | `ashidori-sync`（デプロイ用トークンは Worker を作成できないため、事前に作成する） |
 | カスタムドメイン | Worker `ashidori-sync` に任意のホスト名（例: `sync.example.com`）を割り当てる |
 | Access アプリケーション | 上記ホスト名の `/admin` を自分のみに許可する |
 
