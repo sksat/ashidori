@@ -42,7 +42,7 @@ final case class PeerEntry(seq: Long, fetchedAt: Long, status: DeviceStatus, are
   * ([[SyncConfig.registration]]); state of another registration reads as empty.
   *
   * Only the metadata listing is walked (from a stored cursor); of the blobs,
-  * only the newest `status` batch per other device is fetched.
+  * only the newest readable `status` batch per other device is fetched.
   */
 object PeerStatus:
   private def prefs = AshidoriApp.app.getSharedPreferences("peers", Context.MODE_PRIVATE)
@@ -81,7 +81,7 @@ object PeerStatus:
         e.obj.get("area").flatMap(_.strOpt).getOrElse(""))
     }).getOrElse(Map.empty)
 
-  /** Listing cursor, newest listed and read seq per device, unreadable batches. */
+  /** Listing cursor, listed candidates and read seq per device, unreadable batches. */
   def syncState: StatusSyncState =
     if !current then StatusSyncState.empty
     else Option(prefs.getString("statusSync", null)).flatMap(s => Try(StatusSyncState.fromJson(ujson.read(s))).toOption)
@@ -138,11 +138,14 @@ object PeerStatus:
   /** Lists new batches and fetches the newest `status` of each other device.
     * Runs inside the sync run `run` (under [[SyncLock]]).
     *
-    * The listing cursor moves on after each page: the newest listed seq per
-    * device is stored with it. A network error leaves that device for the
-    * next run. A blob that is received but cannot be read is recorded as
-    * unresolved and retried up to [[StatusSyncState.MaxAttempts]] times; it
-    * stays shown on the device's row until a newer status is read.
+    * The listing cursor moves on after each page: the newest few listed
+    * statuses per device are stored with it. A network error leaves that
+    * device for the next run. A blob that is received but cannot be read is
+    * recorded as unresolved and retried up to [[StatusSyncState.MaxAttempts]]
+    * times, after which the next newest candidate is tried; it stays shown on
+    * the device's row until a status at least as new is read. Now and then
+    * the listing is walked again from cursor 0 ([[StatusSyncState.rescanIfDue]]),
+    * so a row the server made up cannot hide later ones for good.
     */
   def pull(run: SyncRun): Unit =
     val reg = run.reg
@@ -161,9 +164,19 @@ object PeerStatus:
       run.checkStopped()
       val before = st.cursor
       val (items, next) = run.client.listBatches(st.cursor, PageSize)
-      st = st.listed(items, run.deviceId)
+      st = st.listed(items, run.deviceId, PageSize)
       save(st)
       more = next.isDefined && items.nonEmpty && st.cursor > before
+      pages += 1
+    // A rescan from cursor 0 (weekly, or sooner when wanted) shares the
+    // run's page budget and continues on the next run.
+    st = st.rescanIfDue(System.currentTimeMillis())
+    save(st)
+    while st.rescan.isDefined && pages < MaxPages do
+      run.checkStopped()
+      val (items, next) = run.client.listBatches(st.rescan.get, PageSize)
+      st = st.rescanned(items, run.deviceId, PageSize, next.isDefined && items.nonEmpty)
+      save(st)
       pages += 1
 
     var known = entries
@@ -185,7 +198,7 @@ object PeerStatus:
         case Right(None) => ()
         case Left(e) =>
           Log.w(s"status $dev/$seq unreadable", e)
-          st = st.failed(dev, seq, e.getMessage)
+          st = st.failed(dev, cand, e.getMessage)
         case Right(Some(b)) =>
           try
             val plain = Crypto.gunzip(Crypto.open(run.batchKey, Crypto.aad(dev, DeviceStatus.Stream, seq), b), DeviceStatus.MaxPlain)
@@ -195,7 +208,7 @@ object PeerStatus:
           catch
             case e: Exception =>
               Log.w(s"status $dev/$seq unreadable", e)
-              st = st.failed(dev, seq, e.getMessage)
+              st = st.failed(dev, cand, e.getMessage)
       save(st, Some(known))
     changed()
 

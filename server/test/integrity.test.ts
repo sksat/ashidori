@@ -5,7 +5,7 @@
 import { createExecutionContext, createScheduledController, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { legacyBlobKey, ORPHAN_MIN_AGE_MS } from "../src/batches";
+import { COMMIT_DEADLINE_MS, legacyBlobKey, ORPHAN_MIN_AGE_MS } from "../src/batches";
 import worker, { maintenance } from "../src/index";
 import { authed, newDevice, putBatch, sha256Hex } from "./helpers";
 
@@ -167,6 +167,50 @@ describe("batches stored before the immutable keys", () => {
     // Re-sending it is idempotent; a different blob conflicts.
     expect((await putBatch(a.token, "fixes", 3, body)).status).toBe(200);
     expect((await putBatch(a.token, "fixes", 3, bytes(40, 8))).status).toBe(409);
+  });
+});
+
+/** A D1 binding whose reading of the attempt start time is `agoMs` in the past. */
+function startedAgo(agoMs: number): D1Database {
+  const real = env.DB;
+  return new Proxy(real, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) =>
+          target.prepare(/^SELECT .* AS t$/.test(sql) ? sql.replace(" AS t", ` - ${agoMs} AS t`) : sql);
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+}
+
+describe("commit deadline", () => {
+  it("stays below the orphan sweep's grace period", () => {
+    expect(COMMIT_DEADLINE_MS).toBeLessThanOrEqual(ORPHAN_MIN_AGE_MS / 2);
+  });
+
+  it("refuses an expired attempt with a retryable 503 and deletes its object", async () => {
+    const a = await newDevice();
+    const body = bytes(40, 1);
+    const res = await putBatch(a.token, "fixes", 0, body, undefined, { DB: startedAgo(COMMIT_DEADLINE_MS + 60_000) });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM batches").first()).toEqual({ n: 0 });
+    expect(await env.DB.prepare("SELECT storage_bytes, batch_count FROM users").first()).toEqual({ storage_bytes: 0, batch_count: 0 });
+    expect(await slotObjects(a.deviceId, "fixes", 0)).toEqual([]);
+
+    // The client sends the same blob again; a timely attempt commits.
+    expect((await putBatch(a.token, "fixes", 0, body)).status).toBe(201);
+    expect(await slotObjects(a.deviceId, "fixes", 0)).toHaveLength(1);
+  });
+
+  it("commits an attempt that is within the deadline", async () => {
+    const a = await newDevice();
+    const res = await putBatch(a.token, "fixes", 0, bytes(40, 2), undefined, { DB: startedAgo(COMMIT_DEADLINE_MS - 60_000) });
+    expect(res.status).toBe(201);
+    const row = await env.DB.prepare("SELECT r2_key FROM batches").first<{ r2_key: string }>();
+    expect(await slotObjects(a.deviceId, "fixes", 0)).toEqual([row!.r2_key]);
   });
 });
 

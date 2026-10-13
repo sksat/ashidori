@@ -13,6 +13,16 @@
 //   3. A request that did not commit deletes its own object (best effort).
 //      Objects left behind by a crash between 1 and 2 are found by the
 //      scheduled sweep (sweepOrphanBlobs).
+// Before step 1 the request reads D1's clock (startedAt), and the commit in
+// step 2 also requires D1's clock at that statement to be at most
+// COMMIT_DEADLINE_MS after it. A request delayed longer (between the put and
+// the commit, or while the statement is in flight) is refused, deletes its
+// own object and answers 503, and the client sends the same blob again. The
+// sweep only deletes objects older than ORPHAN_MIN_AGE_MS by R2's upload
+// time, which is after startedAt; since COMMIT_DEADLINE_MS plus twice the
+// clock skew between D1, R2 and the Worker stays below ORPHAN_MIN_AGE_MS, an
+// object the sweep finds unreferenced can no longer be committed
+// (formal/tla/BatchCommit.tla, BatchCommit_fixed).
 // GET serves the key the metadata references. Batches stored before
 // migration 0005 have no key there and live at the old key
 // b/{deviceId}/{stream}/{seq 12 digits}; they were not moved.
@@ -45,7 +55,8 @@ export type PutResult =
   | "conflict"
   | "quota exceeded"
   | "server full"
-  | "device gone";
+  | "device gone"
+  | "expired";
 
 function checkUsage(
   u: { storageBytes: number; batchCount: number; totalBytes: number },
@@ -67,6 +78,21 @@ export interface PutInput {
   body: Uint8Array;
   createdAt: number;
 }
+
+/**
+ * D1's clock in milliseconds. Both ends of the commit deadline are read from
+ * it, so the Worker's clock plays no part in the deadline. julianday() rather
+ * than unixepoch('subsec'), which needs SQLite 3.42.
+ */
+const D1_NOW_MS = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
+/**
+ * An upload must commit within this time after it started (by D1's clock),
+ * else it is refused with "expired". Must stay well below ORPHAN_MIN_AGE_MS:
+ * COMMIT_DEADLINE_MS + 2 * (clock skew) <= ORPHAN_MIN_AGE_MS. One hour
+ * leaves 11.5 hours for the skew.
+ */
+export const COMMIT_DEADLINE_MS = 60 * 60 * 1000;
 
 export async function putBatch(
   db: D1Database,
@@ -92,6 +118,11 @@ export async function putBatch(
   const early = checkUsage(usage, size, limits);
   if (early) return early;
 
+  // The attempt's start, by D1's clock, before anything is written to R2.
+  const started = await db.prepare(`SELECT ${D1_NOW_MS} AS t`).first<{ t: number }>();
+  if (!started) throw new Error("D1 returned no time");
+  const startedAt = started.t;
+
   const key = newBlobKey(p.deviceId, p.stream, p.seq, p.sha256);
   await blobs.put(key, p.body, { sha256: p.sha256, httpMetadata: { contentType: "application/octet-stream" } });
 
@@ -100,7 +131,8 @@ export async function putBatch(
   const userBatches =
     "CASE WHEN ?7 IS NULL THEN (SELECT legacy_batch_count FROM server_usage WHERE id = 1) ELSE (SELECT batch_count FROM users WHERE id = ?7) END";
   // One statement: slot uniqueness, the quota and the counters (triggers) are
-  // decided together. The upload time is for display only (ordering is by
+  // decided together, and the attempt must not have expired (D1's clock at
+  // this statement). The upload time is for display only (ordering is by
   // cursor), so it is kept at hour granularity.
   const inserted = await db
     .prepare(
@@ -110,6 +142,7 @@ export async function putBatch(
          AND ${userBytes} + ?4 <= ?9
          AND ${userBatches} + 1 <= ?10
          AND (SELECT total_bytes FROM server_usage WHERE id = 1) + ?4 <= ?11
+         AND ${D1_NOW_MS} - ?12 <= ?13
        ON CONFLICT (device_id, stream, seq) DO NOTHING
        RETURNING cursor`,
     )
@@ -125,6 +158,8 @@ export async function putBatch(
       limits.userQuotaBytes,
       limits.userMaxBatches,
       limits.maxTotalBytes,
+      startedAt,
+      COMMIT_DEADLINE_MS,
     )
     .first<{ cursor: number }>();
   if (inserted) return { status: "created", cursor: inserted.cursor };
@@ -135,7 +170,11 @@ export async function putBatch(
   if (raced) return raced;
   const now = await readUsage(db, p.userId, p.deviceId);
   if (!now.deviceActive) return "device gone";
-  return checkUsage(now, size, limits) ?? "quota exceeded";
+  const full = checkUsage(now, size, limits);
+  if (full) return full;
+  // Every other condition holds now, so the deadline refused it (or a race
+  // that has since resolved, which a retry also handles).
+  return "expired";
 }
 
 /** The R2 key holding a committed batch, or null if the caller's user has no such batch. */
@@ -158,7 +197,10 @@ export async function committedBlob(
   return { key: meta.r2_key ?? legacyBlobKey(deviceId, stream, seq), sha256: meta.sha256 };
 }
 
-/** Objects younger than this are never swept: their upload may still be committing. */
+/**
+ * Objects younger than this (by R2's upload time) are never swept: their
+ * upload may still be committing. See COMMIT_DEADLINE_MS.
+ */
 export const ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 const NEW_KEY_RE = /^b\/[^/]+\/[a-z][a-z0-9_]{0,31}\/[0-9]{12}\/[0-9a-f]{64}\.[0-9a-f]{16}$/;
 

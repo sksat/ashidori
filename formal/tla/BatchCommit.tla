@@ -17,14 +17,24 @@
 (* The sweep deletes objects older than Grace that no row references. It  *)
 (* is two steps (list+D1 check, then delete), as in the code.              *)
 (*                                                                         *)
-(* CommitDeadline = 0 models the current code. CommitDeadline = D > 0      *)
-(* models the proposed fix: D1 refuses the commit when now - start > D,    *)
-(* with `now` taken by D1 itself and start taken before the R2 put.        *)
+(* Deadline = TRUE models the code (the fix): the attempt reads D1's clock *)
+(* (start) before the R2 put, and D1 refuses the commit when               *)
+(* now - start > CommitDeadline, with `now` taken by D1 in that very       *)
+(* statement. A refused attempt deletes its own object (DelOwn) and the    *)
+(* client sends the same blob again (a new attempt). The design needs      *)
+(* CommitDeadline (D) <= Grace (G), checked by ASSUME; with clock skew the *)
+(* code keeps D + 2 * skew <= G.                                           *)
+(* Deadline = FALSE models the design before the fix (no deadline).        *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Devs, Users, Owner, Seqs, Shas, Size, Attempts,
-          Quota, MaxBatches, MaxTotal, Grace, CommitDeadline, MaxTime
+          Quota, MaxBatches, MaxTotal, MaxTime,
+          Grace,           \* G: the sweep only deletes objects older than this
+          Deadline,        \* TRUE: the commit deadline exists (the fix)
+          CommitDeadline   \* D: the longest now - start at which D1 still commits
+
+ASSUME Deadline => CommitDeadline <= Grace
 
 VARIABLES
   now,       \* one clock for the Worker, D1 and R2 (no skew modelled)
@@ -74,7 +84,7 @@ Commit(a) ==
                /\ ubytes[u] + Size[x.sha] <= Quota
                /\ ucount[u] + 1 <= MaxBatches
                /\ total + Size[x.sha] <= MaxTotal
-               /\ (CommitDeadline = 0 \/ now - x.start <= CommitDeadline)
+               /\ (Deadline => now - x.start <= CommitDeadline)
      IN IF ok
           THEN /\ rows' = rows \cup {[dev |-> x.dev, seq |-> x.seq, sha |-> x.sha, key |-> a]}
                /\ ubytes' = [ubytes EXCEPT ![u] = @ + Size[x.sha]]

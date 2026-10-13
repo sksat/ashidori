@@ -276,6 +276,10 @@ v1.put("/batches/:stream/:seq", async (c) => {
       return jsonError(c, 507, "server storage full");
     case "device gone":
       return jsonError(c, 401, "unauthorized");
+    case "expired":
+      // Took too long between the R2 put and the D1 commit; nothing is stored.
+      c.header("Retry-After", "60");
+      return jsonError(c, 503, "upload expired, retry");
   }
   return r.status === "created" ? c.json(r, 201) : c.json(r, 200);
 });

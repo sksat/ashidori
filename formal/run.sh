@@ -146,6 +146,7 @@ FeedResync FeedResync pass
 FeedResync_firstpage FeedResync fail:Invariant_NoMixedVersions_is_violated
 StatusDownload StatusDownload pass
 StatusDownload_hostile StatusDownload pass
+StatusDownload_fixed StatusDownload pass
 StatusDownload_fakeseq StatusDownload fail:Temporal_properties_were_violated
 StatusDownload_fakecursor StatusDownload fail:Temporal_properties_were_violated
 "
