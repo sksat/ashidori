@@ -66,7 +66,11 @@ final class PeerPanel(act: MainActivity):
 
   private val rows = vbox()
   /** Runs the sync now: uploads, then fetches the other devices' status. */
-  private val refreshButton = button("更新", tonal = true)(SyncScheduler.syncNow(act))
+  private val refreshButton = button("更新", tonal = true) {
+    // Also retries statuses that failed to read before, without waiting for their backoff.
+    PeerStatus.requestRetry()
+    SyncScheduler.syncNow(act)
+  }
   private val header =
     val t = text("端末", 16f, bold = true)
     t.setLayoutParams(weighted())

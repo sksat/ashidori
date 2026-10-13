@@ -15,6 +15,11 @@ class AshidoriApp extends Application:
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)
     )
     LoggerWatchdog.schedule(this)
+    Settings.migrate()
+    // Copy the offline basemap out of the APK before the first map needs it.
+    Thread(() => { Basemap.prepare(); () }, "ashidori-basemap").start()
+    // Area names cached from the platform geocoder: recompute on the device.
+    AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
     // Archive finished days (and migrate pre-Parquet data) in the background.
     AshidoriApp.io.execute(() => AshidoriApp.maintainArchive())
 
@@ -60,6 +65,23 @@ object Settings:
   def lastDetailStart: Long = prefs.getLong("lastDetailStart", 0L)
   def lastDetailStart_=(t: Long): Unit = prefs.edit().putLong("lastDetailStart", t).apply()
 
-  /** Fetch nearby venues from OpenStreetMap (Overpass) for check-ins. */
-  def onlineVenues: Boolean = prefs.getBoolean("onlineVenues", true)
-  def onlineVenues_=(b: Boolean): Unit = prefs.edit().putBoolean("onlineVenues", b).apply()
+  /** Never send positions, current or past, to external services on the
+    * app's own initiative: no platform geocoder, no automatic venue search
+    * (OpenStreetMap), and maps and their snapshots drawn from the on-device
+    * basemap only. An explicit user action may still send: a venue search,
+    * or the online map in one map view ("この範囲を詳しい地図で表示").
+    * Off: venues are searched automatically, the platform geocoder fills
+    * names the offline index lacks, and the chosen base map is used.
+    */
+  def blockExternalLocation: Boolean = prefs.getBoolean("blockExternalLocation", true)
+  def blockExternalLocation_=(b: Boolean): Unit = prefs.edit().putBoolean("blockExternalLocation", b).apply()
+
+  /** Upgrades stored settings; call once at start. */
+  def migrate(): Unit =
+    // 「近くの施設を OpenStreetMap で検索」 (onlineVenues) merged into
+    // blockExternalLocation. Whoever had turned venue search off did not
+    // want the position sent automatically: keep the stricter setting.
+    if prefs.contains("onlineVenues") then
+      val e = prefs.edit()
+      if !prefs.getBoolean("onlineVenues", true) then e.putBoolean("blockExternalLocation", true)
+      e.remove("onlineVenues").apply()

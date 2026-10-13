@@ -51,7 +51,9 @@ object DayMap:
     val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays)
     val img = ImageView(act)
     img.setScaleType(ImageView.ScaleType.CENTER_CROP)
-    val style = MapStyle.current
+    // Rendered while scrolling, without the user asking for that area: the
+    // offline map while 「位置情報を外部サービスに送らない」 is on.
+    val style = MapStyle.forSnapshot
     val frame = FrameLayout(act)
     frame.addView(sketch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     frame.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -82,7 +84,7 @@ object DayMap:
             .include(MLatLng(lat0 - padLat, lon0 - padLon))
             .include(MLatLng(lat1 + padLat, lon1 + padLon))
             .build()
-          val builder = style.builder
+          val builder = style.snapshotBuilder
             .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths)))
             .withSource(GeoJsonSource("day-stays", FeatureCollection.fromFeatures(
               stays.map(s => Feature.fromGeometry(Point.fromLngLat(s.lon, s.lat))).asJava)))
@@ -104,6 +106,7 @@ object DayMap:
             .withRegion(bounds)
             .withStyleBuilder(builder)
             .withLogo(false)
+          MapStyle.applyNetworkPolicy(act)
           val snap = MapSnapshotter(act, opts)
           running += snap
           def done(): Unit =

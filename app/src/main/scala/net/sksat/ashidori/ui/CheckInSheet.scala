@@ -79,9 +79,12 @@ object VenueSearch:
           AshidoriApp.app.getMainExecutor.execute(() => done(r))
         }
 
+  /** Searches run without an explicit user action. */
+  def automatic: Boolean = !Settings.blockExternalLocation
+
   /** Warm the cache for a position in the background (no UI). */
   def prefetch(p: LatLng): Unit =
-    if Settings.onlineVenues && cached(p).isEmpty then nearby(p)(_ => ())
+    if automatic && cached(p).isEmpty then nearby(p)(_ => ())
 
 /** Swarm-style check-in as a bottom sheet: search on top, nearby venues,
   * then a short compose step. `at` checks in to a past visit instead of the
@@ -98,6 +101,12 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   search.setSingleLine(true)
   private val status = caption("")
   private val list = vbox()
+  /** Shown while sending location information is blocked: one explicit search. */
+  private val searchOnce =
+    val b = outlined("周辺の施設を検索（位置情報を送信）")(here.foreach(searchOnline))
+    b.setVisibility(View.GONE)
+    b
+  private val footnote = caption("")
 
   // Compose step
   private val chosen = text("", 18f, bold = true)
@@ -125,9 +134,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       text(if at.isDefined then "この滞在にチェックイン" else "チェックイン", 20f, bold = true),
       search,
       status,
+      searchOnce,
       list,
       spacer(12),
-      caption("近くの施設は OpenStreetMap から取得します（位置がそのサーバに送られます）。")
+      footnote
     )
 
   def show(): Unit =
@@ -205,22 +215,38 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
         render()
       }
     }
-    if !Settings.onlineVenues then status.setText("施設の検索はオフです。名前を入力してチェックインできます。")
-    else
-      status.setText("近くの施設を検索中…")
-      VenueSearch.nearby(p) { r =>
-        r.fold(
-          e => status.setText(e match
-            case v: VenueError => v.message
-            case _             => "施設を取得できませんでした。名前を入力してチェックインできます。"
-          ),
-          vs => {
-            venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
-            status.setText("")
-          }
-        )
-        render()
-      }
+    if Settings.blockExternalLocation then
+      // Results of an earlier explicit search stay usable; nothing is sent.
+      VenueSearch.cached(p) match
+        case Some(vs) =>
+          venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
+          status.setText("")
+          searchOnce.setVisibility(View.GONE)
+          render()
+        case None =>
+          status.setText("過去の場所とチェックイン先のみを表示しています。")
+          searchOnce.setVisibility(View.VISIBLE)
+      footnote.setText("検索すると、位置情報が OpenStreetMap のサーバに送られます。")
+    else searchOnline(p)
+
+  /** Venue search on OpenStreetMap: sends the position to the server. */
+  private def searchOnline(p: LatLng): Unit =
+    searchOnce.setVisibility(View.GONE)
+    footnote.setText("近くの施設は OpenStreetMap から取得します（位置情報がそのサーバに送られます）。")
+    status.setText("近くの施設を検索中…")
+    VenueSearch.nearby(p) { r =>
+      r.fold(
+        e => status.setText(e match
+          case v: VenueError => v.message
+          case _             => "施設を取得できませんでした。名前を入力してチェックインできます。"
+        ),
+        vs => {
+          venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
+          status.setText("")
+        }
+      )
+      render()
+    }
 
   private def row(title: String, sub: String)(onClick: => Unit): View =
     val t = text(title, 16f)

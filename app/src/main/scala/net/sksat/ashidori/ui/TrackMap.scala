@@ -27,6 +27,9 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
 
 /** MapLibre map with layers for tracks, visits, check-ins and one highlighted
   * path. Data set before the style finishes loading is applied afterwards.
+  *
+  * With 「位置情報を外部サービスに送らない」 on, it shows the on-device map
+  * until the user asks for the online one in this view ([[detailed]]).
   */
 final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
@@ -35,6 +38,13 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   mapView.onCreate(saved)
   act.registerMap(this)
   TrackMap.all += this
+  MapStyle.applyNetworkPolicy(act)
+
+  /** The user asked for the online map in this view; ends when it closes. */
+  private var detailedFlag = false
+  def detailed: Boolean = detailedFlag
+  /** Base map loaded (or loading) on this map. */
+  private var shown: Option[MapStyle] = None
 
   private var map: Option[(MapLibreMap, Style)] = None
   private var pending: Option[() => Unit] = None
@@ -61,6 +71,37 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     b.setOnClickListener(_ => pickBaseMap())
     b
 
+  /** Explicit switch to the online map for this view (setting on only). */
+  private val detailButton =
+    val b = Ui.button("", tonal = true)(toggleDetailed())(using act)
+    b.setTextSize(12f)
+    b.setMinHeight(0)
+    b.setMinimumHeight(0)
+    b.setInsetTop(0)
+    b.setInsetBottom(0)
+    b.setPadding(Ui.dp(12)(using act), Ui.dp(6)(using act), Ui.dp(12)(using act), Ui.dp(6)(using act))
+    b
+
+  private def updateDetailButton(): Unit =
+    detailButton.setVisibility(if Settings.blockExternalLocation then android.view.View.VISIBLE else android.view.View.GONE)
+    detailButton.setText(
+      if detailedFlag then s"簡易地図に戻す（${MapStyle.forView(true).label}を表示中）"
+      else "この範囲を詳しい地図で表示（位置情報を送信）")
+    // Sending is the exception: mark it with the tertiary (warning) colours.
+    given Ui.Ctx = act
+    if detailedFlag then Ui.tint(detailButton, Ui.color(Ui.attr.tertiaryContainer), Ui.color(Ui.attr.onTertiaryContainer))
+    else Ui.tint(detailButton, Ui.color(Ui.attr.surfaceContainerHigh), Ui.color(Ui.attr.onSurface))
+
+  private def toggleDetailed(): Unit =
+    setDetailed(!detailedFlag)
+
+  /** Switches this view between the offline and the chosen online map. */
+  def setDetailed(on: Boolean): Unit =
+    detailedFlag = on
+    MapStyle.applyNetworkPolicy(act)
+    updateDetailButton()
+    refreshBaseMap()
+
   /** Map plus overlay controls; screens add this instead of `mapView`. */
   val view: FrameLayout =
     val f = FrameLayout(act)
@@ -79,6 +120,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.START)
     lp.setMargins(Ui.dp(12)(using act), Ui.dp(8)(using act), 0, Ui.dp(12)(using act))
     f.addView(controls, lp)
+    val dlp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.END)
+    dlp.setMargins(Ui.dp(76)(using act), Ui.dp(10)(using act), Ui.dp(12)(using act), Ui.dp(14)(using act))
+    f.addView(detailButton, dlp)
+    updateDetailButton()
     f
 
   // Follow the logger's fixes; the map never turns GNSS on by itself.
@@ -88,15 +134,20 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   /** Re-applies the latest data after a base map change. */
   private var lastData: Option[() => Unit] = None
 
+  /** The MapLibre map, also while a style is loading (unlike [[map]]). */
+  private var mlMap: Option[MapLibreMap] = None
+
   mapView.getMapAsync { m =>
+    mlMap = Some(m)
     m.getUiSettings.setRotateGesturesEnabled(false)
     m.getUiSettings.setTiltGesturesEnabled(false)
-    loadStyle(m, MapStyle.current)
+    loadStyle(m, MapStyle.forView(detailedFlag))
   }
 
   /** Loads a base map and (re)adds our sources and layers on top of it. */
   private def loadStyle(m: MapLibreMap, ms: MapStyle): Unit =
     map = None
+    shown = Some(ms)
     m.setStyle(ms.builder, (style: Style) => {
       for id <- Seq("track", "highlight", "visits", "checkins", "live") do style.addSource(GeoJsonSource(id))
       // From the end of the drawn route to where we are now, updated per fix.
@@ -174,14 +225,36 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       pending = None
     })
 
-  /** Switches the base map on this map, keeping what is drawn. */
-  def setBaseMap(ms: MapStyle): Unit =
-    map.map(_._1).foreach { m =>
-      pending = lastData.map(d => () => d())
-      loadStyle(m, ms)
-    }
+  /** Reloads the base map the policy picks now (after a choice, a setting
+    * change or a detail switch), keeping what is drawn. `force` reloads the
+    * same base map (e.g. a new custom URL).
+    */
+  def refreshBaseMap(force: Boolean = false): Unit =
+    updateDetailButton()
+    val ms = MapStyle.forView(detailedFlag)
+    if force || !shown.contains(ms) then
+      mlMap.foreach { m =>
+        pending = lastData.map(d => () => d()).orElse(pending)
+        loadStyle(m, ms)
+      }
 
-  /** Picker as a 2-column grid of thumbnails rendered at the current view. */
+  /** Applies a choice from the picker. With the setting on, choosing an
+    * online map is the explicit request to show it in this view.
+    */
+  private def choose(ms: MapStyle): Unit =
+    MapStyle.current = ms
+    if Settings.blockExternalLocation then
+      detailedFlag = ms.online
+      MapStyle.applyNetworkPolicy(act)
+      // Other open maps keep the offline map; only their label changes.
+      TrackMap.all.filterNot(_ == this).foreach(_.refreshBaseMap())
+      refreshBaseMap(force = ms == MapStyle.Custom)
+    else TrackMap.all.foreach(_.refreshBaseMap(force = ms == MapStyle.Custom))
+
+  /** Picker as a 2-column grid of thumbnails rendered at the current view.
+    * With the setting on, only the offline map gets a thumbnail; the online
+    * ones are marked as sending the visible area and render nothing.
+    */
   private def pickBaseMap(): Unit =
     val dialog = com.google.android.material.bottomsheet.BottomSheetDialog(act)
     given Ui.Ctx = act
@@ -189,30 +262,38 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     val snapshotters = scala.collection.mutable.ArrayBuffer.empty[org.maplibre.android.snapshotter.MapSnapshotter]
     val thumbW = (act.getResources.getDisplayMetrics.widthPixels - Ui.dp(64)) / 2
     val thumbH = (thumbW * 0.7).toInt
+    val block = Settings.blockExternalLocation
     val cards = MapStyle.values.toSeq.map { ms =>
       val img = android.widget.ImageView(act)
       img.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP)
       img.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
-      img.setLayoutParams(android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbH))
       img.setContentDescription(ms.label)
-      val selected = ms == MapStyle.current
+      val thumbnail = MapStyle.thumbnailAllowed(ms)
+      // No thumbnail: a tinted panel that says the area would be sent.
+      val face: android.view.View =
+        if thumbnail then img
+        else
+          val t = Ui.text("選ぶと表示範囲を送信", 13f, colorAttr = Ui.attr.onTertiaryContainer)
+          t.setGravity(Gravity.CENTER)
+          t.setBackgroundColor(Ui.color(Ui.attr.tertiaryContainer))
+          t
+      face.setLayoutParams(android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbH))
+      val selected = ms == (if block then MapStyle.forView(detailedFlag) else MapStyle.current)
       val card = com.google.android.material.card.MaterialCardView(act)
       card.setRadius(Ui.dp(12).toFloat)
       card.setStrokeWidth(Ui.dp(if selected then 3 else 1))
       card.setStrokeColor(Ui.color(if selected then Ui.attr.primary else Ui.attr.outlineVariant))
       card.setCardElevation(0)
-      card.addView(Ui.vbox(img, Ui.padded(Ui.vbox(Ui.text(ms.label, 15f, bold = true), Ui.caption(ms.note)), 10, 6)))
+      card.addView(Ui.vbox(face, Ui.padded(Ui.vbox(Ui.text(ms.label, 15f, bold = true), Ui.caption(ms.note)), 10, 6)))
       val lp = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
       lp.setMargins(Ui.dp(6), Ui.dp(6), Ui.dp(6), Ui.dp(6))
       card.setLayoutParams(lp)
       card.setOnClickListener { _ =>
         dialog.dismiss()
         if ms == MapStyle.Custom then editCustomTiles()
-        else
-          MapStyle.current = ms
-          TrackMap.all.foreach(_.setBaseMap(ms))
+        else choose(ms)
       }
-      if ms == MapStyle.Custom && MapStyle.custom._1.isEmpty then img.setImageDrawable(null)
+      if !thumbnail || (ms == MapStyle.Custom && MapStyle.custom._1.isEmpty) then img.setImageDrawable(null)
       else camera.foreach { cam =>
         val opts = org.maplibre.android.snapshotter.MapSnapshotter.Options(thumbW, thumbH)
           .withStyleBuilder(ms.builder)
@@ -226,7 +307,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     }
     val grid = Ui.vbox(cards.grouped(2).map(row => Ui.hbox(row*)).toSeq*)
     dialog.setOnDismissListener(_ => snapshotters.foreach(_.cancel()))
-    dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(Ui.text("地図の種類", 20f, bold = true), Ui.spacer(8), grid), 14, 12)))
+    val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
+    if block then head.addView(Ui.caption("簡易地図以外は、表示する範囲の地図をサーバから取得します。選んだ地図はこの画面を閉じるまで表示します。"))
+    dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
     dialog.show()
 
   /** Any XYZ raster tile server: the URL template and a credit line. */
@@ -254,8 +337,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
         val u = url.getText.toString.trim
         if u.contains("{z}") && u.contains("{x}") && u.contains("{y}") && u.startsWith("http") then
           MapStyle.custom = (u, credit.getText.toString)
-          MapStyle.current = MapStyle.Custom
-          TrackMap.all.foreach(_.setBaseMap(MapStyle.Custom))
+          choose(MapStyle.Custom)
         else android.widget.Toast.makeText(act, "{z} {x} {y} を含む http(s) の URL を入力してください", android.widget.Toast.LENGTH_LONG).show()
       })
       .show()
@@ -393,6 +475,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   def onSaveInstanceState(b: Bundle): Unit = mapView.onSaveInstanceState(b)
   def onDestroy(): Unit =
     TrackMap.all -= this
+    // A closed detailed view no longer allows the network.
+    MapStyle.applyNetworkPolicy(act)
     mapView.onDestroy()
 
 object TrackMap:
@@ -421,6 +505,14 @@ object TrackMap:
 
   /** Live maps, so a base map change applies everywhere. */
   val all = scala.collection.mutable.ArrayBuffer.empty[TrackMap]
+
+  /** After 「位置情報を外部サービスに送らない」 changes: every open map drops
+    * its detail request and shows what the new setting allows.
+    */
+  def privacyChanged(ctx: android.content.Context): Unit =
+    all.foreach(_.detailedFlag = false)
+    MapStyle.applyNetworkPolicy(ctx)
+    all.foreach(_.refreshBaseMap())
   private var cacheSet = false
 
   /** Keep viewed tiles for offline use: places you have looked at stay

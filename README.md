@@ -28,7 +28,7 @@
 
 ### マップとチェックイン
 
-日ごとの経路を地図上に表示する。背景地図は OpenStreetMap（OpenFreeMap）と国土地理院の各種地図（標準・淡色・航空写真・色別標高）から選択でき、任意の XYZ タイルも指定できる。チェックインは周辺施設（OpenStreetMap）または任意の名称で行う。
+日ごとの経路を地図上に表示する。背景地図は、アプリに同梱する簡易地図（通信しない）、OpenStreetMap（OpenFreeMap）、国土地理院の各種地図（標準・淡色・航空写真・色別標高）から選択でき、任意の XYZ タイルも指定できる。簡易地図は日本をズーム 10 まで、全世界をズーム 5 まで収録し、市区町村名・主要道路・駅を表示する。チェックインは周辺施設（OpenStreetMap）または任意の名称で行う。
 
 <p>
   <img src="docs/images/period.png" width="240" alt="期間の記録">
@@ -64,14 +64,50 @@
 
 複数端末の記録を、自前のサーバを介して共有する。記録は端末側で AES-256-GCM により暗号化して送信するため、サーバは内容を復号できない。鍵は端末のみが保持し、別の端末へは復旧コードで渡す。容量の大きい生ログは従量制でない回線でのみ送信する。サーバは Cloudflare Workers・D1・R2 上で動作する。詳細は [`server/README.md`](server/README.md) と [`docs/sync-protocol.md`](docs/sync-protocol.md) を参照。
 
+### 地名と位置情報の送信
+
+名前のない場所の地名（「渋谷区宇田川町付近」など）は、端末内の索引から求める。日本国内は大字・町丁目の代表点のうち最も近いもの（2 km 以内、それより遠い場合は市区町村名）、国外は GeoNames の都市名を用いる。
+
+地図タイルを取得すると、表示中の範囲がタイルの配信元に伝わる。設定「位置情報を外部サービスに送らない」（既定でオン）は、アプリが自ら位置情報を送る経路をすべて止める。
+
+| 経路 | オン | オフ |
+| --- | --- | --- |
+| 地図の表示（タイムライン、期間、場所） | 簡易地図。「この範囲を詳しい地図で表示（位置情報を送信）」を押した地図のみ、閉じるまで選択中の地図を取得する | 選択中の地図 |
+| 地図の静止画（フィード、期間のカード、他の端末の位置） | 簡易地図 | 選択中の地図 |
+| 地図の種類のサムネイル | 簡易地図のみ描画する | すべて描画する |
+| 地名 | 端末内の索引のみ | 索引で求まらない位置に限り Android の Geocoder |
+| 近くの施設の検索（OpenStreetMap） | 検索を指示したときのみ | 自動 |
+
+オンの間は MapLibre にも通信不可と通知するため、スタイルの指定に漏れがあってもタイルは取得しない（取得済みのキャッシュは表示する）。以前の設定「近くの施設を OpenStreetMap で検索」はこの設定に統合した。以前の設定をオフにしていた場合は、この設定をオンにして引き継ぐ。以前の版が Geocoder で求めて保存した地名は、更新時に索引で求め直し、索引で求まらないものは消去する。
+
 ## 構成
 
 | ディレクトリ | 内容 |
 | --- | --- |
 | `app/` | Android アプリ（Scala 3、Views、MapLibre） |
-| `core/` | 端末に依存しない処理（滞在検出、移動手段推定、記録方針、Parquet、暗号化、軌跡シミュレータ）。JVM 上でテストする |
+| `core/` | 端末に依存しない処理（滞在検出、移動手段推定、記録方針、Parquet、暗号化、軌跡シミュレータ、地名の索引）。JVM 上でテストする |
 | `server/` | 同期サーバ（TypeScript、Hono、Cloudflare Workers） |
 | `docs/` | 同期プロトコル |
+| `tools/geocoder/` | 地名の索引の生成（Python 3、標準ライブラリのみ） |
+| `tools/basemap/` | 簡易地図の生成（go-pmtiles、Python 3、Node） |
+
+## データの出典
+
+地名の索引は次のデータを加工して作成する。生成には `tools/geocoder/fetch.sh <作業ディレクトリ>` を用い、`app/src/main/assets/geocoder/` に索引（`index.bin`）と入力の版・sha256 を記録した `manifest.json` を出力する。位置参照情報のダウンロードには、位置参照情報ダウンロードサービス利用約款と位置参照情報利用約款への同意が必要である。
+
+- 大字・町丁目レベル位置参照情報　国土交通省（2025 年、第 19.0b 版、01000-19.0b.zip〜47000-19.0b.zip）、<https://nlftp.mlit.go.jp/isj/>。加工: 索引形式に変換（ashidori）
+- GeoNames（cities1000.zip、2026-10-13 版）、<https://www.geonames.org/>、[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)。改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）
+
+簡易地図は次のデータから作成する。生成には `tools/basemap/build.sh <作業ディレクトリ>` を用い、`app/src/main/assets/basemap/` に出力する（約 65 MB、リポジトリには含めない）。ツールとデータの版は `build.sh` に固定し、出力の sha256 を `manifest.json` に記録する。
+
+- © OpenStreetMap contributors、[ODbL 1.0](https://www.openstreetmap.org/copyright)。地図データは OpenStreetMap から作成した Produced Work である
+- [Protomaps Basemap](https://protomaps.com/)（2026-10-13 の日次ビルド）。加工: 日本（ズーム 6〜10）と全世界（ズーム 0〜5）を切り出し（ashidori）
+- [Natural Earth](https://www.naturalearthdata.com/)（パブリックドメイン）。低ズームの海岸線と境界に含まれる
+- Noto Sans の字形（SIL Open Font License 1.1）、protomaps/basemaps-assets のアイコン（MIT License）、@protomaps/basemaps の配色（BSD-3-Clause）。漢字とかなは端末のフォントで描画する
+
+出典の一覧は `tools/ATTRIBUTION` と、生成物と同じディレクトリの `ATTRIBUTION` にも記す。
+
+近くの施設の検索には OpenStreetMap のデータ（© OpenStreetMap contributors、ODbL）を用いる。
 
 ## ビルド
 

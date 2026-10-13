@@ -21,6 +21,43 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
   private def section(name: String): View = padded(text(name, 14f, bold = true, colorAttr = attr.primary), 20, 12)
 
+  /** Attribution of the bundled data (from the generated manifests) and of
+    * the online services.
+    */
+  private def showSources(): Unit =
+    val geocoder = scala.util.Try {
+      val in = act.getAssets.open(Geocoding.ManifestPath)
+      try ujson.read(in.readAllBytes())("attribution").arr.map(_.str).toSeq finally in.close()
+    }.getOrElse(Seq.empty)
+    val basemap = Basemap.attribution
+    def bullets(ls: Seq[String]) = ls.map("・" + _).mkString("\n")
+    val lines = Seq(
+      "■ 地名の検索（端末内で処理）",
+      if geocoder.nonEmpty then bullets(geocoder)
+      else "・大字・町丁目レベル位置参照情報　国土交通省。加工: 索引形式に変換（ashidori）\n・GeoNames、CC BY 4.0。改変: 索引形式に変換（ashidori）",
+      "位置参照情報: https://nlftp.mlit.go.jp/isj/",
+      "GeoNames: https://www.geonames.org/（CC BY 4.0: https://creativecommons.org/licenses/by/4.0/）",
+      "",
+      "■ 簡易地図（端末内の地図）",
+      if basemap.nonEmpty then bullets(basemap) else "このビルドには含まれていません。",
+      "OpenStreetMap: https://www.openstreetmap.org/copyright",
+      "",
+      "■ 詳しい地図（サーバから取得）",
+      "・OpenFreeMap: © OpenMapTiles、© OpenStreetMap contributors",
+      "・国土地理院: 地理院タイル",
+      "",
+      "■ 近くの施設の検索",
+      "・© OpenStreetMap contributors（ODbL）"
+    )
+    val body = text(lines.mkString("\n"), 14f)
+    body.setTextIsSelectable(true)
+    android.text.util.Linkify.addLinks(body, android.text.util.Linkify.WEB_URLS)
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("データの出典")
+      .setView(padded(body, 24, 8))
+      .setPositiveButton("閉じる", null)
+      .show()
+
   private val list = vbox()
   val view: View = scroll(list)
 
@@ -28,13 +65,21 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     list.removeAllViews()
     list.addView(section("記録"))
     list.addView(item("記録モード", s"${Settings.mode.label}・${ModeInfo.battery(Settings.mode)}")(act.push(LoggerScreen(act))))
-    val venues = MaterialSwitch(act)
-    venues.setText("近くの施設を OpenStreetMap で検索")
-    venues.setChecked(Settings.onlineVenues)
-    venues.setMinHeight(dp(56))
-    venues.setOnCheckedChangeListener((_, b) => Settings.onlineVenues = b)
-    list.addView(padded(venues, 20, 0))
-    list.addView(padded(caption("オンにすると、チェックインや場所の候補を探すときに位置が OpenStreetMap のサーバに送られます。"), 20, 0))
+
+    list.addView(section("プライバシー"))
+    val block = MaterialSwitch(act)
+    block.setText("位置情報を外部サービスに送らない")
+    block.setChecked(Settings.blockExternalLocation)
+    block.setMinHeight(dp(56))
+    block.setOnCheckedChangeListener { (_, b) =>
+      Settings.blockExternalLocation = b
+      TrackMap.privacyChanged(act)
+    }
+    list.addView(padded(block, 20, 0))
+    list.addView(padded(caption(
+      "オン: 地図は端末内の簡易地図で表示し、地名は端末内のデータで求めます。詳しい地図の表示と施設の検索は、操作したときのみ行い、その位置情報を送信します。\n" +
+      "オフ: 選択した地図をサーバから取得し、近くの施設を自動で検索します（OpenStreetMap）。端末内のデータで地名が求まらない場合は、Android の位置情報サービス（Google など）に問い合わせます。"
+    ), 20, 0))
 
     list.addView(section("同期とバックアップ"))
     val syncState =
@@ -45,6 +90,11 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
     list.addView(section("データ"))
     list.addView(item("エクスポート・インポート", "期間指定: Timeline.json・GPX・Parquet・GNSS ログ")(act.push(DataScreen(act))))
+
+    list.addView(section("情報"))
+    val geo = if Geocoding.available then "地名: 位置参照情報（国土交通省）・GeoNames" else "地名: 端末内のデータなし"
+    val base = if Basemap.bundled then "簡易地図: OpenStreetMap・Protomaps・Natural Earth" else "簡易地図: 端末内のデータなし"
+    list.addView(item("データの出典", s"$geo\n$base")(showSources()))
 
     list.addView(section("開発者向け"))
     list.addView(item("端末診断", "GNSS とセンサーの能力、自己テスト、レポートのコピー")(act.push(DiagnosticsScreen(act))))

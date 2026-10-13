@@ -111,21 +111,16 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
       act.runOnUiThread(() => if token == my then render(tls, ranked, paths, regions))
     }
 
-  /** City / country per place via the platform geocoder, cached in the DB. */
+  /** City / country per place, cached in the DB: from the offline index,
+    * else (if allowed) from the platform geocoder for a few places per call.
+    */
   private def resolveRegions(ps: Seq[Place], cached: Map[Long, (String, String)]): Map[Long, (String, String)] =
-    if !android.location.Geocoder.isPresent then cached
-    else
-      val g = android.location.Geocoder(act, Locale.JAPANESE)
-      ps.filterNot(p => cached.contains(p.id)).take(15).foldLeft(cached) { (acc, p) =>
-        @annotation.nowarn("cat=deprecation")
-        val found = scala.util.Try(g.getFromLocation(p.lat, p.lon, 1)).toOption.flatMap(l => Option(l))
-        found.flatMap(l => scala.jdk.CollectionConverters.ListHasAsScala(l).asScala.headOption).fold(acc) { a =>
-          val city = Option(a.getLocality).orElse(Option(a.getSubAdminArea)).getOrElse("")
-          val country = Option(a.getCountryName).getOrElse("")
-          AshidoriApp.db.setPlaceRegion(p.id, city, country)
-          acc + (p.id -> (city, country))
-        }
+    ps.filterNot(p => cached.contains(p.id)).zipWithIndex.foldLeft(cached) { case (acc, (p, i)) =>
+      Geocoding.region(p.lat, p.lon, platform = i < 15).fold(acc) { (city, country) =>
+        AshidoriApp.db.setPlaceRegion(p.id, city, country)
+        acc + (p.id -> (city, country))
       }
+    }
 
   private def render(tls: Vector[DayTimeline], ranked: Vector[(Place, Vector[Visit])], paths: Seq[MapPath],
                      regions: Map[Long, (String, String)]): Unit =

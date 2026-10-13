@@ -38,6 +38,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    androidResources {
+        // The offline basemap's tiles are gzip-compressed already; stored
+        // uncompressed, the archives copy out fast (and can be read in
+        // place once MapLibre reads byte ranges from assets).
+        noCompress += "pmtiles"
+    }
     packaging {
         resources {
             excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "**/*.tasty")

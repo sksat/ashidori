@@ -146,8 +146,65 @@ class DeviceStatusSuite extends munit.FunSuite:
     // The unreadable seq 9 stays shown: it is never skipped silently.
     assertEquals(st.problem("a").map(_.seq), Some(9L))
     assertEquals(st.targets.get("a"), None)
-    // Its failure count survives storage, so it is not retried.
+    // Its failure count and retry time survive storage, so it is not retried before then.
     assertEquals(StatusSyncState.fromJson(ujson.read(ujson.write(StatusSyncState.toJson(st)))), st)
+  }
+
+  private val hour = 60L * 60 * 1000
+
+  test("a genuine status that failed a few times is retried after a delay, from its own budget (R5)") {
+    val t0 = 1_000 * hour
+    var st = StatusSyncState.empty.listed(Seq(meta(1, "a", "status", 5)), "me")
+    // The server answers 404 three times: exhausted, no normal target left.
+    for i <- 1 to StatusSyncState.MaxAttempts do st = st.failed("a", st.targets("a"), "not found", t0 + i)
+    assertEquals(st.targets.get("a"), None)
+    val t3 = t0 + StatusSyncState.MaxAttempts
+    assertEquals(st.retries(t3 + hour - 1), Map.empty[String, StatusCandidate])
+    // An hour later it is tried again; the server serves it now.
+    assertEquals(st.retries(t3 + hour).get("a").map(_.seq), Some(5L))
+    st = st.succeeded("a", 5)
+    assertEquals(st.authenticated("a"), 5L)
+    assertEquals(st.problem("a"), None)
+    assertEquals(st.retries(Long.MaxValue), Map.empty[String, StatusCandidate])
+  }
+
+  test("retries back off up to a day, are bounded per run, and the user can make them due now") {
+    assertEquals(StatusSyncState.retryDelay(StatusSyncState.MaxAttempts), hour)
+    assertEquals(StatusSyncState.retryDelay(StatusSyncState.MaxAttempts + 2), 4 * hour)
+    assertEquals(StatusSyncState.retryDelay(StatusSyncState.MaxAttempts + 60), 24 * hour)
+    // A made-up row keeps failing: its next try moves further away.
+    var st = exhaust(StatusSyncState.empty.listed(Seq(meta(1, "a", "status", 9, Array[Byte](9))), "me"), "a", 9)
+    val c = st.retries(hour).apply("a")
+    st = st.failed("a", c, "bad tag", 10 * hour)
+    assertEquals(st.candidates("a").head.retryAt, 12 * hour)
+    // Several due devices: at most MaxRetries per run, one per device.
+    var many = StatusSyncState.empty
+    for d <- 1 to StatusSyncState.MaxRetries + 2 do
+      many = many.listed(Seq(meta(d, s"d$d", "status", 1), meta(100 + d, s"d$d", "status", 0)), "me")
+      many = exhaust(exhaust(many, s"d$d", 1), s"d$d", 0)
+    val due = many.retries(Long.MaxValue)
+    assertEquals(due.size, StatusSyncState.MaxRetries)
+    assert(due.forall((d, c) => many.candidates(d).contains(c)))
+    // 更新: every exhausted candidate is due at once.
+    assertEquals(st.retries(hour), Map.empty[String, StatusCandidate])
+    assertEquals(st.retryNow.retries(0L).get("a").map(_.seq), Some(9L))
+  }
+
+  test("a cursor outside the API's range is a malformed row, and a stored one restarts the walk (R4)") {
+    val hash = "ab" * 32
+    def row(cursor: String, seq: String = "2") =
+      ujson.read(s"""{"cursor":$cursor,"deviceId":"a","stream":"status","seq":$seq,"size":40,"sha256":"$hash"}""")
+    assertEquals(BatchMeta.fromJson(row("999999999999999")).cursor, BatchMeta.MaxCursor)
+    intercept[IllegalArgumentException](BatchMeta.fromJson(row("1000000000000000")))
+    intercept[IllegalArgumentException](BatchMeta.fromJson(row("1.5")))
+    intercept[IllegalArgumentException](BatchMeta.fromJson(row("-1")))
+    intercept[IllegalArgumentException](BatchMeta.fromJson(row("1", seq = "1000000000000")))
+    // State stored by a version that took such a cursor: the walk starts over from 0.
+    val st = StatusSyncState.fromJson(ujson.read(
+      """{"cursor":1000000000000000,"candidates":{},"authenticated":{"a":3},"unresolved":{},"rescan":10000000000000000,"rescanAt":5}"""))
+    assertEquals((st.cursor, st.rescan, st.authenticated), (0L, Some(0L), Map("a" -> 3L)))
+    // A refused listing asks for a rescan.
+    assert(StatusSyncState.empty.listFailed.rescanWanted)
   }
 
   test("when the newest candidate is exhausted, the next newest is tried; an older failure does not hide a newer one") {

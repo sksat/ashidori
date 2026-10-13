@@ -130,7 +130,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       .include(MLatLng(f.lat - dLat, f.lon - dLon))
       .include(MLatLng(f.lat + dLat, f.lon + dLon))
       .build()
-    var builder = MapStyle.current.builder
+    // Another device's position: offline map while the setting is on.
+    var builder = MapStyle.forSnapshot.snapshotBuilder
       .withSource(GeoJsonSource("peer-dot", Point.fromLngLat(f.lon, f.lat)))
     if acc > 0 then
       builder = builder
@@ -151,6 +152,7 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       .withStyleBuilder(builder)
       .withLogo(false)
     snapshotter.foreach(_.cancel())
+    MapStyle.applyNetworkPolicy(act)
     val snap = MapSnapshotter(act, opts)
     snapshotter = Some(snap)
     snap.start(

@@ -2,11 +2,14 @@
 # Fetches the pinned verification tools (checksums verified) and runs every
 # model check. Usage:
 #   formal/run.sh                 # everything
+#   formal/run.sh fast            # everything except the slow TLA+ configs ($SLOW_TLA)
 #   formal/run.sh tamarin         # crypto models only
 #   formal/run.sh tla [Name...]   # TLA+ models only (optionally some configs, e.g. Outbox Outbox_nonatomic)
 #   formal/run.sh fetch           # only download the tools
 # Tools are cached in $ASHIDORI_FORMAL_CACHE (default ~/.cache/ashidori-formal).
 # Linux x86_64 only (Tamarin and Maude are prebuilt binaries).
+# TLC runs one config at a time with $TLC_JAVA_OPTS (default -Xmx3g) and
+# $TLC_WORKERS workers (default 4).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +70,10 @@ report() { # report <name> <ok|FAIL> <seconds> <detail>
   printf '%-34s %-4s %6ss  %s\n' "$1" "$2" "$3" "$4"
   [ "$2" = ok ] || failures=$((failures + 1))
 }
+
+# TLC resources: a heap cap and a worker count (one TLC runs at a time).
+TLC_JAVA_OPTS="${TLC_JAVA_OPTS:--Xmx3g}"
+TLC_WORKERS="${TLC_WORKERS:-4}"
 
 LOGS="${ASHIDORI_FORMAL_LOGS:-$CACHE/logs}"
 mkdir -p "$LOGS"
@@ -133,11 +140,16 @@ run_tamarin() {
 TLA_CHECKS="
 Outbox Outbox pass
 Outbox_nonatomic Outbox fail:Invariant_SameSlotSameCiphertext_is_violated
+Outbox_archive Outbox pass
+Outbox_r1 Outbox fail:Invariant_ArchiveComplete_is_violated
 BatchCommit_fixed BatchCommit pass
 BatchCommit_current BatchCommit fail:Invariant_CommittedHasObject_is_violated
 Registration Registration pass
+Registration_client Registration pass
 Registration_norecheck Registration fail:Invariant_RetriesAgree_is_violated
 Registration_applypersist Registration fail:Invariant_TokenRecoverable_is_violated
+Registration_r2 Registration fail:Invariant_CancelledNoEffect_is_violated
+Registration_r3 Registration fail:Invariant_ReadyPersisted_is_violated
 Accounts Accounts pass
 Accounts_norecheck Accounts fail:Invariant_RetriesAgree_is_violated
 SharedCheckin SharedCheckin pass
@@ -147,9 +159,18 @@ FeedResync_firstpage FeedResync fail:Invariant_NoMixedVersions_is_violated
 StatusDownload StatusDownload pass
 StatusDownload_hostile StatusDownload pass
 StatusDownload_fixed StatusDownload pass
+StatusDownload_fixed1 StatusDownload pass
+StatusDownload_fakes StatusDownload pass
+StatusDownload_manyfakes StatusDownload fail:Temporal_properties_were_violated
 StatusDownload_fakeseq StatusDownload fail:Temporal_properties_were_violated
 StatusDownload_fakecursor StatusDownload fail:Temporal_properties_were_violated
+StatusDownload_r4 StatusDownload fail:Temporal_properties_were_violated
+StatusDownload_r5 StatusDownload fail:Temporal_properties_were_violated
 "
+
+# Configs that take 30 s or more here (several times that on a CI runner).
+# `fast` skips them; CI runs them daily and on demand (.github/workflows/formal.yml).
+SLOW_TLA="Outbox Registration_client StatusDownload_hostile StatusDownload_fixed StatusDownload_fixed1"
 
 run_tla() {
   fetch_tla
@@ -157,11 +178,13 @@ run_tla() {
   while read -r cfg module expect; do
     [ -n "$cfg" ] || continue
     if [ ${#only[@]} -gt 0 ] && [[ ! " ${only[*]} " == *" $cfg "* ]]; then continue; fi
+    if [ "${SKIP_SLOW:-}" = 1 ] && [[ " $SLOW_TLA " == *" $cfg "* ]]; then continue; fi
     local log="$LOGS/$cfg.log" t0 t1 states
     t0=$(date +%s)
     mkdir -p "$LOGS/tmp"
-    (cd "$HERE/tla" && java -XX:+UseParallelGC -Djava.io.tmpdir="$LOGS/tmp" -cp "$TLA_JAR" tlc2.TLC \
-      -workers auto -deadlock -metadir "$LOGS/states-$cfg" -config "$cfg.cfg" "$module.tla") >"$log" 2>&1 || true
+    # shellcheck disable=SC2086 # TLC_JAVA_OPTS holds several options
+    (cd "$HERE/tla" && java $TLC_JAVA_OPTS -XX:+UseParallelGC -Djava.io.tmpdir="$LOGS/tmp" -cp "$TLA_JAR" tlc2.TLC \
+      -workers "$TLC_WORKERS" -deadlock -metadir "$LOGS/states-$cfg" -config "$cfg.cfg" "$module.tla") >"$log" 2>&1 || true
     rm -rf "$LOGS/states-$cfg"
     t1=$(date +%s)
     states=$(grep -Eo '[0-9,]+ distinct states found' "$log" | tail -1 || true)
@@ -188,7 +211,8 @@ case "${1:-all}" in
   tamarin) run_tamarin ;;
   tla) shift; run_tla "$@" ;;
   all) run_tamarin; run_tla ;;
-  *) echo "usage: $0 [all|fetch|tamarin|tla [config...]]" >&2; exit 2 ;;
+  fast) SKIP_SLOW=1; run_tamarin; run_tla ;;
+  *) echo "usage: $0 [all|fast|fetch|tamarin|tla [config...]]" >&2; exit 2 ;;
 esac
 
 echo "logs: $LOGS"

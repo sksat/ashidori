@@ -83,25 +83,20 @@ object TimelineRepo:
           .map((c, _) => p.id -> c.venueName)
       }.toMap
 
-  /** Gives unnamed visited places an approximate area name via the platform
-    * geocoder (a few per call, cached in the DB).
+  /** Gives unnamed visited places an approximate area name, cached in the DB:
+    * from the offline index, else (if allowed) from the platform geocoder for
+    * a few places per call.
     */
   private def nameAreas(places: Map[Long, Place], visits: Seq[Visit]): Map[Long, Place] =
-    if !android.location.Geocoder.isPresent then places
-    else
-      val all = places.values.toVector
-      val todo = visits.flatMap(v => Places.nearest(v, all)).distinct.filter(p => !p.named && p.area.isEmpty).take(5)
-      val g = android.location.Geocoder(AshidoriApp.app, java.util.Locale.JAPANESE)
-      todo.foldLeft(places) { (acc, p) =>
-        @annotation.nowarn("cat=deprecation")
-        val found = scala.util.Try(g.getFromLocation(p.lat, p.lon, 1)).toOption.flatMap(l => Option(l))
-        val addr = found.flatMap(l => scala.jdk.CollectionConverters.ListHasAsScala(l).asScala.headOption)
-        addr.flatMap(a => Option(a.getAddressLine(0)).flatMap(AreaName.fromAddressLine).orElse(Option(a.getLocality))) match
-          case Some(area) =>
-            AshidoriApp.db.setPlaceArea(p.id, area)
-            acc + (p.id -> p.copy(area = area))
-          case None => acc
-      }
+    val all = places.values.toVector
+    val todo = visits.flatMap(v => Places.nearest(v, all)).distinct.filter(p => !p.named && p.area.isEmpty)
+    todo.zipWithIndex.foldLeft(places) { case (acc, (p, i)) =>
+      Geocoding.area(p.lat, p.lon, platform = i < 5) match
+        case Some(area) =>
+          AshidoriApp.db.setPlaceArea(p.id, area)
+          acc + (p.id -> p.copy(area = area))
+        case None => acc
+    }
 
   /** A user correction applies to a leg if they overlap by more than half. */
   private def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =

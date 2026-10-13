@@ -22,6 +22,10 @@ on:
       - "app/src/main/scala/net/sksat/ashidori/sync/**"
       - "core/src/main/scala/ashidori/core/sync/**"
       - ".github/workflows/formal.yml"
+  # The slow configs run once a day and on demand; pushes, pull requests and
+  # the server deploy run the fast set (formal/run.sh fast).
+  schedule:
+    - cron: "17 18 * * *"
   workflow_dispatch:
   workflow_call:
 
@@ -31,7 +35,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       ASHIDORI_FORMAL_CACHE: ${{ github.workspace }}/.formal-cache
     steps:
@@ -47,7 +51,7 @@ jobs:
         with:
           path: .formal-cache/dl
           key: formal-tools-${{ hashFiles('formal/run.sh') }}
-      - run: formal/run.sh all
+      - run: formal/run.sh ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'all' || 'fast' }}
       - if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:

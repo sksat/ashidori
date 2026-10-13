@@ -24,3 +24,29 @@ object AreaName:
     // ...or glue the feature name on: "大田区羽田空港羽田空港" → "大田区羽田空港".
     s = Repeated.replaceFirstIn(s, "$1$2")
     Option(s).filter(_.length >= 2)
+
+  private val District = """^.+?郡(.+[町村])$""".r
+  private val DesignatedWard = """^(.+?市).+区$""".r
+  private val Aza = """^(大字|字)""".r
+
+  /** Municipality as shown in an area name: the 郡 is dropped
+    * ("入間郡毛呂山町" → "毛呂山町"); wards of designated cities stay
+    * ("札幌市中央区"), as in [[fromAddressLine]].
+    */
+  def municipality(m: String): String = m.trim match
+    case District(rest) => rest
+    case other          => other
+
+  /** City for per-period summaries: "札幌市中央区" → "札幌市", "渋谷区" → "渋谷区". */
+  def city(m: String): String = municipality(m) match
+    case DesignatedWard(c) => c
+    case other             => other
+
+  /** Area name from a municipality and a 大字・町丁目 name, in the same form as
+    * [[fromAddressLine]]: ("渋谷区", "神宮前六丁目") → "渋谷区神宮前",
+    * ("入間郡毛呂山町", "大字阿諏訪") → "毛呂山町阿諏訪".
+    */
+  def fromParts(municipality: String, town: String): Option[String] =
+    val m = this.municipality(municipality)
+    val t = Numbers.replaceFirstIn(Aza.replaceFirstIn(town.trim, ""), "").trim
+    Option(m + t).filter(_.length >= 2)

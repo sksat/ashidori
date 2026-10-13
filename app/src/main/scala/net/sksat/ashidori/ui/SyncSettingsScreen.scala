@@ -59,17 +59,20 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     unobserve()
     net.shutdown()
 
-  /** Outcomes of registration attempts, whichever screen instance started them. */
+  /** Outcomes of registration attempts, whichever screen instance started
+    * them. A result of an attempt that is no longer the latest (cancelled,
+    * or followed by another) only redraws.
+    */
   private def onRegistration(e: RegistrationEvent): Unit =
     e match
       case RegistrationEvent.Changed => render()
-      case RegistrationEvent.Failed(msg) =>
-        toast(msg)
+      case RegistrationEvent.Failed(attempt, msg) =>
+        if Registration.isLatest(attempt) then toast(msg)
         render()
-      case RegistrationEvent.Paired(newAccount) =>
+      case RegistrationEvent.Paired(attempt, newAccount) =>
         render()
         // Self-registered: no other device has a key, so go straight to making one.
-        if newAccount then createKey()
+        if newAccount && Registration.isLatest(attempt) then createKey()
 
   private def async[A](work: => A)(done: Try[A] => Unit): Unit =
     net.execute { () =>
@@ -208,7 +211,9 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private def pendingCard(s: RegistrationState): View =
     val retry = button("もう一度送る")(Registration.retry())
     retry.setEnabled(!s.sending && !busy)
-    val cancel = outlined("やめる")(Registration.cancel())
+    val cancel = outlined("やめる") {
+      if !Registration.cancel() then toast("サーバの応答を保存しているため、やめられませんでした")
+    }
     val head = Seq(
       text("1. 端末を登録", 16f, bold = true),
       caption(if s.sending then "サーバに登録しています…"

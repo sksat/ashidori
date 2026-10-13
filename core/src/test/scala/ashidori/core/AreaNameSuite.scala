@@ -18,3 +18,23 @@ class AreaNameSuite extends munit.FunSuite:
     assertEquals(AreaName.fromAddressLine("日本、〒066-0012 北海道千歳市美々 道路"), Some("千歳市美々"))
     assertEquals(AreaName.fromAddressLine("日本、〒144-0041 東京都大田区羽田空港羽田空港"), Some("大田区羽田空港"))
   }
+
+  test("from 位置参照情報 parts") {
+    assertEquals(AreaName.fromParts("渋谷区", "宇田川町"), Some("渋谷区宇田川町"))
+    assertEquals(AreaName.fromParts("渋谷区", "神宮前六丁目"), Some("渋谷区神宮前"))
+    assertEquals(AreaName.fromParts("札幌市中央区", "北五条西一丁目"), Some("札幌市中央区北五条西"))
+    assertEquals(AreaName.fromParts("北広島市", "フェア河増1丁目"), Some("北広島市フェア河増"))
+    assertEquals(AreaName.fromParts("入間郡毛呂山町", "大字阿諏訪"), Some("毛呂山町阿諏訪"))
+    assertEquals(AreaName.fromParts("上川郡比布町", "字近文五線"), Some("比布町近文五線"))
+    assertEquals(AreaName.fromParts("赤穂郡上郡町", "大持"), Some("上郡町大持"))
+  }
+
+  test("municipality and city names") {
+    assertEquals(AreaName.municipality("西多摩郡奥多摩町"), "奥多摩町")
+    assertEquals(AreaName.municipality("郡山市"), "郡山市")
+    assertEquals(AreaName.municipality("小郡市"), "小郡市")
+    assertEquals(AreaName.municipality("大和郡山市"), "大和郡山市")
+    assertEquals(AreaName.city("札幌市中央区"), "札幌市")
+    assertEquals(AreaName.city("渋谷区"), "渋谷区")
+    assertEquals(AreaName.city("四日市市"), "四日市市")
+  }

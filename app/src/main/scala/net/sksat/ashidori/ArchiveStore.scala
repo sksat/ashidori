@@ -75,7 +75,13 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   def archivedFiles(t: Archive.TableDef): Seq[File] =
     Option(File(root, t.name).listFiles()).toSeq.flatten.filter(_.getName.endsWith(".parquet")).sortBy(_.getName)
 
-  /** Writes rows atomically and verifies them by reading back. */
+  /** Writes rows atomically and verifies them by reading back.
+    *
+    * An archive file is never written in place: a new file is written next to
+    * it and renamed over it atomically. The uploader relies on this
+    * (`ArchiveSnapshot`): a descriptor it opened keeps reading the version it
+    * opened, whole, while the path already names the new one.
+    */
   private def writeVerified(t: Archive.TableDef, rows: Seq[Seq[Any]], dest: File): Unit =
     dest.getParentFile.mkdirs()
     val tmp = File(dest.getParentFile, dest.getName + ".tmp")
@@ -88,7 +94,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     if back.rows != rows.size then
       tmp.delete()
       throw IllegalStateException(s"archive verify failed for ${dest.getName}: ${back.rows} != ${rows.size}")
-    if !tmp.renameTo(dest) then throw IllegalStateException(s"rename failed: $dest")
+    java.nio.file.Files.move(tmp.toPath, dest.toPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+      java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     invalidate(dest)
 
   /** Archives one finished day and removes it from SQLite. */

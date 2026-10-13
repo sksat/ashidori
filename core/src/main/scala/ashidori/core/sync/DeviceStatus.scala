@@ -91,13 +91,26 @@ final case class BatchMeta(cursor: Long, deviceId: String, stream: String, seq: 
   def candidate: StatusCandidate = StatusCandidate(seq, size, sha256)
 
 object BatchMeta:
-  /** Throws on a malformed row (the listing is not trusted). */
+  /** The largest cursor the API takes back as `after` (15 decimal digits). */
+  val MaxCursor: Long = 999_999_999_999_999L
+  /** The largest seq the API takes (12 decimal digits). */
+  val MaxSeq: Long = 999_999_999_999L
+
+  def validCursor(c: Long): Boolean = c >= 0 && c <= MaxCursor
+
+  /** Throws on a malformed row (the listing is not trusted): every number
+    * must be an integer in the API's range, so a cursor taken from a row can
+    * always be sent back as `after`.
+    */
   def fromJson(v: ujson.Value): BatchMeta =
-    val b = BatchMeta(v("cursor").num.toLong, v("deviceId").str, v("stream").str, v("seq").num.toLong,
-      v("size").num.toLong, v("sha256").str)
-    require(b.cursor >= 0 && b.seq >= 0 && b.size >= 0 && b.deviceId.matches("[A-Za-z0-9_-]{1,64}") &&
-      b.stream.matches("[a-z0-9_-]{1,32}") && b.sha256.matches("[0-9a-f]{64}"),
-      s"malformed batch metadata: $v")
+    def int(k: String, max: Long): Long =
+      val d = v(k).num
+      require(d.isWhole && d >= 0 && d <= max.toDouble, s"malformed batch metadata ($k): $v")
+      d.toLong
+    val b = BatchMeta(int("cursor", MaxCursor), v("deviceId").str, v("stream").str, int("seq", MaxSeq),
+      int("size", Int.MaxValue), v("sha256").str)
+    require(b.deviceId.matches("[A-Za-z0-9_-]{1,64}") && b.stream.matches("[a-z0-9_-]{1,32}") &&
+      b.sha256.matches("[0-9a-f]{64}"), s"malformed batch metadata: $v")
     b
 
   /** The newest `status` batch per other device, among `items`, that is newer
@@ -109,11 +122,12 @@ object BatchMeta:
       .filter((d, seq) => known.get(d).forall(seq > _))
 
 /** A listed `status` batch to fetch: its seq, the size and SHA-256 the
-  * listing gave for it, and how often a fetched blob failed to read.
+  * listing gave for it, how often a fetched blob failed to read, and, once
+  * exhausted, when it may be tried again (`retryAt`, ms).
   * Candidates are told apart by (seq, size, SHA-256): a server that lists
   * another row for a seq gives another candidate.
   */
-final case class StatusCandidate(seq: Long, size: Long, sha256: String, failures: Int = 0):
+final case class StatusCandidate(seq: Long, size: Long, sha256: String, failures: Int = 0, retryAt: Long = 0L):
   /** Why the fetched `blob` is not the listed one, if it is not. A blob that
     * fails this is not decrypted; it counts as unresolved.
     */
@@ -124,6 +138,9 @@ final case class StatusCandidate(seq: Long, size: Long, sha256: String, failures
 
   def sameRow(o: StatusCandidate): Boolean = seq == o.seq && size == o.size && sha256.equalsIgnoreCase(o.sha256)
 
+  /** Failed [[StatusSyncState.MaxAttempts]] times: no longer a normal target,
+    * only retried now and then (see [[StatusSyncState.retries]]).
+    */
   def exhausted: Boolean = failures >= StatusSyncState.MaxAttempts
 
 /** A `status` batch that was listed but could not be read: wrong key,
@@ -143,10 +160,16 @@ final case class Unresolved(seq: Long, attempts: Int, error: String)
   * is still to be done or retried, and a newest candidate that keeps failing
   * (e.g. a row the server made up) does not hide the older genuine ones.
   *
+  * An exhausted candidate is not given up for good: it is retried after a
+  * delay of 1 hour, doubling up to a day, from a budget separate from the
+  * normal fetches ([[retries]]). A server that failed a genuine status a few
+  * times therefore does not hide it once it serves it again, and rows it made
+  * up cannot take the normal fetches.
+  *
   * A listing can lie, so the walk is redone from cursor 0 now and then
   * (`rescan`: the position of a rescan in progress; `rescanAt`: when the
   * last one started; `rescanWanted`: one is wanted soon, after a suspicious
-  * page or when a device has no candidate left to try).
+  * page, a refused listing, or when a device has no candidate left to try).
   */
 final case class StatusSyncState(
     cursor: Long,
@@ -182,6 +205,11 @@ final case class StatusSyncState(
     val (to, suspicious) = advance(cursor, items, limit)
     take(items, self).copy(cursor = to, rescanWanted = rescanWanted || suspicious)
 
+  /** The main walk's listing failed other than by a network error (e.g. the
+    * server refused the cursor, or a row was malformed): a rescan is wanted.
+    */
+  def listFailed: StatusSyncState = copy(rescanWanted = true)
+
   /** Starts a rescan when one is due: every [[RescanEvery]], or after
     * [[RescanMinGap]] when one is wanted. A fresh walk (cursor 0) needs none.
     */
@@ -210,6 +238,20 @@ final case class StatusSyncState(
   def targets: Map[String, StatusCandidate] =
     candidates.flatMap((d, cs) => cs.find(c => c.seq > auth(d) && !c.exhausted).map(d -> _))
 
+  /** Exhausted candidates due for another try at `now`: per device the one
+    * due longest (then the newest), and at most `budget` in all, those due
+    * longest first. Fetched in addition to [[targets]].
+    */
+  def retries(now: Long, budget: Int = MaxRetries): Map[String, StatusCandidate] =
+    candidates.toSeq.flatMap { (d, cs) =>
+      cs.filter(c => c.seq > auth(d) && c.exhausted && c.retryAt <= now).sortBy(c => (c.retryAt, -c.seq)).headOption
+        .map(d -> _)
+    }.sortBy((d, c) => (c.retryAt, d)).take(budget).toMap
+
+  /** Makes every exhausted candidate due now (the user asked to refresh). */
+  def retryNow: StatusSyncState =
+    copy(candidates = candidates.view.mapValues(_.map(c => if c.exhausted then c.copy(retryAt = 0L) else c)).toMap)
+
   def succeeded(device: String, seq: Long): StatusSyncState =
     val a = math.max(seq, auth(device))
     copy(
@@ -218,14 +260,16 @@ final case class StatusSyncState(
       unresolved = unresolved.filter((d, u) => d != device || u.seq > seq)
     )
 
-  /** The blob of candidate `c` was received but is unreadable. A network
-    * error is not a failure: nothing changes. When the device has no
+  /** The blob of candidate `c` was received at `now` but is unreadable. A
+    * network error is not a failure: nothing changes. An exhausted candidate
+    * waits [[retryDelay]] before its next try. When the device has no
     * candidate left to try, a rescan is wanted.
     */
-  def failed(device: String, c: StatusCandidate, error: String): StatusSyncState =
+  def failed(device: String, c: StatusCandidate, error: String, now: Long = 0L): StatusSyncState =
     val have = candidates.getOrElse(device, Vector.empty)
     val failures = have.find(_.sameRow(c)).fold(c.failures)(_.failures) + 1
-    val cs = trim((have.filterNot(_.sameRow(c)) :+ c.copy(failures = failures)).sortBy(-_.seq))
+    val retryAt = if failures >= MaxAttempts then now + retryDelay(failures) else 0L
+    val cs = trim((have.filterNot(_.sameRow(c)) :+ c.copy(failures = failures, retryAt = retryAt)).sortBy(-_.seq))
     // The newest failure stays shown: an older one does not replace it.
     val shown = problem(device).filter(_.seq > c.seq)
     val st = copy(
@@ -241,6 +285,18 @@ final case class StatusSyncState(
 
 object StatusSyncState:
   val MaxAttempts = 3
+  /** An exhausted candidate is retried after this, doubling with each
+    * further failure up to [[RetryMaxDelay]].
+    */
+  val RetryDelay: Long = 60L * 60 * 1000
+  val RetryMaxDelay: Long = 24L * 60 * 60 * 1000
+  /** Exhausted candidates retried per run, over all devices. */
+  val MaxRetries = 4
+
+  /** Wait after the `failures`-th failure of an exhausted candidate. */
+  def retryDelay(failures: Int): Long =
+    val n = math.min(math.max(failures - MaxAttempts, 0), 10)
+    math.min(RetryDelay << n, RetryMaxDelay)
   /** Listed candidates kept per device: this many still to try, and this many exhausted. */
   val MaxCandidates = 4
   /** On a page with fewer rows than asked for (the end of the listing), a
@@ -280,11 +336,11 @@ object StatusSyncState:
 
   private def candidateJson(c: StatusCandidate): ujson.Value =
     ujson.Obj("seq" -> ujson.Num(c.seq.toDouble), "size" -> ujson.Num(c.size.toDouble), "sha256" -> c.sha256,
-      "failures" -> c.failures)
+      "failures" -> c.failures, "retryAt" -> ujson.Num(c.retryAt.toDouble))
 
   private def candidateOf(o: collection.Map[String, ujson.Value]): StatusCandidate =
     StatusCandidate(o("seq").num.toLong, o("size").num.toLong, o("sha256").str,
-      o.get("failures").flatMap(_.numOpt).fold(0)(_.toInt))
+      o.get("failures").flatMap(_.numOpt).fold(0)(_.toInt), o.get("retryAt").flatMap(_.numOpt).fold(0L)(_.toLong))
 
   def toJson(s: StatusSyncState): ujson.Value =
     ujson.Obj(
@@ -298,7 +354,11 @@ object StatusSyncState:
       "rescanWanted" -> s.rescanWanted
     )
 
-  /** Also reads older state: one candidate per device under `latest` (its
+  /** A stored cursor or rescan position the API would refuse (e.g. taken
+    * from a row before rows were checked) is dropped: the walk restarts from
+    * cursor 0, which is a rescan.
+    *
+    * Also reads older state: one candidate per device under `latest` (its
     * failures taken from `unresolved`), and, before candidates kept the
     * listed size and SHA-256, a bare seq per device. Such bare candidates
     * have nothing to check a blob against: they are dropped and the cursor
@@ -317,12 +377,13 @@ object StatusSyncState:
     val legacy = oldLatest.size != rawLatest.size
     val candidates = v.obj.get("candidates").flatMap(_.objOpt).fold(oldLatest)(_.toMap.map((d, cs) =>
       d -> cs.arr.toVector.map(c => candidateOf(c.obj))))
+    def position(d: Double): Long = if d.isWhole && BatchMeta.validCursor(d.toLong) then d.toLong else 0L
     StatusSyncState(
-      if legacy then 0L else v.obj.get("cursor").flatMap(_.numOpt).fold(0L)(_.toLong),
+      if legacy then 0L else v.obj.get("cursor").flatMap(_.numOpt).fold(0L)(position),
       candidates,
       v.obj.get("authenticated").flatMap(_.objOpt).fold(Map.empty[String, Long])(_.toMap.map((d, n) => d -> n.num.toLong)),
       unresolved,
-      v.obj.get("rescan").flatMap(_.numOpt).map(_.toLong),
+      v.obj.get("rescan").flatMap(_.numOpt).map(position),
       v.obj.get("rescanAt").flatMap(_.numOpt).fold(0L)(_.toLong),
       v.obj.get("rescanWanted").flatMap(_.boolOpt).getOrElse(false)
     )

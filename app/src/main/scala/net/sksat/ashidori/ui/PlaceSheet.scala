@@ -124,25 +124,34 @@ final class PlaceSheet(
       act.runOnUiThread { () =>
         candidates.removeAllViews()
         for (v, d) <- past.take(4) do candidates.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
-        if !Settings.onlineVenues then
-          if past.isEmpty then candidates.addView(caption("候補はありません。名前を入力してください。"))
-        else
-          val loading = caption("近くの施設を検索中…")
-          candidates.addView(loading)
-          VenueSearch.nearby(place.latLng, 120) { r =>
-            candidates.removeView(loading)
-            r.fold(
-              e => candidates.addView(caption(e match
-                case v: VenueError => v.message
-                case _             => "候補を取得できませんでした"
-              )),
-              vs =>
-                val fresh = vs.filterNot(x => past.exists(_._1.name == x._1.name))
-                if fresh.isEmpty && past.isEmpty then candidates.addView(caption("近くに候補がありません"))
-                for (v, d) <- fresh.take(6) do candidates.addView(candidateRow(v, s"${v.category}・${d.round}m"))
-            )
+        if Settings.blockExternalLocation && VenueSearch.cached(place.latLng, 120).isEmpty then
+          // Sent only on an explicit request.
+          candidates.addView(caption("過去のチェックイン先のみを表示しています。検索すると、位置情報が OpenStreetMap のサーバに送られます。"))
+          lazy val once: View = outlined("周辺の施設を検索（位置情報を送信）") {
+            candidates.removeView(once)
+            searchOnline(past)
           }
+          candidates.addView(once)
+        else searchOnline(past)
       }
+    }
+
+  /** OpenStreetMap venues near the place: sends its position to the server. */
+  private def searchOnline(past: Seq[(Venue, Double)]): Unit =
+    val loading = caption("近くの施設を検索中…")
+    candidates.addView(loading)
+    VenueSearch.nearby(place.latLng, 120) { r =>
+      candidates.removeView(loading)
+      r.fold(
+        e => candidates.addView(caption(e match
+          case v: VenueError => v.message
+          case _             => "候補を取得できませんでした"
+        )),
+        vs =>
+          val fresh = vs.filterNot(x => past.exists(_._1.name == x._1.name))
+          if fresh.isEmpty && past.isEmpty then candidates.addView(caption("近くに候補がありません"))
+          for (v, d) <- fresh.take(6) do candidates.addView(candidateRow(v, s"${v.category}・${d.round}m"))
+      )
     }
 
   private def loadHistory(): Unit =

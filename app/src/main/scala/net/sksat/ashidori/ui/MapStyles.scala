@@ -1,13 +1,18 @@
 package net.sksat.ashidori.ui
 
 import android.content.Context
+import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
-import net.sksat.ashidori.AshidoriApp
+import net.sksat.ashidori.{AshidoriApp, Basemap, Settings}
+import ashidori.core.BaseMapPolicy
 
-/** Selectable base maps. The built-in ones are free to use without an API
-  * key; "カスタム" takes any XYZ raster tile URL (e.g. a provider with a key).
+/** Selectable base maps. "簡易地図" is drawn from data in the app and never
+  * uses the network; the others fetch tiles of the visible area from their
+  * servers. The built-in online ones are free to use without an API key;
+  * "カスタム" takes any XYZ raster tile URL (e.g. a provider with a key).
   */
 enum MapStyle(val key: String, val label: String, val note: String):
+  case Offline extends MapStyle("offline", "簡易地図", "端末内のデータで表示。通信しない")
   case Standard extends MapStyle("ofm-liberty", "標準", "OpenStreetMap（OpenFreeMap）")
   case Light extends MapStyle("ofm-positron", "シンプル", "淡い配色で経路が見やすい（OpenFreeMap）")
   case GsiStd extends MapStyle("gsi-std", "地理院 標準", "国土地理院の標準地図")
@@ -16,30 +21,94 @@ enum MapStyle(val key: String, val label: String, val note: String):
   case GsiRelief extends MapStyle("gsi-relief", "色別標高", "国土地理院。高さを色で表示（ズーム15まで）")
   case Custom extends MapStyle("custom", "カスタム", "XYZ タイルの URL を指定")
 
-  /** MapLibre style for this base map. */
-  def builder: Style.Builder = this match
-    case Standard  => Style.Builder().fromUri("https://tiles.openfreemap.org/styles/liberty")
-    case Light     => Style.Builder().fromUri("https://tiles.openfreemap.org/styles/positron")
-    case GsiStd    => Style.Builder().fromJson(MapStyle.raster(MapStyle.gsi("std", "png")))
-    case GsiPale   => Style.Builder().fromJson(MapStyle.raster(MapStyle.gsi("pale", "png")))
-    case GsiPhoto  => Style.Builder().fromJson(MapStyle.raster(MapStyle.gsi("seamlessphoto", "jpg")))
-    case GsiRelief => Style.Builder().fromJson(MapStyle.raster(MapStyle.gsi("relief", "png"), maxZoom = 15))
+  /** Fetches tiles from a server (and so reveals the visible area). */
+  def online: Boolean = this != Offline
+
+  /** Style document: a URL, or inline JSON. */
+  private def source: Either[String, String] = this match
+    case Offline   => Right(Basemap.styleJson)
+    case Standard  => Left("https://tiles.openfreemap.org/styles/liberty")
+    case Light     => Left("https://tiles.openfreemap.org/styles/positron")
+    case GsiStd    => Right(MapStyle.raster(MapStyle.gsi("std", "png")))
+    case GsiPale   => Right(MapStyle.raster(MapStyle.gsi("pale", "png")))
+    case GsiPhoto  => Right(MapStyle.raster(MapStyle.gsi("seamlessphoto", "jpg")))
+    case GsiRelief => Right(MapStyle.raster(MapStyle.gsi("relief", "png"), maxZoom = 15))
     case Custom =>
       val (url, credit) = MapStyle.custom
-      if url.isEmpty then Standard.builder
+      if url.isEmpty then Standard.source
       // Without a credit line, at least name where the tiles come from.
-      else Style.Builder().fromJson(MapStyle.raster(url, credit = if credit.nonEmpty then credit else url.takeWhile(_ != '{')))
+      else Right(MapStyle.raster(url, credit = if credit.nonEmpty then credit else url.takeWhile(_ != '{')))
+
+  /** MapLibre style for this base map. */
+  def builder: Style.Builder = source match
+    case Left(uri)   => Style.Builder().fromUri(uri)
+    case Right(json) => Style.Builder().fromJson(json)
+
+  /** Style for a [[org.maplibre.android.snapshotter.MapSnapshotter]] whose
+    * builder also adds sources. An inline JSON style finishes loading inside
+    * the snapshotter's constructor, before its native peer exists, so adding
+    * those sources fails ("invalid native peer"). Loading the same JSON from a
+    * local file makes it asynchronous like a URL style.
+    */
+  def snapshotBuilder: Style.Builder = source match
+    case Left(uri)   => Style.Builder().fromUri(uri)
+    case Right(json) => Style.Builder().fromUri(MapStyle.styleFile(key, json))
 
 object MapStyle:
   private def prefs = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-  def current: MapStyle = values.find(_.key == prefs.getString("mapStyle", Standard.key)).getOrElse(Standard)
-  def current_=(s: MapStyle): Unit = prefs.edit().putString("mapStyle", s.key).apply()
+  private def byKey(k: String): Option[MapStyle] = values.find(_.key == k)
+
+  /** The user's choice; may be [[Offline]]. */
+  def current: MapStyle = byKey(prefs.getString("mapStyle", Standard.key)).getOrElse(Standard)
+  def current_=(s: MapStyle): Unit =
+    val e = prefs.edit().putString("mapStyle", s.key)
+    if s.online then e.putString("mapStyleOnline", s.key)
+    e.apply()
+
+  /** The online map last chosen: what "詳しい地図" shows when [[current]] is offline. */
+  def lastOnline: MapStyle =
+    byKey(prefs.getString("mapStyleOnline", "")).filter(_.online)
+      .orElse(Some(current).filter(_.online)).getOrElse(Standard)
+
+  /** Base map of an interactive map; `detailed` if the user asked for the
+    * online map in that view (see [[BaseMapPolicy]]).
+    */
+  def forView(detailed: Boolean): MapStyle =
+    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, lastOnline, Offline, detailed)
+
+  /** Base map of a still image (feed, period, other devices). */
+  def forSnapshot: MapStyle = BaseMapPolicy.snapshot(Settings.blockExternalLocation, current, Offline)
+
+  /** Whether the picker may render this map's thumbnail at the current view. */
+  def thumbnailAllowed(s: MapStyle): Boolean = BaseMapPolicy.thumbnail(Settings.blockExternalLocation, s, Offline)
+
+  /** Lets MapLibre use the network only when the policy allows it: with
+    * the setting on and no detailed map open, it is told it is offline, so
+    * even an overlooked style URL cannot fetch tiles (cached tiles still show).
+    */
+  def applyNetworkPolicy(ctx: Context): Unit =
+    MapLibre.getInstance(ctx)
+    val allowed = BaseMapPolicy.network(Settings.blockExternalLocation, TrackMap.all.exists(_.detailed))
+    MapLibre.setConnected(if allowed then null else java.lang.Boolean.FALSE)
 
   /** User-supplied XYZ raster tiles: URL template ({z}/{x}/{y}) and credit line. */
   def custom: (String, String) = (prefs.getString("customTileUrl", ""), prefs.getString("customTileCredit", ""))
   def custom_=(v: (String, String)): Unit =
     prefs.edit().putString("customTileUrl", v._1.trim).putString("customTileCredit", v._2.trim).apply()
+
+  /** Writes `json` to the cache (once per content) and returns its file:// URI. */
+  private def styleFile(key: String, json: String): String =
+    val bytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    val hash = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).take(8).map(b => f"${b & 0xff}%02x").mkString
+    val dir = java.io.File(AshidoriApp.app.getCacheDir, "map-styles")
+    dir.mkdirs()
+    val f = java.io.File(dir, s"$key-$hash.json")
+    if !f.exists() then
+      val tmp = java.io.File(dir, s"${f.getName}.tmp")
+      java.nio.file.Files.write(tmp.toPath, bytes)
+      tmp.renameTo(f)
+    "file://" + f.getAbsolutePath
 
   private def gsi(layer: String, ext: String) = s"https://cyberjapandata.gsi.go.jp/xyz/$layer/{z}/{x}/{y}.$ext"
   /** GSI tiles must carry this attribution (terms of use). */

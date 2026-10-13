@@ -1,0 +1,330 @@
+{
+  "format": "AGEO v1",
+  "attribution": [
+    "大字・町丁目レベル位置参照情報　国土交通省（2025年、第19.0b版、ファイル: 01000-19.0b.zip〜47000-19.0b.zip（47 ファイル））。加工: 索引形式に変換（ashidori）",
+    "GeoNames（cities1000.zip、2026-10-13 版）、CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）。改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）"
+  ],
+  "output": {
+    "file": "index.bin",
+    "bytes": 4141467,
+    "uncompressedBytes": 8582541,
+    "sha256": "b84a3a0fa02f690d1f79cd795b88394e0c60ed67d5f45fba22f4c0c6957bdc5f"
+  },
+  "counts": {
+    "strings": 293813,
+    "regions": 2137,
+    "cells": 197161,
+    "points": 350802,
+    "japanTowns": 191106,
+    "worldCities": 159696
+  },
+  "inputs": {
+    "isj": {
+      "source": "位置参照情報 大字・町丁目レベル（国土交通省）",
+      "url": "https://nlftp.mlit.go.jp/isj/",
+      "terms": "位置参照情報利用約款",
+      "files": [
+        {
+          "file": "01000-19.0b.zip",
+          "bytes": 369292,
+          "sha256": "da269f15dbc0350f31ead4772c1cd4e01b4d8056152c96fb7c8f4231fdae060c"
+        },
+        {
+          "file": "02000-19.0b.zip",
+          "bytes": 54747,
+          "sha256": "6e00974d07249b235b79eb6d4f8782c078002a88f33c413dd28ea95396fd0635"
+        },
+        {
+          "file": "03000-19.0b.zip",
+          "bytes": 41336,
+          "sha256": "ebfe311f5ed731256f6364ccb4f1979cc8de960e701adeceae070435a8648d3f"
+        },
+        {
+          "file": "04000-19.0b.zip",
+          "bytes": 80953,
+          "sha256": "d22cd9c91533ab5c81fe8ef0f6c2b2e493ea60bdc900f3306ddd92cd808f79c7"
+        },
+        {
+          "file": "05000-19.0b.zip",
+          "bytes": 38251,
+          "sha256": "274239913a8026a3ef5b2f7e1fe8c3e6b2cd33efc60b4f8b29f923104cfdff39"
+        },
+        {
+          "file": "06000-19.0b.zip",
+          "bytes": 46389,
+          "sha256": "1f2f9d5b0876b5235a7035821a9891b20ca42be74d313e480e612c7af35a573a"
+        },
+        {
+          "file": "07000-19.0b.zip",
+          "bytes": 72704,
+          "sha256": "15f449189a2cc48e6c9c1e5e9b9e2bd849a4a5826e855cd5d4b07c413b51bf89"
+        },
+        {
+          "file": "08000-19.0b.zip",
+          "bytes": 64904,
+          "sha256": "366597c1f35722087e54c4a402b22745dbe15778b692d14dbe93e1e522d35e96"
+        },
+        {
+          "file": "09000-19.0b.zip",
+          "bytes": 42128,
+          "sha256": "5a391012d58d86ab1e5daed0d52f90b281fbadefd6d1cc0a2a5910160faeece5"
+        },
+        {
+          "file": "10000-19.0b.zip",
+          "bytes": 32352,
+          "sha256": "14d0cf0baf58effb6dc8d3fc7d772c09b78718bcc81cdc508e4f3383570fc36e"
+        },
+        {
+          "file": "11000-19.0b.zip",
+          "bytes": 86944,
+          "sha256": "612084eb7a4a68f8ef34e57c1e3e7f237b46a736acc26aaaf139c1188c7eb386"
+        },
+        {
+          "file": "12000-19.0b.zip",
+          "bytes": 93616,
+          "sha256": "4096e21f055ae4b26f9e0f4368b118e6b3030bcb7640b3e820541f9317fd9b9c"
+        },
+        {
+          "file": "13000-19.0b.zip",
+          "bytes": 83077,
+          "sha256": "37b1dbc7a059d8517e1def20a243a5aa8e371fda5ece56767a9f858caed9c2ed"
+        },
+        {
+          "file": "14000-19.0b.zip",
+          "bytes": 81439,
+          "sha256": "d4678c555db60696a26c0d92e8382640d6a45361201c2ce6c6fdf8ddf472fe7f"
+        },
+        {
+          "file": "15000-19.0b.zip",
+          "bytes": 117963,
+          "sha256": "371dff44767f30f8d6e21bb406a0eb261222c13f82e0c5ae8eb0f0f51e133196"
+        },
+        {
+          "file": "16000-19.0b.zip",
+          "bytes": 56350,
+          "sha256": "2ddc61f4b0b2986046dde6437a4004e7e78b32c0e4900c5c9ebe3c46452bca2f"
+        },
+        {
+          "file": "17000-19.0b.zip",
+          "bytes": 54585,
+          "sha256": "15b93f412ce5c41d5243f3c74c719b07341933bf39b7d3f10643b472fabb0009"
+        },
+        {
+          "file": "18000-19.0b.zip",
+          "bytes": 48366,
+          "sha256": "9920bc7fd369288bf74a8f0a0390e8db45c424c1feb1e07e46667bfd7f871e33"
+        },
+        {
+          "file": "19000-19.0b.zip",
+          "bytes": 26140,
+          "sha256": "679d359ca4088d9aaf7a63f66e0d7090233a2f0b538e7d5928948cff292f948d"
+        },
+        {
+          "file": "20000-19.0b.zip",
+          "bytes": 41478,
+          "sha256": "7ba65d8d6276cf35a15d66047c09c29e1c02ea1ba1abc5ebd484c63ff5cf56b3"
+        },
+        {
+          "file": "21000-19.0b.zip",
+          "bytes": 107006,
+          "sha256": "51ddac95fd5c096ee1e03cb4098d037909a74a32f212ce9d6c01696fc67ffe41"
+        },
+        {
+          "file": "22000-19.0b.zip",
+          "bytes": 62047,
+          "sha256": "dbb38071b817f92446ce71911cf74257418b289163ba9c8acf7b3e178f42e086"
+        },
+        {
+          "file": "23000-19.0b.zip",
+          "bytes": 223249,
+          "sha256": "c8504bc97b84e86d95daee414091ac2d9220ce4fb971ee08323208423a61e893"
+        },
+        {
+          "file": "24000-19.0b.zip",
+          "bytes": 52993,
+          "sha256": "72ea7241615603e18f365d602cdb28509cce80440182c03fe1c056696207813c"
+        },
+        {
+          "file": "25000-19.0b.zip",
+          "bytes": 44548,
+          "sha256": "9d1b1e03b68e520ab275efe1c11574c168359cbdbd47845a07bc6a24ee6ed7ea"
+        },
+        {
+          "file": "26000-19.0b.zip",
+          "bytes": 123679,
+          "sha256": "9a6e7301e7d379cbe5baff85c0eff8b2c4ab540f9ffcb86bf4baf1f694688d47"
+        },
+        {
+          "file": "27000-19.0b.zip",
+          "bytes": 130688,
+          "sha256": "a0047e103274abecca94579ba409acbc9855b4cbc22f1fe84510b413e7b5aefe"
+        },
+        {
+          "file": "28000-19.0b.zip",
+          "bytes": 141675,
+          "sha256": "9013b702bdf20f23f7f2b54d707e6013ba0890320511e5cf50c8950870fad126"
+        },
+        {
+          "file": "29000-19.0b.zip",
+          "bytes": 44207,
+          "sha256": "1f2be1c81f7b5e29aca01f8d0a182a30fd6c548690eebdace44529b8b3fa0886"
+        },
+        {
+          "file": "30000-19.0b.zip",
+          "bytes": 36583,
+          "sha256": "ed2f47dccb7a7fdc1a35b1a3304c1263e5ea579be3526518fa7d9151e307939c"
+        },
+        {
+          "file": "31000-19.0b.zip",
+          "bytes": 30729,
+          "sha256": "ec4bf5b891a7c7bbf241e0dfa74e4abbf8afdec188febce3545a62d596ed4535"
+        },
+        {
+          "file": "32000-19.0b.zip",
+          "bytes": 26072,
+          "sha256": "6f616d04a5a1dd7f355de635ce1664a859a228fb586be208d7c194820b20fd9d"
+        },
+        {
+          "file": "33000-19.0b.zip",
+          "bytes": 46881,
+          "sha256": "fd970179c6c84e4b8b10828674851114d9792ac7426408ca47ac9d95d1c4426a"
+        },
+        {
+          "file": "34000-19.0b.zip",
+          "bytes": 62852,
+          "sha256": "aab85f0c1eb987e3146b2052f5338babcac428c65740322e29ad051f93b7cadd"
+        },
+        {
+          "file": "35000-19.0b.zip",
+          "bytes": 44809,
+          "sha256": "68961ad1b18bc48db3dfad24fcad1584fa28196da0d00adcdc404abb485d4df3"
+        },
+        {
+          "file": "36000-19.0b.zip",
+          "bytes": 26458,
+          "sha256": "89be5d75c109f0db250c75a2787a5620ed65aa1749f665f9666d9821e6b3b8d4"
+        },
+        {
+          "file": "37000-19.0b.zip",
+          "bytes": 19777,
+          "sha256": "4d2093e0aecffff4fa09c45c3fa458746fbb1370482a0c6b3d3061169a4c238d"
+        },
+        {
+          "file": "38000-19.0b.zip",
+          "bytes": 43825,
+          "sha256": "a748a4f28daeb610143cd013d4a7a8adb4205048847089fcb1d31411c8140284"
+        },
+        {
+          "file": "39000-19.0b.zip",
+          "bytes": 37856,
+          "sha256": "573a47b7cb15c21577de24a97b1a318dc018cf02b04258ca342f1aa9edccc000"
+        },
+        {
+          "file": "40000-19.0b.zip",
+          "bytes": 100311,
+          "sha256": "060283682baf849b42d07613cf48babb23b458474c5b5f214602c413f3a842d1"
+        },
+        {
+          "file": "41000-19.0b.zip",
+          "bytes": 21453,
+          "sha256": "d356b0a89fd1a1553915d04f57ff2038812694dbe28f7d4d117f849bd038acf6"
+        },
+        {
+          "file": "42000-19.0b.zip",
+          "bytes": 37594,
+          "sha256": "1dc54fca5afe0e93eddf5b0e0b4e9ed1eee6388ed61b50ddc2d8093e70ef4583"
+        },
+        {
+          "file": "43000-19.0b.zip",
+          "bytes": 43456,
+          "sha256": "1bdaa45d100ae67f74c48712f4df64f785e32edbad55c03acd8ea7292f50daa6"
+        },
+        {
+          "file": "44000-19.0b.zip",
+          "bytes": 38287,
+          "sha256": "094cfcecd913a73a4b6dc94d8dbe37e0870c3b59ee0776bbd1ed93a86882bf76"
+        },
+        {
+          "file": "45000-19.0b.zip",
+          "bytes": 26350,
+          "sha256": "2150366730324b9c415819f602ffd8b71cca04389dc0dbc7e23254fe1be2edbf"
+        },
+        {
+          "file": "46000-19.0b.zip",
+          "bytes": 33355,
+          "sha256": "fe7a65b92458ae4a918af1fdaad249a0b42e967e203797cf7800e4c3b4e1e722"
+        },
+        {
+          "file": "47000-19.0b.zip",
+          "bytes": 24640,
+          "sha256": "dbfafb8633dbb3a6ad07f4c8415e12e1d2f420a793958dafca3ee0a2d94c8d8e"
+        }
+      ],
+      "members": [
+        "01000-19.0b/01_2025.csv",
+        "02000-19.0b/02_2025.csv",
+        "03000-19.0b/03_2025.csv",
+        "04000-19.0b/04_2025.csv",
+        "05000-19.0b/05_2025.csv",
+        "06000-19.0b/06_2025.csv",
+        "07000-19.0b/07_2025.csv",
+        "08000-19.0b/08_2025.csv",
+        "09000-19.0b/09_2025.csv",
+        "10000-19.0b/10_2025.csv",
+        "11000-19.0b/11_2025.csv",
+        "12000-19.0b/12_2025.csv",
+        "13000-19.0b/13_2025.csv",
+        "14000-19.0b/14_2025.csv",
+        "15000-19.0b/15_2025.csv",
+        "16000-19.0b/16_2025.csv",
+        "17000-19.0b/17_2025.csv",
+        "18000-19.0b/18_2025.csv",
+        "19000-19.0b/19_2025.csv",
+        "20000-19.0b/20_2025.csv",
+        "21000-19.0b/21_2025.csv",
+        "22000-19.0b/22_2025.csv",
+        "23000-19.0b/23_2025.csv",
+        "24000-19.0b/24_2025.csv",
+        "25000-19.0b/25_2025.csv",
+        "26000-19.0b/26_2025.csv",
+        "27_2025.csv",
+        "28000-19.0b/28_2025.csv",
+        "29000-19.0b/29_2025.csv",
+        "30000-19.0b/30_2025.csv",
+        "31000-19.0b/31_2025.csv",
+        "32000-19.0b/32_2025.csv",
+        "33000-19.0b/33_2025.csv",
+        "34000-19.0b/34_2025.csv",
+        "35000-19.0b/35_2025.csv",
+        "36000-19.0b/36_2025.csv",
+        "37000-19.0b/37_2025.csv",
+        "38000-19.0b/38_2025.csv",
+        "39000-19.0b/39_2025.csv",
+        "40000-19.0b/40_2025.csv",
+        "41000-19.0b/41_2025.csv",
+        "42000-19.0b/42_2025.csv",
+        "43000-19.0b/43_2025.csv",
+        "44000-19.0b/44_2025.csv",
+        "45000-19.0b/45_2025.csv",
+        "46000-19.0b/46_2025.csv",
+        "47000-19.0b/47_2025.csv"
+      ]
+    },
+    "geonames": {
+      "source": "GeoNames",
+      "url": "https://download.geonames.org/export/dump/",
+      "license": "CC BY 4.0",
+      "files": [
+        {
+          "file": "cities1000.zip",
+          "bytes": 11061686,
+          "sha256": "ed7963ce473c7ff0a03c03481b6cc359b1849a05d5b30cccc02114e5967b16d3",
+          "date": "2026-10-13"
+        }
+      ],
+      "members": [
+        "cities1000.txt"
+      ]
+    }
+  }
+}
