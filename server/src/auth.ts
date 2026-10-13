@@ -49,16 +49,25 @@ export const deviceAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
  * only, ALLOW_DEV_ADMIN == "true") the ADMIN_DEV_TOKEN secret as a bearer token.
  */
 export const adminAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
-  // Cross-site requests are never legitimate for the admin API.
-  const origin = c.req.header("Origin");
-  if (origin && origin !== new URL(c.req.url).origin) return jsonError(c, 403, "forbidden");
-  if (c.req.header("Sec-Fetch-Site") === "cross-site") return jsonError(c, 403, "forbidden");
+  // Cross-site state-changing requests are never legitimate for the admin API.
+  // Page loads (GET) arrive cross-site right after the Access login redirect,
+  // so only unsafe methods are checked; GET still needs the Access JWT below.
+  const unsafe = !["GET", "HEAD", "OPTIONS"].includes(c.req.method);
+  if (unsafe) {
+    const origin = c.req.header("Origin");
+    if (origin && origin !== new URL(c.req.url).origin) return jsonError(c, 403, "forbidden");
+    if (c.req.header("Sec-Fetch-Site") === "cross-site") return jsonError(c, 403, "forbidden");
+  }
 
   const assertion = c.req.header("Cf-Access-Jwt-Assertion");
   if (assertion) {
     const r = await verifyAccessJwt(assertion, c.env.CF_ACCESS_TEAM_DOMAIN, c.env.CF_ACCESS_AUD);
     if (r.ok) return next();
-    return jsonError(c, 403, "forbidden");
+    // Only requests that passed Access carry this header, so the reason is
+    // shown to an authenticated operator, which makes misconfiguration
+    // (wrong AUD or team domain) diagnosable.
+    console.warn("admin: Access JWT rejected", r.reason);
+    return jsonError(c, 403, `forbidden: ${r.reason}`);
   }
 
   const devToken = c.env.ADMIN_DEV_TOKEN;
