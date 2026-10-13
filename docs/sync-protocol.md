@@ -15,7 +15,9 @@ check-ins that a user explicitly shares with their followers; see
 
 - One deployment serves several users. Every device belongs to exactly one
   user, and a user's devices share that user's data. Users do not sign in to
-  the web; an admin creates the user and hands them a pairing code.
+  the web. Either an admin creates the user and hands them a pairing code, or,
+  when the server allows it, the user's first device creates the user itself
+  (see [Registration and storage quota](#registration-and-storage-quota)).
 - Data is isolated per user: a device only sees the devices and batches of its
   own user. Devices registered before users existed have no user; they only
   see each other, and cannot use shared check-ins or follows.
@@ -58,12 +60,13 @@ check-ins that a user explicitly shares with their followers; see
   - A pairing code is 8 characters of Crockford base32, single use, with a TTL of 10 minutes.
   - Every code is bound to a user, and the device registered with it belongs to that user.
   - Codes are created either by an existing device (`POST /v1/pairing`, for the device's own user) or by an admin for a given user (`POST /admin/users/:id/pairing`).
-  - A user's first device is always paired with a code from an admin.
+  - A user's first device registers with a code from an admin, or, when registration is open, creates its user with `POST /v1/accounts`. Further devices always pair with a code.
 - Tokens can be revoked per device. A revoked or unknown token gets `401`.
 - An admin can disable a user. The user's device tokens then get `401` and the
   user's unused pairing codes are rejected, until the user is enabled again.
-- Pairing, registration and handle lookups are rate limited per IP. The
-  counters are deleted as soon as their window (10 minutes) has ended.
+- Pairing, registration, self-registration and handle lookups are rate limited
+  per IP. The counters are deleted as soon as their window (10 minutes; one
+  hour for self-registration) has ended.
 
 ## HTTP API
 
@@ -80,11 +83,13 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | POST | `/admin/devices/:id/revoke` | admin | revoke any device |
 | GET | `/admin/checkins` | admin | the 200 most recently changed shared check-ins (moderation) |
 | POST | `/admin/checkins/:id/delete` | admin | remove a shared check-in (leaves a tombstone) |
+| GET | `/v1/info` | – | `{registration: "admin" \| "open"}` |
+| POST | `/v1/accounts` | – | `{deviceName?}` → `{deviceId, token}`; creates a user with this device. Only when registration is `open`, else `403 {"error": "registration closed"}` |
 | POST | `/v1/devices/register` | – | `{code, name}` → `{deviceId, token}`; the code is consumed |
 | POST | `/v1/pairing` | device | → `{code, expiresAt}` for the device's user |
 | GET | `/v1/devices` | device | the user's devices: `[{id, name, createdAt, lastSeenAt, revoked}]` |
 | POST | `/v1/devices/:id/revoke` | device | revoke one of the user's devices (including self) |
-| PUT | `/v1/batches/:stream/:seq` | device | body: blob (`application/octet-stream`, ≤ 8 MiB) |
+| PUT | `/v1/batches/:stream/:seq` | device | body: blob (`application/octet-stream`, ≤ 8 MiB); `507 {"error": "quota exceeded"}` beyond the user's quota |
 | GET | `/v1/batches?after=<cursor>&limit=<n>` | device | metadata of the batches of all the user's devices, ordered by a global cursor |
 | GET | `/v1/batches/:deviceId/:stream/:seq` | device | blob of one of the user's devices |
 | PUT | `/v1/checkins/shared/:localId` | user device | share or update a check-in (see below) → `{id, cursor}` |
@@ -110,6 +115,32 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 - Listings, fetches and revocations only cover the caller's user. A device of another user is reported like a missing one (`404`).
 - R2 key: `b/{deviceId}/{stream}/{seq as 12-digit zero padded}`.
 - "user device" means a device that belongs to a user. Legacy devices without a user get `403 {"error": "no user"}`.
+
+## Registration and storage quota
+
+The server variable `REGISTRATION` decides who creates users:
+
+- `admin` (default): only admins, on the admin page. Any value other than `open`, including an empty one, means `admin`.
+- `open`: anyone may create a user from the app. The server is then only an end-to-end encrypted backup and sync target; no admin is involved.
+
+`GET /v1/info` tells the app which mode the server is in, so that it can offer the right setup steps. A server without this endpoint is treated as `admin`.
+
+`POST /v1/accounts {deviceName?}`:
+
+- Creates a user and registers the calling device as its first device, in one step. The response is the same as for `/v1/devices/register`: `{deviceId, token}` (`201`).
+- The user's name is the trimmed `deviceName` (1–64 characters, no control characters; else `400`). Without one, both names are `"device"`.
+- The user has no handle (an admin may set one later) and is marked as self-registered (`createdBy: "self"` in the admin user list). Admins can disable such users like any other.
+- Rate limited per IP: 5 attempts per hour, failed ones included (`429`).
+- The app then creates `K` and shows the recovery code, as for any first device. Further devices pair from this device (`POST /v1/pairing`) and enter the recovery code.
+
+Every user has a **storage quota** (`USER_QUOTA_BYTES`, default 2 GiB when empty or invalid), in both modes:
+
+- It counts the blob sizes of all batches of all the user's devices, revoked devices included (their blobs are kept).
+- `PUT /v1/batches/...` of a new batch fails with `507 {"error": "quota exceeded"}` when the stored total plus the new blob would exceed the quota. Nothing is stored. Re-sending an existing batch still returns `200 {"status": "exists"}`.
+- Concurrent uploads of one user are checked independently, so together they may overshoot the quota by at most their own sizes (≤ 8 MiB each).
+- Legacy devices without a user share their data, so together they share one quota.
+- The admin user list shows each user's usage (`storageBytes`).
+- Clients treat `quota exceeded` as a persistent condition: they show it to the user and do not retry with backoff; the next scheduled run tries again (e.g. after the admin raised the quota).
 
 ## Shared check-ins and follows
 
@@ -167,7 +198,7 @@ uses the service.
 
 - **Detailed logs**: ciphertext only. Without `K` the operator cannot read positions, times, places or check-ins in batches.
 - **Metadata the server keeps**:
-  - users: name, handle, optional e-mail address, status, creation time;
+  - users: name, handle, optional e-mail address, status, creation time, and who created the user (an admin, or self-registration);
   - devices: id, name, registration time, last-seen time (rounded down to the hour);
   - batches: device, stream name, sequence number, blob size, SHA-256, upload time (rounded down to the hour);
   - follows: who follows whom, with request and acceptance times (rounded down to the hour);
@@ -213,3 +244,4 @@ After each successful small-stream upload, a device downloads the latest status 
   - With "モバイル回線でも同期" off, the job requires `NetworkType.UNMETERED` instead.
 - **Raw GNSS logs**: a separate periodic job, every 6 h, requiring `NetworkType.UNMETERED`, and optionally charging.
 - Both jobs use exponential backoff and resume from their cursors. Batches are at most 5 000 rows or 4 MiB of plaintext.
+- `quota exceeded` is not retried with backoff: the job ends, the error is shown in the sync settings, and the next periodic run tries again.

@@ -1,4 +1,5 @@
 import { Hono, type MiddlewareHandler } from "hono";
+import { registrationMode, SELF_REGISTERED, storageUsed, userQuotaBytes } from "./accounts";
 import { deviceAuth } from "./auth";
 import { listFeed, LOCAL_ID_RE, parseCheckin, unshareCheckin, upsertCheckin } from "./checkins";
 import {
@@ -10,15 +11,13 @@ import {
   normalizeHandle,
   requestFollow,
 } from "./follows";
-import { createPairingCode, listDevices, MAX_DEVICE_NAME, revokeDevice } from "./devices";
+import { createPairingCode, listDevices, newDeviceStmt, parseDeviceName, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, hitRateLimit, RULES } from "./ratelimit";
 import {
-  base64UrlEncode,
   floorHour,
   jsonError,
   normalizePairingCode,
-  randomBytes,
   readBody,
   readJson,
   sha256Hex,
@@ -33,6 +32,8 @@ const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 const LIST_DEFAULT_LIMIT = 100;
 const LIST_MAX_LIMIT = 1000;
 const FEED_MAX_LIMIT = 500;
+/** Device (and user) name of a self-registered account when the app sends none. */
+const DEFAULT_DEVICE_NAME = "device";
 
 export function blobKey(deviceId: string, stream: string, seq: number): string {
   return `b/${deviceId}/${stream}/${String(seq).padStart(12, "0")}`;
@@ -69,10 +70,8 @@ v1.post("/devices/register", async (c) => {
   if (typeof rawCode !== "string" || typeof rawName !== "string") {
     return jsonError(c, 400, "code and name are required");
   }
-  const name = rawName.trim();
-  if (name.length === 0 || name.length > MAX_DEVICE_NAME || /[\u0000-\u001f\u007f]/.test(name)) {
-    return jsonError(c, 400, "invalid name");
-  }
+  const name = parseDeviceName(rawName);
+  if (name === null) return jsonError(c, 400, "invalid name");
   const code = normalizePairingCode(rawCode);
   if (!code) return jsonError(c, 401, "invalid or expired pairing code");
 
@@ -91,12 +90,49 @@ v1.post("/devices/register", async (c) => {
   if (!consumed) return jsonError(c, 401, "invalid or expired pairing code");
 
   // The device belongs to the code's user (null only for legacy codes).
-  const token = base64UrlEncode(randomBytes(32));
-  await c.env.DB.prepare(
-    "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-  )
-    .bind(deviceId, name, await sha256Hex(token), now, floorHour(now), consumed.user_id)
-    .run();
+  const { stmt, token } = await newDeviceStmt(c.env.DB, deviceId, name, consumed.user_id, now);
+  await stmt.run();
+  return c.json({ deviceId, token }, 201);
+});
+
+// ---- Self-registration (unauthenticated, only when REGISTRATION = "open") ----
+
+v1.get("/info", (c) => c.json({ registration: registrationMode(c.env) }));
+
+// Creates a user and registers the calling device as its first device. The
+// user has no handle (an admin may set one) and is marked as self-registered.
+// Further devices are paired from this one (POST /v1/pairing).
+v1.post("/accounts", async (c) => {
+  if (registrationMode(c.env) !== "open") return jsonError(c, 403, "registration closed");
+  if (!(await hitRateLimit(c.env.DB, RULES.account, clientKey(c.req.raw)))) {
+    return jsonError(c, 429, "too many requests");
+  }
+  let body: unknown;
+  try {
+    body = await readJson(c.req.raw);
+  } catch (e) {
+    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
+    return jsonError(c, 400, "invalid JSON body");
+  }
+  const { deviceName: rawName } = (body ?? {}) as { deviceName?: unknown };
+  let name: string | null = DEFAULT_DEVICE_NAME;
+  if (rawName !== undefined && rawName !== null && rawName !== "") {
+    name = typeof rawName === "string" ? parseDeviceName(rawName) : null;
+    if (name === null) return jsonError(c, 400, "invalid deviceName");
+  }
+
+  const now = Date.now();
+  const userId = crypto.randomUUID();
+  const deviceId = crypto.randomUUID();
+  const { stmt, token } = await newDeviceStmt(c.env.DB, deviceId, name, userId, now);
+  // One batch: the user never exists without its device.
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO users (id, name, handle, email, status, created_at, created_by)
+       VALUES (?1, ?2, NULL, NULL, 'active', ?3, ?4)`,
+    ).bind(userId, name, now, SELF_REGISTERED),
+    stmt,
+  ]);
   return c.json({ deviceId, token }, 201);
 });
 
@@ -179,6 +215,12 @@ v1.put("/batches/:stream/:seq", async (c) => {
     if (existing.sha256 === sha256) return c.json({ status: "exists" }, 200);
     return jsonError(c, 409, "batch already exists with a different hash");
   }
+
+  // Quota: checked after the idempotency check, so that re-sending an
+  // existing batch succeeds even at the limit. Concurrent uploads of one user
+  // may together overshoot it by at most their own sizes.
+  const used = await storageUsed(db, c.get("device").user_id);
+  if (used + body.byteLength > userQuotaBytes(c.env)) return jsonError(c, 507, "quota exceeded");
 
   // Blob first, then metadata: a batch is listed only once its blob is durable.
   // The cursor is assigned at metadata insert time, so listings never skip it.

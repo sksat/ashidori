@@ -1,8 +1,9 @@
 // User accounts. Admins (operators, see adminAuth) create users from the admin
 // page; users never sign in to the web. A user receives a pairing code from an
 // admin, registers their first device with it, and pairs further devices from
-// the app. All /v1/* data is scoped to the device's user, except shared
-// check-ins, which followers see (see follows.ts).
+// the app. With REGISTRATION = "open", the first device may instead create its
+// own user (see accounts.ts). All /v1/* data is scoped to the device's user,
+// except shared check-ins, which followers see (see follows.ts).
 
 import { bumpUserCheckins } from "./checkins";
 import type { UserRow, UserStatus } from "./env";
@@ -37,6 +38,8 @@ export interface UserListItem extends UserView {
   deviceCount: number;
   /** Latest lastSeenAt over the user's devices. */
   lastSeenAt: number | null;
+  /** Blob bytes stored by the user's devices (what the quota counts, see accounts.ts). */
+  storageBytes: number;
 }
 
 /** Another user already has the handle. */
@@ -160,12 +163,19 @@ export async function listUsers(db: D1Database): Promise<UserListItem[]> {
     .prepare(
       `SELECT u.id, u.name, u.handle, u.email, u.status, u.created_at, u.created_by, u.disabled_at,
          COUNT(d.id) - COUNT(d.revoked_at) AS device_count,
-         MAX(d.last_seen_at) AS last_seen_at
+         MAX(d.last_seen_at) AS last_seen_at,
+         (SELECT COALESCE(SUM(b.size), 0) FROM devices d2 JOIN batches b ON b.device_id = d2.id
+          WHERE d2.user_id = u.id) AS storage_bytes
        FROM users u LEFT JOIN devices d ON d.user_id = u.id
        GROUP BY u.id ORDER BY u.created_at, u.id`,
     )
-    .all<UserRow & { device_count: number; last_seen_at: number | null }>();
-  return results.map((r) => ({ ...toView(r), deviceCount: r.device_count, lastSeenAt: r.last_seen_at }));
+    .all<UserRow & { device_count: number; last_seen_at: number | null; storage_bytes: number }>();
+  return results.map((r) => ({
+    ...toView(r),
+    deviceCount: r.device_count,
+    lastSeenAt: r.last_seen_at,
+    storageBytes: r.storage_bytes,
+  }));
 }
 
 /**

@@ -1,5 +1,5 @@
 import type { DeviceRow } from "./env";
-import { generatePairingCode, sha256Hex } from "./util";
+import { base64UrlEncode, floorHour, generatePairingCode, randomBytes, sha256Hex } from "./util";
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
 export const MAX_DEVICE_NAME = 64;
@@ -47,6 +47,34 @@ export async function createPairingCode(
       .bind(await sha256Hex(code), now, expiresAt, createdBy, userId),
   ]);
   return { code, expiresAt };
+}
+
+/**
+ * A new device of `userId` (null only for legacy codes) with a fresh token.
+ * Returns the INSERT, to run alone or in a batch, and the token, which is
+ * shown to the device once; only its hash is stored.
+ */
+export async function newDeviceStmt(
+  db: D1Database,
+  deviceId: string,
+  name: string,
+  userId: string | null,
+  now: number,
+): Promise<{ stmt: D1PreparedStatement; token: string }> {
+  const token = base64UrlEncode(randomBytes(32));
+  const stmt = db
+    .prepare(
+      "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(deviceId, name, await sha256Hex(token), now, floorHour(now), userId);
+  return { stmt, token };
+}
+
+/** Trims a device name; null if it is empty, too long or has control characters. */
+export function parseDeviceName(raw: string): string | null {
+  const name = raw.trim();
+  if (name.length === 0 || name.length > MAX_DEVICE_NAME || /[\u0000-\u001f\u007f]/.test(name)) return null;
+  return name;
 }
 
 function toView(r: Omit<DeviceRow, "token_hash" | "user_id">): DeviceView {

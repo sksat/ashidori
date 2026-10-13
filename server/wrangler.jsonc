@@ -43,7 +43,12 @@
     "ALLOW_DEV_ADMIN": "false",
     // Comma-separated e-mail addresses (case-insensitive) of the admins. /admin/* requires a
     // verified Access JWT whose email is listed here. Empty = nobody (admin API disabled).
-    "ADMIN_EMAILS": ""
+    "ADMIN_EMAILS": "",
+    // Who creates users. "admin": only admins (admin page). "open": anyone may create a user
+    // from the app (POST /v1/accounts). Any other value, including empty, means "admin".
+    "REGISTRATION": "admin",
+    // Per-user storage quota (total blob bytes). Empty or invalid = 2 GiB (2147483648).
+    "USER_QUOTA_BYTES": ""
   }
 
   // Secrets (not in this file):

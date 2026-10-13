@@ -8,6 +8,10 @@ export interface Env {
   ADMIN_DEV_TOKEN?: string;
   /** Comma-separated, case-insensitive e-mail addresses of the admins. */
   ADMIN_EMAILS: string;
+  /** "admin" (default) or "open" (anyone may create an account). Anything else = "admin". */
+  REGISTRATION: string;
+  /** Per-user storage quota in bytes. Empty or invalid = 2 GiB. */
+  USER_QUOTA_BYTES: string;
 }
 
 export interface DeviceRow {
@@ -31,6 +35,7 @@ export interface UserRow {
   email: string | null;
   status: UserStatus;
   created_at: number;
+  /** E-mail address of the admin who created the user, or "self" (self-registered, see accounts.ts). */
   created_by: string;
   disabled_at: number | null;
 }

@@ -31,11 +31,15 @@ object SyncConfig:
   def masterKey: Option[Array[Byte]] = SecureStore.get("master")
   def setMasterKey(k: Array[Byte]): Unit = SecureStore.put("master", k)
 
+  /** This device created its user (self-registration), so no other device has a key yet. */
+  def newAccount: Boolean = prefs.getBoolean("newAccount", false)
+
   def paired: Boolean = serverUrl.nonEmpty && deviceId.nonEmpty && token.isDefined
   def ready: Boolean = paired && masterKey.isDefined
 
-  def savePairing(url: String, deviceId: String, token: String): Unit =
-    prefs.edit().putString("url", url.stripSuffix("/")).putString("deviceId", deviceId).apply()
+  def savePairing(url: String, deviceId: String, token: String, newAccount: Boolean = false): Unit =
+    prefs.edit().putString("url", url.stripSuffix("/")).putString("deviceId", deviceId)
+      .putBoolean("newAccount", newAccount).apply()
     SecureStore.put("token", token.getBytes(UTF_8))
 
   def forget(): Unit =
@@ -43,6 +47,11 @@ object SyncConfig:
     SecureStore.remove("token")
     SecureStore.remove("master")
     PeerStatus.clear()
+
+/** The server refused an upload because the user's storage quota is full.
+  * This persists until the quota is raised, so it is not retried with backoff.
+  */
+final class QuotaExceeded extends RuntimeException("サーバの保存容量が上限に達しています")
 
 /** Minimal HTTP client for the ashidori server. Blocking; call off the main thread. */
 final class SyncClient(base: String, token: Option[String]):
@@ -74,6 +83,22 @@ final class SyncClient(base: String, token: Option[String]):
     if r.code != 200 && r.code != 201 then throw RuntimeException(s"登録に失敗しました (${r.code}): ${r.text}")
     (r.json("deviceId").str, r.json("token").str)
 
+  /** Who may create users on this server: "admin" or "open". Anything else
+    * (including an older server without `/v1/info`) counts as "admin".
+    */
+  def registration(): String =
+    val r = request("GET", "/v1/info")
+    if r.code == 200 && Try(r.json("registration").str).toOption.contains("open") then "open" else "admin"
+
+  /** Creates a user with this device as its first device (open registration only). */
+  def createAccount(deviceName: String): (String, String) =
+    val r = request("POST", "/v1/accounts", ujson.write(ujson.Obj("deviceName" -> deviceName)).getBytes(UTF_8))
+    r.code match
+      case 200 | 201 => (r.json("deviceId").str, r.json("token").str)
+      case 403 => throw RuntimeException("このサーバでは新規登録を受け付けていません")
+      case 429 => throw RuntimeException("登録の試行回数が上限に達しました。時間をおいて再度お試しください")
+      case c => throw RuntimeException(s"登録に失敗しました ($c): ${r.text.take(200)}")
+
   def createPairing(): (String, Long) =
     val r = request("POST", "/v1/pairing", "{}".getBytes(UTF_8))
     if r.code != 200 && r.code != 201 then throw RuntimeException(s"HTTP ${r.code}")
@@ -86,6 +111,7 @@ final class SyncClient(base: String, token: Option[String]):
     r.code match
       case 200 | 201 => true
       case 409 => throw IllegalStateException(s"batch $stream/$seq conflicts with a different blob on the server")
+      case 507 => throw QuotaExceeded()
       case c => throw RuntimeException(s"upload $stream/$seq failed: HTTP $c ${r.text.take(200)}")
 
   /** One page of the user's batch metadata after `cursor`, and the cursor to
@@ -229,7 +255,7 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
         e => {
           Log.w("sync failed", e)
           SyncConfig.lastError = e.getMessage
-          ListenableWorker.Result.retry()
+          SyncScheduler.onFailure(e)
         },
         n => {
           SyncConfig.lastSync = System.currentTimeMillis()
@@ -248,12 +274,21 @@ class RawLogSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ct
       Try(Uploader.uploadRawLogs()).fold(
         e => {
           Log.w("raw log sync failed", e)
-          ListenableWorker.Result.retry()
+          // Only a full quota is shown: other raw-log errors are transient,
+          // and the small-stream job reports the connection state.
+          if e.isInstanceOf[QuotaExceeded] then SyncConfig.lastError = e.getMessage
+          SyncScheduler.onFailure(e)
         },
         _ => ListenableWorker.Result.success()
       )
 
 object SyncScheduler:
+  /** A full quota does not clear by retrying soon: end this run without
+    * backoff retries and let the next periodic run try again.
+    */
+  def onFailure(e: Throwable): ListenableWorker.Result =
+    if e.isInstanceOf[QuotaExceeded] then ListenableWorker.Result.failure() else ListenableWorker.Result.retry()
+
   def schedule(ctx: Context): Unit =
     val wm = WorkManager.getInstance(ctx)
     if !SyncConfig.ready then

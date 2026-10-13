@@ -1,9 +1,9 @@
 package net.sksat.ashidori.ui
 
 import android.content.{ClipData, ClipboardManager}
-import android.text.InputType
+import android.text.{Editable, InputType, TextWatcher}
 import android.view.View
-import android.widget.{EditText, Toast}
+import android.widget.{EditText, LinearLayout, Toast}
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
 import java.time.Instant
@@ -53,44 +53,101 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       body.addView(devicesCard())
     body.addView(spacer(24))
 
+  /** Step 1: the server URL first. What follows depends on the server's
+    * registration mode (`/v1/info`): with open registration, a choice between
+    * creating an account and joining from another device; otherwise (or when
+    * the server cannot be asked) the pairing code input.
+    */
   private def registerCard(): View =
     val url = EditText(act)
     url.setHint("サーバの URL（https://...）")
     url.setInputType(InputType.TYPE_TEXT_VARIATION_URI)
     url.setText(SyncConfig.serverUrl)
-    val code = EditText(act)
-    code.setHint("ペアリングコード（8文字）")
-    code.setInputType(InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS)
-    val go = button("この端末を登録") {
+    val next = vbox()
+    // The steps below belong to the URL they were shown for.
+    url.addTextChangedListener(new TextWatcher:
+      def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()
+      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = next.removeAllViews()
+      def afterTextChanged(s: Editable): Unit = ()
+    )
+    val check = button("次へ") {
       val u = url.getText.toString.trim.stripSuffix("/")
-      val c = code.getText.toString.trim.toUpperCase
       // Debug builds may talk to a local `wrangler dev` over http.
       val debuggable = (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
       if !u.startsWith("https://") && !(debuggable && u.startsWith("http://")) then
         toast("https:// で始まる URL を入力してください")
       else
-        async(SyncClient(u, None).register(c, SyncScheduler.deviceName)) {
-          _.fold(e => toast(e.getMessage), { (id, token) =>
-            SyncConfig.savePairing(u, id, token)
-            render()
-          })
+        async(SyncClient(u, None).registration()) { r =>
+          next.removeAllViews()
+          // Network errors fall back to the pairing code, which works on every server.
+          if r.toOption.contains("open") then next.addView(startChoice(u, next))
+          else next.addView(pairingCodeInput(u))
         }
     }
     card(
       text("1. 端末を登録", 16f, bold = true),
-      caption("サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
+      caption("同期先のサーバの URL を入力します。"),
       url,
+      check,
+      next
+    )
+
+  /** Open registration: this device is either the user's first or joins one. */
+  private def startChoice(u: String, next: LinearLayout): View =
+    vbox(
+      spacer(8),
+      button("新しく始める（この端末が最初）") {
+        async(SyncClient(u, None).createAccount(SyncScheduler.deviceName)) {
+          _.fold(e => toast(e.getMessage), { (id, token) =>
+            SyncConfig.savePairing(u, id, token, newAccount = true)
+            render()
+            createKey()
+          })
+        }
+      },
+      caption("このサーバに新しく登録し、暗号化の鍵を作成します。"),
+      outlined("別の端末から追加") {
+        next.removeAllViews()
+        next.addView(pairingCodeInput(u))
+      },
+      caption("登録済みの端末で発行したペアリングコードと、復旧コードを入力します。")
+    )
+
+  private def pairingCodeInput(u: String): View =
+    val code = EditText(act)
+    code.setHint("ペアリングコード（8文字）")
+    code.setInputType(InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS)
+    val go = button("この端末を登録") {
+      val c = code.getText.toString.trim.toUpperCase
+      async(SyncClient(u, None).register(c, SyncScheduler.deviceName)) {
+        _.fold(e => toast(e.getMessage), { (id, token) =>
+          SyncConfig.savePairing(u, id, token)
+          render()
+        })
+      }
+    }
+    vbox(
+      spacer(8),
+      caption("サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
       code,
       go
     )
 
   private def keyCard(): View =
-    card(
-      text("2. 暗号化の鍵", 16f, bold = true),
-      caption("最初の端末なら鍵を新しく作ります。2台目以降は、最初の端末で控えた復旧コードを入力します。"),
-      button("新しい鍵を作る（最初の端末）")(createKey()),
-      outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode())
-    )
+    if SyncConfig.newAccount then
+      // Self-registered: no other device has a key, so only a new one makes sense.
+      card(
+        text("2. 暗号化の鍵", 16f, bold = true),
+        caption("鍵を新しく作成し、表示される復旧コードを控えます。"),
+        button("新しい鍵を作る")(createKey())
+      )
+    else
+      card(
+        text("2. 暗号化の鍵", 16f, bold = true),
+        caption("最初の端末なら鍵を新しく作ります。2台目以降は、最初の端末で控えた復旧コードを入力します。"),
+        button("新しい鍵を作る（最初の端末）")(createKey()),
+        outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode())
+      )
 
   private def createKey(): Unit =
     val key = Crypto.newMasterKey()

@@ -15,9 +15,48 @@ ashidori の同期サーバです。
 
 - **管理者**は admin ページ（`/admin/`）を使う。条件は、Cloudflare Access のログインを経て、その JWT の `email` が `ADMIN_EMAILS`（カンマ区切り、大文字小文字を区別しない）に含まれることである。Worker が JWT を検証して照合するため、Access のポリシーが広くても（例: SSO でログインできる全員）一覧にない人は `403` になる。`ADMIN_EMAILS` が空なら admin API はすべて拒否する。
 - **利用者**は web にログインしない。管理者が admin ページで利用者を作成し（名前は必須、メールアドレスは控えとして任意）、その利用者用のペアリングコードを発行して渡す。利用者はアプリにコードを入力して最初のデバイスを登録する。2 台目以降は、アプリから `POST /v1/pairing` でコードを発行して追加する。
+- `REGISTRATION` が `open` のときは、管理者を介さずに最初のデバイスが利用者を作成できる（自己登録、`POST /v1/accounts`）。2 台目以降の追加は上と同じである。詳細は「[新規登録と容量の上限](#新規登録と容量の上限)」を参照。
 - デバイスはペアリングコードの利用者に属する。デバイスから見えるのは、同じ利用者のデバイスとバッチだけである。他の利用者のバッチは一覧に出ず、取得しようとしても `404` になる。
 - 利用者を停止すると、その利用者のデバイストークンと未使用のペアリングコードは使えなくなる。データは消さない。再開すれば元どおり使える。
 - 利用者の導入前に登録されたデバイス（`user_id` が NULL）は、旧形式のデバイスとしてそのまま動く。旧形式のデバイスどうしはデータを共有し、利用者のデバイスとは分離される。管理者が旧形式のコードを発行することはできない。旧形式のデバイスは共有チェックインとフォローを使えない（`403`）。
+
+## 新規登録と容量の上限
+
+### 変数
+
+Worker の変数（`wrangler.jsonc` の `vars`）は次のとおり。CI では GitHub のリポジトリ変数を `--var` で渡す（「[3. GitHub に登録する](#3-github-に登録する)」）。
+
+| 変数 | 既定値 | 内容 |
+| --- | --- | --- |
+| `CF_ACCESS_TEAM_DOMAIN` | 空 | Access の Team domain。空なら admin API を拒否する |
+| `CF_ACCESS_AUD` | 空 | `/admin/*` を保護する Access アプリケーションの AUD Tag。空なら admin API を拒否する |
+| `ADMIN_EMAILS` | 空 | 管理者のメールアドレス（カンマ区切り）。空なら admin API を拒否する |
+| `REGISTRATION` | `admin` | 利用者を作成できる者。`admin` は管理者のみ、`open` は誰でもアプリから作成できる。`open` 以外の値（空を含む）は `admin` として扱う |
+| `USER_QUOTA_BYTES` | 空（2 GiB） | 利用者ごとの容量の上限（バイト）。空または正の整数でない値なら 2 GiB とする |
+| `CORS_ALLOWED_ORIGINS` | 空 | `/v1/*` で CORS を許可するオリジン（カンマ区切り）。空なら CORS ヘッダを返さない |
+| `ALLOW_DEV_ADMIN` | `false` | ローカル開発でのみ `true` にする。本番では必ず `false` |
+
+### 自己登録（`REGISTRATION=open`）
+
+`open` にすると、アプリが `GET /v1/info` で方式を確認し、「新しく始める」を選んだ端末が `POST /v1/accounts` で利用者を作成する。サーバはエンドツーエンド暗号化されたバックアップと同期の保存先としてだけ働き、管理者の操作は要らない。
+
+- 作成される利用者の名前はデバイス名（未指定なら `device`）で、ハンドルとメールアドレスはない。admin ページでは「自己登録」と表示する。
+- 2 台目以降は、最初の端末で発行したペアリングコードで追加する。暗号化の鍵は端末で作成し、サーバには渡らない。
+- IP ごとに 1 時間 5 回までに制限する（失敗した試行も数える）。
+- `admin` のとき `POST /v1/accounts` は `403 registration closed` を返す。
+
+`open` が向くのは、自分や身内だけが使うサーバで管理者の手間を省きたい場合と、暗号化済みデータの保存先として公開する場合である。公開サーバで `open` にすると、誰でも容量の上限まで暗号化済みデータを保存できる。管理者はその中身を読めないが、admin ページで利用者ごとの使用量を確認し、利用者を停止できる。利用者を限定したい場合は `admin` のままにする。
+
+### 容量の上限（`USER_QUOTA_BYTES`）
+
+方式によらず、利用者ごとに保存できる blob の合計に上限を設ける。
+
+- 利用者の全デバイス（失効したものを含む）のバッチのサイズを合計して判定する。失効しても blob は消えないためである。
+- 新しいバッチの PUT で、合計と新しい blob の和が上限を超える場合は `507 quota exceeded` を返し、保存しない。既存のバッチの再送は上限に関係なく `200` を返す。
+- 同じ利用者の同時アップロードは個別に判定するため、合計がそれらのサイズ（1 件 8 MiB 以下）の分だけ上限を超えることがある。
+- 旧形式のデバイス（利用者なし）はデータを共有しているため、全体で 1 つの上限を共有する。
+- admin ページの利用者一覧に使用量（`storageBytes`）と上限に対する割合を表示する。
+- アプリは `quota exceeded` を受けると同期の状態にエラーとして表示し、バックオフによる再試行をせず、次回の定期同期で再び試す。
 
 ## 共有チェックインとフォロー
 
@@ -37,7 +76,7 @@ ashidori の同期サーバです。
 | Method | Path | 内容 |
 | --- | --- | --- |
 | GET | `/admin/` | admin ページ |
-| GET | `/admin/users` | 利用者の一覧（名前、メールアドレス、状態、作成日時、失効していないデバイス数、デバイスの最終アクセス） |
+| GET | `/admin/users` | 利用者の一覧（名前、メールアドレス、状態、作成日時、作成者 `createdBy`（管理者のメールアドレス、自己登録なら `self`）、失効していないデバイス数、デバイスの最終アクセス、使用量 `storageBytes`） |
 | POST | `/admin/users` | `{name, handle?, email?}` → 作成した利用者。ハンドルが使用済みなら `409` |
 | PATCH | `/admin/users/:id` | `{name?, handle?}` で名前・ハンドルを変更する。`handle: null` でハンドルを削除する |
 | POST | `/admin/users/:id/pairing` | その利用者のペアリングコード → `{code, expiresAt}`。停止中の利用者には `409` |
@@ -130,6 +169,8 @@ CI 用には、ユーザーではなくアカウントが所有する API トー
 | Variable | `CF_ACCESS_TEAM_DOMAIN` | リポジトリ | Access の Team domain |
 | Variable | `CF_ACCESS_AUD` | リポジトリ | Access アプリケーションの AUD Tag |
 | Variable | `ADMIN_EMAILS` | リポジトリ | 管理者のメールアドレス（カンマ区切り） |
+| Variable | `REGISTRATION` | リポジトリ | `admin` または `open`（任意。未設定なら `admin`） |
+| Variable | `USER_QUOTA_BYTES` | リポジトリ | 利用者ごとの容量の上限（バイト、任意。未設定なら 2 GiB） |
 | Variable | `DEPLOY_SERVER` | リポジトリ | `true`（`true` のときのみデプロイする） |
 
 ```sh
@@ -166,6 +207,8 @@ Actions の `server` ワークフローを Run workflow で実行する（`main`
 
 2 台目以降は、利用者が既存デバイスから `POST /v1/pairing` でコードを発行して追加する。admin ページでは利用者の停止・再開と、デバイスの一覧確認・失効もできる。
 
+`REGISTRATION` が `open` なら 1.〜3. は不要で、利用者はアプリで「新しく始める」を選ぶ。
+
 ### 手元からデプロイする場合
 
 `wrangler login` した上で、`wrangler.jsonc` の `database_id` を D1 の ID に置き換えて実行する（置き換えはコミットしない）。
@@ -174,6 +217,8 @@ Actions の `server` ワークフローを Run workflow で実行する（`main`
 pnpm exec wrangler d1 migrations apply ashidori --remote
 pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.com --var CF_ACCESS_AUD:<AUD Tag> --var ADMIN_EMAILS:<管理者のメールアドレス>
 ```
+
+`REGISTRATION` と `USER_QUOTA_BYTES` を変える場合は、同じく `--var REGISTRATION:open` のように渡す。
 
 ## 実装メモ
 
@@ -194,13 +239,15 @@ pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.co
     - `register`: 10 回 / 10 分。失敗した試行も数えます。
     - `pairing`: 20 回 / 10 分。`/v1/pairing` と `/admin/users/:id/pairing` で共通です。
     - `lookup`: 20 回 / 10 分。`/v1/users/lookup`（ハンドルの列挙対策）。
+    - `account`: 5 回 / 1 時間。`/v1/accounts`（自己登録）。成功するたびに利用者が増えるため厳しくする。失敗した試行も数える。
   - 上限を超えると `429` を返します。
-  - カウンタのキーは IP を含むため、ウィンドウが終わったものはすぐ削除する。各チェック時に削除し、さらに cron trigger（10 分ごと、`wrangler.jsonc` の `triggers`）でも削除する。後者はリクエストが来ない場合のためである。
+  - カウンタのキーは IP を含むため、ウィンドウが終わったものはすぐ削除する。ウィンドウの長さはバケットごとに判定する。各チェック時に削除し、さらに cron trigger（10 分ごと、`wrangler.jsonc` の `triggers`）でも削除する。後者はリクエストが来ない場合のためである。
 - **ログ**: IP アドレスやリクエスト本文はログに出さない。`console.error` はエラー自体だけを出す。Workers Logs の invocation log（リクエストごとのメタデータ）は `wrangler.jsonc` で無効にしている。
 - **PUT**: `Content-Type: application/octet-stream` と `X-Content-SHA256` が必須です。
   - 本文は 8 MiB を超えた時点で読み込みを打ち切り、`413` を返します。
   - R2 への put が成功してから D1 にメタデータを insert します。そのため、一覧に出るバッチは必ず blob が存在します。
   - R2 には `sha256` を渡して、R2 側でも整合性を検証させています。
+  - 新しいバッチは容量の上限を確かめてから保存する。使用量は `batches` の `size` を利用者のデバイスについて合計して求め、インデックス `batches_device_size`（マイグレーション 0004）で表を読まずに計算する。
 - **GET blob**: D1 にメタデータがあるものだけを返します。
 - **admin**: GET・HEAD・OPTIONS 以外で、`Origin` ヘッダが別オリジンのリクエストと `Sec-Fetch-Site: cross-site` のリクエストは `403` で拒否する（CSRF 対策）。GET を対象外にするのは、Access のログイン後に `/admin/` へ戻るリダイレクトが cross-site になるためである。GET は状態を変えず、`/admin/*` は CORS ヘッダを返さないため、別オリジンのページは応答を読めない。
 - **セキュリティヘッダ**: 全レスポンスに付けます。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP (`default-src 'none'`、admin ページは nonce 付き)、`Cache-Control: no-store` です。

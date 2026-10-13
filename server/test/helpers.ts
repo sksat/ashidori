@@ -56,16 +56,41 @@ export function register(code: string, name = "pixel", ip = "192.0.2.1"): Promis
   });
 }
 
+/** Env with open self-registration (REGISTRATION is "admin" in wrangler.jsonc). */
+export const OPEN: Partial<Cloudflare.Env> = { REGISTRATION: "open" };
+
+/** POST /v1/accounts with `body` as JSON. */
+export function selfRegister(
+  body: unknown = { deviceName: "pixel" },
+  ip = "192.0.2.1",
+  envOverrides: Partial<Cloudflare.Env> = OPEN,
+): Promise<Response> {
+  return call(
+    "/v1/accounts",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+      body: JSON.stringify(body),
+    },
+    envOverrides,
+  );
+}
+
 export async function newDevice(name = "pixel", userId?: string): Promise<{ deviceId: string; token: string }> {
   const res = await register(await issueAdminCode(userId), name);
   if (res.status !== 201) throw new Error(`register failed: ${res.status}`);
   return (await res.json()) as { deviceId: string; token: string };
 }
 
-export function authed(token: string, path: string, init: RequestInit = {}): Promise<Response> {
+export function authed(
+  token: string,
+  path: string,
+  init: RequestInit = {},
+  envOverrides: Partial<Cloudflare.Env> = {},
+): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  return call(path, { ...init, headers });
+  return call(path, { ...init, headers }, envOverrides);
 }
 
 export async function sha256Hex(data: Uint8Array): Promise<string> {
@@ -79,15 +104,21 @@ export async function putBatch(
   seq: number | string,
   body: Uint8Array,
   hash?: string,
+  envOverrides: Partial<Cloudflare.Env> = {},
 ): Promise<Response> {
-  return authed(token, `/v1/batches/${stream}/${seq}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Content-SHA256": hash ?? (await sha256Hex(body)),
+  return authed(
+    token,
+    `/v1/batches/${stream}/${seq}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Content-SHA256": hash ?? (await sha256Hex(body)),
+      },
+      body,
     },
-    body,
-  });
+    envOverrides,
+  );
 }
 
 export function blob(text: string): Uint8Array {

@@ -73,3 +73,5 @@ jobs:
           --var "CF_ACCESS_TEAM_DOMAIN:${{ vars.CF_ACCESS_TEAM_DOMAIN }}"
           --var "CF_ACCESS_AUD:${{ vars.CF_ACCESS_AUD }}"
           --var "ADMIN_EMAILS:${{ vars.ADMIN_EMAILS }}"
+          --var "REGISTRATION:${{ vars.REGISTRATION || 'admin' }}"
+          --var "USER_QUOTA_BYTES:${{ vars.USER_QUOTA_BYTES }}"

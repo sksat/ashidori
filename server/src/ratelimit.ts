@@ -16,6 +16,9 @@ export const RULES = {
   pairing: { bucket: "pairing", limit: 20, windowMs: 10 * 60 * 1000 },
   // Handle lookups (exact match), against enumerating users.
   lookup: { bucket: "lookup", limit: 20, windowMs: 10 * 60 * 1000 },
+  // Self-registration (REGISTRATION = "open"): each success creates a user,
+  // so it is much stricter than pairing-code registration.
+  account: { bucket: "account", limit: 5, windowMs: 60 * 60 * 1000 },
 } satisfies Record<string, RateLimitRule>;
 
 /** Client IP; IPv6 addresses are bucketed by their /64 prefix. */
@@ -32,6 +35,14 @@ export function clientKey(req: Request): string {
 }
 
 const MAX_WINDOW_MS = Math.max(...Object.values(RULES).map((r) => r.windowMs));
+const MIN_WINDOW_MS = Math.min(...Object.values(RULES).map((r) => r.windowMs));
+
+// Window length per bucket (the part of the key before ":"), so that each
+// counter goes as soon as its own window has ended. The values come from
+// RULES, not from requests.
+const WINDOW_OF_KEY = `CASE substr(key, 1, instr(key, ':') - 1) ${Object.values(RULES)
+  .map((r) => `WHEN '${r.bucket}' THEN ${r.windowMs}`)
+  .join(" ")} ELSE ${MAX_WINDOW_MS} END`;
 
 /**
  * Counters are keyed by client IP, so they are deleted as soon as their window
@@ -39,7 +50,10 @@ const MAX_WINDOW_MS = Math.max(...Object.values(RULES).map((r) => r.windowMs));
  * covers the case where no further request comes.
  */
 export function deleteExpiredRateLimits(db: D1Database, now: number): D1PreparedStatement {
-  return db.prepare("DELETE FROM rate_limits WHERE window_start <= ?1").bind(now - MAX_WINDOW_MS);
+  // The first condition lets the window_start index narrow the scan.
+  return db
+    .prepare(`DELETE FROM rate_limits WHERE window_start <= ?2 AND window_start + ${WINDOW_OF_KEY} <= ?1`)
+    .bind(now, now - MIN_WINDOW_MS);
 }
 
 /** Returns true if the request is allowed. */
