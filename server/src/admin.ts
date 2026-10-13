@@ -1,9 +1,19 @@
 import { Hono } from "hono";
 import { adminAuth } from "./auth";
+import { listRecentCheckins, removeCheckin } from "./checkins";
 import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, hitRateLimit, RULES } from "./ratelimit";
-import { createUser, getUser, listUsers, parseNewUser, setUserStatus } from "./users";
+import {
+  createUser,
+  getUser,
+  HandleTaken,
+  listUsers,
+  parseNewUser,
+  parseUserPatch,
+  setUserStatus,
+  updateUser,
+} from "./users";
 import { base64UrlEncode, jsonError, randomBytes, readJson, TooLarge } from "./util";
 
 // Operator API. Every route requires an admin (see adminAuth), which also
@@ -27,7 +37,32 @@ admin.post("/users", async (c) => {
   }
   const parsed = parseNewUser(body);
   if (typeof parsed === "string") return jsonError(c, 400, parsed);
-  return c.json(await createUser(c.env.DB, parsed.name, parsed.email, c.get("adminEmail")), 201);
+  try {
+    return c.json(await createUser(c.env.DB, parsed, c.get("adminEmail")), 201);
+  } catch (e) {
+    if (e instanceof HandleTaken) return jsonError(c, 409, "handle already taken");
+    throw e;
+  }
+});
+
+// `{name?, handle?}`; `handle: null` removes the handle.
+admin.patch("/users/:id", async (c) => {
+  let body: unknown;
+  try {
+    body = await readJson(c.req.raw);
+  } catch (e) {
+    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
+    return jsonError(c, 400, "invalid JSON body");
+  }
+  const parsed = parseUserPatch(body);
+  if (typeof parsed === "string") return jsonError(c, 400, parsed);
+  try {
+    const user = await updateUser(c.env.DB, c.req.param("id"), parsed);
+    return user ? c.json(user) : jsonError(c, 404, "no such user");
+  } catch (e) {
+    if (e instanceof HandleTaken) return jsonError(c, 409, "handle already taken");
+    throw e;
+  }
 });
 
 // A pairing code for the user's device; the user enters it in the app.
@@ -60,7 +95,21 @@ admin.post("/devices/:id/revoke", async (c) => {
   return c.json({ revoked: true });
 });
 
-// Minimal admin page (behind Access) to manage users and devices.
+// ---- Shared check-ins (moderation) ----
+// Shared check-ins are plaintext by design (see checkins.ts); everything else
+// users store is ciphertext the admin cannot read.
+
+const ADMIN_CHECKINS_LIMIT = 200;
+
+admin.get("/checkins", async (c) => c.json(await listRecentCheckins(c.env.DB, ADMIN_CHECKINS_LIMIT)));
+
+admin.post("/checkins/:id/delete", async (c) => {
+  if (!(await removeCheckin(c.env.DB, c.req.param("id")))) return jsonError(c, 404, "no such check-in");
+  return c.json({ deleted: true });
+});
+
+// Minimal admin page (behind Access) to manage users and devices and to
+// moderate shared check-ins.
 admin.get("/", (c) => {
   const nonce = base64UrlEncode(randomBytes(16));
   c.header(
@@ -80,17 +129,21 @@ td button{margin-right:.3rem}#err{color:#b00}
 <h1>ashidori admin</h1>
 <p id="err"></p>
 <section><h2>利用者</h2>
-<p><input id="name" placeholder="名前" maxlength="64"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
+<p><input id="name" placeholder="名前" maxlength="64"> <input id="handle" placeholder="ハンドル (任意)" maxlength="20"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
+<p>ハンドルは英小文字・数字・_ の 3〜20 文字です。他の利用者はハンドルの完全一致で検索し、フォローを申請します。</p>
 <div id="pairing" hidden><p id="for"></p><p id="code"></p><p id="exp"></p></div>
-<table><thead><tr><th>名前</th><th>メールアドレス</th><th>状態</th><th>デバイス</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
+<table><thead><tr><th>名前</th><th>ハンドル</th><th>メールアドレス</th><th>状態</th><th>デバイス</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
 <section><h2>デバイス</h2>
 <p>利用者が「なし」のデバイスは、利用者の導入前に登録されたものです。</p>
 <table><thead><tr><th>名前</th><th>利用者</th><th>作成</th><th>最終アクセス</th><th></th></tr></thead><tbody id="devices"></tbody></table></section>
+<section><h2>共有チェックイン</h2>
+<p>利用者がフォロワーに共有したチェックインです (新しい順、最大 200 件)。</p>
+<table><thead><tr><th>日時</th><th>利用者</th><th>場所</th><th>カテゴリ</th><th>コメント</th><th></th></tr></thead><tbody id="checkins"></tbody></table></section>
 <script nonce="${nonce}">
 const fmt = (t) => t == null ? "-" : new Date(t).toLocaleString();
 const $ = (id) => document.getElementById(id);
-async function api(path, body) {
-  const init = { method: "POST" };
+async function api(path, body, method = "POST") {
+  const init = { method };
   if (body !== undefined) { init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(body); }
   const res = await fetch(path, init);
   const json = await res.json();
@@ -107,18 +160,23 @@ function row(tbody, values, buttons) {
   tr.appendChild(td); tbody.appendChild(tr);
 }
 async function load() {
-  const [users, devices] = await Promise.all([
+  const [users, devices, checkins] = await Promise.all([
     fetch("/admin/users").then((r) => r.json()),
     fetch("/admin/devices").then((r) => r.json()),
+    fetch("/admin/checkins").then((r) => r.json()),
   ]);
   const ut = $("users"); ut.textContent = "";
   for (const u of users) {
     const active = u.status === "active";
     const buttons = active
       ? [["ペアリングコード発行", () => issue(u)],
+         ["ハンドル変更", async () => {
+           const h = prompt(u.name + " のハンドル (空欄で削除)", u.handle ?? "");
+           if (h !== null && await api("/admin/users/" + encodeURIComponent(u.id), { handle: h.trim() || null }, "PATCH")) load();
+         }],
          ["停止", async () => { if (confirm(u.name + " を停止しますか。この利用者のデバイスは同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
       : [["再開", async () => { if (await api("/admin/users/" + encodeURIComponent(u.id) + "/enable")) load(); }]];
-    row(ut, [u.name, u.email ?? "-", active ? "有効" : "停止中", String(u.deviceCount), fmt(u.lastSeenAt)], buttons);
+    row(ut, [u.name, u.handle ?? "-", u.email ?? "-", active ? "有効" : "停止中", String(u.deviceCount), fmt(u.lastSeenAt)], buttons);
   }
   const dt = $("devices"); dt.textContent = "";
   for (const d of devices) {
@@ -126,6 +184,13 @@ async function load() {
       if (confirm(d.name + " を失効させますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
     }]];
     row(dt, [d.name + (d.revoked ? " (失効)" : ""), d.userName ?? "なし", fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
+  }
+  const ct = $("checkins"); ct.textContent = "";
+  for (const p of checkins) {
+    const where = p.venue + (p.place ? " (" + p.place + ")" : "");
+    row(ct, [fmt(p.t), p.user.name + (p.userStatus === "active" ? "" : " (停止中)"), where, p.category ?? "-", p.comment ?? "-"], [["削除", async () => {
+      if (confirm(where + " を削除しますか。フォロワーの一覧から消えます。") && await api("/admin/checkins/" + encodeURIComponent(p.id) + "/delete")) load();
+    }]]);
   }
 }
 async function issue(u) {
@@ -138,9 +203,11 @@ async function issue(u) {
 }
 $("create").onclick = async () => {
   const email = $("email").value.trim();
+  const handle = $("handle").value.trim();
   const body = { name: $("name").value.trim() };
   if (email) body.email = email;
-  if (await api("/admin/users", body)) { $("name").value = ""; $("email").value = ""; load(); }
+  if (handle) body.handle = handle;
+  if (await api("/admin/users", body)) { $("name").value = ""; $("handle").value = ""; $("email").value = ""; load(); }
 };
 load();
 </script></body></html>`);

@@ -2,9 +2,7 @@ import type { MiddlewareHandler } from "hono";
 import { verifyAccessJwt } from "./access";
 import type { AppEnv, DeviceRow, UserStatus } from "./env";
 import { parseAdminEmails } from "./users";
-import { DEVICE_TOKEN_RE, jsonError, sha256Hex, timingSafeEqualStr } from "./util";
-
-const LAST_SEEN_RESOLUTION_MS = 60 * 1000;
+import { DEVICE_TOKEN_RE, floorHour, jsonError, sha256Hex, timingSafeEqualStr } from "./util";
 
 function bearer(req: Request): string | null {
   const h = req.headers.get("Authorization");
@@ -35,10 +33,12 @@ export const deviceAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (row.user_id !== null && row.user_status !== "active") return jsonError(c, 401, "unauthorized");
   const { user_status: _, ...device } = row;
 
-  const now = Date.now();
-  if (device.last_seen_at === null || now - device.last_seen_at >= LAST_SEEN_RESOLUTION_MS) {
+  // Hour granularity: enough to spot unused devices, without a timeline of
+  // when the user is active. At most one write per device per hour.
+  const hour = floorHour(Date.now());
+  if (device.last_seen_at === null || device.last_seen_at < hour) {
     const update = c.env.DB.prepare("UPDATE devices SET last_seen_at = ?2 WHERE id = ?1")
-      .bind(device.id, now)
+      .bind(device.id, hour)
       .run();
     try {
       c.executionCtx.waitUntil(update);

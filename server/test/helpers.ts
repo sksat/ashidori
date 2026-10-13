@@ -24,11 +24,11 @@ export function adminCall(path: string, init: RequestInit = {}): Promise<Respons
   return call(path, { ...init, headers });
 }
 
-export async function createUser(name: string, email?: string): Promise<string> {
+export async function createUser(name: string, email?: string, handle?: string): Promise<string> {
   const res = await adminCall("/admin/users", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, email }),
+    body: JSON.stringify({ name, email, handle }),
   });
   if (res.status !== 201) throw new Error(`create user failed: ${res.status}`);
   return ((await res.json()) as { id: string }).id;
@@ -92,6 +92,82 @@ export async function putBatch(
 
 export function blob(text: string): Uint8Array {
   return new TextEncoder().encode(text);
+}
+
+/** Inserts a device as it existed before accounts (user_id NULL). */
+export async function legacyDevice(id: string): Promise<{ deviceId: string; token: string }> {
+  const token = id.padEnd(43, "x");
+  await env.DB.prepare("INSERT INTO devices (id, name, token_hash, created_at) VALUES (?1, ?1, ?2, ?3)")
+    .bind(id, await sha256Hex(new TextEncoder().encode(token)), Date.now())
+    .run();
+  return { deviceId: id, token };
+}
+
+// ---- Shared check-ins and follows ----
+
+export const CHECKIN = { t: 1_760_000_000_000, lat: 35.68, lon: 139.76, venue: "Cafe" };
+
+export function putCheckin(token: string, localId: string, body: unknown): Promise<Response> {
+  return authed(token, `/v1/checkins/shared/${localId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function unshare(token: string, localId: string): Promise<Response> {
+  return authed(token, `/v1/checkins/shared/${localId}`, { method: "DELETE" });
+}
+
+export function postJson(token: string, path: string, body?: unknown): Promise<Response> {
+  return authed(token, path, {
+    method: "POST",
+    ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  });
+}
+
+/** `follower` requests to follow `followee`'s user, and `followee` accepts. */
+export async function follow(
+  follower: { token: string; userId: string },
+  followee: { token: string; userId: string },
+): Promise<void> {
+  const req = await postJson(follower.token, "/v1/follows", { userId: followee.userId });
+  if (req.status !== 200) throw new Error(`follow request failed: ${req.status}`);
+  const acc = await postJson(followee.token, `/v1/follow-requests/${follower.userId}/accept`);
+  if (acc.status !== 200) throw new Error(`accept failed: ${acc.status}`);
+}
+
+/** A user with one device. */
+export async function newUser(name: string, handle?: string): Promise<{ userId: string; token: string; deviceId: string }> {
+  const userId = await createUser(name, undefined, handle);
+  return { userId, ...(await newDevice(name, userId)) };
+}
+
+export interface FeedItem {
+  id: string;
+  cursor: number;
+  user: { id: string; handle: string | null; name: string };
+  t: number | null;
+  lat: number | null;
+  lon: number | null;
+  venue: string | null;
+  category: string | null;
+  place: string | null;
+  comment: string | null;
+  updatedAt: number;
+  deleted: boolean;
+}
+
+export interface Feed {
+  items: FeedItem[];
+  next: number | null;
+  followsVersion: number;
+}
+
+export async function feed(token: string, query = ""): Promise<Feed> {
+  const res = await authed(token, `/v1/checkins/feed${query}`);
+  if (res.status !== 200) throw new Error(`feed failed: ${res.status}`);
+  return (await res.json()) as Feed;
 }
 
 // ---- Cloudflare Access JWTs ----

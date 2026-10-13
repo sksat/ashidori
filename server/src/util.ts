@@ -3,6 +3,17 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 
 const encoder = new TextEncoder();
 
+export const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Rounds a time down to the hour. Times the server keeps only for display
+ * (upload, last seen) are stored this coarsely, so that they reveal little
+ * about when a user is active.
+ */
+export function floorHour(ms: number): number {
+  return ms - (ms % HOUR_MS);
+}
+
 export function jsonError(c: Context, status: ContentfulStatusCode, error: string): Response {
   return c.json({ error }, status);
 }

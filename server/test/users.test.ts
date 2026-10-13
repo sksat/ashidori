@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { adminCall, authed, blob, createUser, issueAdminCode, newDevice, putBatch, register, sha256Hex } from "./helpers";
+import { adminCall, authed, blob, createUser, issueAdminCode, legacyDevice, newDevice, putBatch, register } from "./helpers";
 
 interface ListItem {
   cursor: number;
@@ -20,15 +20,6 @@ async function deviceUser(id: string): Promise<string | null> {
     .bind(id)
     .first<{ user_id: string | null }>();
   return row!.user_id;
-}
-
-/** Inserts a device as it existed before accounts (user_id NULL). */
-async function legacyDevice(id: string): Promise<{ deviceId: string; token: string }> {
-  const token = id.padEnd(43, "x");
-  await env.DB.prepare("INSERT INTO devices (id, name, token_hash, created_at) VALUES (?1, ?1, ?2, ?3)")
-    .bind(id, await sha256Hex(new TextEncoder().encode(token)), Date.now())
-    .run();
-  return { deviceId: id, token };
 }
 
 describe("registration binds devices to users", () => {

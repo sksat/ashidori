@@ -1,9 +1,29 @@
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
 import { deviceAuth } from "./auth";
+import { listFeed, LOCAL_ID_RE, parseCheckin, unshareCheckin, upsertCheckin } from "./checkins";
+import {
+  acceptFollow,
+  deleteFollow,
+  listFollowers,
+  listFollowing,
+  lookupHandle,
+  normalizeHandle,
+  requestFollow,
+} from "./follows";
 import { createPairingCode, listDevices, MAX_DEVICE_NAME, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, hitRateLimit, RULES } from "./ratelimit";
-import { base64UrlEncode, jsonError, normalizePairingCode, randomBytes, readBody, readJson, sha256Hex, TooLarge } from "./util";
+import {
+  base64UrlEncode,
+  floorHour,
+  jsonError,
+  normalizePairingCode,
+  randomBytes,
+  readBody,
+  readJson,
+  sha256Hex,
+  TooLarge,
+} from "./util";
 
 export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
 const STREAM_RE = /^[a-z][a-z0-9_]{0,31}$/;
@@ -12,6 +32,7 @@ const SEQ_RE = /^(0|[1-9][0-9]{0,11})$/;
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 const LIST_DEFAULT_LIMIT = 100;
 const LIST_MAX_LIMIT = 1000;
+const FEED_MAX_LIMIT = 500;
 
 export function blobKey(deviceId: string, stream: string, seq: number): string {
   return `b/${deviceId}/${stream}/${String(seq).padStart(12, "0")}`;
@@ -72,9 +93,9 @@ v1.post("/devices/register", async (c) => {
   // The device belongs to the code's user (null only for legacy codes).
   const token = base64UrlEncode(randomBytes(32));
   await c.env.DB.prepare(
-    "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+    "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
   )
-    .bind(deviceId, name, await sha256Hex(token), now, consumed.user_id)
+    .bind(deviceId, name, await sha256Hex(token), now, floorHour(now), consumed.user_id)
     .run();
   return c.json({ deviceId, token }, 201);
 });
@@ -88,6 +109,25 @@ v1.use("/devices", deviceAuth);
 v1.use("/devices/:id/revoke", deviceAuth);
 v1.use("/batches", deviceAuth);
 v1.use("/batches/*", deviceAuth);
+
+// Shared check-ins and follows are between users, so legacy devices, which
+// have no user, cannot take part.
+const requireUser: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (c.get("device").user_id === null) return jsonError(c, 403, "no user");
+  await next();
+};
+for (const path of [
+  "/checkins/*",
+  "/users/lookup",
+  "/follows",
+  "/follows/*",
+  "/follow-requests/*",
+  "/follow-requests",
+  "/followers",
+  "/followers/*",
+]) {
+  v1.use(path, deviceAuth, requireUser);
+}
 
 v1.post("/pairing", async (c) => {
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
@@ -153,7 +193,9 @@ v1.put("/batches/:stream/:seq", async (c) => {
        ON CONFLICT (device_id, stream, seq) DO NOTHING
        RETURNING cursor`,
     )
-    .bind(deviceId, stream, seq, body.byteLength, sha256, Date.now())
+    // The upload time is for display only (ordering is by cursor), so it is
+    // kept at hour granularity.
+    .bind(deviceId, stream, seq, body.byteLength, sha256, floorHour(Date.now()))
     .first<{ cursor: number }>();
   if (inserted) return c.json({ status: "created", cursor: inserted.cursor }, 201);
 
@@ -219,4 +261,106 @@ v1.get("/batches/:deviceId/:stream/:seq", async (c) => {
       ETag: `"${meta.sha256}"`,
     },
   });
+});
+
+// ---- Shared check-ins (see checkins.ts) ----
+
+v1.put("/checkins/shared/:localId", async (c) => {
+  const localId = c.req.param("localId");
+  if (!LOCAL_ID_RE.test(localId)) return jsonError(c, 400, "invalid id");
+  let body: unknown;
+  try {
+    body = await readJson(c.req.raw);
+  } catch (e) {
+    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
+    return jsonError(c, 400, "invalid JSON body");
+  }
+  const parsed = parseCheckin(body);
+  if (typeof parsed === "string") return jsonError(c, 400, parsed);
+  const device = c.get("device");
+  return c.json(await upsertCheckin(c.env.DB, device.user_id!, device.id, localId, parsed));
+});
+
+v1.delete("/checkins/shared/:localId", async (c) => {
+  const localId = c.req.param("localId");
+  if (!LOCAL_ID_RE.test(localId) || !(await unshareCheckin(c.env.DB, c.get("device").id, localId))) {
+    return jsonError(c, 404, "not found");
+  }
+  return c.json({ deleted: true });
+});
+
+v1.get("/checkins/feed", async (c) => {
+  const afterStr = c.req.query("after") ?? "0";
+  const limitStr = c.req.query("limit") ?? String(LIST_DEFAULT_LIMIT);
+  if (!/^[0-9]{1,15}$/.test(afterStr)) return jsonError(c, 400, "invalid cursor");
+  if (!/^[0-9]{1,5}$/.test(limitStr)) return jsonError(c, 400, "invalid limit");
+  const limit = Math.min(Math.max(Number(limitStr), 1), FEED_MAX_LIMIT);
+  return c.json(await listFeed(c.env.DB, c.get("device").user_id!, Number(afterStr), limit));
+});
+
+// ---- Follows (see follows.ts) ----
+
+// Exact match only, and rate limited, so that handles cannot be enumerated.
+v1.get("/users/lookup", async (c) => {
+  if (!(await hitRateLimit(c.env.DB, RULES.lookup, clientKey(c.req.raw)))) {
+    return jsonError(c, 429, "too many requests");
+  }
+  const handle = normalizeHandle(c.req.query("handle") ?? "");
+  const user = handle ? await lookupHandle(c.env.DB, handle) : null;
+  return user ? c.json(user) : jsonError(c, 404, "no such user");
+});
+
+v1.post("/follows", async (c) => {
+  let body: unknown;
+  try {
+    body = await readJson(c.req.raw);
+  } catch (e) {
+    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
+    return jsonError(c, 400, "invalid JSON body");
+  }
+  const { userId } = (body ?? {}) as { userId?: unknown };
+  if (typeof userId !== "string" || userId.length === 0 || userId.length > 64) {
+    return jsonError(c, 400, "userId is required");
+  }
+  const result = await requestFollow(c.env.DB, c.get("device").user_id!, userId);
+  if (result === "self") return jsonError(c, 400, "cannot follow yourself");
+  if (result === "no user") return jsonError(c, 404, "no such user");
+  return c.json(result);
+});
+
+v1.get("/follows", async (c) => c.json(await listFollowing(c.env.DB, c.get("device").user_id!)));
+
+// Unfollow, or cancel a request.
+v1.delete("/follows/:userId", async (c) => {
+  if (!(await deleteFollow(c.env.DB, c.get("device").user_id!, c.req.param("userId")))) {
+    return jsonError(c, 404, "not following");
+  }
+  return c.json({ deleted: true });
+});
+
+v1.get("/follow-requests", async (c) => c.json(await listFollowers(c.env.DB, c.get("device").user_id!, "pending")));
+
+v1.post("/follow-requests/:userId/accept", async (c) => {
+  if (!(await acceptFollow(c.env.DB, c.req.param("userId"), c.get("device").user_id!))) {
+    return jsonError(c, 404, "no such request");
+  }
+  return c.json({ status: "accepted" });
+});
+
+// Deletes the request; the user may send it again.
+v1.post("/follow-requests/:userId/decline", async (c) => {
+  if (!(await deleteFollow(c.env.DB, c.req.param("userId"), c.get("device").user_id!, "pending"))) {
+    return jsonError(c, 404, "no such request");
+  }
+  return c.json({ deleted: true });
+});
+
+v1.get("/followers", async (c) => c.json(await listFollowers(c.env.DB, c.get("device").user_id!, "accepted")));
+
+// Removing a follower: they stop seeing the caller's shared check-ins.
+v1.delete("/followers/:userId", async (c) => {
+  if (!(await deleteFollow(c.env.DB, c.req.param("userId"), c.get("device").user_id!, "accepted"))) {
+    return jsonError(c, 404, "not a follower");
+  }
+  return c.json({ deleted: true });
 });

@@ -26,6 +26,8 @@ export type UserStatus = "active" | "disabled";
 export interface UserRow {
   id: string;
   name: string;
+  /** Lowercase; NULL for users that cannot be looked up. */
+  handle: string | null;
   email: string | null;
   status: UserStatus;
   created_at: number;

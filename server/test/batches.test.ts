@@ -139,6 +139,8 @@ describe("GET /v1/batches (listing)", () => {
       sha256: await sha256Hex(blob(`${a.token}/fixes/0`)),
       createdAt: expect.any(Number),
     });
+    // The upload time is kept at hour granularity.
+    expect(seen.every((i) => i.createdAt % (60 * 60 * 1000) === 0)).toBe(true);
 
     // Resuming from the last cursor yields nothing; a new upload appears after it.
     const last = cursors[cursors.length - 1]!;

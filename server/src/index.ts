@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { admin } from "./admin";
-import type { AppEnv } from "./env";
+import type { AppEnv, Env } from "./env";
+import { deleteExpiredRateLimits } from "./ratelimit";
 import { jsonError } from "./util";
 import { v1 } from "./v1";
 
@@ -39,7 +40,7 @@ app.use("/v1/*", async (c, next) => {
     if (!origin) return c.body(null, 204, { Vary: "Origin" });
     return c.body(null, 204, {
       "Access-Control-Allow-Origin": origin,
-      "Access-Control-Allow-Methods": "GET, PUT, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Content-SHA256",
       "Access-Control-Max-Age": "600",
       Vary: "Origin",
@@ -58,8 +59,16 @@ app.route("/admin", admin);
 
 app.notFound((c) => jsonError(c, 404, "not found"));
 app.onError((err, c) => {
+  // Never log request data (IPs, bodies): only the error itself.
   console.error("unhandled error", err);
   return jsonError(c, 500, "internal error");
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  // Cron trigger (wrangler.jsonc): drops IP-keyed rate-limit counters whose
+  // window has ended even when no further request arrives.
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(deleteExpiredRateLimits(env.DB, Date.now()).run());
+  },
+} satisfies ExportedHandler<Env>;

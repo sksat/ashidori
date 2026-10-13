@@ -1,6 +1,8 @@
+import { createExecutionContext, createScheduledController, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { normalizePairingCode } from "../src/util";
+import worker from "../src/index";
+import { HOUR_MS as HOUR, normalizePairingCode } from "../src/util";
 import { authed, call, issueAdminCode, newDevice, register } from "./helpers";
 
 describe("health", () => {
@@ -108,6 +110,24 @@ describe("pairing and registration", () => {
     expect((await register("ZZZZZZZZ", "x", "2001:db8:1:3::1")).status).toBe(401);
   });
 
+  it("does not keep IP-keyed counters after their window", async () => {
+    const ended = Date.now() - 2 * 10 * 60 * 1000;
+    await env.DB.prepare("INSERT INTO rate_limits (key, window_start, count) VALUES ('register:203.0.113.1', ?1, 3)")
+      .bind(ended)
+      .run();
+    // Any check deletes counters whose window has ended.
+    await register("ZZZZZZZZ", "x", "198.51.100.7");
+    const keys = await env.DB.prepare("SELECT key FROM rate_limits").all<{ key: string }>();
+    expect(keys.results.map((r) => r.key)).toEqual(["register:198.51.100.7"]);
+
+    // The cron trigger deletes them even when no request comes.
+    await env.DB.prepare("UPDATE rate_limits SET window_start = ?1").bind(ended).run();
+    const ctx = createExecutionContext();
+    await worker.scheduled!(createScheduledController(), env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM rate_limits").first<{ n: number }>())!.n).toBe(0);
+  });
+
   it("normalizes codes", () => {
     expect(normalizePairingCode("abcd-efgh")).toBe("ABCDEFGH");
     expect(normalizePairingCode("0OIL 1111")).toBe("00111111");
@@ -126,8 +146,14 @@ describe("device auth", () => {
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  it("lists devices and updates lastSeenAt at most once per minute", async () => {
+  it("lists devices and keeps lastSeenAt at hour granularity, written at most once per hour", async () => {
+    const lastSeen = async () =>
+      (await env.DB.prepare("SELECT last_seen_at FROM devices").first<{ last_seen_at: number }>())!.last_seen_at;
     const a = await newDevice("a");
+    const hour = Date.now() - (Date.now() % HOUR);
+    // Registration already stores the hour, not the exact time.
+    expect([hour, hour + HOUR]).toContain(await lastSeen());
+
     await env.DB.prepare("UPDATE devices SET last_seen_at = 1000").run();
     const res = await authed(a.token, "/v1/devices");
     expect(res.status).toBe(200);
@@ -135,17 +161,15 @@ describe("device auth", () => {
     expect(list).toEqual([
       { id: a.deviceId, name: "a", createdAt: expect.any(Number), lastSeenAt: expect.any(Number), revoked: false },
     ]);
-    const seen = await env.DB.prepare("SELECT last_seen_at FROM devices").first<{ last_seen_at: number }>();
-    expect(seen!.last_seen_at).toBeGreaterThan(1000);
+    const seen = await lastSeen();
+    expect(seen % HOUR).toBe(0);
+    expect(seen).toBeGreaterThanOrEqual(hour);
+    expect(list[0]!.lastSeenAt).toBe(seen);
 
-    // Within a minute, no further writes.
-    await env.DB.prepare("UPDATE devices SET last_seen_at = ?1").bind(Date.now() - 30_000).run();
-    const pinned = (await env.DB.prepare("SELECT last_seen_at FROM devices").first<{ last_seen_at: number }>())!
-      .last_seen_at;
+    // Within the same hour, no further writes (a marker value stays put).
+    await env.DB.prepare("UPDATE devices SET last_seen_at = ?1").bind(seen + 1).run();
     await authed(a.token, "/v1/devices");
-    const after = (await env.DB.prepare("SELECT last_seen_at FROM devices").first<{ last_seen_at: number }>())!
-      .last_seen_at;
-    expect(after).toBe(pinned);
+    expect(await lastSeen()).toBe(seen + 1);
   });
 
   it("revokes other devices and self", async () => {

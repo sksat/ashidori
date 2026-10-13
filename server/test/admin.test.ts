@@ -161,6 +161,7 @@ describe("admin API: users", () => {
     expect(await res.json()).toEqual({
       id: expect.any(String),
       name: "Alice",
+      handle: null,
       email: "alice@example.com",
       status: "active",
       createdAt: expect.any(Number),
@@ -174,6 +175,34 @@ describe("admin API: users", () => {
     expect((await adminCall("/admin/users", json({ name: "x".repeat(65) }))).status).toBe(400);
     expect((await adminCall("/admin/users", json({ name: "x", email: "not an email" }))).status).toBe(400);
     expect((await adminCall("/admin/users", { method: "POST", body: '{"name":"x"}' })).status).toBe(400);
+  });
+
+  it("sets handles: lowercase, validated, unique", async () => {
+    const res = await adminCall("/admin/users", json({ name: "Carol", handle: " Carol_1 " }));
+    expect(res.status).toBe(201);
+    const carol = (await res.json()) as { id: string; handle: string };
+    expect(carol.handle).toBe("carol_1");
+    for (const handle of ["ab", "x".repeat(21), "has-dash", "ハンドル", 3]) {
+      expect((await adminCall("/admin/users", json({ name: "x", handle }))).status, String(handle)).toBe(400);
+    }
+    // Uniqueness is case-insensitive (handles are stored lowercase).
+    expect((await adminCall("/admin/users", json({ name: "x", handle: "CAROL_1" }))).status).toBe(409);
+    expect((await adminCall("/admin/users", json({ name: "y", handle: "" }))).status).toBe(201);
+
+    const dave = (await (await adminCall("/admin/users", json({ name: "Dave" }))).json()) as { id: string };
+    const patch = (body: unknown) => adminCall(`/admin/users/${dave.id}`, { ...json(body), method: "PATCH" });
+    expect((await patch({ handle: "Carol_1" })).status).toBe(409);
+    const ok = await patch({ handle: "dave", name: "David" });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ name: "David", handle: "dave" });
+    expect(await (await patch({ name: "Dave" })).json()).toMatchObject({ name: "Dave", handle: "dave" });
+    expect(await (await patch({ handle: null })).json()).toMatchObject({ handle: null });
+    expect((await patch({ handle: "x" })).status).toBe(400);
+    expect((await patch({ name: "" })).status).toBe(400);
+    expect((await adminCall("/admin/users/nope", { ...json({ name: "z" }), method: "PATCH" })).status).toBe(404);
+
+    const users = (await (await adminCall("/admin/users")).json()) as Array<{ name: string; handle: string | null }>;
+    expect(users.find((u) => u.name === "Carol")!.handle).toBe("carol_1");
   });
 
   it("lists users with device counts and last access", async () => {
