@@ -10,6 +10,7 @@ import {
   makeAccessJwt,
   mockAccessCerts,
   newDevice,
+  register,
 } from "./helpers";
 
 let otherKeyPair: CryptoKeyPair;
@@ -248,11 +249,7 @@ describe("admin API: users", () => {
     const code = (pending as { code: string }).code;
     expect(
       (
-        await call("/v1/devices/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code, name: "b" }),
-        })
+        await register(code, "b")
       ).status,
     ).toBe(401);
     expect((await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).status).toBe(409);
@@ -266,11 +263,7 @@ describe("admin API: users", () => {
     // The code issued before disabling still works once re-enabled (it was never consumed).
     expect(
       (
-        await call("/v1/devices/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code, name: "b" }),
-        })
+        await register(code, "b")
       ).status,
     ).toBe(201);
 

@@ -7,7 +7,9 @@
   // Keep console.error/warn output, but not the per-request invocation logs,
   // which would keep metadata (and timing) of every request.
   "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } },
-  // Deletes rate-limit counters (keyed by client IP) once their window has ended.
+  // Maintenance (src/index.ts): deletes ended rate-limit counters (keyed by
+  // client IP), old pairing codes, unused self-registered accounts and
+  // unreferenced R2 objects, each in bounded chunks.
   "triggers": { "crons": ["*/10 * * * *"] },
   // Routing (a custom domain, needed so Cloudflare Access can protect
   // /admin/*) is configured outside this file, e.g. in the dashboard or by
@@ -32,6 +34,17 @@
     }
   ],
 
+  // Coarse rate limits in front of the precise D1 counters (src/ratelimit.ts):
+  // per Cloudflare location, 60-second windows, looser than the D1 limits.
+  // namespace_id must be unique within the Cloudflare account; change these
+  // if another Worker of the account already uses them.
+  "ratelimits": [
+    { "name": "RL_REGISTER", "namespace_id": "41001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_ACCOUNT", "namespace_id": "41002", "simple": { "limit": 5, "period": 60 } },
+    { "name": "RL_PAIRING", "namespace_id": "41003", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_LOOKUP", "namespace_id": "41004", "simple": { "limit": 20, "period": 60 } }
+  ],
+
   "vars": {
     // Cloudflare Access team domain, e.g. "example.cloudflareaccess.com".
     "CF_ACCESS_TEAM_DOMAIN": "",
@@ -44,11 +57,24 @@
     // Comma-separated e-mail addresses (case-insensitive) of the admins. /admin/* requires a
     // verified Access JWT whose email is listed here. Empty = nobody (admin API disabled).
     "ADMIN_EMAILS": "",
-    // Who creates users. "admin": only admins (admin page). "open": anyone may create a user
-    // from the app (POST /v1/accounts). Any other value, including empty, means "admin".
+    // Who creates users. "admin": only admins (admin page). Exactly "open": anyone may create a
+    // user from the app (POST /v1/accounts). Any other value, including empty, means "admin".
     "REGISTRATION": "admin",
-    // Per-user storage quota (total blob bytes). Empty or invalid = 2 GiB (2147483648).
-    "USER_QUOTA_BYTES": ""
+    // Limits (src/config.ts). Empty = the default. Any other value must be a positive integer:
+    // an invalid one (e.g. "0", "10MiB") stops the creation of new users, devices and data,
+    // and fails the deploy workflow.
+    // Per user (the legacy devices together count as one): total blob bytes (default 2 GiB),
+    "USER_QUOTA_BYTES": "",
+    // number of batches (default 200000),
+    "USER_MAX_BATCHES": "",
+    // devices ever registered, revoked ones included (default 50),
+    "USER_MAX_DEVICES": "",
+    // shared check-ins, unshared ones included (default 5000).
+    "USER_MAX_SHARED_CHECKINS": "",
+    // Whole server: users, for self-registration (default 100),
+    "MAX_USERS": "",
+    // total blob bytes (default 50 GiB).
+    "MAX_TOTAL_BYTES": ""
   }
 
   // Secrets (not in this file):

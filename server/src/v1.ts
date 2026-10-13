@@ -1,7 +1,17 @@
-import { Hono, type MiddlewareHandler } from "hono";
-import { registrationMode, SELF_REGISTERED, storageUsed, userQuotaBytes } from "./accounts";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { createAccount, registrationMode } from "./accounts";
 import { deviceAuth } from "./auth";
-import { listFeed, LOCAL_ID_RE, parseCheckin, unshareCheckin, upsertCheckin } from "./checkins";
+import { committedBlob, MAX_BLOB_BYTES, MIN_BLOB_BYTES, putBatch } from "./batches";
+import {
+  listFeed,
+  LOCAL_ID_RE,
+  parseCheckin,
+  parseRev,
+  unshareCheckin,
+  unshareCheckinById,
+  upsertCheckin,
+} from "./checkins";
+import { type Limits, parseLimits } from "./config";
 import {
   acceptFollow,
   deleteFollow,
@@ -11,10 +21,11 @@ import {
   normalizeHandle,
   requestFollow,
 } from "./follows";
-import { createPairingCode, listDevices, newDeviceStmt, parseDeviceName, revokeDevice } from "./devices";
+import { createPairingCode, listDevices, parseDeviceName, registerWithCode, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
-import { clientKey, hitRateLimit, RULES } from "./ratelimit";
+import { clientKey, edgeAllowed, hitRateLimit, RULES } from "./ratelimit";
 import {
+  DEVICE_TOKEN_RE,
   floorHour,
   jsonError,
   normalizePairingCode,
@@ -24,7 +35,7 @@ import {
   TooLarge,
 } from "./util";
 
-export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
+export { MAX_BLOB_BYTES };
 const STREAM_RE = /^[a-z][a-z0-9_]{0,31}$/;
 // Non-negative integer that fits the 12-digit zero-padded R2 key.
 const SEQ_RE = /^(0|[1-9][0-9]{0,11})$/;
@@ -34,10 +45,6 @@ const LIST_MAX_LIMIT = 1000;
 const FEED_MAX_LIMIT = 500;
 /** Device (and user) name of a self-registered account when the app sends none. */
 const DEFAULT_DEVICE_NAME = "device";
-
-export function blobKey(deviceId: string, stream: string, seq: number): string {
-  return `b/${deviceId}/${stream}/${String(seq).padStart(12, "0")}`;
-}
 
 interface BatchRow {
   cursor: number;
@@ -51,89 +58,99 @@ interface BatchRow {
 
 export const v1 = new Hono<AppEnv>();
 
-v1.get("/health", (c) => c.json({ ok: true }));
+/** The limits, or a 503 response if a limit variable is invalid (fail closed: nothing new is created). */
+function limitsOr503(c: Context<AppEnv>): Limits | Response {
+  const r = parseLimits(c.env);
+  if (r.ok) return r.limits;
+  console.error("invalid limit variables; refusing new users, devices and data:", r.invalid.join(", "));
+  return jsonError(c, 503, "server misconfigured");
+}
 
-// ---- Registration (unauthenticated, consumes a pairing code) ----
+/** Work that should not delay the response (falls back to awaiting it when there is no execution context). */
+function background(c: Context<AppEnv>): (work: Promise<unknown>) => void {
+  return (work) => {
+    try {
+      c.executionCtx.waitUntil(work);
+    } catch {
+      void work;
+    }
+  };
+}
 
-v1.post("/devices/register", async (c) => {
-  if (!(await hitRateLimit(c.env.DB, RULES.register, clientKey(c.req.raw)))) {
-    return jsonError(c, 429, "too many requests");
-  }
-  let body: unknown;
+async function jsonBody(c: Context<AppEnv>): Promise<{ body: Record<string, unknown> } | Response> {
   try {
-    body = await readJson(c.req.raw);
+    const body = await readJson(c.req.raw);
+    return { body: (body ?? {}) as Record<string, unknown> };
   } catch (e) {
     if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
     return jsonError(c, 400, "invalid JSON body");
   }
-  const { code: rawCode, name: rawName } = (body ?? {}) as { code?: unknown; name?: unknown };
+}
+
+v1.get("/health", (c) => c.json({ ok: true }));
+
+// ---- Registration (unauthenticated, consumes a pairing code) ----
+
+// `{code, name, token}`: the client generates the device token and keeps it
+// before sending, so that it can retry after a lost response: a retry with
+// the same code and token returns the same device (200).
+v1.post("/devices/register", async (c) => {
+  const ip = clientKey(c.req.raw);
+  if (!(await edgeAllowed(c.env.RL_REGISTER, `register:${ip}`))) return jsonError(c, 429, "too many requests");
+  const parsed = await jsonBody(c);
+  if (parsed instanceof Response) return parsed;
+  const { code: rawCode, name: rawName, token } = parsed.body;
   if (typeof rawCode !== "string" || typeof rawName !== "string") {
     return jsonError(c, 400, "code and name are required");
   }
+  if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
   const name = parseDeviceName(rawName);
   if (name === null) return jsonError(c, 400, "invalid name");
+  // Counted after validation, before the code is looked at: wrong codes count.
+  if (!(await hitRateLimit(c.env.DB, RULES.register, ip))) return jsonError(c, 429, "too many requests");
   const code = normalizePairingCode(rawCode);
   if (!code) return jsonError(c, 401, "invalid or expired pairing code");
+  const limits = limitsOr503(c);
+  if (limits instanceof Response) return limits;
 
-  const now = Date.now();
-  const deviceId = crypto.randomUUID();
-  // A code of a disabled user is neither accepted nor consumed. The response is
-  // the same as for an unknown code, so the endpoint does not reveal it.
-  const consumed = await c.env.DB.prepare(
-    `UPDATE pairing_codes SET used_at = ?2, used_by = ?3
-     WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2
-       AND (user_id IS NULL OR user_id IN (SELECT id FROM users WHERE status = 'active'))
-     RETURNING user_id`,
-  )
-    .bind(await sha256Hex(code), now, deviceId)
-    .first<{ user_id: string | null }>();
-  if (!consumed) return jsonError(c, 401, "invalid or expired pairing code");
-
-  // The device belongs to the code's user (null only for legacy codes).
-  const { stmt, token } = await newDeviceStmt(c.env.DB, deviceId, name, consumed.user_id, now);
-  await stmt.run();
-  return c.json({ deviceId, token }, 201);
+  const r = await registerWithCode(c.env.DB, { code, name, token, maxDevices: limits.userMaxDevices });
+  // A code of a disabled user, or issued by a revoked device, is neither
+  // accepted nor consumed. The response is the same as for an unknown code.
+  if (r === "invalid") return jsonError(c, 401, "invalid or expired pairing code");
+  if (r === "too many devices") return jsonError(c, 409, "too many devices");
+  return c.json({ deviceId: r.deviceId }, r.created ? 201 : 200);
 });
 
 // ---- Self-registration (unauthenticated, only when REGISTRATION = "open") ----
 
 v1.get("/info", (c) => c.json({ registration: registrationMode(c.env) }));
 
-// Creates a user and registers the calling device as its first device. The
-// user has no handle (an admin may set one) and is marked as self-registered.
-// Further devices are paired from this one (POST /v1/pairing).
+// `{token, deviceName?}`: creates a user and registers the calling device,
+// authenticated by the client-generated token, as its first device. The user
+// has no handle (an admin may set one) and is marked as self-registered.
+// Further devices are paired from this one (POST /v1/pairing). A retry with
+// the same token returns the same device (200).
 v1.post("/accounts", async (c) => {
   if (registrationMode(c.env) !== "open") return jsonError(c, 403, "registration closed");
-  if (!(await hitRateLimit(c.env.DB, RULES.account, clientKey(c.req.raw)))) {
-    return jsonError(c, 429, "too many requests");
-  }
-  let body: unknown;
-  try {
-    body = await readJson(c.req.raw);
-  } catch (e) {
-    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
-    return jsonError(c, 400, "invalid JSON body");
-  }
-  const { deviceName: rawName } = (body ?? {}) as { deviceName?: unknown };
+  const ip = clientKey(c.req.raw);
+  if (!(await edgeAllowed(c.env.RL_ACCOUNT, `account:${ip}`))) return jsonError(c, 429, "too many requests");
+  const parsed = await jsonBody(c);
+  if (parsed instanceof Response) return parsed;
+  const { deviceName: rawName, token } = parsed.body;
+  if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
   let name: string | null = DEFAULT_DEVICE_NAME;
   if (rawName !== undefined && rawName !== null && rawName !== "") {
     name = typeof rawName === "string" ? parseDeviceName(rawName) : null;
     if (name === null) return jsonError(c, 400, "invalid deviceName");
   }
+  if (!(await hitRateLimit(c.env.DB, RULES.account, ip))) return jsonError(c, 429, "too many requests");
+  const limits = limitsOr503(c);
+  if (limits instanceof Response) return limits;
 
-  const now = Date.now();
-  const userId = crypto.randomUUID();
-  const deviceId = crypto.randomUUID();
-  const { stmt, token } = await newDeviceStmt(c.env.DB, deviceId, name, userId, now);
-  // One batch: the user never exists without its device.
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `INSERT INTO users (id, name, handle, email, status, created_at, created_by)
-       VALUES (?1, ?2, NULL, NULL, 'active', ?3, ?4)`,
-    ).bind(userId, name, now, SELF_REGISTERED),
-    stmt,
-  ]);
-  return c.json({ deviceId, token }, 201);
+  const r = await createAccount(c.env.DB, { token, name, maxUsers: limits.maxUsers });
+  if (r === "full") return jsonError(c, 403, "registration full");
+  if (r === "token in use") return jsonError(c, 409, "token already in use");
+  return c.json({ deviceId: r.deviceId }, r.created ? 201 : 200);
 });
 
 // ---- Everything below requires a device token ----
@@ -166,11 +183,14 @@ for (const path of [
 }
 
 v1.post("/pairing", async (c) => {
+  const device = c.get("device");
+  if (!(await edgeAllowed(c.env.RL_PAIRING, `pairing:${device.user_id ?? "legacy"}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
-  const device = c.get("device");
-  return c.json(await createPairingCode(c.env.DB, device.id, device.user_id), 201);
+  return c.json(await createPairingCode(c.env.DB, device.id, device.user_id, device.id), 201);
 });
 
 v1.get("/devices", async (c) => c.json(await listDevices(c.env.DB, c.get("device").user_id)));
@@ -202,49 +222,38 @@ v1.put("/batches/:stream/:seq", async (c) => {
     if (e instanceof TooLarge) return jsonError(c, 413, "blob too large");
     throw e;
   }
+  if (body.byteLength < MIN_BLOB_BYTES) return jsonError(c, 400, "blob too small");
   if ((await sha256Hex(body)) !== sha256) return jsonError(c, 400, "X-Content-SHA256 does not match body");
+  const limits = limitsOr503(c);
+  if (limits instanceof Response) return limits;
 
-  const deviceId = c.get("device").id; // never from the URL
-  const db = c.env.DB;
-  const existingStmt = db
-    .prepare("SELECT sha256 FROM batches WHERE device_id = ?1 AND stream = ?2 AND seq = ?3")
-    .bind(deviceId, stream, seq);
-
-  const existing = await existingStmt.first<{ sha256: string }>();
-  if (existing) {
-    if (existing.sha256 === sha256) return c.json({ status: "exists" }, 200);
-    return jsonError(c, 409, "batch already exists with a different hash");
+  const device = c.get("device");
+  const r = await putBatch(
+    c.env.DB,
+    c.env.BLOBS,
+    {
+      deviceId: device.id, // never from the URL
+      userId: device.user_id,
+      stream,
+      seq,
+      sha256,
+      body,
+      createdAt: floorHour(Date.now()),
+    },
+    limits,
+    background(c),
+  );
+  switch (r) {
+    case "conflict":
+      return jsonError(c, 409, "batch already exists with a different hash");
+    case "quota exceeded":
+      return jsonError(c, 507, "quota exceeded");
+    case "server full":
+      return jsonError(c, 507, "server storage full");
+    case "device gone":
+      return jsonError(c, 401, "unauthorized");
   }
-
-  // Quota: checked after the idempotency check, so that re-sending an
-  // existing batch succeeds even at the limit. Concurrent uploads of one user
-  // may together overshoot it by at most their own sizes.
-  const used = await storageUsed(db, c.get("device").user_id);
-  if (used + body.byteLength > userQuotaBytes(c.env)) return jsonError(c, 507, "quota exceeded");
-
-  // Blob first, then metadata: a batch is listed only once its blob is durable.
-  // The cursor is assigned at metadata insert time, so listings never skip it.
-  await c.env.BLOBS.put(blobKey(deviceId, stream, seq), body, {
-    sha256,
-    httpMetadata: { contentType: "application/octet-stream" },
-  });
-  const inserted = await db
-    .prepare(
-      `INSERT INTO batches (device_id, stream, seq, size, sha256, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-       ON CONFLICT (device_id, stream, seq) DO NOTHING
-       RETURNING cursor`,
-    )
-    // The upload time is for display only (ordering is by cursor), so it is
-    // kept at hour granularity.
-    .bind(deviceId, stream, seq, body.byteLength, sha256, floorHour(Date.now()))
-    .first<{ cursor: number }>();
-  if (inserted) return c.json({ status: "created", cursor: inserted.cursor }, 201);
-
-  // Lost a race with a concurrent upload of the same slot.
-  const raced = await existingStmt.first<{ sha256: string }>();
-  if (raced?.sha256 === sha256) return c.json({ status: "exists" }, 200);
-  return jsonError(c, 409, "batch already exists with a different hash");
+  return r.status === "created" ? c.json(r, 201) : c.json(r, 200);
 });
 
 v1.get("/batches", async (c) => {
@@ -283,16 +292,9 @@ v1.get("/batches", async (c) => {
 v1.get("/batches/:deviceId/:stream/:seq", async (c) => {
   const { deviceId, stream, seq: seqStr } = c.req.param();
   if (!STREAM_RE.test(stream) || !SEQ_RE.test(seqStr)) return jsonError(c, 404, "not found");
-  const seq = Number(seqStr);
-  // Another user's batch is indistinguishable from a missing one.
-  const meta = await c.env.DB.prepare(
-    `SELECT b.size, b.sha256 FROM batches b JOIN devices d ON d.id = b.device_id
-     WHERE b.device_id = ?1 AND b.stream = ?2 AND b.seq = ?3 AND d.user_id IS ?4`,
-  )
-    .bind(deviceId, stream, seq, c.get("device").user_id)
-    .first<{ size: number; sha256: string }>();
+  const meta = await committedBlob(c.env.DB, c.get("device").user_id, deviceId, stream, Number(seqStr));
   if (!meta) return jsonError(c, 404, "not found");
-  const obj = await c.env.BLOBS.get(blobKey(deviceId, stream, seq));
+  const obj = await c.env.BLOBS.get(meta.key);
   if (!obj) return jsonError(c, 404, "not found");
   return new Response(obj.body, {
     status: 200,
@@ -310,22 +312,36 @@ v1.get("/batches/:deviceId/:stream/:seq", async (c) => {
 v1.put("/checkins/shared/:localId", async (c) => {
   const localId = c.req.param("localId");
   if (!LOCAL_ID_RE.test(localId)) return jsonError(c, 400, "invalid id");
-  let body: unknown;
-  try {
-    body = await readJson(c.req.raw);
-  } catch (e) {
-    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
-    return jsonError(c, 400, "invalid JSON body");
-  }
-  const parsed = parseCheckin(body);
+  const json = await jsonBody(c);
+  if (json instanceof Response) return json;
+  const parsed = parseCheckin(json.body);
   if (typeof parsed === "string") return jsonError(c, 400, parsed);
+  const limits = limitsOr503(c);
+  if (limits instanceof Response) return limits;
   const device = c.get("device");
-  return c.json(await upsertCheckin(c.env.DB, device.user_id!, device.id, localId, parsed));
+  const r = await upsertCheckin(c.env.DB, device.user_id!, device.id, localId, parsed, limits.userMaxSharedCheckins);
+  if (r === "stale") return jsonError(c, 409, "stale revision");
+  if (r === "removed") return jsonError(c, 409, "removed by an admin");
+  if (r === "limit") return jsonError(c, 507, "too many shared check-ins");
+  return c.json(r);
+});
+
+// Unshare by server id, from any device of the entry's user.
+v1.delete("/checkins/shared/by-id/:id", async (c) => {
+  const rev = parseRev(c.req.query("rev"));
+  if (rev === undefined) return jsonError(c, 400, "invalid rev");
+  const id = c.req.param("id");
+  if (id.length > 64 || !(await unshareCheckinById(c.env.DB, c.get("device").user_id!, id, rev))) {
+    return jsonError(c, 404, "not found");
+  }
+  return c.json({ deleted: true });
 });
 
 v1.delete("/checkins/shared/:localId", async (c) => {
+  const rev = parseRev(c.req.query("rev"));
+  if (rev === undefined) return jsonError(c, 400, "invalid rev");
   const localId = c.req.param("localId");
-  if (!LOCAL_ID_RE.test(localId) || !(await unshareCheckin(c.env.DB, c.get("device").id, localId))) {
+  if (!LOCAL_ID_RE.test(localId) || !(await unshareCheckin(c.env.DB, c.get("device").id, localId, rev))) {
     return jsonError(c, 404, "not found");
   }
   return c.json({ deleted: true });
@@ -342,8 +358,11 @@ v1.get("/checkins/feed", async (c) => {
 
 // ---- Follows (see follows.ts) ----
 
-// Exact match only, and rate limited, so that handles cannot be enumerated.
+// Exact match only, and rate limited, which limits bulk probing of handles.
 v1.get("/users/lookup", async (c) => {
+  if (!(await edgeAllowed(c.env.RL_LOOKUP, `lookup:${c.get("device").user_id}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   if (!(await hitRateLimit(c.env.DB, RULES.lookup, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
@@ -353,14 +372,9 @@ v1.get("/users/lookup", async (c) => {
 });
 
 v1.post("/follows", async (c) => {
-  let body: unknown;
-  try {
-    body = await readJson(c.req.raw);
-  } catch (e) {
-    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
-    return jsonError(c, 400, "invalid JSON body");
-  }
-  const { userId } = (body ?? {}) as { userId?: unknown };
+  const json = await jsonBody(c);
+  if (json instanceof Response) return json;
+  const { userId } = json.body;
   if (typeof userId !== "string" || userId.length === 0 || userId.length > 64) {
     return jsonError(c, 400, "userId is required");
   }
@@ -406,3 +420,4 @@ v1.delete("/followers/:userId", async (c) => {
   }
   return c.json({ deleted: true });
 });
+

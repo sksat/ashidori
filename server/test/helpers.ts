@@ -7,13 +7,36 @@ import { base64UrlEncode } from "../src/util";
 export const ADMIN_DEV_TOKEN = "dev-admin-token-for-tests";
 export const BASE = "https://ashidori.example";
 
+/** A Rate Limiting binding stub; `allow` decides each call. */
+export function fakeLimiter(allow: (key: string) => boolean = () => true): RateLimit & { keys: string[] } {
+  const keys: string[] = [];
+  return {
+    keys,
+    async limit({ key }: RateLimitOptions) {
+      keys.push(key);
+      return { success: allow(key) };
+    },
+  };
+}
+
+/**
+ * The edge rate limiters never limit in tests unless a test overrides them:
+ * their counters are not reset between tests.
+ */
+const NO_EDGE_LIMITS: Partial<Cloudflare.Env> = {
+  RL_REGISTER: fakeLimiter(),
+  RL_ACCOUNT: fakeLimiter(),
+  RL_PAIRING: fakeLimiter(),
+  RL_LOOKUP: fakeLimiter(),
+};
+
 export async function call(
   path: string,
   init: RequestInit = {},
   envOverrides: Partial<Cloudflare.Env> = {},
 ): Promise<Response> {
   const ctx = createExecutionContext();
-  const res = await app.fetch(new Request(BASE + path, init), { ...env, ...envOverrides }, ctx);
+  const res = await app.fetch(new Request(BASE + path, init), { ...env, ...NO_EDGE_LIMITS, ...envOverrides }, ctx);
   await waitOnExecutionContext(ctx);
   return res;
 }
@@ -48,20 +71,35 @@ export async function issueAdminCode(userId?: string): Promise<string> {
   return ((await res.json()) as { code: string }).code;
 }
 
-export function register(code: string, name = "pixel", ip = "192.0.2.1"): Promise<Response> {
-  return call("/v1/devices/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
-    body: JSON.stringify({ code, name }),
-  });
+/** A device token as the app generates it: 32 random bytes, base64url. */
+export function newToken(): string {
+  return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+export function register(
+  code: string,
+  name = "pixel",
+  ip = "192.0.2.1",
+  token = newToken(),
+  envOverrides: Partial<Cloudflare.Env> = {},
+): Promise<Response> {
+  return call(
+    "/v1/devices/register",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+      body: JSON.stringify({ code, name, token }),
+    },
+    envOverrides,
+  );
 }
 
 /** Env with open self-registration (REGISTRATION is "admin" in wrangler.jsonc). */
 export const OPEN: Partial<Cloudflare.Env> = { REGISTRATION: "open" };
 
-/** POST /v1/accounts with `body` as JSON. */
+/** POST /v1/accounts with `body` as JSON (a fresh token is added unless `body` has one). */
 export function selfRegister(
-  body: unknown = { deviceName: "pixel" },
+  body: Record<string, unknown> = { deviceName: "pixel" },
   ip = "192.0.2.1",
   envOverrides: Partial<Cloudflare.Env> = OPEN,
 ): Promise<Response> {
@@ -70,16 +108,17 @@ export function selfRegister(
     {
       method: "POST",
       headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
-      body: JSON.stringify(body),
+      body: JSON.stringify("token" in body ? body : { ...body, token: newToken() }),
     },
     envOverrides,
   );
 }
 
 export async function newDevice(name = "pixel", userId?: string): Promise<{ deviceId: string; token: string }> {
-  const res = await register(await issueAdminCode(userId), name);
+  const token = newToken();
+  const res = await register(await issueAdminCode(userId), name, "192.0.2.1", token);
   if (res.status !== 201) throw new Error(`register failed: ${res.status}`);
-  return (await res.json()) as { deviceId: string; token: string };
+  return { ...((await res.json()) as { deviceId: string }), token };
 }
 
 export function authed(
@@ -121,8 +160,9 @@ export async function putBatch(
   );
 }
 
+/** A blob of at least MIN_BLOB_BYTES (32): the text, padded with spaces. */
 export function blob(text: string): Uint8Array {
-  return new TextEncoder().encode(text);
+  return new TextEncoder().encode(text.padEnd(32, " "));
 }
 
 /** Inserts a device as it existed before accounts (user_id NULL). */
@@ -136,7 +176,7 @@ export async function legacyDevice(id: string): Promise<{ deviceId: string; toke
 
 // ---- Shared check-ins and follows ----
 
-export const CHECKIN = { t: 1_760_000_000_000, lat: 35.68, lon: 139.76, venue: "Cafe" };
+export const CHECKIN = { rev: 1, t: 1_760_000_000_000, lat: 35.68, lon: 139.76, venue: "Cafe" };
 
 export function putCheckin(token: string, localId: string, body: unknown): Promise<Response> {
   return authed(token, `/v1/checkins/shared/${localId}`, {
@@ -146,8 +186,8 @@ export function putCheckin(token: string, localId: string, body: unknown): Promi
   });
 }
 
-export function unshare(token: string, localId: string): Promise<Response> {
-  return authed(token, `/v1/checkins/shared/${localId}`, { method: "DELETE" });
+export function unshare(token: string, localId: string, query = ""): Promise<Response> {
+  return authed(token, `/v1/checkins/shared/${localId}${query}`, { method: "DELETE" });
 }
 
 export function postJson(token: string, path: string, body?: unknown): Promise<Response> {

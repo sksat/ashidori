@@ -18,9 +18,15 @@ describe("PUT /v1/batches/:stream/:seq", () => {
     const body = blob("ASH1 ciphertext one");
     const first = await putBatch(a.token, "fixes", 0, body);
     expect(first.status).toBe(201);
+    expect(await first.json()).toEqual({ status: "created", cursor: expect.any(Number) });
 
-    const obj = await env.BLOBS.get(`b/${a.deviceId}/fixes/000000000000`);
-    expect(new Uint8Array(await obj!.arrayBuffer())).toEqual(body);
+    // Stored under an immutable key with the hash, referenced by the metadata.
+    const objects = async () => (await env.BLOBS.list({ prefix: `b/${a.deviceId}/fixes/000000000000/` })).objects;
+    const [obj] = await objects();
+    expect(obj!.key).toMatch(new RegExp(`^b/${a.deviceId}/fixes/000000000000/${await sha256Hex(body)}\\.[0-9a-f]{16}$`));
+    const row = await env.DB.prepare("SELECT r2_key FROM batches").first<{ r2_key: string }>();
+    expect(row!.r2_key).toBe(obj!.key);
+    expect(new Uint8Array(await (await env.BLOBS.get(obj!.key))!.arrayBuffer())).toEqual(body);
 
     const again = await putBatch(a.token, "fixes", 0, body);
     expect(again.status).toBe(200);
@@ -28,9 +34,21 @@ describe("PUT /v1/batches/:stream/:seq", () => {
 
     const conflict = await putBatch(a.token, "fixes", 0, blob("different"));
     expect(conflict.status).toBe(409);
-    // The stored blob is untouched.
-    const still = await env.BLOBS.get(`b/${a.deviceId}/fixes/000000000000`);
-    expect(new Uint8Array(await still!.arrayBuffer())).toEqual(body);
+    // The stored blob is untouched, and nothing else was stored.
+    expect((await objects()).map((o) => o.key)).toEqual([obj!.key]);
+    const got = await authed(a.token, `/v1/batches/${a.deviceId}/fixes/0`);
+    expect(new Uint8Array(await got.arrayBuffer())).toEqual(body);
+  });
+
+  it("rejects blobs shorter than magic, nonce and tag", async () => {
+    const a = await newDevice();
+    for (const n of [0, 1, 31]) {
+      const res = await putBatch(a.token, "fixes", n, new Uint8Array(n));
+      expect(res.status, String(n)).toBe(400);
+      expect(await res.json()).toEqual({ error: "blob too small" });
+    }
+    expect((await putBatch(a.token, "fixes", 32, new Uint8Array(32))).status).toBe(201);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM batches").first<{ n: number }>())!.n).toBe(1);
   });
 
   it("accepts an upper-case hash header", async () => {
@@ -50,7 +68,7 @@ describe("PUT /v1/batches/:stream/:seq", () => {
       body: blob("abc"),
     });
     expect(missing.status).toBe(400);
-    expect(await env.BLOBS.get(`b/${a.deviceId}/fixes/000000000000`)).toBeNull();
+    expect((await env.BLOBS.list({ prefix: `b/${a.deviceId}/` })).objects).toEqual([]);
   });
 
   it("enforces the 8 MiB limit", async () => {

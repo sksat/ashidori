@@ -1,5 +1,6 @@
 // Follows between users. A user finds another by their exact handle (there is
-// no directory or search, so users cannot be enumerated) and sends a follow
+// no directory or search, and lookups are rate limited, which limits bulk
+// probing; guessing a handle still reveals that it exists) and sends a follow
 // request. Once the other user accepts it, the follower sees their shared
 // check-ins. Following is one-way; either side can end it (unfollow, remove
 // follower), and declining deletes the request, so it can be sent again.

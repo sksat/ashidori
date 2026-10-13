@@ -1,10 +1,11 @@
 import { Hono } from "hono";
-import { registrationMode, SELF_REGISTERED, userQuotaBytes } from "./accounts";
+import { registrationMode, SELF_REGISTERED, serverUsage } from "./accounts";
 import { adminAuth } from "./auth";
 import { listRecentCheckins, removeCheckin } from "./checkins";
+import { parseLimits } from "./config";
 import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
-import { clientKey, hitRateLimit, RULES } from "./ratelimit";
+import { clientKey, edgeAllowed, hitRateLimit, RULES } from "./ratelimit";
 import {
   createUser,
   getUser,
@@ -68,13 +69,16 @@ admin.patch("/users/:id", async (c) => {
 
 // A pairing code for the user's device; the user enters it in the app.
 admin.post("/users/:id/pairing", async (c) => {
+  if (!(await edgeAllowed(c.env.RL_PAIRING, `pairing:admin:${c.get("adminEmail")}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
   const user = await getUser(c.env.DB, c.req.param("id"));
   if (!user) return jsonError(c, 404, "no such user");
   if (user.status !== "active") return jsonError(c, 409, "user is disabled");
-  return c.json(await createPairingCode(c.env.DB, `admin:${c.get("adminEmail")}`, user.id), 201);
+  return c.json(await createPairingCode(c.env.DB, `admin:${c.get("adminEmail")}`, user.id, null), 201);
 });
 
 admin.post("/users/:id/disable", async (c) => {
@@ -111,14 +115,20 @@ admin.post("/checkins/:id/delete", async (c) => {
 
 // Minimal admin page (behind Access) to manage users and devices and to
 // moderate shared check-ins.
-admin.get("/", (c) => {
+admin.get("/", async (c) => {
   const nonce = base64UrlEncode(randomBytes(16));
-  // Both are server-generated (a fixed string and a number), safe to embed.
+  // All server-generated (fixed strings and numbers), safe to embed.
   const modeText =
     registrationMode(c.env) === "open"
       ? "新規登録: 公開（誰でもアプリから利用者を作成できる）"
       : "新規登録: 管理者のみ（この画面で利用者を作成する）";
-  const quota = userQuotaBytes(c.env);
+  const parsed = parseLimits(c.env);
+  const limits = parsed.ok ? parsed.limits : null;
+  const quota = limits ? limits.userQuotaBytes : null;
+  const usage = await serverUsage(c.env.DB);
+  const limitsText = parsed.ok
+    ? ""
+    : `<p id="misconfig">設定が不正なため、新しい利用者・デバイス・データの作成を停止している: ${parsed.invalid.join(", ")}</p>`;
   c.header(
     "Content-Security-Policy",
     `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
@@ -131,12 +141,14 @@ body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0
 #code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em;margin:.2rem 0}
 #pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ccc;padding:.3rem;text-align:left}
-td button{margin-right:.3rem}#err{color:#b00}
+td button{margin-right:.3rem}#err,#misconfig{color:#b00}
 </style></head><body>
 <h1>ashidori admin</h1>
 <p id="err"></p>
 <section><h2>利用者</h2>
+${limitsText}
 <p>${modeText}。容量の上限は利用者ごとに <span id="quota"></span> です。</p>
+<p>サーバ全体: 利用者 ${usage.userCount}${limits ? ` / ${limits.maxUsers}（自己登録の上限）` : ""}、保存量 <span id="total"></span></p>
 <p><input id="name" placeholder="名前" maxlength="64"> <input id="handle" placeholder="ハンドル (任意)" maxlength="20"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
 <p>ハンドルは英小文字・数字・_ の 3〜20 文字です。他の利用者はハンドルの完全一致で検索し、フォローを申請します。</p>
 <div id="pairing" hidden><p id="for"></p><p id="code"></p><p id="exp"></p></div>
@@ -151,13 +163,16 @@ td button{margin-right:.3rem}#err{color:#b00}
 const fmt = (t) => t == null ? "-" : new Date(t).toLocaleString();
 const $ = (id) => document.getElementById(id);
 const QUOTA = ${quota};
+const TOTAL = ${usage.totalBytes};
+const MAX_TOTAL = ${limits ? limits.maxTotalBytes : null};
 function fmtBytes(n) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
   return (i === 0 ? String(n) : n.toFixed(1)) + " " + units[i];
 }
-$("quota").textContent = fmtBytes(QUOTA);
+$("quota").textContent = QUOTA === null ? "（設定が不正）" : fmtBytes(QUOTA);
+$("total").textContent = fmtBytes(TOTAL) + (MAX_TOTAL === null ? "" : " / " + fmtBytes(MAX_TOTAL));
 async function api(path, body, method = "POST") {
   const init = { method };
   if (body !== undefined) { init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(body); }
@@ -193,7 +208,7 @@ async function load() {
          ["停止", async () => { if (confirm(u.name + " を停止しますか。この利用者のデバイスは同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
       : [["再開", async () => { if (await api("/admin/users/" + encodeURIComponent(u.id) + "/enable")) load(); }]];
     const createdBy = u.createdBy === ${JSON.stringify(SELF_REGISTERED)} ? "自己登録" : "管理者";
-    const used = fmtBytes(u.storageBytes) + " (" + Math.floor((u.storageBytes / QUOTA) * 100) + "%)";
+    const used = fmtBytes(u.storageBytes) + (QUOTA === null ? "" : " (" + Math.floor((u.storageBytes / QUOTA) * 100) + "%)");
     row(ut, [u.name, u.handle ?? "-", u.email ?? "-", createdBy, active ? "有効" : "停止中", String(u.deviceCount), used, fmt(u.lastSeenAt)], buttons);
   }
   const dt = $("devices"); dt.textContent = "";

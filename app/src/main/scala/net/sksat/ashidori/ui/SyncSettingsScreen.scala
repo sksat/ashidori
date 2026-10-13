@@ -1,22 +1,29 @@
 package net.sksat.ashidori.ui
 
-import android.content.{ClipData, ClipboardManager}
+import android.content.{ClipData, ClipDescription, ClipboardManager, DialogInterface}
+import android.hardware.biometrics.{BiometricManager, BiometricPrompt}
+import android.os.{CancellationSignal, PersistableBundle}
 import android.text.{Editable, InputType, TextWatcher}
-import android.view.View
+import android.view.{View, WindowManager}
 import android.widget.{EditText, LinearLayout, Toast}
+import androidx.appcompat.app.AlertDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.{TextInputEditText, TextInputLayout}
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
+import scala.collection.mutable
 import scala.util.Try
 import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
 import ashidori.core.sync.{Crypto, RecoveryCode}
 import Ui.*
 
-/** Server sync setup. Steps are shown in order and only the next needed one
-  * is active: register this device, set up the encryption key, then options.
+/** Server sync setup, one step at a time from the persisted state:
+  * server URL → registration (request pending until the server answered)
+  * → encryption key confirmed → syncing. Sync stays off until the key is
+  * confirmed, and a confirmed key is never replaced.
   */
 final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private given Ctx = act
@@ -25,6 +32,19 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private val fmt = DateTimeFormatter.ofPattern("M/d HH:mm")
   private val body = vbox()
   val view: View = scroll(body)
+
+  /** Bumped by every URL edit and every server query; an answer of an older
+    * generation is dropped.
+    */
+  private var gen = 0
+  /** A registration or unpairing request is in flight: the actions are disabled. */
+  private var busy = false
+  /** A key dialog is open; only one at a time. */
+  private var keyDialogOpen = false
+  /** The URL last entered, kept across re-renders (a refused registration re-renders step 1). */
+  private var lastUrl = ""
+  /** Buttons that start a request, disabled while [[busy]]. */
+  private val actions = mutable.ArrayBuffer.empty[View]
 
   override def onShow(): Unit = render()
   override def onDestroy(): Unit = net.shutdown()
@@ -37,21 +57,42 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
 
   private def toast(s: String): Unit = Toast.makeText(act, s, Toast.LENGTH_LONG).show()
 
+  private def action[B <: View](b: B): B =
+    b.setEnabled(!busy)
+    actions += b
+    b
+
+  private def setBusy(b: Boolean): Unit =
+    busy = b
+    actions.foreach(_.setEnabled(!b))
+
+  /** The server a step talks to, shown before the step's final action. */
+  private def target(url: String): View =
+    val t = text(s"登録先: $url", 14f, bold = true)
+    t.setPadding(0, dp(8), 0, dp(4))
+    t
+
   private def render(): Unit =
     body.removeAllViews()
+    actions.clear()
     body.addView(
       card(
         text("エンドツーエンド暗号化", 16f, bold = true),
         caption("記録は端末で暗号化してから送ります。鍵はあなたの端末だけが持ち、サーバ（Cloudflare）からは中身を読めません。鍵をなくすとサーバ上のデータは復元できないため、復旧コードを必ず控えてください。")
       )
     )
-    if !SyncConfig.paired then body.addView(registerCard())
+    if !SyncConfig.paired then
+      Registration.pending match
+        case Some(p) => body.addView(pendingCard(p))
+        case None    => body.addView(registerCard())
     else if SyncConfig.masterKey.isEmpty then body.addView(keyCard())
     else
       body.addView(statusCard())
       body.addView(optionsCard())
       body.addView(devicesCard())
     body.addView(spacer(24))
+
+  // --- step 1: server and registration ---
 
   /** Step 1: the server URL first. What follows depends on the server's
     * registration mode (`/v1/info`): with open registration, a choice between
@@ -61,27 +102,37 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private def registerCard(): View =
     val url = EditText(act)
     url.setHint("サーバの URL（https://...）")
-    url.setInputType(InputType.TYPE_TEXT_VARIATION_URI)
-    url.setText(SyncConfig.serverUrl)
+    url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI)
+    url.setText(if SyncConfig.serverUrl.nonEmpty then SyncConfig.serverUrl else lastUrl)
     val next = vbox()
+    def entered = url.getText.toString.trim.stripSuffix("/")
     // The steps below belong to the URL they were shown for.
     url.addTextChangedListener(new TextWatcher:
       def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()
-      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = next.removeAllViews()
+      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit =
+        gen += 1
+        lastUrl = s.toString
+        next.removeAllViews()
       def afterTextChanged(s: Editable): Unit = ()
     )
     val check = button("次へ") {
-      val u = url.getText.toString.trim.stripSuffix("/")
+      val u = entered
       // Debug builds may talk to a local `wrangler dev` over http.
       val debuggable = (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
       if !u.startsWith("https://") && !(debuggable && u.startsWith("http://")) then
         toast("https:// で始まる URL を入力してください")
       else
+        gen += 1
+        val g = gen
+        next.removeAllViews()
+        next.addView(caption("サーバに問い合わせています…"))
         async(SyncClient(u, None).registration()) { r =>
-          next.removeAllViews()
-          // Network errors fall back to the pairing code, which works on every server.
-          if r.toOption.contains("open") then next.addView(startChoice(u, next))
-          else next.addView(pairingCodeInput(u))
+          // An answer for an earlier URL (or an earlier query) is dropped.
+          if g == gen && entered == u then
+            next.removeAllViews()
+            // Network errors fall back to the pairing code, which works on every server.
+            if r.toOption.contains("open") then next.addView(startChoice(u, next))
+            else next.addView(pairingCodeInput(u))
         }
     }
     card(
@@ -95,16 +146,8 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   /** Open registration: this device is either the user's first or joins one. */
   private def startChoice(u: String, next: LinearLayout): View =
     vbox(
-      spacer(8),
-      button("新しく始める（この端末が最初）") {
-        async(SyncClient(u, None).createAccount(SyncScheduler.deviceName)) {
-          _.fold(e => toast(e.getMessage), { (id, token) =>
-            SyncConfig.savePairing(u, id, token, newAccount = true)
-            render()
-            createKey()
-          })
-        }
-      },
+      target(u),
+      action(button("新しく始める（この端末が最初）")(startRegistration(u, "account", ""))),
       caption("このサーバに新しく登録し、暗号化の鍵を作成します。"),
       outlined("別の端末から追加") {
         next.removeAllViews()
@@ -116,90 +159,195 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private def pairingCodeInput(u: String): View =
     val code = EditText(act)
     code.setHint("ペアリングコード（8文字）")
-    code.setInputType(InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS)
-    val go = button("この端末を登録") {
+    code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+    val go = action(button("この端末を登録") {
       val c = code.getText.toString.trim.toUpperCase
-      async(SyncClient(u, None).register(c, SyncScheduler.deviceName)) {
-        _.fold(e => toast(e.getMessage), { (id, token) =>
-          SyncConfig.savePairing(u, id, token)
-          render()
-        })
-      }
-    }
+      if c.isEmpty then toast("ペアリングコードを入力してください")
+      else startRegistration(u, "pair", c)
+    })
     vbox(
       spacer(8),
       caption("サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
       code,
+      target(u),
       go
     )
 
+  /** Stores the request with a new device token, then sends it. One at a time. */
+  private def startRegistration(u: String, kind: String, code: String): Unit =
+    if !busy then
+      Try(Registration.begin(u, kind, code, SyncScheduler.deviceName)).fold(
+        e => { toast(e.getMessage); render() },
+        _ => sendPending()
+      )
+
+  /** Sends the stored request (a first try or a retry with the same token). */
+  private def sendPending(): Unit =
+    if !busy then
+      busy = true
+      render()
+      async(Registration.complete()) { r =>
+        busy = false
+        r.failed.foreach(e => toast(e.getMessage))
+        render()
+        // Self-registered: no other device has a key, so go straight to making one.
+        if r.isSuccess && SyncConfig.newAccount then createKey()
+      }
+
+  /** A registration was sent but not answered (or not sent yet): retry it
+    * with the same token, or give it up.
+    */
+  private def pendingCard(p: PendingRegistration): View =
+    card(
+      text("1. 端末を登録", 16f, bold = true),
+      caption(if busy then "サーバに登録しています…"
+        else "登録の応答を受け取れていません。同じ内容でもう一度送ると、サーバで登録済みならその登録を使います。"),
+      target(p.url),
+      caption(if p.kind == "account" then "新しく始める（この端末が最初）" else s"ペアリングコード ${p.code}"),
+      action(button("もう一度送る")(sendPending())),
+      action(outlined("やめる") {
+        Registration.discard()
+        render()
+      })
+    )
+
+  // --- step 2: the encryption key ---
+
   private def keyCard(): View =
+    val head = Seq(text("2. 暗号化の鍵", 16f, bold = true), target(SyncConfig.serverUrl))
     if SyncConfig.newAccount then
       // Self-registered: no other device has a key, so only a new one makes sense.
-      card(
-        text("2. 暗号化の鍵", 16f, bold = true),
+      card((head ++ Seq(
         caption("鍵を新しく作成し、表示される復旧コードを控えます。"),
         button("新しい鍵を作る")(createKey())
-      )
+      ))*)
     else
-      card(
-        text("2. 暗号化の鍵", 16f, bold = true),
+      card((head ++ Seq(
         caption("最初の端末なら鍵を新しく作ります。2台目以降は、最初の端末で控えた復旧コードを入力します。"),
         button("新しい鍵を作る（最初の端末）")(createKey()),
         outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode())
-      )
+      ))*)
+
+  /** Keeps the dialog's content out of screenshots and the recent-apps view while it is open. */
+  private def secure(d: AlertDialog, onDismiss: () => Unit = () => ()): Unit =
+    d.getWindow.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    act.getWindow.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    d.setOnDismissListener { _ =>
+      act.getWindow.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+      onDismiss()
+    }
+
+  /** Copies the recovery code, marked sensitive so the system does not preview it. */
+  private def copySecret(code: String): Unit =
+    val clip = ClipData.newPlainText("ashidori recovery code", code)
+    val extras = PersistableBundle()
+    extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+    clip.getDescription.setExtras(extras)
+    act.getSystemService(classOf[ClipboardManager]).setPrimaryClip(clip)
+    toast("コピーしました。保存したらクリップボードを消してください")
+
+  /** Sets the key for the registration the dialog was opened for. */
+  private def confirm(key: Array[Byte], reg: String): Unit =
+    if SyncConfig.confirmKey(key, reg) then SyncScheduler.schedule(act)
+    else toast("鍵はすでに設定されているか、登録が変わりました。鍵は変更していません")
+    render()
 
   private def createKey(): Unit =
-    val key = Crypto.newMasterKey()
-    val code = RecoveryCode.encode(key)
-    val groups = code.split('-')
-    val confirm = EditText(act)
-    confirm.setHint(s"最後の4文字（${groups.length}番目のブロック）")
-    MaterialAlertDialogBuilder(act)
-      .setTitle("復旧コードを控えてください")
-      .setMessage(s"$code\n\n別の端末の追加や、この端末をなくしたときの復元に必要です。パスワードマネージャーなどに保存してください。確認のため、最後のブロックを入力してください。")
-      .setView(padded(vbox(confirm), 20, 0))
-      .setCancelable(false)
-      .setNeutralButton("コピー", null)
-      .setNegativeButton("やめる", null)
-      .setPositiveButton("控えました", null)
-      .create()
-      .tap { d =>
-        d.setOnShowListener { _ =>
-          d.getButton(android.content.DialogInterface.BUTTON_NEUTRAL).setOnClickListener { _ =>
-            act.getSystemService(classOf[ClipboardManager]).setPrimaryClip(ClipData.newPlainText("ashidori recovery code", code))
-            toast("コピーしました。保存したらクリップボードを消してください")
-          }
-          d.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
-            if confirm.getText.toString.trim.equalsIgnoreCase(groups.last) then
-              SyncConfig.setMasterKey(key)
-              SyncScheduler.schedule(act)
-              d.dismiss()
-              render()
-            else confirm.setError("一致しません")
-          }
+    if !keyDialogOpen && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
+      keyDialogOpen = true
+      val reg = SyncConfig.registration
+      val key = Crypto.newMasterKey()
+      val code = RecoveryCode.encode(key)
+      val groups = code.split('-')
+      val check = EditText(act)
+      check.setHint(s"最後の4文字（${groups.length}番目のブロック）")
+      check.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+      check.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
+      val d = MaterialAlertDialogBuilder(act)
+        .setTitle("復旧コードを控えてください")
+        .setMessage(s"$code\n\n別の端末の追加や、この端末をなくしたときの復元に必要です。パスワードマネージャーなどに保存してください。確認のため、最後のブロックを入力してください。")
+        .setView(padded(vbox(check), 20, 0))
+        .setCancelable(false)
+        .setNeutralButton("コピー", null)
+        .setNegativeButton("やめる", null)
+        .setPositiveButton("控えました", null)
+        .create()
+      secure(d, () => keyDialogOpen = false)
+      d.setOnShowListener { _ =>
+        d.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(_ => copySecret(code))
+        d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
+          if check.getText.toString.trim.equalsIgnoreCase(groups.last) then
+            d.dismiss()
+            confirm(key, reg)
+          else check.setError("一致しません")
         }
-        d.show()
       }
-
-  extension [A](a: A) private def tap(f: A => Unit): A = { f(a); a }
+      d.show()
 
   private def enterRecoveryCode(): Unit =
-    val input = EditText(act)
-    input.setHint("XXXX-XXXX-...")
-    MaterialAlertDialogBuilder(act)
-      .setTitle("復旧コードを入力")
-      .setView(padded(vbox(input), 20, 0))
-      .setNegativeButton("やめる", null)
-      .setPositiveButton("設定", (_, _) =>
-        RecoveryCode.decode(input.getText.toString) match
-          case Right(k) =>
-            SyncConfig.setMasterKey(k)
-            SyncScheduler.schedule(act)
-            render()
-          case Left(err) => toast(err)
-      )
-      .show()
+    if !keyDialogOpen && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
+      keyDialogOpen = true
+      val reg = SyncConfig.registration
+      // Hidden, kept out of suggestions and autofill; the eye icon shows it.
+      val layout = TextInputLayout(act)
+      layout.setEndIconMode(TextInputLayout.END_ICON_PASSWORD_TOGGLE)
+      val input = TextInputEditText(layout.getContext)
+      input.setHint("XXXX-XXXX-...")
+      input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+      input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
+      layout.addView(input)
+      val d = MaterialAlertDialogBuilder(act)
+        .setTitle("復旧コードを入力")
+        .setView(padded(vbox(layout), 20, 0))
+        .setNegativeButton("やめる", null)
+        .setPositiveButton("設定", null)
+        .create()
+      secure(d, () => keyDialogOpen = false)
+      d.setOnShowListener { _ =>
+        d.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
+          RecoveryCode.decode(input.getText.toString) match
+            case Right(k) =>
+              d.dismiss()
+              confirm(k, reg)
+            case Left(err) => layout.setError(err)
+        }
+      }
+      d.show()
+
+  /** Runs `f` once the user proved they can unlock the device (biometrics
+    * or the screen lock). Without a screen lock there is nothing to ask.
+    */
+  private def withDeviceCredential(f: => Unit): Unit =
+    val km = act.getSystemService(classOf[android.app.KeyguardManager])
+    if !km.isDeviceSecure then f
+    else
+      BiometricPrompt.Builder(act)
+        .setTitle("復旧コードを表示")
+        .setSubtitle("本人確認のため、画面ロックを解除してください")
+        .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG | BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+        .build()
+        .authenticate(CancellationSignal(), act.getMainExecutor, new BiometricPrompt.AuthenticationCallback:
+          override def onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult): Unit = f
+          override def onAuthenticationError(code: Int, msg: CharSequence): Unit =
+            if code != BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED && code != BiometricPrompt.BIOMETRIC_ERROR_CANCELED then
+              toast(msg.toString)
+        )
+
+  private def showRecoveryCode(): Unit =
+    SyncConfig.masterKey.foreach { k =>
+      val code = RecoveryCode.encode(k)
+      val d = MaterialAlertDialogBuilder(act)
+        .setTitle("復旧コード")
+        .setMessage(code)
+        .setNeutralButton("コピー", null)
+        .setPositiveButton("閉じる", null)
+        .create()
+      secure(d)
+      d.setOnShowListener(_ => d.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener(_ => copySecret(code)))
+      d.show()
+    }
+
+  // --- syncing ---
 
   private def statusCard(): View =
     val last = SyncConfig.lastSync
@@ -209,10 +357,10 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       caption(SyncConfig.serverUrl),
       caption(if last == 0 then "まだ同期していません" else s"最終同期 ${Instant.ofEpochMilli(last).atZone(AshidoriApp.zone).format(fmt)}"),
       (if err.nonEmpty then text(s"前回のエラー: $err", 13f, colorAttr = attr.error) else spacer(0)),
-      button("今すぐ同期", tonal = true) {
+      action(button("今すぐ同期", tonal = true) {
         SyncScheduler.syncNow(act)
         toast("同期を予約しました（ネットワークにつながると始まります）")
-      }
+      })
     )
 
   private def optionsCard(): View =
@@ -234,6 +382,7 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private def devicesCard(): View =
     val list = vbox(caption("読み込み中…"))
     val client = SyncClient(SyncConfig.serverUrl, SyncConfig.token)
+    val reg = SyncConfig.registration
     def load(): Unit =
       async(client.request("GET", "/v1/devices").json) { r =>
         list.removeAllViews()
@@ -241,7 +390,7 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
           e => list.addView(caption(s"取得できませんでした: ${e.getMessage}")),
           js =>
             // Same list as the 端末 section of the ステータス tab.
-            PeerStatus.saveDevices(js)
+            PeerStatus.saveDevices(js, reg)
             for d <- js.arr do
               val id = d("id").str
               val revoked = d.obj.get("revoked").exists(_.bool)
@@ -277,17 +426,25 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
           })
         }
       },
-      outlined("復旧コードを表示") {
-        SyncConfig.masterKey.foreach { k =>
-          MaterialAlertDialogBuilder(act).setTitle("復旧コード").setMessage(RecoveryCode.encode(k)).setPositiveButton("閉じる", null).show()
-        }
-      },
-      outlined("この端末の同期を解除") {
+      outlined("復旧コードを表示")(withDeviceCredential(showRecoveryCode())),
+      action(outlined("この端末の同期を解除") {
         MaterialAlertDialogBuilder(act)
           .setTitle("同期を解除しますか")
-          .setMessage("この端末から鍵と登録情報を消します。端末内の記録は残ります。")
+          .setMessage("この端末から鍵と登録情報、同期の進み具合を消します。端末内の記録は残ります。もう一度登録すると、記録をすべて送り直します。")
           .setNegativeButton("やめる", null)
-          .setPositiveButton("解除", (_, _) => { SyncConfig.forget(); SyncScheduler.schedule(act); render() })
+          .setPositiveButton("解除", (_, _) => unpair())
           .show()
-      }
+      })
     )
+
+  /** Stops and waits for running sync work, then clears the registration. */
+  private def unpair(): Unit =
+    if !busy then
+      setBusy(true)
+      toast("同期を止めています…")
+      async(SyncConfig.forget(act)) { r =>
+        setBusy(false)
+        r.failed.foreach(e => toast(e.getMessage))
+        SyncScheduler.schedule(act)
+        render()
+      }

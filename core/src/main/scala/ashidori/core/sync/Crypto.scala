@@ -70,8 +70,9 @@ object Crypto:
     Using.resource(GZIPOutputStream(bo))(_.write(b))
     bo.toByteArray
 
-  def gunzip(b: Array[Byte]): Array[Byte] =
-    Using.resource(GZIPInputStream(ByteArrayInputStream(b)))(_.readAllBytes())
+  /** Decompresses `b`, aborting once the output passes `max` bytes. */
+  def gunzip(b: Array[Byte], max: Int = Int.MaxValue): Array[Byte] =
+    Using.resource(GZIPInputStream(ByteArrayInputStream(b)))(in => Limits.readAtMost(in, max, "decompressed batch"))
 
   def sha256Hex(b: Array[Byte]): String =
     MessageDigest.getInstance("SHA-256").digest(b).map(x => f"${x & 0xff}%02x").mkString
@@ -80,6 +81,21 @@ object Crypto:
     val b = new Array[Byte](32)
     rnd.nextBytes(b)
     java.util.Base64.getUrlEncoder.withoutPadding.encodeToString(b)
+
+/** Input exceeded a size or count cap; reading was aborted. */
+final class LimitExceeded(what: String, max: Long) extends java.io.IOException(s"$what exceeds $max")
+
+object Limits:
+  /** Reads `in` to the end, aborting as soon as more than `max` bytes arrive. */
+  def readAtMost(in: java.io.InputStream, max: Int, what: String): Array[Byte] =
+    val out = ByteArrayOutputStream()
+    val buf = new Array[Byte](8192)
+    var n = in.read(buf)
+    while n >= 0 do
+      if out.size.toLong + n > max then throw LimitExceeded(what, max)
+      out.write(buf, 0, n)
+      n = in.read(buf)
+    out.toByteArray
 
 /** Human-friendly encoding of the master key: Crockford base32 with a
   * 2-byte checksum, grouped by 4 characters.

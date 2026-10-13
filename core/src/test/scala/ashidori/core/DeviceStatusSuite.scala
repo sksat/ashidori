@@ -46,3 +46,36 @@ class DeviceStatusSuite extends munit.FunSuite:
     )
     assertEquals(BatchMeta.newestStatus(items, "me", Map("b" -> 4L, "c" -> 1L)), Map("a" -> 1L, "c" -> 2L))
   }
+
+  test("listing caps: decompressed size and line count abort") {
+    val bomb = Crypto.gzip(new Array[Byte](1 << 20))
+    intercept[LimitExceeded](Crypto.gunzip(bomb, DeviceStatus.MaxPlain))
+    assertEquals(Crypto.gunzip(bomb).length, 1 << 20)
+    val many = (DeviceStatus.encode(status) ++ Array.fill(DeviceStatus.MaxLines)(DeviceStatus.encode(status)).flatten)
+    intercept[LimitExceeded](DeviceStatus.decode(many))
+    intercept[IllegalArgumentException](BatchMeta.fromJson(ujson.read("""{"cursor":1,"deviceId":"../x","stream":"status","seq":0}""")))
+  }
+
+  test("an unreadable status is retried a few times, kept, and cleared by a newer readable one") {
+    var st = StatusSyncState.empty.listed(Seq(BatchMeta(10, "a", "status", 5), BatchMeta(11, "me", "status", 9)), "me")
+    assertEquals(st.cursor, 11L)
+    assertEquals(st.targets, Map("a" -> 5L))
+    for _ <- 1 to StatusSyncState.MaxAttempts do st = st.failed("a", 5, "bad tag")
+    // Given up on for now, but still shown and not counted as read.
+    assertEquals(st.targets, Map.empty[String, Long])
+    assertEquals(st.problem("a").map(_.seq), Some(5L))
+    assertEquals(st.authenticated.get("a"), None)
+    st = st.listed(Seq(BatchMeta(12, "a", "status", 6)), "me")
+    assertEquals(st.targets, Map("a" -> 6L))
+    st = st.succeeded("a", 6)
+    assertEquals(st.problem("a"), None)
+    assertEquals(st.targets, Map.empty[String, Long])
+    assertEquals(StatusSyncState.fromJson(ujson.read(ujson.write(StatusSyncState.toJson(st)))), st)
+  }
+
+  test("the cursor only moves to listed rows; an older seq does not lower latest") {
+    val st = StatusSyncState.empty.listed(Seq(BatchMeta(3, "a", "status", 7)), "me").listed(Seq(BatchMeta(4, "a", "status", 2)), "me")
+    assertEquals(st.cursor, 4L)
+    assertEquals(st.latest, Map("a" -> 7L))
+    assertEquals(st.listed(Nil, "me").cursor, 4L)
+  }

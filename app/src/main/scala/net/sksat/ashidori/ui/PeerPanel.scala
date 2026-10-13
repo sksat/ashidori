@@ -53,6 +53,11 @@ object PeerFormat:
   def place(e: PeerEntry): String =
     e.status.lastFix.fold("位置なし")(f => if e.area.nonEmpty then e.area else coords(f))
 
+  /** A received status that could not be read, in the error color. */
+  def problem(u: Unresolved)(using Ctx): TextView =
+    val retry = if u.attempts >= StatusSyncState.MaxAttempts then "" else "・再試行します"
+    text(s"⚠ 受信した状態を読み取れませんでした（${u.attempts}回）$retry", 13f, colorAttr = attr.error)
+
 /** The 端末 section at the top of the ステータス tab: one row per other
   * device of the user. Hidden unless sync is set up with another device.
   */
@@ -105,10 +110,11 @@ final class PeerPanel(act: MainActivity):
       val es = PeerStatus.entries
       val now = System.currentTimeMillis()
       rows.removeAllViews()
-      for p <- PeerStatus.others do rows.addView(row(p, es.get(p.id), now))
+      val st = PeerStatus.syncState
+      for p <- PeerStatus.others do rows.addView(row(p, es.get(p.id), st.problem(p.id), now))
 
   /** Name and status age on top; recording and battery; then the place. */
-  private def row(p: Peer, e: Option[PeerEntry], now: Long): View =
+  private def row(p: Peer, e: Option[PeerEntry], problem: Option[Unresolved], now: Long): View =
     val name = text(p.name, 15f, bold = true)
     name.setSingleLine(true)
     name.setEllipsize(android.text.TextUtils.TruncateAt.END)
@@ -133,6 +139,8 @@ final class PeerPanel(act: MainActivity):
         where.setSingleLine(true)
         where.setEllipsize(android.text.TextUtils.TruncateAt.END)
         body.addView(where)
+    // Shown, not skipped: the server may have served a damaged or foreign blob.
+    problem.foreach(u => body.addView(PeerFormat.problem(u)))
     body.setLayoutParams(weighted())
     val chevron = text("›", 22f, colorAttr = attr.onSurfaceVariant)
     chevron.setPadding(dp(8), 0, 0, 0)

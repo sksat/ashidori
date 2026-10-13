@@ -1,6 +1,9 @@
 import { Hono } from "hono";
 import { admin } from "./admin";
 import type { AppEnv, Env } from "./env";
+import { sweepUnusedAccounts } from "./accounts";
+import { sweepOrphanBlobs } from "./batches";
+import { deleteOldPairingCodes } from "./devices";
 import { deleteExpiredRateLimits } from "./ratelimit";
 import { jsonError } from "./util";
 import { v1 } from "./v1";
@@ -64,11 +67,30 @@ app.onError((err, c) => {
   return jsonError(c, 500, "internal error");
 });
 
+/**
+ * Scheduled maintenance (cron trigger in wrangler.jsonc, every 10 minutes).
+ * Every task is bounded per run, and one failing does not stop the others.
+ */
+export async function maintenance(env: Env, now: number): Promise<void> {
+  const tasks: Array<[string, () => Promise<unknown>]> = [
+    // IP-keyed rate-limit counters whose window has ended.
+    ["rate limits", () => deleteExpiredRateLimits(env.DB, now)],
+    ["pairing codes", () => deleteOldPairingCodes(env.DB, now)],
+    ["unused accounts", () => sweepUnusedAccounts(env.DB, now)],
+    ["orphan blobs", () => sweepOrphanBlobs(env.DB, env.BLOBS, now)],
+  ];
+  for (const [name, task] of tasks) {
+    try {
+      await task();
+    } catch (e) {
+      console.error(`maintenance (${name}) failed`, e);
+    }
+  }
+}
+
 export default {
   fetch: app.fetch,
-  // Cron trigger (wrangler.jsonc): drops IP-keyed rate-limit counters whose
-  // window has ended even when no further request arrives.
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(deleteExpiredRateLimits(env.DB, Date.now()).run());
+    ctx.waitUntil(maintenance(env, Date.now()));
   },
 } satisfies ExportedHandler<Env>;

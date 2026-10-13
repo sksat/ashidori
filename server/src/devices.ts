@@ -1,7 +1,9 @@
 import type { DeviceRow } from "./env";
-import { base64UrlEncode, floorHour, generatePairingCode, randomBytes, sha256Hex } from "./util";
+import { floorHour, generatePairingCode, sha256Hex } from "./util";
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
+/** Used and expired codes are kept this long after expiry (registration retries, auditing). */
+export const PAIRING_KEEP_MS = 24 * 60 * 60 * 1000;
 export const MAX_DEVICE_NAME = 64;
 
 export interface DeviceView {
@@ -25,49 +27,125 @@ export interface AdminDeviceView extends DeviceView {
 export type DeviceScope = { userId: string | null } | "all";
 
 /**
- * `createdBy` is "admin:<email>" or the id of the device that created the code.
- * The device registered with the code belongs to `userId` (null only when a
- * legacy device creates a code).
+ * `createdBy` is "admin:<email>" or the id of the device that created the
+ * code; `issuerDeviceId` is that device id (null for admins). The code is
+ * only accepted while its issuing device is not revoked. The device
+ * registered with the code belongs to `userId` (null only when a legacy
+ * device creates a code).
  */
 export async function createPairingCode(
   db: D1Database,
   createdBy: string,
   userId: string | null,
+  issuerDeviceId: string | null,
 ): Promise<{ code: string; expiresAt: number }> {
   const now = Date.now();
   const code = generatePairingCode();
   const expiresAt = now + PAIRING_TTL_MS;
-  await db.batch([
-    // Housekeeping: expired codes are useless; keep used ones for a day for auditing.
-    db.prepare("DELETE FROM pairing_codes WHERE expires_at < ?1").bind(now - 24 * 60 * 60 * 1000),
-    db
-      .prepare(
-        "INSERT INTO pairing_codes (code_hash, created_at, expires_at, created_by, user_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-      )
-      .bind(await sha256Hex(code), now, expiresAt, createdBy, userId),
-  ]);
+  await db
+    .prepare(
+      `INSERT INTO pairing_codes (code_hash, created_at, expires_at, created_by, user_id, issuer_device_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+    )
+    .bind(await sha256Hex(code), now, expiresAt, createdBy, userId, issuerDeviceId)
+    .run();
   return { code, expiresAt };
 }
 
-/**
- * A new device of `userId` (null only for legacy codes) with a fresh token.
- * Returns the INSERT, to run alone or in a batch, and the token, which is
- * shown to the device once; only its hash is stored.
- */
-export async function newDeviceStmt(
-  db: D1Database,
-  deviceId: string,
-  name: string,
-  userId: string | null,
-  now: number,
-): Promise<{ stmt: D1PreparedStatement; token: string }> {
-  const token = base64UrlEncode(randomBytes(32));
-  const stmt = db
+/** Scheduled: deletes codes that expired more than PAIRING_KEEP_MS ago, at most `limit`. */
+export async function deleteOldPairingCodes(db: D1Database, now: number, limit = 1000): Promise<number> {
+  const res = await db
     .prepare(
-      "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+      "DELETE FROM pairing_codes WHERE code_hash IN (SELECT code_hash FROM pairing_codes WHERE expires_at < ?1 LIMIT ?2)",
     )
-    .bind(deviceId, name, await sha256Hex(token), now, floorHour(now), userId);
-  return { stmt, token };
+    .bind(now - PAIRING_KEEP_MS, limit)
+    .run();
+  return res.meta.changes;
+}
+
+export function isUniqueTokenError(e: unknown): boolean {
+  return e instanceof Error && /UNIQUE constraint failed: devices\.token_hash/.test(e.message);
+}
+
+export type RegisterResult = { deviceId: string; created: boolean } | "invalid" | "too many devices";
+
+// A code is usable if unused, unexpired, of an active user (or legacy), and
+// its issuing device (if any) is not revoked. ?2 is the current time.
+const CODE_USABLE = `used_at IS NULL AND expires_at > ?2
+  AND (user_id IS NULL OR user_id IN (SELECT id FROM users WHERE status = 'active'))
+  AND (issuer_device_id IS NULL OR issuer_device_id IN (SELECT id FROM devices WHERE revoked_at IS NULL))`;
+// Devices ever registered for the code's user (revoked ones included); `IS` so that NULL counts the legacy devices.
+const USER_DEVICES = "(SELECT COUNT(*) FROM devices WHERE user_id IS pairing_codes.user_id)";
+
+/**
+ * Registers a device with a pairing code and a client-generated token (only
+ * its hash is stored).
+ *
+ * Idempotent per token: if a device with this token already exists and was
+ * registered with this very code, its id is returned (`created: false`), so a
+ * client whose response got lost can retry. A used code without that token
+ * gives nothing ("invalid"), and so does a known token with another code.
+ *
+ * Consuming the code and creating the device are one D1 batch (one
+ * transaction): either both happen or neither.
+ */
+export async function registerWithCode(
+  db: D1Database,
+  r: { code: string; name: string; token: string; maxDevices: number },
+): Promise<RegisterResult> {
+  const codeHash = await sha256Hex(r.code);
+  const tokenHash = await sha256Hex(r.token);
+
+  const earlier = async (): Promise<RegisterResult | null> => {
+    const row = await db
+      .prepare(
+        `SELECT d.id, d.revoked_at, p.code_hash AS matched FROM devices d
+         LEFT JOIN pairing_codes p ON p.used_by = d.id AND p.code_hash = ?2
+         WHERE d.token_hash = ?1`,
+      )
+      .bind(tokenHash, codeHash)
+      .first<{ id: string; revoked_at: number | null; matched: string | null }>();
+    if (!row) return null;
+    return row.matched !== null && row.revoked_at === null ? { deviceId: row.id, created: false } : "invalid";
+  };
+
+  const prior = await earlier();
+  if (prior) return prior;
+
+  const now = Date.now();
+  const deviceId = crypto.randomUUID();
+  let consumed: D1Result;
+  try {
+    [consumed] = (await db.batch([
+      db
+        .prepare(
+          `UPDATE pairing_codes SET used_at = ?2, used_by = ?3
+           WHERE code_hash = ?1 AND ${CODE_USABLE} AND ${USER_DEVICES} < ?4
+           RETURNING user_id`,
+        )
+        .bind(codeHash, now, deviceId, r.maxDevices),
+      // The device belongs to the code's user (null only for legacy codes).
+      // Inserted only if the UPDATE above consumed the code for this device.
+      db
+        .prepare(
+          `INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id)
+           SELECT ?1, ?2, ?3, ?4, ?5, user_id FROM pairing_codes WHERE code_hash = ?6 AND used_by = ?1`,
+        )
+        .bind(deviceId, r.name, tokenHash, now, floorHour(now), codeHash),
+    ])) as [D1Result];
+  } catch (e) {
+    // A concurrent request with the same token won; this batch rolled back.
+    if (isUniqueTokenError(e)) return (await earlier()) ?? "invalid";
+    throw e;
+  }
+  if (consumed.results.length > 0) return { deviceId, created: true };
+
+  // Not consumed. Only to a caller who holds a usable code, tell that the user has too many devices.
+  const full = await db
+    .prepare(`SELECT 1 FROM pairing_codes WHERE code_hash = ?1 AND ${CODE_USABLE} AND ${USER_DEVICES} >= ?3`)
+    .bind(codeHash, now, r.maxDevices)
+    .first();
+  return full ? "too many devices" : "invalid";
 }
 
 /** Trims a device name; null if it is empty, too long or has control characters. */
@@ -109,14 +187,30 @@ export async function listAllDevices(db: D1Database): Promise<AdminDeviceView[]>
   return results.map((r) => ({ ...toView(r), userId: r.user_id, userName: r.user_name }));
 }
 
-/** Returns false if the device does not exist in `scope`. Revoking twice is a no-op. */
+/**
+ * Revokes a device and, in the same batch (one transaction), deletes the
+ * unused pairing codes it issued. Returns false if the device does not exist
+ * in `scope`. Revoking twice is a no-op.
+ */
 export async function revokeDevice(db: D1Database, id: string, scope: DeviceScope): Promise<boolean> {
-  const stmt =
+  const now = Date.now();
+  const stmts =
     scope === "all"
-      ? db.prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1").bind(id, Date.now())
-      : db
-          .prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1 AND user_id IS ?3")
-          .bind(id, Date.now(), scope.userId);
-  const res = await stmt.run();
-  return res.meta.changes > 0;
+      ? [
+          db.prepare("DELETE FROM pairing_codes WHERE issuer_device_id = ?1 AND used_at IS NULL").bind(id),
+          db.prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1").bind(id, now),
+        ]
+      : [
+          db
+            .prepare(
+              `DELETE FROM pairing_codes WHERE issuer_device_id = ?1 AND used_at IS NULL
+                 AND EXISTS (SELECT 1 FROM devices WHERE id = ?1 AND user_id IS ?2)`,
+            )
+            .bind(id, scope.userId),
+          db
+            .prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1 AND user_id IS ?3")
+            .bind(id, now, scope.userId),
+        ];
+  const [, revoked] = await db.batch(stmts);
+  return revoked!.meta.changes > 0;
 }

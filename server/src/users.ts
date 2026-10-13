@@ -40,6 +40,9 @@ export interface UserListItem extends UserView {
   lastSeenAt: number | null;
   /** Blob bytes stored by the user's devices (what the quota counts, see accounts.ts). */
   storageBytes: number;
+  batchCount: number;
+  /** Shared check-ins, tombstones included. */
+  sharedCheckinCount: number;
 }
 
 /** Another user already has the handle. */
@@ -163,18 +166,26 @@ export async function listUsers(db: D1Database): Promise<UserListItem[]> {
     .prepare(
       `SELECT u.id, u.name, u.handle, u.email, u.status, u.created_at, u.created_by, u.disabled_at,
          COUNT(d.id) - COUNT(d.revoked_at) AS device_count,
-         MAX(d.last_seen_at) AS last_seen_at,
-         (SELECT COALESCE(SUM(b.size), 0) FROM devices d2 JOIN batches b ON b.device_id = d2.id
-          WHERE d2.user_id = u.id) AS storage_bytes
+         MAX(d.last_seen_at) AS last_seen_at, u.storage_bytes, u.batch_count, u.checkin_count
        FROM users u LEFT JOIN devices d ON d.user_id = u.id
        GROUP BY u.id ORDER BY u.created_at, u.id`,
     )
-    .all<UserRow & { device_count: number; last_seen_at: number | null; storage_bytes: number }>();
+    .all<
+      UserRow & {
+        device_count: number;
+        last_seen_at: number | null;
+        storage_bytes: number;
+        batch_count: number;
+        checkin_count: number;
+      }
+    >();
   return results.map((r) => ({
     ...toView(r),
     deviceCount: r.device_count,
     lastSeenAt: r.last_seen_at,
     storageBytes: r.storage_bytes,
+    batchCount: r.batch_count,
+    sharedCheckinCount: r.checkin_count,
   }));
 }
 

@@ -50,7 +50,7 @@ describe("PUT /v1/checkins/shared/:localId", () => {
     expect(items[0]!.updatedAt % HOUR_MS).toBe(0);
 
     // Same local id: same server id, new cursor, optional fields cleared.
-    const updated = (await (await putCheckin(alice.token, "c1", { ...CHECKIN, venue: " Bar " })).json()) as {
+    const updated = (await (await putCheckin(alice.token, "c1", { ...CHECKIN, rev: 2, venue: " Bar " })).json()) as {
       id: string;
       cursor: number;
     };
@@ -97,6 +97,10 @@ describe("PUT /v1/checkins/shared/:localId", () => {
       { ...CHECKIN, t: 1.5 },
       { ...CHECKIN, t: -1 },
       { ...CHECKIN, t: undefined },
+      { ...CHECKIN, rev: undefined },
+      { ...CHECKIN, rev: -1 },
+      { ...CHECKIN, rev: 1.5 },
+      { ...CHECKIN, rev: "2" },
       null,
     ];
     for (const body of bad) {
@@ -154,8 +158,8 @@ describe("DELETE /v1/checkins/shared/:localId", () => {
     expect((await unshare(a.token, "c1")).status).toBe(200);
     expect((await feed(a.token, `?after=${items[0]!.cursor}`)).items).toEqual([]);
 
-    // Sharing again revives the same entry.
-    await putCheckin(a.token, "c1", CHECKIN);
+    // Sharing again (with a newer rev) revives the same entry.
+    expect((await putCheckin(a.token, "c1", { ...CHECKIN, rev: Date.now() + 60_000 })).status).toBe(200);
     expect((await feed(a.token, `?after=${items[0]!.cursor}`)).items).toEqual([
       expect.objectContaining({ id, venue: "Cafe", deleted: false }),
     ]);

@@ -8,10 +8,22 @@ export interface Env {
   ADMIN_DEV_TOKEN?: string;
   /** Comma-separated, case-insensitive e-mail addresses of the admins. */
   ADMIN_EMAILS: string;
-  /** "admin" (default) or "open" (anyone may create an account). Anything else = "admin". */
+  /** Exactly "open": anyone may create an account. Anything else = "admin" (see config.ts). */
   REGISTRATION: string;
-  /** Per-user storage quota in bytes. Empty or invalid = 2 GiB. */
+  // Limits (see config.ts): empty = default; any other non-positive-integer
+  // value is invalid and stops the creation of new users, devices and data.
   USER_QUOTA_BYTES: string;
+  USER_MAX_BATCHES: string;
+  USER_MAX_DEVICES: string;
+  USER_MAX_SHARED_CHECKINS: string;
+  MAX_USERS: string;
+  MAX_TOTAL_BYTES: string;
+  // Workers Rate Limiting bindings (coarse, per Cloudflare location) checked
+  // before the precise D1 counters; optional (see ratelimit.ts).
+  RL_REGISTER?: RateLimit;
+  RL_ACCOUNT?: RateLimit;
+  RL_PAIRING?: RateLimit;
+  RL_LOOKUP?: RateLimit;
 }
 
 export interface DeviceRow {

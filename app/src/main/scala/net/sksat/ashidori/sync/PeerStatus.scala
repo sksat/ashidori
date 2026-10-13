@@ -2,7 +2,6 @@ package net.sksat.ashidori.sync
 
 import android.content.Context
 import android.os.{BatteryManager, Build, Handler, Looper}
-import java.security.GeneralSecurityException
 import scala.collection.mutable
 import scala.util.Try
 import net.sksat.ashidori.*
@@ -39,7 +38,8 @@ final case class Peer(id: String, name: String, revoked: Boolean, lastSeenAt: Lo
 final case class PeerEntry(seq: Long, fetchedAt: Long, status: DeviceStatus, area: String)
 
 /** Status of the user's other devices: downloaded after each small-stream
-  * upload and kept in private preferences.
+  * upload and kept in private preferences, tagged with the registration
+  * ([[SyncConfig.registration]]); state of another registration reads as empty.
   *
   * Only the metadata listing is walked (from a stored cursor); of the blobs,
   * only the newest `status` batch per other device is fetched.
@@ -52,25 +52,48 @@ object PeerStatus:
 
   // --- stored state ---
 
+  /** The stored state belongs to the current registration. */
+  private def current: Boolean =
+    val reg = SyncConfig.registration
+    reg.nonEmpty && prefs.getString("reg", "") == reg
+
+  /** Starts an edit for registration `reg`: none if that is no longer the
+    * current one; a reset one if the stored state belongs to another.
+    */
+  private def edit(reg: String): Option[android.content.SharedPreferences.Editor] =
+    if reg.isEmpty || reg != SyncConfig.registration then None
+    else if prefs.getString("reg", "") == reg then Some(prefs.edit())
+    else Some(prefs.edit().clear().putString("reg", reg))
+
   def devices: Vector[Peer] =
-    Try(ujson.read(prefs.getString("devices", "[]")).arr.toVector.map { d =>
+    if !current then Vector.empty
+    else Try(ujson.read(prefs.getString("devices", "[]")).arr.toVector.map { d =>
       Peer(d("id").str, d("name").str, d.obj.get("revoked").exists(_.boolOpt.contains(true)),
         d.obj.get("lastSeenAt").flatMap(_.numOpt).map(_.toLong).getOrElse(0L))
     }).getOrElse(Vector.empty)
 
-  def devicesFetchedAt: Long = prefs.getLong("devicesAt", 0L)
+  def devicesFetchedAt: Long = if current then prefs.getLong("devicesAt", 0L) else 0L
 
   def entries: Map[String, PeerEntry] =
-    Try(ujson.read(prefs.getString("status", "{}")).obj.toMap.map { (id, e) =>
+    if !current then Map.empty
+    else Try(ujson.read(prefs.getString("status", "{}")).obj.toMap.map { (id, e) =>
       id -> PeerEntry(e("seq").num.toLong, e("fetchedAt").num.toLong, DeviceStatus.fromJson(e("status")),
         e.obj.get("area").flatMap(_.strOpt).getOrElse(""))
     }).getOrElse(Map.empty)
 
-  private def saveEntries(es: Map[String, PeerEntry]): Unit =
-    val js = ujson.Obj.from(es.map((id, e) => id -> ujson.Obj(
+  /** Listing cursor, newest listed and read seq per device, unreadable batches. */
+  def syncState: StatusSyncState =
+    if !current then StatusSyncState.empty
+    else Option(prefs.getString("statusSync", null)).flatMap(s => Try(StatusSyncState.fromJson(ujson.read(s))).toOption)
+      .getOrElse(StatusSyncState.empty)
+
+  /** A status of the device that was received but could not be read. */
+  def problem(deviceId: String): Option[Unresolved] = syncState.problem(deviceId)
+
+  private def entriesJson(es: Map[String, PeerEntry]): String =
+    ujson.write(ujson.Obj.from(es.map((id, e) => id -> ujson.Obj(
       "seq" -> ujson.Num(e.seq.toDouble), "fetchedAt" -> ujson.Num(e.fetchedAt.toDouble),
-      "status" -> e.status.toJson, "area" -> e.area)))
-    prefs.edit().putString("status", ujson.write(js)).apply()
+      "status" -> e.status.toJson, "area" -> e.area))))
 
   /** Other devices that are not revoked, in the server's order. */
   def others: Vector[Peer] = devices.filter(p => !p.revoked && p.id != SyncConfig.deviceId)
@@ -78,7 +101,9 @@ object PeerStatus:
   /** The 端末 section is worth showing. */
   def visible: Boolean = SyncConfig.ready && others.nonEmpty
 
-  def clear(): Unit = prefs.edit().clear().apply()
+  def clear(): Unit =
+    prefs.edit().clear().commit()
+    changed()
 
   // --- observers (main thread) ---
 
@@ -93,62 +118,81 @@ object PeerStatus:
 
   // --- network (blocking; call off the main thread) ---
 
-  private def client = SyncClient(SyncConfig.serverUrl, SyncConfig.token)
-
-  /** Device names and revocations, for the 端末 section. */
-  def fetchDevices(): Unit = saveDevices(client.devices())
-
-  /** Keeps a `GET /v1/devices` response (also from the 同期 screen's list). */
-  def saveDevices(js: ujson.Value): Unit =
-    prefs.edit().putString("devices", ujson.write(js)).putLong("devicesAt", System.currentTimeMillis()).apply()
-    changed()
+  /** Keeps a `GET /v1/devices` response (also from the 同期 screen's list),
+    * if the registration `reg` it was fetched for is still the current one.
+    */
+  def saveDevices(js: ujson.Value, reg: String): Unit =
+    edit(reg).foreach { e =>
+      e.putString("devices", ujson.write(js)).putLong("devicesAt", System.currentTimeMillis()).apply()
+      changed()
+    }
 
   /** For when the section is first shown, before any sync ran with this version. */
   def fetchDevicesAsync(): Unit =
+    val reg = SyncConfig.registration
     AshidoriApp.io.execute { () =>
-      try fetchDevices()
+      try saveDevices(SyncClient(SyncConfig.serverUrl, SyncConfig.token).devices(), reg)
       catch case e: Exception => Log.w("device list failed", e)
     }
 
-  /** Lists new batches and fetches the newest `status` of each other device. */
-  def pull(): Unit =
-    if !SyncConfig.ready then return
-    try fetchDevices()
+  /** Lists new batches and fetches the newest `status` of each other device.
+    * Runs inside the sync run `run` (under [[SyncLock]]).
+    *
+    * The listing cursor moves on after each page: the newest listed seq per
+    * device is stored with it. A network error leaves that device for the
+    * next run. A blob that is received but cannot be read is recorded as
+    * unresolved and retried up to [[StatusSyncState.MaxAttempts]] times; it
+    * stays shown on the device's row until a newer status is read.
+    */
+  def pull(run: SyncRun): Unit =
+    val reg = run.reg
+    try saveDevices(run.client.devices(), reg)
     catch case e: Exception => Log.w("device list failed", e)
-    val c = client
-    val self = SyncConfig.deviceId
-    var cursor = prefs.getLong("cursor", 0L)
-    val seen = mutable.ArrayBuffer.empty[BatchMeta]
+    def save(st: StatusSyncState, es: Option[Map[String, PeerEntry]] = None): Unit =
+      edit(reg).foreach { e =>
+        e.putString("statusSync", ujson.write(StatusSyncState.toJson(st)))
+        es.foreach(m => e.putString("status", entriesJson(m)))
+        e.commit()
+      }
+    var st = syncState
     var more = true
     var pages = 0
     while more && pages < MaxPages do
-      val (items, next) = c.listBatches(cursor, PageSize)
-      seen ++= items.filter(_.stream == DeviceStatus.Stream)
-      cursor = (items.map(_.cursor) ++ next :+ cursor).max
-      more = next.isDefined && items.nonEmpty
+      run.checkStopped()
+      val before = st.cursor
+      val (items, next) = run.client.listBatches(st.cursor, PageSize)
+      st = st.listed(items, run.deviceId)
+      save(st)
+      more = next.isDefined && items.nonEmpty && st.cursor > before
       pages += 1
 
-    val key = Crypto.batchKey(SyncConfig.masterKey.get)
     var known = entries
-    // A network error keeps the cursor, so the next run lists these again.
-    // A blob that cannot be opened (other key, damaged) is skipped for good.
-    var retry = false
-    for (dev, seq) <- BatchMeta.newestStatus(seen.toSeq, self, known.view.mapValues(_.seq).toMap) do
-      try
-        val blob = c.getBatch(dev, DeviceStatus.Stream, seq)
-        val plain = Crypto.gunzip(Crypto.open(key, Crypto.aad(dev, DeviceStatus.Stream, seq), blob))
-        DeviceStatus.decode(plain).foreach { s =>
-          val area = areaFor(s.lastFix, known.get(dev))
-          known += dev -> PeerEntry(seq, System.currentTimeMillis(), s, area)
-        }
-      catch
-        case e: (GeneralSecurityException | IllegalArgumentException | java.util.zip.ZipException | ujson.ParseException | NoSuchElementException) =>
+    for (dev, seq) <- st.targets do
+      run.checkStopped()
+      // Left: received but unusable; None: not received (network), next run.
+      val blob: Either[Exception, Option[Array[Byte]]] =
+        try Right(Some(run.client.getBatch(dev, DeviceStatus.Stream, seq, DeviceStatus.MaxBlob)))
+        catch
+          case e: (LimitExceeded | BatchMissing) => Left(e)
+          case e: Exception =>
+            Log.w(s"status $dev/$seq not fetched", e)
+            Right(None)
+      blob match
+        case Right(None) => ()
+        case Left(e) =>
           Log.w(s"status $dev/$seq unreadable", e)
-        case e: Exception =>
-          Log.w(s"status $dev/$seq not fetched", e)
-          retry = true
-    saveEntries(known)
-    if !retry then prefs.edit().putLong("cursor", cursor).apply()
+          st = st.failed(dev, seq, e.getMessage)
+        case Right(Some(b)) =>
+          try
+            val plain = Crypto.gunzip(Crypto.open(run.batchKey, Crypto.aad(dev, DeviceStatus.Stream, seq), b), DeviceStatus.MaxPlain)
+            val s = DeviceStatus.decode(plain).getOrElse(throw IllegalArgumentException("empty status batch"))
+            known += dev -> PeerEntry(seq, System.currentTimeMillis(), s, areaFor(s.lastFix, known.get(dev)))
+            st = st.succeeded(dev, seq)
+          catch
+            case e: Exception =>
+              Log.w(s"status $dev/$seq unreadable", e)
+              st = st.failed(dev, seq, e.getMessage)
+      save(st, Some(known))
     changed()
 
   /** Area name of the position, reusing the previous one when it barely moved. */

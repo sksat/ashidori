@@ -176,12 +176,13 @@ class MainActivity extends AppCompatActivity:
       for url <- Option(getIntent.getStringExtra("ashidori.syncUrl")); code <- Option(getIntent.getStringExtra("ashidori.syncCode")) do
         AshidoriApp.io.execute { () =>
           try
-            val (id, token) = net.sksat.ashidori.sync.SyncClient(url, None).register(code, "emulator")
-            net.sksat.ashidori.sync.SyncConfig.savePairing(url, id, token)
+            import net.sksat.ashidori.sync.*
+            Registration.begin(url, "pair", code, "emulator")
+            val id = Registration.complete()
             val key = ashidori.core.sync.Crypto.newMasterKey()
-            net.sksat.ashidori.sync.SyncConfig.setMasterKey(key)
-            Log.i(s"debug sync paired device=$id token=$token recovery=${ashidori.core.sync.RecoveryCode.encode(key)}")
-            val sent = net.sksat.ashidori.sync.Uploader.uploadSmall()
+            SyncConfig.confirmKey(key, SyncConfig.registration)
+            Log.i(s"debug sync paired device=$id token=${SyncConfig.token.getOrElse("")} recovery=${ashidori.core.sync.RecoveryCode.encode(key)}")
+            val sent = SyncLock.run(SyncRun.current().fold(0)(Uploader.uploadSmall))
             Log.i(s"debug sync uploaded batches=$sent")
           catch case e: Exception => Log.e("debug sync failed", e)
         }

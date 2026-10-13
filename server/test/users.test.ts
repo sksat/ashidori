@@ -1,6 +1,17 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { adminCall, authed, blob, createUser, issueAdminCode, legacyDevice, newDevice, putBatch, register } from "./helpers";
+import {
+  adminCall,
+  authed,
+  blob,
+  createUser,
+  issueAdminCode,
+  legacyDevice,
+  newDevice,
+  newToken,
+  putBatch,
+  register,
+} from "./helpers";
 
 interface ListItem {
   cursor: number;
@@ -25,9 +36,10 @@ async function deviceUser(id: string): Promise<string | null> {
 describe("registration binds devices to users", () => {
   it("assigns the code's user, and device-issued codes inherit it", async () => {
     const alice = await createUser("alice");
-    const res = await register(await issueAdminCode(alice), "a1");
+    const token = newToken();
+    const res = await register(await issueAdminCode(alice), "a1", undefined, token);
     expect(res.status).toBe(201);
-    const a1 = (await res.json()) as { deviceId: string; token: string };
+    const a1 = { ...((await res.json()) as { deviceId: string }), token };
     expect(await deviceUser(a1.deviceId)).toBe(alice);
 
     const pairing = await authed(a1.token, "/v1/pairing", { method: "POST" });
@@ -41,7 +53,8 @@ describe("registration binds devices to users", () => {
     const res = await authed(old.token, "/v1/pairing", { method: "POST" });
     expect(res.status).toBe(201);
     const { code } = (await res.json()) as { code: string };
-    const added = (await (await register(code, "legacy2")).json()) as { deviceId: string; token: string };
+    const addedToken = newToken();
+    const added = { ...((await (await register(code, "legacy2", undefined, addedToken)).json()) as { deviceId: string }), token: addedToken };
     expect(await deviceUser(added.deviceId)).toBeNull();
 
     const alice = await createUser("alice");

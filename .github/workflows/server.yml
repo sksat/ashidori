@@ -31,6 +31,19 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
       - run: pnpm test
+      # Validates the repository variables a deploy would pass, so that a
+      # typo fails here, before anything is deployed. The values reach the
+      # shell only as environment variables, never as interpolated code.
+      - name: Check server variables
+        env:
+          REGISTRATION: ${{ vars.REGISTRATION }}
+          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
+          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
+          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
+          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
+          MAX_USERS: ${{ vars.MAX_USERS }}
+          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+        run: node scripts/check-config.ts
 
   # Runs only when the repository variable DEPLOY_SERVER is "true". The D1
   # database, R2 bucket, custom domain and Access application must already
@@ -59,6 +72,20 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
 
+      # Repository variables are passed through env and quoted in the shell
+      # ("$VAR"), never interpolated into the script as an expression, so that a
+      # value cannot inject shell code.
+      - name: Check server variables
+        env:
+          REGISTRATION: ${{ vars.REGISTRATION }}
+          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
+          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
+          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
+          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
+          MAX_USERS: ${{ vars.MAX_USERS }}
+          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+        run: node scripts/check-config.ts
+
       - name: Set D1 database id
         run: |
           test -n "$D1_DATABASE_ID" || { echo "D1_DATABASE_ID is not set" >&2; exit 1; }
@@ -68,10 +95,26 @@ jobs:
         run: pnpm exec wrangler d1 migrations apply ashidori --remote
 
       - name: Deploy
-        run: >-
-          pnpm exec wrangler deploy
-          --var "CF_ACCESS_TEAM_DOMAIN:${{ vars.CF_ACCESS_TEAM_DOMAIN }}"
-          --var "CF_ACCESS_AUD:${{ vars.CF_ACCESS_AUD }}"
-          --var "ADMIN_EMAILS:${{ vars.ADMIN_EMAILS }}"
-          --var "REGISTRATION:${{ vars.REGISTRATION || 'admin' }}"
-          --var "USER_QUOTA_BYTES:${{ vars.USER_QUOTA_BYTES }}"
+        env:
+          CF_ACCESS_TEAM_DOMAIN: ${{ vars.CF_ACCESS_TEAM_DOMAIN }}
+          CF_ACCESS_AUD: ${{ vars.CF_ACCESS_AUD }}
+          ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
+          REGISTRATION: ${{ vars.REGISTRATION }}
+          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
+          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
+          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
+          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
+          MAX_USERS: ${{ vars.MAX_USERS }}
+          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+        run: |
+          pnpm exec wrangler deploy \
+            --var "CF_ACCESS_TEAM_DOMAIN:$CF_ACCESS_TEAM_DOMAIN" \
+            --var "CF_ACCESS_AUD:$CF_ACCESS_AUD" \
+            --var "ADMIN_EMAILS:$ADMIN_EMAILS" \
+            --var "REGISTRATION:${REGISTRATION:-admin}" \
+            --var "USER_QUOTA_BYTES:$USER_QUOTA_BYTES" \
+            --var "USER_MAX_BATCHES:$USER_MAX_BATCHES" \
+            --var "USER_MAX_DEVICES:$USER_MAX_DEVICES" \
+            --var "USER_MAX_SHARED_CHECKINS:$USER_MAX_SHARED_CHECKINS" \
+            --var "MAX_USERS:$MAX_USERS" \
+            --var "MAX_TOTAL_BYTES:$MAX_TOTAL_BYTES"

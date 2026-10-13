@@ -35,12 +35,52 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       // User corrections of a leg's transport mode, keyed by time range.
       "CREATE TABLE mode_overrides(start INTEGER, end INTEGER, mode TEXT, updated_at INTEGER)",
       "CREATE TABLE gnss_sessions(start INTEGER, end INTEGER, file TEXT, reason TEXT, uploaded INTEGER DEFAULT 0)",
-      // Server sync: highest rowid uploaded per append-only table, and the
-      // updated_at watermark for editable tables.
+      // Server sync progress, keyed by registration: next seq per stream,
+      // change-counter watermark per editable table, archive files handed over.
       "CREATE TABLE sync_state(name TEXT PRIMARY KEY, value INTEGER)"
     ).foreach(db.execSQL)
     createGnssStatus(db)
     createRawLines(db)
+    createSyncOutbox(db)
+    addChangeCounter(db)
+
+  /** Sealed batches not yet accepted by the server. A row is written in the
+    * same transaction that claims its seq and records the source progress,
+    * and is deleted only after the server accepted it.
+    */
+  private def createSyncOutbox(db: SQLiteDatabase): Unit =
+    db.execSQL("""CREATE TABLE IF NOT EXISTS sync_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,
+      |reg TEXT NOT NULL, device_id TEXT NOT NULL, stream TEXT NOT NULL, seq INTEGER NOT NULL,
+      |class TEXT NOT NULL, blob BLOB NOT NULL, created_at INTEGER NOT NULL, UNIQUE(reg, stream, seq))""".stripMargin)
+
+  /** Editable tables get `sync_rev`, a local change counter set by triggers on
+    * every insert and synced-column update. Unlike `updated_at` it never
+    * repeats or goes back, so a watermark on it cannot skip rows. Existing
+    * rows are numbered in `updated_at` order.
+    */
+  private def addChangeCounter(db: SQLiteDatabase): Unit =
+    db.execSQL("CREATE TABLE IF NOT EXISTS sync_counter(id INTEGER PRIMARY KEY CHECK(id=0), value INTEGER NOT NULL)")
+    db.execSQL("INSERT OR IGNORE INTO sync_counter(id, value) VALUES(0, 0)")
+    for (table, cols) <- Db.RevColumns do
+      val existing = Using.resource(db.rawQuery(s"PRAGMA table_info($table)", null)) { c =>
+        val names = Set.newBuilder[String]
+        while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
+        names.result()
+      }
+      if !existing("sync_rev") then
+        db.execSQL(s"ALTER TABLE $table ADD COLUMN sync_rev INTEGER")
+        val rowids = Using.resource(db.rawQuery(s"SELECT rowid FROM $table ORDER BY updated_at, rowid", null)) { c =>
+          val b = Vector.newBuilder[Long]
+          while c.moveToNext() do b += c.getLong(0)
+          b.result()
+        }
+        for id <- rowids do
+          db.execSQL("UPDATE sync_counter SET value=value+1")
+          db.execSQL(s"UPDATE $table SET sync_rev=(SELECT value FROM sync_counter) WHERE rowid=?", Array[AnyRef](java.lang.Long.valueOf(id)))
+      db.execSQL(s"CREATE INDEX IF NOT EXISTS ${table}_sync_rev ON $table(sync_rev)")
+      val bump = s"UPDATE sync_counter SET value=value+1; UPDATE $table SET sync_rev=(SELECT value FROM sync_counter) WHERE rowid=NEW.rowid;"
+      db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_ins AFTER INSERT ON $table BEGIN $bump END")
+      db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_upd AFTER UPDATE OF ${cols.map(c => "\"" + c + "\"").mkString(",")} ON $table BEGIN $bump END")
 
   /** Detail-session signals (GNSS raw/status/nav/NMEA, IMU) as GnssLogger-format
     * lines until their day is archived to Parquet.
@@ -68,6 +108,9 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       Seq("city", "country", "area").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE places ADD COLUMN $c TEXT"))
     if oldV < 3 then createGnssStatus(db)
     if oldV < 4 then createRawLines(db)
+    if oldV < 5 then
+      createSyncOutbox(db)
+      addChangeCounter(db)
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -399,6 +442,84 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def setSyncValue(name: String, v: Long): Unit =
     w.execSQL("INSERT OR REPLACE INTO sync_state(name, value) VALUES(?, ?)", Array[AnyRef](name, java.lang.Long.valueOf(v)))
 
+  /** Seals batches into the outbox in one transaction: each claims the next
+    * seq of its stream (`<reg>|seq:<stream>`), and the source progress is
+    * written with them. A crash leaves either all of it or none.
+    * `seal(seq)` encrypts for that slot; it runs inside the transaction.
+    */
+  def enqueueBatches(reg: String, deviceId: String, cls: String, batches: Seq[(String, Long => Array[Byte])],
+                     progress: Seq[(String, Long)]): Int = tx { db =>
+    val st = db.compileStatement(
+      "INSERT INTO sync_outbox(reg, device_id, stream, seq, class, blob, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
+    for (stream, seal) <- batches do
+      val key = s"$reg|seq:$stream"
+      val seq = syncValue(key)
+      st.clearBindings()
+      st.bindString(1, reg)
+      st.bindString(2, deviceId)
+      st.bindString(3, stream)
+      st.bindLong(4, seq)
+      st.bindString(5, cls)
+      st.bindBlob(6, seal(seq))
+      st.bindLong(7, System.currentTimeMillis())
+      st.executeInsert()
+      setSyncValue(key, seq + 1)
+    progress.foreach(setSyncValue)
+    batches.size
+  }
+
+  /** Outbox rows of a registration and constraint classes, oldest first (without the blob). */
+  def outbox(reg: String, classes: Set[String]): Vector[Db.OutboxEntry] =
+    query(s"SELECT id, device_id, stream, seq, class FROM sync_outbox WHERE reg=? AND class IN (${classes.toSeq.map(_ => "?").mkString(",")}) ORDER BY id",
+      (reg +: classes.toSeq)*) { c =>
+      Db.OutboxEntry(c.getLong(0), c.getString(1), c.getString(2), c.getLong(3), c.getString(4))
+    }
+
+  /** The sealed blob, read in pieces: a cursor window holds at most ~2 MB. */
+  def outboxBlob(id: Long): Array[Byte] =
+    val len = query("SELECT length(blob) FROM sync_outbox WHERE id=?", id)(_.getLong(0)).headOption.getOrElse(0L)
+    val out = java.io.ByteArrayOutputStream(len.toInt)
+    val piece = 512 * 1024
+    var off = 0L
+    while off < len do
+      query("SELECT substr(blob, ?, ?) FROM sync_outbox WHERE id=?", off + 1, piece, id)(_.getBlob(0)).foreach(out.write)
+      off += piece
+    out.toByteArray
+
+  def deleteOutbox(id: Long): Unit =
+    w.delete("sync_outbox", "id=?", Array(id.toString))
+
+  /** Forgets all sync progress and unsent batches (unpairing). */
+  def clearSync(): Unit = tx { db =>
+    db.delete("sync_outbox", null, null)
+    db.delete("sync_state", null, null)
+  }
+
+  /** State from before registration-keyed sync (unprefixed `seq:`, `up:`,
+    * `updated:` rows). The seq counters and handed-over archive files carry
+    * over to `reg`; `updated:` watermarks are dropped (the editable tables
+    * are sent again once by change counter). `legacyPending` are the old
+    * pending files `(stream, seq, blob)`; they become outbox rows.
+    */
+  def adoptLegacySync(reg: String, deviceId: String, legacyPending: Seq[(String, Long, Array[Byte])]): Unit = tx { db =>
+    val legacy = query("SELECT name, value FROM sync_state WHERE instr(name, '|')=0")(c => c.getString(0) -> c.getLong(1))
+    for (name, v) <- legacy if name.startsWith("seq:") || name.startsWith("up:") do
+      setSyncValue(s"$reg|$name", math.max(v, syncValue(s"$reg|$name")))
+    for (stream, seq, blob) <- legacyPending do
+      val cv = ContentValues()
+      cv.put("reg", reg)
+      cv.put("device_id", deviceId)
+      cv.put("stream", stream)
+      cv.put("seq", java.lang.Long.valueOf(seq))
+      cv.put("class", if stream == "archive" then "raw" else "small")
+      cv.put("blob", blob)
+      cv.put("created_at", java.lang.Long.valueOf(System.currentTimeMillis()))
+      db.insertWithOnConflict("sync_outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+      // A file written before its seq was saved.
+      if syncValue(s"$reg|seq:$stream") <= seq then setSyncValue(s"$reg|seq:$stream", seq + 1)
+    for (name, _) <- legacy do db.delete("sync_state", "name=?", Array(name))
+  }
+
   private def rowJson(c: Cursor, cols: Seq[(String, String)], offset: Int): ujson.Obj =
     val o = ujson.Obj()
     for ((_, field), i) <- cols.zipWithIndex do
@@ -421,10 +542,12 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       (c.getLong(0), rowJson(c, cols, 1))
     }
 
-  /** Editable tables: rows changed after the watermark. */
-  def rowsUpdatedAfter(table: String, updatedAt: Long, limit: Int): Vector[(Long, ujson.Obj)] =
+  /** Editable tables: rows changed after the change-counter watermark, as
+    * `(sync_rev, record)` in counter order.
+    */
+  def rowsChangedAfter(table: String, rev: Long, limit: Int): Vector[(Long, ujson.Obj)] =
     val cols = Db.SyncColumns(table)
-    query(s"SELECT rowid, ${cols.map(_._1).mkString(",")} FROM $table WHERE updated_at>? ORDER BY updated_at LIMIT $limit", updatedAt) { c =>
+    query(s"SELECT sync_rev, ${cols.map(_._1).mkString(",")} FROM $table WHERE sync_rev>? ORDER BY sync_rev LIMIT $limit", rev) { c =>
       (c.getLong(0), rowJson(c, cols, 1))
     }
 
@@ -446,7 +569,19 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   }
 
 object Db:
-  val Version = 4
+  val Version = 5
+
+  /** A sealed batch waiting in the outbox. `cls` is the constraint class:
+    * "small" (any allowed network) or "raw" (unmetered only).
+    */
+  final case class OutboxEntry(id: Long, deviceId: String, stream: String, seq: Long, cls: String)
+
+  /** Editable tables and the columns whose change bumps `sync_rev` (the synced ones). */
+  val RevColumns: Seq[(String, Seq[String])] = Seq(
+    "places" -> Seq("lat", "lon", "radius", "name", "kind", "external_id", "updated_at"),
+    "checkins" -> Seq("time", "lat", "lon", "venue", "category", "external_id", "place_id", "comment", "private", "updated_at"),
+    "mode_overrides" -> Seq("start", "end", "mode", "updated_at")
+  )
 
   /** Column -> JSON field mapping per synced table (docs/sync-protocol.md). */
   val SyncColumns: Map[String, Seq[(String, String)]] = Map(
