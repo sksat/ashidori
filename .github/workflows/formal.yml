@@ -10,6 +10,8 @@ on:
       - "docs/sync-protocol.md"
       - "server/src/**"
       - "server/migrations/**"
+      - "app/src/main/scala/net/sksat/ashidori/sync/**"
+      - "core/src/main/scala/ashidori/core/sync/**"
       - ".github/workflows/formal.yml"
   pull_request:
     paths:
@@ -17,8 +19,11 @@ on:
       - "docs/sync-protocol.md"
       - "server/src/**"
       - "server/migrations/**"
+      - "app/src/main/scala/net/sksat/ashidori/sync/**"
+      - "core/src/main/scala/ashidori/core/sync/**"
       - ".github/workflows/formal.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

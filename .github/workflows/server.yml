@@ -45,11 +45,15 @@ jobs:
           MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
         run: node scripts/check-config.ts
 
+  # The formal models (formal/README.md) must pass on the same commit.
+  formal:
+    uses: ./.github/workflows/formal.yml
+
   # Runs only when the repository variable DEPLOY_SERVER is "true". The D1
   # database, R2 bucket, custom domain and Access application must already
   # exist (see server/README.md); this job only migrates and deploys.
   deploy:
-    needs: test
+    needs: [test, formal]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_SERVER == 'true'
     runs-on: ubuntu-latest
     environment: production
