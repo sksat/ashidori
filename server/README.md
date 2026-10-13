@@ -64,12 +64,15 @@ Worker は `Cf-Access-Jwt-Assertion` を自身でも検証する。検証内容�
 
 CI 用には、ユーザーではなくアカウントが所有する API トークン（Account API token）を使う。作成者の権限やアカウント所属に依存せず、`cfat_` 接頭辞により漏洩の検出もしやすい。ダッシュボード → 対象アカウント → Manage account → Account API tokens → Create Token で作成する。
 
-| 権限 | 用途（API 上の名称） |
-| --- | --- |
-| Account: Workers Scripts: Edit | Worker のデプロイ（Workers Scripts Write） |
-| Account: D1: Edit | マイグレーションの適用（D1 Write） |
+| 権限 | 範囲 | 用途 |
+| --- | --- | --- |
+| Workers: Editor | Specified Workers: `ashidori-sync` | Worker のデプロイ（既存の Worker の更新・バージョン・設定） |
+| D1: Edit | アカウント | マイグレーションの適用 |
 
-- Zone Resources は選択しない。Workers Scripts と D1 はアカウント単位の権限で、ゾーンでは絞れない。
+- Workers ロールは Worker 単位で付与できる。Editor は既存の Worker を更新・デプロイできるが、作成・削除はできない。Worker が未作成の場合は、初回のみ Workers 全体の Admin で作成するか、ダッシュボード・IaC で作成しておく。
+- ルーティング（カスタムドメイン）は `wrangler.jsonc` で変更しないため、Zone の Workers Routes 権限は不要。
+- D1 は Workers ロールの対象外で、アカウント単位の権限になる。
+- 旧来の Workers Scripts: Edit（legacy）は Workers 全体の Editor に相当する。範囲を絞れないため使わない。
 - 有効期限を設定し、期限前に作り直す。
 - `CLOUDFLARE_ACCOUNT_ID` を渡すため、アカウントの検索（Memberships・Account Settings）の権限は不要。
 
