@@ -80,6 +80,11 @@ class LoggerService extends Service:
       case ActionStop =>
         Settings.loggingEnabled = false
         stopSelf()
+      // Sticky restarts arrive here without a permission check.
+      case _ if !LoggerService.hasLocationPermission(this) =>
+        Log.w("logger: no location permission, not starting")
+        stopSelf()
+        return Service.START_NOT_STICKY
       case _ =>
         if action == ActionBurst then Settings.burstUntil = System.currentTimeMillis() + BurstMs
         startForeground(NotificationId, notification("記録を開始しています"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
@@ -483,4 +488,17 @@ object LoggerService:
   val BurstMs: Long = 5 * 60_000L
 
   def send(ctx: Context, action: String): Unit =
-    ctx.startForegroundService(Intent(ctx, classOf[LoggerService]).setAction(action))
+    if action == ActionStop then
+      // Starting a foreground service only to stop it crashes the app when
+      // startForeground() is never reached: stop it directly instead.
+      Settings.loggingEnabled = false
+      ctx.stopService(Intent(ctx, classOf[LoggerService]))
+    // A location service without location permission is refused by the OS
+    // (e.g. settings restored or imported before permissions were granted).
+    else if hasLocationPermission(ctx) then
+      ctx.startForegroundService(Intent(ctx, classOf[LoggerService]).setAction(action))
+    else Log.w(s"not starting the logger ($action): no location permission")
+
+  def hasLocationPermission(ctx: Context): Boolean =
+    Seq(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)
+      .exists(p => ctx.checkSelfPermission(p) == android.content.pm.PackageManager.PERMISSION_GRANTED)
