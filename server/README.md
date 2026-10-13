@@ -81,7 +81,7 @@ CI 用には、ユーザーではなくアカウントが所有する API トー
 | --- | --- | --- | --- |
 | Secret | `CLOUDFLARE_API_TOKEN` | 環境 `production` | 2. のトークン |
 | Secret | `CLOUDFLARE_ACCOUNT_ID` | 環境 `production` | Account ID |
-| Variable | `D1_DATABASE_ID` | リポジトリ | D1 データベースの ID |
+| Secret | `D1_DATABASE_ID` | 環境 `production` | D1 データベースの ID |
 | Variable | `CF_ACCESS_TEAM_DOMAIN` | リポジトリ | Access の Team domain |
 | Variable | `CF_ACCESS_AUD` | リポジトリ | Access アプリケーションの AUD Tag |
 | Variable | `DEPLOY_SERVER` | リポジトリ | `true`（`true` のときのみデプロイする） |
@@ -96,7 +96,7 @@ gh api -X POST 'repos/{owner}/{repo}/environments/production/deployment-branch-p
 
 gh secret set CLOUDFLARE_API_TOKEN --env production
 gh secret set CLOUDFLARE_ACCOUNT_ID --env production
-gh variable set D1_DATABASE_ID --body '<D1 の ID>'
+gh secret set D1_DATABASE_ID --env production
 gh variable set CF_ACCESS_TEAM_DOMAIN --body '<team>.cloudflareaccess.com'
 gh variable set CF_ACCESS_AUD --body '<AUD Tag>'
 gh variable set DEPLOY_SERVER --body true
