@@ -190,12 +190,26 @@ uses the service.
   - `places`: `{id, lat, lon, r, name, kind, ext, updatedAt}`
   - `checkins`: `{id, t, lat, lon, venue, cat, ext, place, comment, private, updatedAt}`
   - `overrides`: `{s, e, mode, updatedAt}`
+- **Device status** (stream `status`, append-only): one record per successful small-stream sync run (hourly job and "sync now"), uploaded after the other small streams:
+  `{t, battery:{pct, charging}, recording:{on, mode, since}, lastFix:{t, lat, lon, acc}|null, app:{versionName, versionCode}, device:{model}}`
+  - `mode` is the logging mode key (`eco`, `balanced`, `precise`, `max`); `since` is when recording was switched on (0 if off or unknown).
+  - `lat`/`lon` are rounded to 1e-6°, `acc` (metres, may be null) to 0.1 m. Readers ignore unknown fields and tolerate missing ones.
 - **Raw GNSS logs** (stream `gnss`): `{file, part, parts, data}`, where `data` is base64 of a ≤ 4 MiB chunk of the GnssLogger text file.
 - Ids are device-local. Consumers namespace them by device id.
 
+## Other devices' status (download)
+
+After each successful small-stream upload, a device downloads the latest status of the user's other devices. Failures here never fail or retry the upload.
+
+- It refreshes `GET /v1/devices` (names, revocations).
+- It walks `GET /v1/batches?after=<cursor>&limit=1000` from a cursor kept on the device, at most 20 pages per run, and keeps only the highest `seq` of `status` per other device that is newer than the one it has.
+- It fetches just those blobs (`GET /v1/batches/:deviceId/status/:seq`) and opens them with the AAD of the source device, `"{deviceId}/status/{seq}"`, using the last record. Blobs of other streams are not downloaded.
+- If a fetch fails on the network, the cursor is not saved, so the next run lists those batches again. A blob that fails to decrypt or parse is skipped.
+- The receiving device keeps the latest status per device locally and may resolve an area name for the position locally. Nothing derived is uploaded.
+
 ## Network policy on the device
 
-- **Small streams** (fixes, motion, battery, places, check-ins, overrides): WorkManager periodic job, every hour, `NetworkType.CONNECTED`.
+- **Small streams** (fixes, motion, battery, places, check-ins, overrides, status): WorkManager periodic job, every hour, `NetworkType.CONNECTED`.
   - With "モバイル回線でも同期" off, the job requires `NetworkType.UNMETERED` instead.
 - **Raw GNSS logs**: a separate periodic job, every 6 h, requiring `NetworkType.UNMETERED`, and optionally charging.
 - Both jobs use exponential backoff and resume from their cursors. Batches are at most 5 000 rows or 4 MiB of plaintext.

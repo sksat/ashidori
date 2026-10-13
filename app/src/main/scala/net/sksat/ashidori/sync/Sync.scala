@@ -42,6 +42,7 @@ object SyncConfig:
     prefs.edit().clear().apply()
     SecureStore.remove("token")
     SecureStore.remove("master")
+    PeerStatus.clear()
 
 /** Minimal HTTP client for the ashidori server. Blocking; call off the main thread. */
 final class SyncClient(base: String, token: Option[String]):
@@ -87,6 +88,27 @@ final class SyncClient(base: String, token: Option[String]):
       case 409 => throw IllegalStateException(s"batch $stream/$seq conflicts with a different blob on the server")
       case c => throw RuntimeException(s"upload $stream/$seq failed: HTTP $c ${r.text.take(200)}")
 
+  /** One page of the user's batch metadata after `cursor`, and the cursor to
+    * continue from (None at the end).
+    */
+  def listBatches(after: Long, limit: Int): (Vector[BatchMeta], Option[Long]) =
+    val r = request("GET", s"/v1/batches?after=$after&limit=$limit")
+    if r.code != 200 then throw RuntimeException(s"list batches failed: HTTP ${r.code}")
+    val js = r.json
+    (js("items").arr.map(BatchMeta.fromJson).toVector, js.obj.get("next").flatMap(_.numOpt).map(_.toLong))
+
+  /** The blob of another device's batch, as stored (still encrypted). */
+  def getBatch(deviceId: String, stream: String, seq: Long): Array[Byte] =
+    val r = request("GET", s"/v1/batches/$deviceId/$stream/$seq")
+    if r.code != 200 then throw RuntimeException(s"fetch $deviceId/$stream/$seq failed: HTTP ${r.code}")
+    r.body
+
+  /** The user's devices: `[{id, name, createdAt, lastSeenAt, revoked}]`. */
+  def devices(): ujson.Value =
+    val r = request("GET", "/v1/devices")
+    if r.code != 200 then throw RuntimeException(s"HTTP ${r.code}")
+    r.json
+
 /** Builds and uploads encrypted batches. */
 object Uploader:
   private val MaxRows = 5000
@@ -112,7 +134,16 @@ object Uploader:
       val table = if stream == "overrides" then "mode_overrides" else stream
       sent += drain(stream, () => db.rowsUpdatedAfter(table, db.syncValue(s"updated:$stream"), MaxRows), rows =>
         db.setSyncValue(s"updated:$stream", rows.map(_._2("updatedAt").num.toLong).max))
-    sent + uploadArchive(Seq(ashidori.core.Archive.Fixes, ashidori.core.Archive.Motion, ashidori.core.Archive.Battery, ashidori.core.Archive.GnssStatus))
+    sent += uploadArchive(Seq(ashidori.core.Archive.Fixes, ashidori.core.Archive.Motion, ashidori.core.Archive.Battery, ashidori.core.Archive.GnssStatus))
+    // Last, so it only goes out once everything else made it.
+    sent + uploadStatus()
+
+  /** One `status` record per run: how this device is doing, for the others. */
+  private def uploadStatus(): Int =
+    val sent = resumePending(DeviceStatus.Stream)
+    val f = prepare(DeviceStatus.Stream, Vector(StatusReport.current().toJson))
+    send(DeviceStatus.Stream, f)
+    sent + 1
 
   /** Raw GNSS / IMU archives: large, so only on unmetered networks. */
   def uploadRawLogs(): Int = uploadArchive(ashidori.core.Archive.RawTables)
@@ -203,6 +234,9 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
         n => {
           SyncConfig.lastSync = System.currentTimeMillis()
           SyncConfig.lastError = ""
+          // Other devices' status: best effort, never fails the upload.
+          try PeerStatus.pull()
+          catch case e: Exception => Log.w("peer status failed", e)
           ListenableWorker.Result.success()
         }
       )
@@ -252,10 +286,12 @@ object SyncScheduler:
           .build()
       )
 
+  val SyncNow = "sync-now"
+
   def syncNow(ctx: Context): Unit =
     val c = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
     WorkManager.getInstance(ctx).enqueueUniqueWork(
-      "sync-now",
+      SyncNow,
       ExistingWorkPolicy.REPLACE,
       OneTimeWorkRequest.Builder(classOf[SmallSyncWorker]).setConstraints(c).build()
     )

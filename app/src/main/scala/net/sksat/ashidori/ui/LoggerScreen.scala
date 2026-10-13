@@ -196,11 +196,14 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val files = vbox()
 
   private val panel = PositioningPanel(act)
+  /** The user's other devices; first, since it is about all of them. */
+  private val peers = PeerPanel(act)
   private val sensorPanel = SensorPanel(act)
 
   val view: View =
     scroll(
       vbox((Seq(
+        peers.view,
         card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, notes, spacer(4), start, stopRow),
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
@@ -221,6 +224,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private var unobserve: () => Unit = () => ()
   override def onShow(): Unit =
     unobserve = LoggerState.observe(() => refresh())
+    peers.onShow()
     paintModes()
     refresh()
     panel.loadHistory()
@@ -228,6 +232,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     loadFiles()
   override def onHide(): Unit =
     unobserve()
+    peers.onHide()
     blink.cancel()
 
   private def loadFiles(): Unit =

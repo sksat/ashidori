@@ -183,6 +183,8 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
         r.fold(
           e => list.addView(caption(s"取得できませんでした: ${e.getMessage}")),
           js =>
+            // Same list as the 端末 section of the ステータス tab.
+            PeerStatus.saveDevices(js)
             for d <- js.arr do
               val id = d("id").str
               val revoked = d.obj.get("revoked").exists(_.bool)

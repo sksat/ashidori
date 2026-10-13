@@ -11,3 +11,6 @@ object BuildInfo:
   def versionName: String =
     val app = AshidoriApp.app
     app.getPackageManager.getPackageInfo(app.getPackageName, 0).versionName
+  def versionCode: Long =
+    val app = AshidoriApp.app
+    app.getPackageManager.getPackageInfo(app.getPackageName, 0).getLongVersionCode
