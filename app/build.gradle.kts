@@ -38,12 +38,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    androidResources {
-        // The offline basemap's tiles are gzip-compressed already; stored
-        // uncompressed, the archives copy out fast (and can be read in
-        // place once MapLibre reads byte ranges from assets).
-        noCompress += "pmtiles"
-    }
     packaging {
         resources {
             excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "**/*.tasty")
@@ -59,6 +53,17 @@ dependencies {
     implementation(libs.material)
     implementation(libs.maplibre)
     implementation(libs.work.runtime)
+}
+
+// The offline basemap is downloaded on first run (tools/basemap/package.sh),
+// not bundled. Older checkouts generated it into the assets: refuse to ship it.
+val staleBasemap = file("src/main/assets/basemap")
+tasks.named("preBuild") {
+    doFirst {
+        if (staleBasemap.exists()) {
+            throw GradleException("$staleBasemap is no longer bundled: move it to tools/basemap/out/ (see README「簡易地図」)")
+        }
+    }
 }
 
 tasks.withType<ScalaCompile>().configureEach {

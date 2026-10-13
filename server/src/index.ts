@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { admin } from "./admin";
+import { basemap } from "./basemap";
 import type { AppEnv, Env } from "./env";
 import { sweepUnusedAccounts } from "./accounts";
 import { sweepOrphanBlobs } from "./batches";
@@ -59,6 +60,8 @@ app.use("/v1/*", async (c, next) => {
 
 app.route("/v1", v1);
 app.route("/admin", admin);
+// Public, unauthenticated, read-only (see basemap.ts).
+app.route("/basemap", basemap);
 
 app.notFound((c) => jsonError(c, 404, "not found"));
 app.onError((err, c) => {

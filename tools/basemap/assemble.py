@@ -7,8 +7,10 @@ system font (localIdeographFontFamily, on by default on Android), so only the
 256-codepoint ranges holding other characters that occur in the tiles' strings
 are fetched. The set mirrors mln::util::i18n::allowsFixedWidthGlyphGeneration.
 
-The style's sources point at "pmtiles://file://@BASEMAP_DIR@/<name>.pmtiles";
-the app substitutes the directory it copied the archives to.
+The style refers to its files as "pmtiles://file://@BASEMAP_DIR@/<name>.pmtiles",
+"file://@BASEMAP_DIR@/fonts/..." and "file://@BASEMAP_DIR@/sprites/..."; the
+app substitutes the directory it extracted the downloaded archive to
+(tools/basemap/package.sh).
 
 Standard library only.
 """
@@ -258,8 +260,8 @@ def main():
             name: {"type": "vector", "url": f"pmtiles://file://@BASEMAP_DIR@/{name}.pmtiles", "attribution": credit}
             for name in ("world", "japan")
         },
-        "glyphs": "asset://basemap/fonts/{fontstack}/{range}.pbf",
-        "sprite": "asset://basemap/sprites/light",
+        "glyphs": "file://@BASEMAP_DIR@/fonts/{fontstack}/{range}.pbf",
+        "sprite": "file://@BASEMAP_DIR@/sprites/light",
         "layers": layers,
     }
     with open(os.path.join(a.out, "style.json"), "w", encoding="utf-8") as f:

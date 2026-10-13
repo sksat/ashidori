@@ -30,6 +30,7 @@ import {
   registerWithCode,
   revokeDevice,
 } from "./devices";
+import { basemapVersions } from "./basemap";
 import type { AppEnv } from "./env";
 import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
@@ -156,7 +157,17 @@ v1.post("/devices/register", async (c) => {
 
 // ---- Self-registration (unauthenticated, only when REGISTRATION = "open") ----
 
-v1.get("/info", (c) => c.json({ registration: registrationMode(c.env) }));
+// `basemap`: versions of the app's offline basemap this server serves at
+// GET /basemap/<version>/<file> (see basemap.ts); older servers lack it.
+v1.get("/info", async (c) => {
+  let versions: string[] = [];
+  try {
+    versions = await basemapVersions(c.env.BLOBS);
+  } catch (e) {
+    console.error("basemap listing failed", e);
+  }
+  return c.json({ registration: registrationMode(c.env), basemap: versions });
+});
 
 // `{token, deviceName?}`: creates a user and registers the calling device,
 // authenticated by the client-generated token, as its first device. The user

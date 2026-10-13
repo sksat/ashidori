@@ -185,6 +185,17 @@ class MainActivity extends AppCompatActivity:
             Log.i(s"debug sync uploaded batches=$sent")
           catch case e: Exception => Log.e("debug sync failed", e)
         }
+    // Debug builds: the offline basemap without a release.
+    //   --es ashidori.basemapUrl http://10.0.2.2:8000  download <url>/<pinned file> ("" = pinned sources)
+    //   --ez ashidori.basemapImport true                install <external files>/basemap/<pinned file>
+    // Either way the archive must match the pin (app/src/main/assets/basemap-pin.json).
+    if debuggable then
+      Option(getIntent.getStringExtra("ashidori.basemapUrl")).foreach { u =>
+        BasemapDownload.debugUrl = u
+        if u.trim.nonEmpty then BasemapDownload.start(this, allowMetered = true)
+      }
+      if getIntent.getBooleanExtra("ashidori.basemapImport", false) then
+        Basemap.pin.foreach(p => BasemapDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"basemap/${p.file}")))
     if debuggable && getIntent.getBooleanExtra("ashidori.sim", false) then
       AshidoriApp.io.execute { () =>
         val today = LocalDate.now(AshidoriApp.zone)

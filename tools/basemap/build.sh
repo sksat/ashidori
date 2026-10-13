@@ -13,14 +13,16 @@
 # Needs curl, tar, sha256sum (or shasum), python3 (3.9+) and node (18+).
 # Downloads only from the pinned URLs below and checks their checksums.
 #
-# Output (default app/src/main/assets/basemap/, untracked):
+# Output (default tools/basemap/out/, untracked):
 #   japan.pmtiles  world.pmtiles  style.json  fonts/<stack>/<range>.pbf
 #   sprites/light{,@2x}.{json,png}  manifest.json  ATTRIBUTION  OFL.txt
+# The app does not bundle it: tools/basemap/package.sh packs it into the
+# archive that the app downloads on first run and pins in the app.
 set -eu
 
 work=${1:?work dir}
-out=${2:-app/src/main/assets/basemap}
 here=$(cd "$(dirname "$0")" && pwd)
+out=${2:-$here/out}
 
 BUILD=${BUILD:-20261013}
 JAPAN_MAXZOOM=${JAPAN_MAXZOOM:-10}

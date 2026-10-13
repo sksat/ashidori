@@ -86,6 +86,29 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     b.setPadding(Ui.dp(12)(using act), Ui.dp(6)(using act), Ui.dp(12)(using act), Ui.dp(6)(using act))
     b
 
+  /** Offers the offline basemap's download while this map shows the offline
+    * map without it (routes and stays on a plain background).
+    */
+  private val basemapBanner =
+    val b = Ui.button("", tonal = true)(BasemapUi.bannerClicked(act))(using act)
+    b.setTextSize(12f)
+    b.setMinHeight(0)
+    b.setMinimumHeight(0)
+    b.setInsetTop(0)
+    b.setInsetBottom(0)
+    b.setPadding(Ui.dp(12)(using act), Ui.dp(6)(using act), Ui.dp(12)(using act), Ui.dp(6)(using act))
+    b.setVisibility(android.view.View.GONE)
+    b
+
+  /** Basemap version the loaded offline style was drawn from. */
+  private var loadedBasemap: Option[String] = None
+
+  private def updateBasemapBanner(): Unit =
+    val st = BasemapDownload.status
+    val missing = shown.contains(MapStyle.Offline) && !Basemap.installed && st != BasemapStatus.Unavailable
+    basemapBanner.setVisibility(if missing then android.view.View.VISIBLE else android.view.View.GONE)
+    if missing then basemapBanner.setText(BasemapUi.bannerText(st))
+
   private def updateDetailButton(): Unit =
     detailButton.setVisibility(if Settings.blockExternalLocation then android.view.View.VISIBLE else android.view.View.GONE)
     detailButton.setText(
@@ -137,6 +160,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     dlp.setMargins(Ui.dp(76)(using act), Ui.dp(10)(using act), Ui.dp(12)(using act), Ui.dp(14)(using act))
     f.addView(detailButton, dlp)
     updateDetailButton()
+    // Below the detail button when the controls are at the top.
+    val blp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      Gravity.TOP | Gravity.CENTER_HORIZONTAL)
+    blp.setMargins(Ui.dp(12)(using act), Ui.dp(if controlsOnTop then 56 else 10)(using act), Ui.dp(12)(using act), 0)
+    f.addView(basemapBanner, blp)
     f
 
   // Follow the logger's fixes; the map never turns GNSS on by itself.
@@ -160,6 +188,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   private def loadStyle(m: MapLibreMap, ms: MapStyle): Unit =
     map = None
     shown = Some(ms)
+    if ms == MapStyle.Offline then loadedBasemap = Basemap.installedVersion
+    updateBasemapBanner()
     m.setStyle(ms.builder, (style: Style) => {
       for id <- Seq("track", "highlight", "visits", "checkins", "live") do style.addSource(GeoJsonSource(id))
       // From the end of the drawn route to where we are now, updated per fix.
@@ -236,6 +266,13 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       pending.foreach(_())
       pending = None
     })
+
+  // The basemap was downloaded or deleted: redraw the offline map with or
+  // without it. Progress only updates the banner.
+  private val stopBasemap = BasemapDownload.listen { () =>
+    if shown.contains(MapStyle.Offline) && loadedBasemap != Basemap.installedVersion then refreshBaseMap(force = true)
+    updateBasemapBanner()
+  }
 
   /** Reloads the base map the policy picks now (after a choice, a setting
     * change or a detail switch), keeping what is drawn. `force` reloads the
@@ -493,6 +530,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   def onLowMemory(): Unit = mapView.onLowMemory()
   def onSaveInstanceState(b: Bundle): Unit = mapView.onSaveInstanceState(b)
   def onDestroy(): Unit =
+    stopBasemap()
     Settings.gate.revoke(this)
     TrackMap.all -= this
     // A closed detailed view no longer allows the network.

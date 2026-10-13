@@ -103,6 +103,30 @@ Worker の変数（`wrangler.jsonc` の `vars`）は次のとおり。CI では 
 | GET | `/admin/checkins` | 共有チェックインの一覧（変更の新しい順に 200 件。`user`・`userStatus` 付き。削除済みは含まない） |
 | POST | `/admin/checkins/:id/delete` | 共有チェックインを削除する（内容を消し、削除済みの記録だけを残す）。利用者は同じ local id で共有し直せない |
 
+## 簡易地図の配信
+
+アプリの簡易地図（端末内の地図）のデータを、GitHub Releases の代わりにこのサーバから配信できる。配信は任意である。同期を設定した端末は、`GET /v1/info` の `basemap` に自分の固定する版があればこのサーバから、なければ GitHub Releases から取得し、一方が失敗すると他方を試す。どちらから取得しても、アプリは自身に固定したサイズと sha256 で照合する。このため、サーバの運用者を信頼する必要はない。
+
+- `GET /basemap/:version/:file` が R2 の `basemap/<version>/<file>` を返す。認証は不要で、Cookie も設定しない。データは全利用者で同じで、国全体を含むため、要求から利用者の位置は分からない。
+- 返すのは `ashidori-basemap-<version>.zip`（アーカイブ）と `ashidori-basemap-<version>.json`（記述子）だけである。それ以外の名前と、存在しないオブジェクトには `404` を返す。`b/...` のバッチなど他のキーは読めない。
+- 1 つの `Range` に `206`（範囲外は `416`）で応じ、`ETag`・`If-None-Match`・`If-Range`・`Content-Length` を扱う。版ごとの内容は変わらないため、`Cache-Control` は `public, max-age=604800, immutable` とする。
+- `GET /v1/info` は、R2 にアーカイブがある版を `basemap: ["<version>", ...]` として返す。R2 の一覧は isolate ごとに 10 分間キャッシュする。古いサーバにはこのフィールドがなく、アプリは GitHub Releases から取得する。マイグレーションは不要である。
+- 定期処理の R2 の掃除は `b/` だけを走査するため、`basemap/` は削除しない。
+
+運用者は、リポジトリで `tools/basemap/package.sh` が作ったアーカイブと記述子を R2 に置く。`tools/basemap/release.sh` は、次のコマンドを版とパスを埋めて表示する。`server/` で実行し、`--remote` を付けて本番の R2 に書き込む（付けないとローカルの R2 に書き込まれる）。
+
+```sh
+v=20261013
+pnpm exec wrangler r2 object put "ashidori-blobs/basemap/$v/ashidori-basemap-$v.zip" \
+  --file "../tools/basemap/dist/ashidori-basemap-$v.zip" --content-type application/zip --remote
+pnpm exec wrangler r2 object put "ashidori-blobs/basemap/$v/ashidori-basemap-$v.json" \
+  --file "../tools/basemap/dist/ashidori-basemap-$v.json" --content-type application/json --remote
+curl -sI "https://<サーバ>/basemap/$v/ashidori-basemap-$v.zip"   # 200 と Content-Length を確かめる
+curl -s "https://<サーバ>/v1/info"                                 # 10 分以内に basemap に版が載る
+```
+
+置く版は、配布するアプリが固定する版（`app/src/main/assets/basemap-pin.json` の `version`）とする。それ以外の版は使われない。古い版は `pnpm exec wrangler r2 object delete "ashidori-blobs/basemap/<版>/<ファイル名>" --remote` で削除する。
+
 ## 開発
 
 Node 24 と pnpm を使います。
@@ -292,7 +316,7 @@ Rate Limiting binding の `namespace_id`（`wrangler.jsonc` の `ratelimits`）�
   - 保存と確定の間で処理が止まった場合に残るオブジェクトは、定期処理が R2 を少しずつ走査し、1 日以上たっても参照されていなければ削除する。走査の位置は `server_usage.orphan_sweep_after` に保存する。
 - **GET blob**: D1 のメタデータが参照するキーのオブジェクトだけを返す。マイグレーション 0005 より前に保存したバッチはメタデータにキーがなく（`r2_key` が NULL）、旧形式のキー `b/{deviceId}/{stream}/{seq 12 桁}` から返す。既存のオブジェクトは移動していない。
 - **admin**: GET・HEAD・OPTIONS 以外で、`Origin` ヘッダが別オリジンのリクエストと `Sec-Fetch-Site: cross-site` のリクエストは `403` で拒否する（CSRF 対策）。GET を対象外にするのは、Access のログイン後に `/admin/` へ戻るリダイレクトが cross-site になるためである。GET は状態を変えず、`/admin/*` は CORS ヘッダを返さないため、別オリジンのページは応答を読めない。
-- **セキュリティヘッダ**: 全レスポンスに付ける。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP（`default-src 'none'`、admin ページは nonce 付き）、`Cache-Control: no-store` である。
+- **セキュリティヘッダ**: 全レスポンスに付ける。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP（`default-src 'none'`、admin ページは nonce 付き）、`Cache-Control: no-store`（簡易地図の配信を除く）である。
 
 ### 既知の制限
 

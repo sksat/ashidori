@@ -28,7 +28,7 @@
 
 ### マップとチェックイン
 
-日ごとの経路を地図上に表示する。背景地図は、アプリに同梱する簡易地図（通信しない）、OpenStreetMap（OpenFreeMap）、国土地理院の各種地図（標準・淡色・航空写真・色別標高）から選択でき、任意の XYZ タイルも指定できる。簡易地図は日本をズーム 10 まで、全世界をズーム 5 まで収録し、市区町村名・主要道路・駅を表示する。チェックインは周辺施設（OpenStreetMap）または任意の名称で行う。
+日ごとの経路を地図上に表示する。背景地図は、端末内の簡易地図（初回にダウンロードし、表示では通信しない）、OpenStreetMap（OpenFreeMap）、国土地理院の各種地図（標準・淡色・航空写真・色別標高）から選択でき、任意の XYZ タイルも指定できる。簡易地図は日本をズーム 10 まで、全世界をズーム 5 まで収録し、市区町村名・主要道路・駅を表示する。チェックインは周辺施設（OpenStreetMap）または任意の名称で行う。
 
 <p>
   <img src="docs/images/period.png" width="240" alt="期間の記録">
@@ -87,6 +87,7 @@
 - OS の測位サービス：現在地は、端末の設定に従い fused／network provider から取得する。Google の位置情報の精度などが端末側で送る情報は、この設定では止まらない。
 - 利用者の明示的な操作：地図アプリで開く（`geo:` インテント）、エクスポートの共有、詳しい地図の表示、施設の検索の各操作は、その操作の分だけ位置情報を渡す。
 - 端末間の同期：記録は端末側で暗号化してから送るため、サーバは位置を読めない。
+- 簡易地図のダウンロード：日本と全世界のデータをまとめて取得するため、位置情報を含まない。設定によらず、初回に Wi-Fi で取得する（取得元には端末の IP アドレスが伝わる）。詳細は「[簡易地図](#簡易地図)」を参照。
 - チェックインの共有：共有したチェックインは暗号化しないため、サーバの運用者とフォロワーが位置を読める。外部への送信として扱い、設定によらずチェックインごとの共有操作でのみ送る（共有の画面は未実装）。以前の設定「近くの施設を OpenStreetMap で検索」はこの設定に統合した。以前の設定をオフにしていた場合は、この設定をオンにして引き継ぐ。以前の版が Geocoder で求めて保存した地名は、更新時に索引で求め直し、索引で求まらないものは消去する。
 
 ## 構成
@@ -96,7 +97,7 @@
 | `app/` | Android アプリ（Scala 3、Views、MapLibre） |
 | `core/` | 端末に依存しない処理（滞在検出、移動手段推定、記録方針、Parquet、暗号化、軌跡シミュレータ、地名の索引）。JVM 上でテストする |
 | `server/` | 同期サーバ（TypeScript、Hono、Cloudflare Workers） |
-| `docs/` | 同期プロトコル |
+| `docs/` | 仕組みの概要（[`docs/overview.md`](docs/overview.md)）と同期プロトコル |
 | `tools/geocoder/` | 地名の索引の生成（Python 3、標準ライブラリのみ） |
 | `tools/basemap/` | 簡易地図の生成（go-pmtiles、Python 3、Node） |
 
@@ -107,16 +108,51 @@
 - 大字・町丁目レベル位置参照情報　国土交通省（2025 年、第 19.0b 版、01000-19.0b.zip〜47000-19.0b.zip）、<https://nlftp.mlit.go.jp/isj/>。加工: 索引形式に変換（ashidori）
 - GeoNames（cities1000.zip、2026-10-13 版）、<https://www.geonames.org/>、[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)。改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）
 
-簡易地図は次のデータから作成する。生成には `tools/basemap/build.sh <作業ディレクトリ>` を用い、`app/src/main/assets/basemap/` に出力する（約 65 MB、リポジトリには含めない）。ツールとデータの版は `build.sh` に固定し、出力の sha256 を `manifest.json` に記録する。
+簡易地図は次のデータから作成する。生成には `tools/basemap/build.sh <作業ディレクトリ>` を用い、`tools/basemap/out/` に出力する（約 65 MB、リポジトリにも APK にも含めない）。ツールとデータの版は `build.sh` に固定し、出力の sha256 を `manifest.json` に記録する。アプリへの配布は「[簡易地図](#簡易地図)」を参照。
 
 - © OpenStreetMap contributors、[ODbL 1.0](https://www.openstreetmap.org/copyright)。地図データは OpenStreetMap から作成した Produced Work である
 - [Protomaps Basemap](https://protomaps.com/)（2026-10-13 の日次ビルド）。加工: 日本（ズーム 6〜10）と全世界（ズーム 0〜5）を切り出し（ashidori）
 - [Natural Earth](https://www.naturalearthdata.com/)（パブリックドメイン）。低ズームの海岸線と境界に含まれる
 - Noto Sans の字形（SIL Open Font License 1.1）、protomaps/basemaps-assets のアイコン（MIT License）、@protomaps/basemaps の配色（BSD-3-Clause）。漢字とかなは端末のフォントで描画する
 
-出典の一覧は `tools/ATTRIBUTION` と、生成物と同じディレクトリの `ATTRIBUTION` にも記す。
+出典の一覧は `tools/ATTRIBUTION` と、生成物と同じディレクトリの `ATTRIBUTION` にも記す。アプリの「データの出典」は、ダウンロードした簡易地図の `manifest.json` の出典を表示し、未取得の間は同じ内容の固定の文を表示する。
 
 近くの施設の検索には OpenStreetMap のデータ（© OpenStreetMap contributors、ODbL）を用いる。
+
+## 簡易地図
+
+簡易地図のデータ（約 64 MB）は APK に含めない。アプリは初回の起動時に、版ごとのアーカイブ `ashidori-basemap-<版>.zip` を Wi-Fi 接続時にダウンロードし、`filesDir/basemap/<版>/` に展開する。従量制の回線では、設定の「簡易地図」で確認した後にだけ取得する。取得するまでの地図は、無地の背景に経路と滞在地を表示する。
+
+- 取得元：同期を設定した端末は、サーバの `GET /v1/info` が固定の版を挙げていればサーバ（`/basemap/<版>/<ファイル>`）から、それ以外は GitHub Releases（タグ `basemap-<版>`）から取得する。一方が失敗すると他方を試す。サーバへの要求にデバイスのトークンは付けない。
+- 照合：アプリは `app/src/main/assets/basemap-pin.json`（版、ファイル名、サイズ、sha256）に固定したアーカイブだけを受け入れる。取得元を信頼する必要はない。
+- 中断と再開：WorkManager で実行し、一時ファイルに HTTP Range で続きから取得する。照合後に一時ディレクトリへ展開し、版のディレクトリへ rename で置き換え、古い版を削除する。
+- Protomaps の日次ビルドは 1 週間ほどで消え、直接の参照も推奨されないため、切り出したデータを自前で配布する。
+
+アーカイブはリポジトリで作り、公開する。
+
+```sh
+tools/basemap/build.sh <作業ディレクトリ>   # tools/basemap/out/ に生成する（BUILD=YYYYMMDD で日次ビルドを指定）
+tools/basemap/package.sh                    # tools/basemap/dist/ にアーカイブと記述子を作り、アプリの固定値を更新する
+tools/basemap/release.sh                    # 公開のコマンドを表示する（実行はしない）
+```
+
+`package.sh` の版は、既定では Protomaps の日次ビルドの日付である。データを変えたときは `VERSION=<版>` で新しい版にする。`release.sh` は `gh release create basemap-<版> …` と、同期サーバに置く場合の `wrangler r2 object put … --remote` を表示する（[`server/README.md`](server/README.md#簡易地図の配信)）。固定値（`basemap-pin.json`）の変更をコミットし、そのアプリを配布する前にアーカイブを公開する。
+
+リリースを作らずにエミュレータで確かめるには、`package.sh` で固定値を更新してデバッグ版をビルドし、アーカイブを端末に置いて取り込む。取り込みも固定値で照合する。
+
+```sh
+./gradlew :app:installDebug
+v=$(python3 -c 'import json; print(json.load(open("app/src/main/assets/basemap-pin.json"))["version"])')
+adb push tools/basemap/dist/ashidori-basemap-$v.zip /sdcard/Android/data/net.sksat.ashidori.debug/files/basemap/
+adb shell am start -n net.sksat.ashidori.debug/net.sksat.ashidori.MainActivity --ez ashidori.basemapImport true
+```
+
+ダウンロードの経路を確かめるには、手元の HTTP サーバから取得させる（デバッグ版のみ。`""` で既定の取得元に戻す）。
+
+```sh
+(cd tools/basemap/dist && python3 -m http.server 8000) &
+adb shell am start -n net.sksat.ashidori.debug/net.sksat.ashidori.MainActivity --es ashidori.basemapUrl http://10.0.2.2:8000
+```
 
 ## ビルド
 

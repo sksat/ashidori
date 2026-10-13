@@ -38,8 +38,8 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "位置参照情報: https://nlftp.mlit.go.jp/isj/",
       "GeoNames: https://www.geonames.org/（CC BY 4.0: https://creativecommons.org/licenses/by/4.0/）",
       "",
-      "■ 簡易地図（端末内の地図）",
-      if basemap.nonEmpty then bullets(basemap) else "このビルドには含まれていません。",
+      "■ 簡易地図（端末内の地図。初回にダウンロード）",
+      if basemap.nonEmpty then bullets(basemap) else BasemapStaticCredits,
       "OpenStreetMap: https://www.openstreetmap.org/copyright",
       "",
       "■ 詳しい地図（サーバから取得）",
@@ -58,8 +58,24 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       .setPositiveButton("閉じる", null)
       .show()
 
+  /** Credits of the basemap before it is downloaded (tools/basemap/assemble.py writes the same). */
+  private val BasemapStaticCredits = Seq(
+    "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
+    "Protomaps Basemap（https://protomaps.com/）。加工: 日本と全世界の低ズームを切り出し（ashidori）",
+    "Natural Earth（パブリックドメイン、https://www.naturalearthdata.com/）",
+    "Noto Sans（SIL Open Font License 1.1）。字形データは protomaps/basemaps-assets による",
+    "アイコン: protomaps/basemaps-assets（tangrams/icons に由来、MIT License）",
+    "地図の配色: @protomaps/basemaps（BSD-3-Clause）"
+  ).map("・" + _).mkString("\n")
+
   private val list = vbox()
   val view: View = scroll(list)
+
+  /** Status line of the 簡易地図 row, kept current while the download runs. */
+  private var basemapCaption: Option[android.widget.TextView] = None
+  private val stopBasemap = BasemapDownload.listen(() =>
+    basemapCaption.foreach(_.setText(BasemapUi.summary(BasemapDownload.status))))
+  override def onDestroy(): Unit = stopBasemap()
 
   override def onShow(): Unit =
     list.removeAllViews()
@@ -83,6 +99,11 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "対象外: 現在地の測位は端末の位置情報の設定に従います。地図アプリで開く、エクスポートを共有するなどの操作では、その位置情報を渡します。"
     ), 20, 0))
 
+    list.addView(section("地図"))
+    val basemapRow = item("簡易地図", BasemapUi.summary(BasemapDownload.status))(BasemapUi.showDialog(act))
+    basemapCaption = Some(basemapRow.asInstanceOf[android.view.ViewGroup].getChildAt(1).asInstanceOf[android.widget.TextView])
+    list.addView(basemapRow)
+
     list.addView(section("同期とバックアップ"))
     val syncState =
       if SyncConfig.ready then s"同期中・${SyncConfig.serverUrl}"
@@ -95,7 +116,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
     list.addView(section("情報"))
     val geo = if Geocoding.available then "地名: 位置参照情報（国土交通省）・GeoNames" else "地名: 端末内のデータなし"
-    val base = if Basemap.bundled then "簡易地図: OpenStreetMap・Protomaps・Natural Earth" else "簡易地図: 端末内のデータなし"
+    val base = "簡易地図: OpenStreetMap・Protomaps・Natural Earth"
     list.addView(item("データの出典", s"$geo\n$base")(showSources()))
 
     list.addView(section("開発者向け"))

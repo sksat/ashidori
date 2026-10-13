@@ -21,6 +21,11 @@ enum MapStyle(val key: String, val label: String, val note: String):
   case GsiRelief extends MapStyle("gsi-relief", "色別標高", "国土地理院。高さを色で表示（ズーム15まで）")
   case Custom extends MapStyle("custom", "カスタム", "XYZ タイルの URL を指定")
 
+  /** Identifies what a snapshot of this map shows: the offline map changes
+    * when its data is downloaded or deleted.
+    */
+  def cacheKey: String = if this == Offline then s"$key@${Basemap.installedVersion.getOrElse("none")}" else key
+
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
 

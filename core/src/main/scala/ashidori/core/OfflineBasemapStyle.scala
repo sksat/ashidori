@@ -2,10 +2,12 @@ package ashidori.core
 
 /** The on-device basemap's MapLibre style (built by tools/basemap/).
   *
-  * Its sources are "pmtiles://file://@BASEMAP_DIR@/<name>.pmtiles"; the app
-  * fills in the directory holding the archives. Without the generated
-  * assets, a style with only a background is used, so a map never falls
-  * back to a network style.
+  * Its sources, glyphs and sprites are under "file://@BASEMAP_DIR@/" (the
+  * sources as "pmtiles://file://@BASEMAP_DIR@/<name>.pmtiles"); the app
+  * fills in the directory it extracted the downloaded archive to. Before
+  * the download (or without the data), a style with only a background is
+  * used, so a map never falls back to a network style: the app draws its
+  * routes and stays on it.
   */
 object OfflineBasemapStyle:
   val Placeholder = "@BASEMAP_DIR@"

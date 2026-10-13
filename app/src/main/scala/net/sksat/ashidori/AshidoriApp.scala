@@ -18,8 +18,10 @@ class AshidoriApp extends Application:
     Settings.migrate()
     // An unpairing cut short by a crash is finished before anything syncs.
     Thread(() => net.sksat.ashidori.sync.SyncConfig.resumeUnpair(this), "ashidori-unpair").start()
-    // Copy the offline basemap out of the APK before the first map needs it.
-    Thread(() => { Basemap.prepare(); () }, "ashidori-basemap").start()
+    // The offline basemap: drop older versions (and the copy older APKs made),
+    // then queue the first download for an unmetered network.
+    AshidoriApp.io.execute(() => Basemap.cleanup())
+    BasemapDownload.autoStart(this)
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
     // Archive finished days (and migrate pre-Parquet data) in the background.

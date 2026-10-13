@@ -12,7 +12,7 @@ ATTRIBUTION を出力する。アプリでは「設定 > データの出典」�
   https://www.geonames.org/  https://creativecommons.org/licenses/by/4.0/
   改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）
 
-■ tools/basemap/ — 簡易地図（app/src/main/assets/basemap/）
+■ tools/basemap/ — 簡易地図（ashidori-basemap-<版>.zip。アプリが初回にダウンロードする）
 
 - © OpenStreetMap contributors。Open Database License 1.0
   https://www.openstreetmap.org/copyright

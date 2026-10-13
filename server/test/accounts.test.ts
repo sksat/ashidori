@@ -57,8 +57,8 @@ describe("GET /v1/info", () => {
   it("reports the registration mode without auth", async () => {
     const res = await call("/v1/info");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ registration: "admin" });
-    expect(await (await call("/v1/info", {}, OPEN)).json()).toEqual({ registration: "open" });
+    expect(await res.json()).toEqual({ registration: "admin", basemap: [] });
+    expect(await (await call("/v1/info", {}, OPEN)).json()).toEqual({ registration: "open", basemap: [] });
   });
 
   it("opens only for exactly \"open\"", async () => {
@@ -67,7 +67,7 @@ describe("GET /v1/info", () => {
     }
     expect(registrationMode({})).toBe("admin");
     expect(registrationMode({ REGISTRATION: "open" })).toBe("open");
-    expect(await (await call("/v1/info", {}, { REGISTRATION: "Open" })).json()).toEqual({ registration: "admin" });
+    expect(await (await call("/v1/info", {}, { REGISTRATION: "Open" })).json()).toEqual({ registration: "admin", basemap: [] });
   });
 });
 

@@ -68,7 +68,7 @@ object DayMap:
 
     // Same route, same picture: edits (mode changes) change the key.
     def key(style: MapStyle) =
-      s"${style.key}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
+      s"${style.cacheKey}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
     // The snapshot draws the base map's attribution itself.
     def show(b: Bitmap): Unit = img.setImageBitmap(b)
     Option(cache.get(key(MapStyle.forSnapshot))) match

@@ -1,87 +1,77 @@
 package net.sksat.ashidori
 
 import java.io.File
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
 import scala.util.Try
-import ashidori.core.OfflineBasemapStyle
+import ashidori.core.{BasemapPin, BasemapStore, OfflineBasemapStyle}
 
-/** The on-device coarse basemap (tools/basemap/build.sh): Japan to about
-  * zoom 10 and the world to zoom 5, drawn without any network access.
+/** The on-device coarse basemap (tools/basemap/): Japan to about zoom 10 and
+  * the world to zoom 5, drawn without any network access.
   *
-  * The generated files live in the APK under [[AssetDir]]. MapLibre 13.6
-  * reads PMTiles byte ranges only from plain files (range reads from APK
-  * assets came later), so the archives are copied to [[dir]] once per data
-  * version. Glyphs and sprites are read from the assets directly.
+  * The APK does not carry it. It is downloaded once ([[BasemapDownload]])
+  * as the archive pinned in the asset [[PinAsset]] (version, size, sha256)
+  * and extracted to filesDir/basemap/<version>/ ([[BasemapStore]]). Until
+  * then the offline map is a plain background under the routes and stays
+  * (the fallback style of [[OfflineBasemapStyle]]).
   */
 object Basemap:
-  val AssetDir = "basemap"
-  val ManifestPath = s"$AssetDir/manifest.json"
-  private val Archives = Seq("japan.pmtiles", "world.pmtiles")
+  /** Written by tools/basemap/package.sh. */
+  val PinAsset = "basemap-pin.json"
 
-  def dir: File = File(AshidoriApp.app.getFilesDir, "basemap")
-
-  /** Whether this build bundles the generated basemap. */
-  lazy val bundled: Boolean = Try(AshidoriApp.app.getAssets.open(s"$AssetDir/style.json").close()).isSuccess
-
-  private def asset(path: String): Option[Array[Byte]] =
+  /** The archive this build accepts; None if the build has no pin. */
+  lazy val pin: Option[BasemapPin] =
     Try {
-      val in = AshidoriApp.app.getAssets.open(path)
-      try in.readAllBytes() finally in.close()
-    }.toOption
-
-  /** Identifies the bundled archives (their sha256 from the manifest). */
-  private def stamp: String =
-    asset(ManifestPath).flatMap(b => Try {
-      val files = ujson.read(b)("files")
-      Archives.map(a => files(a)("sha256").str).mkString(",")
-    }.toOption).getOrElse("")
-
-  private var ready: Option[Boolean] = None
-
-  /** Copies the archives out of the APK if needed. Blocking; safe to call
-    * from any thread. False if this build has no basemap.
-    */
-  def prepare(): Boolean = synchronized {
-    ready.getOrElse {
-      val ok =
-        if !bundled then false
-        else
-          try
-            val d = dir
-            val stampFile = File(d, "stamp")
-            val want = stamp
-            val current = Try(String(java.nio.file.Files.readAllBytes(stampFile.toPath), "UTF-8")).getOrElse("")
-            if current != want || !Archives.forall(a => File(d, a).isFile) then
-              d.mkdirs()
-              stampFile.delete()
-              for a <- Archives do
-                val tmp = File(d, s"$a.tmp")
-                val in = AshidoriApp.app.getAssets.open(s"$AssetDir/$a")
-                try java.nio.file.Files.copy(in, tmp.toPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                finally in.close()
-                if !tmp.renameTo(File(d, a)) then throw java.io.IOException(s"cannot move $a")
-              java.nio.file.Files.write(stampFile.toPath, want.getBytes("UTF-8"))
-            true
-          catch
-            case e: Exception =>
-              Log.w("offline basemap unavailable", e)
-              false
-      ready = Some(ok)
-      ok
+      val in = AshidoriApp.app.getAssets.open(PinAsset)
+      try String(in.readAllBytes(), UTF_8) finally in.close()
+    }.toOption.flatMap { s =>
+      BasemapPin.parse(s) match
+        case Right(p) => Some(p)
+        case Left(e) =>
+          Log.w(s"basemap pin invalid: $e")
+          None
     }
+
+  lazy val store: BasemapStore = BasemapStore(File(AshidoriApp.app.getFilesDir, "basemap"))
+
+  /** Serializes installation, cleanup and deletion (one process). */
+  val lock = new Object
+
+  /** Directory of the installed pinned version. */
+  def dir: Option[File] = pin.flatMap(store.installed)
+  def installed: Boolean = dir.nonEmpty
+  def installedVersion: Option[String] = dir.map(_.getName)
+
+  /** Removes other versions, the pre-download layout (archives copied out of
+    * older APKs) and leftovers. Blocking.
+    */
+  def cleanup(): Unit = lock.synchronized {
+    val gone = store.cleanup(pin)
+    if gone.nonEmpty then Log.i(s"basemap: removed ${gone.mkString(", ")}")
   }
 
-  private var style: Option[String] = None
+  /** Deletes every downloaded file. Blocking. */
+  def deleteAll(): Unit = lock.synchronized(store.deleteAll())
+
+  private var style: Option[(Option[String], String)] = None
 
   /** MapLibre style JSON of the offline map; a plain background without the data. */
   def styleJson: String = synchronized {
-    style.getOrElse {
-      val template = if prepare() then asset(s"$AssetDir/style.json").map(String(_, "UTF-8")) else None
-      val s = OfflineBasemapStyle.render(template, dir.getAbsolutePath)
-      style = Some(s)
-      s
-    }
+    val d = dir
+    val key = d.map(_.getAbsolutePath)
+    style match
+      case Some((k, s)) if k == key => s
+      case _ =>
+        val template = d.flatMap(x => Try(String(Files.readAllBytes(File(x, "style.json").toPath), UTF_8)).toOption)
+        val s = OfflineBasemapStyle.render(template, key.getOrElse(""))
+        style = Some((key, s))
+        s
   }
 
-  /** Credit lines from the manifest, for データの出典. */
+  /** Credit lines of the downloaded copy (its manifest), for データの出典. */
   def attribution: Seq[String] =
-    asset(ManifestPath).flatMap(b => Try(ujson.read(b)("attribution").arr.map(_.str).toSeq).toOption).getOrElse(Seq.empty)
+    dir.flatMap(d => Try(ujson.read(Files.readAllBytes(File(d, "manifest.json").toPath))("attribution").arr.map(_.str).toSeq).toOption)
+      .getOrElse(Seq.empty)
+
+  /** Approximate size for the UI, e.g. "約 64 MB". */
+  def sizeLabel: String = pin.fold("")(p => s"約 ${math.max(1, math.round(p.bytes / 1e6))} MB")
