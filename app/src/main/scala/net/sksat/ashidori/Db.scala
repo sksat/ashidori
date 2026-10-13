@@ -442,31 +442,43 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def setSyncValue(name: String, v: Long): Unit =
     w.execSQL("INSERT OR REPLACE INTO sync_state(name, value) VALUES(?, ?)", Array[AnyRef](name, java.lang.Long.valueOf(v)))
 
-  /** Seals batches into the outbox in one transaction: each claims the next
-    * seq of its stream (`<reg>|seq:<stream>`), and the source progress is
-    * written with them. A crash leaves either all of it or none.
-    * `seal(seq)` encrypts for that slot; it runs inside the transaction.
+  /** The seq the next batch of `stream` of registration `reg` takes. */
+  def nextSeq(reg: String, stream: String): Long = syncValue(s"$reg|seq:$stream")
+
+  /** Stores one batch sealed for slot `seq`, claims that seq and writes the
+    * source progress in one small transaction: a crash leaves all of it or
+    * none. The sealing happens before, outside the transaction. Refuses
+    * (throws) if the stream's next seq is no longer `seq`.
+    * `remove` are progress rows that end with this batch.
     */
-  def enqueueBatches(reg: String, deviceId: String, cls: String, batches: Seq[(String, Long => Array[Byte])],
-                     progress: Seq[(String, Long)]): Int = tx { db =>
-    val st = db.compileStatement(
-      "INSERT INTO sync_outbox(reg, device_id, stream, seq, class, blob, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
-    for (stream, seal) <- batches do
-      val key = s"$reg|seq:$stream"
-      val seq = syncValue(key)
-      st.clearBindings()
-      st.bindString(1, reg)
-      st.bindString(2, deviceId)
-      st.bindString(3, stream)
-      st.bindLong(4, seq)
-      st.bindString(5, cls)
-      st.bindBlob(6, seal(seq))
-      st.bindLong(7, System.currentTimeMillis())
-      st.executeInsert()
-      setSyncValue(key, seq + 1)
+  def enqueueSealed(reg: String, deviceId: String, cls: String, stream: String, seq: Long, blob: Array[Byte],
+                    progress: Seq[(String, Long)], remove: Seq[String] = Nil): Unit = tx { db =>
+    val key = s"$reg|seq:$stream"
+    if syncValue(key) != seq then throw IllegalStateException(s"seq of $stream moved from $seq: not enqueued")
+    val cv = ContentValues()
+    cv.put("reg", reg)
+    cv.put("device_id", deviceId)
+    cv.put("stream", stream)
+    cv.put("seq", java.lang.Long.valueOf(seq))
+    cv.put("class", cls)
+    cv.put("blob", blob)
+    cv.put("created_at", java.lang.Long.valueOf(System.currentTimeMillis()))
+    db.insertOrThrow("sync_outbox", null, cv)
+    setSyncValue(key, seq + 1)
     progress.foreach(setSyncValue)
-    batches.size
+    remove.foreach(n => db.delete("sync_state", "name=?", Array(n)))
   }
+
+  /** Writes and removes progress rows in one transaction. */
+  def updateSync(progress: Seq[(String, Long)], remove: Seq[String]): Unit = tx { db =>
+    progress.foreach(setSyncValue)
+    remove.foreach(n => db.delete("sync_state", "name=?", Array(n)))
+  }
+
+  /** Bytes of sealed batches of class `cls` waiting in the outbox of registration `reg`. */
+  def outboxBytes(reg: String, cls: String): Long =
+    query("SELECT COALESCE(SUM(length(blob)), 0) FROM sync_outbox WHERE reg=? AND class=?", reg, cls)(_.getLong(0)).head
+
 
   /** Outbox rows of a registration and constraint classes, oldest first (without the blob). */
   def outbox(reg: String, classes: Set[String]): Vector[Db.OutboxEntry] =
@@ -495,28 +507,20 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     db.delete("sync_state", null, null)
   }
 
-  /** State from before registration-keyed sync (unprefixed `seq:`, `up:`,
-    * `updated:` rows). The seq counters and handed-over archive files carry
-    * over to `reg`; `updated:` watermarks are dropped (the editable tables
-    * are sent again once by change counter). `legacyPending` are the old
-    * pending files `(stream, seq, blob)`; they become outbox rows.
+  /** Discards the state of versions before registration-keyed sync
+    * (unprefixed `seq:`, `up:`, `updated:` rows): it may belong to an earlier
+    * registration, so no mark of it is trusted and the data is sent again.
+    * Only seq numbers carry over, as a floor for `reg`'s counters: each
+    * stream continues above the highest legacy counter and the highest
+    * legacy pending seq (`pendingFloors`: stream → that seq + 1), so no slot
+    * an older version may have filled is reused.
     */
-  def adoptLegacySync(reg: String, deviceId: String, legacyPending: Seq[(String, Long, Array[Byte])]): Unit = tx { db =>
+  def discardLegacySync(reg: String, pendingFloors: Seq[(String, Long)]): Unit = tx { db =>
     val legacy = query("SELECT name, value FROM sync_state WHERE instr(name, '|')=0")(c => c.getString(0) -> c.getLong(1))
-    for (name, v) <- legacy if name.startsWith("seq:") || name.startsWith("up:") do
-      setSyncValue(s"$reg|$name", math.max(v, syncValue(s"$reg|$name")))
-    for (stream, seq, blob) <- legacyPending do
-      val cv = ContentValues()
-      cv.put("reg", reg)
-      cv.put("device_id", deviceId)
-      cv.put("stream", stream)
-      cv.put("seq", java.lang.Long.valueOf(seq))
-      cv.put("class", if stream == "archive" then "raw" else "small")
-      cv.put("blob", blob)
-      cv.put("created_at", java.lang.Long.valueOf(System.currentTimeMillis()))
-      db.insertWithOnConflict("sync_outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
-      // A file written before its seq was saved.
-      if syncValue(s"$reg|seq:$stream") <= seq then setSyncValue(s"$reg|seq:$stream", seq + 1)
+    val floors = legacy.collect { case (n, v) if n.startsWith("seq:") => n.stripPrefix("seq:") -> v } ++ pendingFloors
+    for (stream, floor) <- floors do
+      val key = s"$reg|seq:$stream"
+      if syncValue(key) < floor then setSyncValue(key, floor)
     for (name, _) <- legacy do db.delete("sync_state", "name=?", Array(name))
   }
 

@@ -167,11 +167,15 @@ object PeerStatus:
       pages += 1
 
     var known = entries
-    for (dev, seq) <- st.targets do
+    for (dev, cand) <- st.targets do
       run.checkStopped()
+      val seq = cand.seq
       // Left: received but unusable; None: not received (network), next run.
+      // A blob that is not the listed one (size or SHA-256) is not opened.
       val blob: Either[Exception, Option[Array[Byte]]] =
-        try Right(Some(run.client.getBatch(dev, DeviceStatus.Stream, seq, DeviceStatus.MaxBlob)))
+        try
+          val b = run.client.getBatch(dev, DeviceStatus.Stream, seq, DeviceStatus.MaxBlob)
+          cand.mismatch(b).fold(Right(Some(b)))(m => Left(IllegalStateException(s"not the listed blob: $m")))
         catch
           case e: (LimitExceeded | BatchMissing) => Left(e)
           case e: Exception =>

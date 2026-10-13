@@ -6,7 +6,6 @@ import androidx.work.*
 import java.io.File
 import java.net.{HttpURLConnection, URL}
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import scala.util.{Try, Using}
 import net.sksat.ashidori.*
@@ -32,7 +31,9 @@ object SyncConfig:
 
   /** Sets the key of the registration `reg`, once. Refuses (false) when a key
     * is already set or the registration changed since the key step began, so
-    * a confirmed key is never replaced.
+    * a confirmed key is never replaced. Returns true only once the key is on
+    * disk; a failed write throws, and sync must then stay off.
+    * Blocking: call off the main thread.
     */
   def confirmKey(k: Array[Byte], reg: String): Boolean = synchronized {
     if reg.isEmpty || reg != registration || masterKey.isDefined then false
@@ -55,11 +56,15 @@ object SyncConfig:
     val (u, d) = (serverUrl, deviceId)
     if u.isEmpty || d.isEmpty then "" else Crypto.sha256Hex(s"$u\n$d".getBytes(UTF_8)).take(16)
 
+  /** Stores the registration, each part checked to be on disk; throws
+    * [[java.io.IOException]] otherwise. Blocking: call off the main thread.
+    */
   def savePairing(url: String, deviceId: String, token: String, newAccount: Boolean = false): Unit =
     // The token first: the URL and id make the registration count.
     SecureStore.put("token", token.getBytes(UTF_8))
-    prefs.edit().putString("url", url.stripSuffix("/")).putString("deviceId", deviceId)
-      .putBoolean("newAccount", newAccount).commit()
+    if !prefs.edit().putString("url", url.stripSuffix("/")).putString("deviceId", deviceId)
+        .putBoolean("newAccount", newAccount).commit()
+    then throw java.io.IOException("登録情報を保存できませんでした")
 
   /** Unpairs this device. Blocking: call off the main thread.
     *
@@ -75,7 +80,7 @@ object SyncConfig:
       prefs.edit().clear().commit()
       SecureStore.remove("token")
       SecureStore.remove("master")
-      Registration.discard()
+      Registration.reset()
       AshidoriApp.db.clearSync()
       Uploader.deleteLegacyPending()
       PeerStatus.clear()
@@ -122,17 +127,52 @@ final case class PendingRegistration(url: String, kind: String, code: String, na
 /** The server refused a registration for good (a 4xx other than 408/429). */
 final class RegistrationRejected(msg: String) extends RuntimeException(msg)
 
-/** Device registration with a client-generated token.
+/** What the registration screen shows: the stored request, and whether an
+  * attempt to send it is in flight.
+  */
+final case class RegistrationState(pending: Option[PendingRegistration], sending: Boolean)
+
+/** Outcomes of registration attempts, delivered on the main thread. */
+enum RegistrationEvent:
+  /** The state changed; redraw. */
+  case Changed
+  /** The current attempt paired this device. */
+  case Paired(newAccount: Boolean)
+  /** The current attempt (or starting / cancelling one) failed. */
+  case Failed(message: String)
+
+/** Device registration with a client-generated token: an app-wide state
+  * machine, independent of any screen instance.
   *
-  * The token (32 random bytes, base64url) is stored before the request is
-  * sent. A lost response is retried with the same token and request; the
-  * server answers with the same device id. The pending request is
-  * discarded only when the server definitely refused it.
+  * The token (32 random bytes, base64url) is stored, and checked to be on
+  * disk, before the request is sent. A lost response is retried with the
+  * same token and request; the server answers with the same device id. The
+  * pending request is discarded only when the server definitely refused it
+  * or the user cancelled it.
+  *
+  * Each send is an attempt with its own id. `current` holds the id of the
+  * attempt in flight (0: none). Cancelling sets it to 0, so the cancelled
+  * attempt's answer is dropped: the pairing is saved only if its attempt is
+  * still current, checked under [[lock]] right before saving.
+  *
+  * Threads: [[lock]] guards the stored request and the pairing it turns
+  * into. It is held only for local storage writes, never across network
+  * I/O, and the main thread never takes it: the screen calls the
+  * non-blocking [[start]], [[retry]] and [[cancel]] and observes [[state]].
   */
 object Registration:
   private val Key = "pendingRegistration"
+  private val lock = Object()
+  private val ids = java.util.concurrent.atomic.AtomicLong(0)
+  private val current = java.util.concurrent.atomic.AtomicLong(0)
+  /** The stored request, cached once read. None: not read yet. */
+  private val cached = java.util.concurrent.atomic.AtomicReference[Option[Option[PendingRegistration]]](None)
+  /** Storage steps (start, cancel), in the order they were asked for. */
+  private val local = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-registration"))
+  /** Requests to the server; one per attempt, so a stuck one blocks nothing else. */
+  private val network = java.util.concurrent.Executors.newCachedThreadPool(r => Thread(r, "ashidori-registration-net"))
 
-  def pending: Option[PendingRegistration] =
+  private def load(): Option[PendingRegistration] =
     Try(SecureStore.get(Key)).toOption.flatten.flatMap { b =>
       Try {
         val js = ujson.read(String(b, UTF_8))
@@ -140,24 +180,59 @@ object Registration:
       }.toOption
     }
 
-  /** Stores a new request with a fresh token. Not while paired or while another request is pending. */
-  def begin(url: String, kind: String, code: String, name: String): PendingRegistration = synchronized {
-    require(!SyncConfig.paired && pending.isEmpty, "登録の処理がすでに進んでいます")
+  /** The stored request. Takes no lock (read from disk on first use). */
+  def pending: Option[PendingRegistration] =
+    cached.get.getOrElse {
+      val p = load()
+      // A writer that stored a newer value in the meantime wins.
+      cached.compareAndSet(None, Some(p))
+      cached.get.get
+    }
+
+  def state: RegistrationState = RegistrationState(pending, current.get != 0)
+
+  // --- observers (main thread) ---
+
+  private val listeners = scala.collection.mutable.LinkedHashSet.empty[RegistrationEvent => Unit]
+  private lazy val main = android.os.Handler(android.os.Looper.getMainLooper)
+
+  /** Main thread only. Returns the function that stops observing. */
+  def observe(f: RegistrationEvent => Unit): () => Unit =
+    listeners += f
+    () => listeners -= f
+
+  private def emit(e: RegistrationEvent): Unit = main.post(() => listeners.toVector.foreach(_(e)))
+
+  // --- storage (under lock) ---
+
+  private def store(p: Option[PendingRegistration]): Unit =
+    p match
+      case Some(r) =>
+        SecureStore.put(Key, ujson.write(ujson.Obj("url" -> r.url, "kind" -> r.kind, "code" -> r.code, "name" -> r.name,
+          "token" -> r.token)).getBytes(UTF_8))
+      case None => SecureStore.remove(Key)
+    cached.set(Some(p))
+
+  /** Claims a new attempt id, unless one is in flight. Non-blocking. */
+  private def claim(): Option[Long] =
+    val id = ids.incrementAndGet()
+    if current.compareAndSet(0, id) then Some(id) else None
+
+  /** Ends attempt `id` if it is still the current one. */
+  private def release(id: Long): Unit =
+    if current.compareAndSet(id, 0) then emit(RegistrationEvent.Changed)
+
+  /** Stores a new request with a fresh token, checked to be on disk. */
+  private def begin(id: Long, url: String, kind: String, code: String, name: String): PendingRegistration = lock.synchronized {
+    if current.get != id then throw IllegalStateException("登録をやめました")
+    if SyncConfig.paired || pending.isDefined then throw IllegalStateException("登録の処理がすでに進んでいます")
     val p = PendingRegistration(url.stripSuffix("/"), kind, code, name, Crypto.randomToken())
-    SecureStore.put(Key, ujson.write(ujson.Obj("url" -> p.url, "kind" -> p.kind, "code" -> p.code, "name" -> p.name,
-      "token" -> p.token)).getBytes(UTF_8))
+    store(Some(p))
     p
   }
 
-  def discard(): Unit = SecureStore.remove(Key)
-
-  /** Sends the pending request; network errors are retried a few times.
-    * Blocking. On success the device is paired and the request cleared; on
-    * [[RegistrationRejected]] the request is cleared; otherwise it stays for
-    * a later retry with the same token.
-    */
-  def complete(): String = synchronized {
-    val p = pending.getOrElse(throw IllegalStateException("登録の処理がありません"))
+  /** Sends `p`; network errors are retried a few times. Blocking, no lock held. */
+  private def send(p: PendingRegistration): String =
     val c = SyncClient(p.url, None)
     def attempt(n: Int): String =
       try if p.kind == "account" then c.createAccount(p.name, p.token) else c.register(p.code, p.name, p.token)
@@ -166,16 +241,95 @@ object Registration:
           Log.w(s"registration attempt $n failed", e)
           Thread.sleep(1000L * n * n)
           attempt(n + 1)
+    attempt(1)
+
+  /** Takes in the answer to attempt `id`, unless it was cancelled meanwhile.
+    * The check and the saving are one step under [[lock]]. Returns the
+    * device id when this attempt paired the device.
+    */
+  private def finish(id: Long, p: PendingRegistration, answer: Try[String]): Option[String] =
+    val paired = lock.synchronized {
+      if current.get != id then None
+      else
+        answer match
+          case scala.util.Success(deviceId) =>
+            SyncConfig.savePairing(p.url, deviceId, p.token, newAccount = p.kind == "account")
+            // Paired now; a request left over would only be cleared by unpairing.
+            Try(store(None)).failed.foreach(e => Log.w("pending registration not cleared", e))
+            Some(deviceId)
+          case scala.util.Failure(e: RegistrationRejected) =>
+            store(None)
+            throw e
+          case scala.util.Failure(e) => throw e
+    }
+    paired
+
+  /** Runs attempt `id` of `p` on the network executor and reports the outcome. */
+  private def run(id: Long, p: PendingRegistration): Unit =
+    network.execute { () =>
+      val outcome = Try(finish(id, p, Try(send(p))))
+      release(id)
+      outcome match
+        case scala.util.Success(Some(_)) => emit(RegistrationEvent.Paired(p.kind == "account"))
+        case scala.util.Success(None)    => () // cancelled meanwhile: dropped
+        case scala.util.Failure(e)       => emit(RegistrationEvent.Failed(e.getMessage))
+    }
+
+  /** Starts a registration: stores the request, then sends it. Non-blocking. */
+  def start(url: String, kind: String, code: String, name: String): Unit =
+    claim() match
+      case None => emit(RegistrationEvent.Failed("登録の処理がすでに進んでいます"))
+      case Some(id) =>
+        emit(RegistrationEvent.Changed)
+        local.execute { () =>
+          Try(begin(id, url, kind, code, name)) match
+            case scala.util.Success(p) =>
+              emit(RegistrationEvent.Changed)
+              run(id, p)
+            case scala.util.Failure(e) =>
+              release(id)
+              emit(RegistrationEvent.Failed(e.getMessage))
+        }
+
+  /** Sends the stored request again, with the same token. Non-blocking. */
+  def retry(): Unit =
+    claim() match
+      case None => emit(RegistrationEvent.Failed("登録の処理がすでに進んでいます"))
+      case Some(id) =>
+        emit(RegistrationEvent.Changed)
+        local.execute { () =>
+          pending match
+            case Some(p) => run(id, p)
+            case None =>
+              release(id)
+              emit(RegistrationEvent.Failed("登録の処理がありません"))
+        }
+
+  /** Gives up the request. The attempt in flight, if any, is invalidated at
+    * once: its answer is dropped. Non-blocking.
+    */
+  def cancel(): Unit =
+    current.set(0)
+    emit(RegistrationEvent.Changed)
+    local.execute { () =>
+      Try(lock.synchronized(store(None))).failed.foreach(e => emit(RegistrationEvent.Failed(e.getMessage)))
+      emit(RegistrationEvent.Changed)
+    }
+
+  /** Forgets any request and invalidates any attempt (unpairing). Blocking. */
+  def reset(): Unit =
+    current.set(0)
+    lock.synchronized(store(None))
+    emit(RegistrationEvent.Changed)
+
+  /** Registers on the calling thread and returns the device id (debug hook). Blocking. */
+  def registerBlocking(url: String, kind: String, code: String, name: String): String =
+    val id = claim().getOrElse(throw IllegalStateException("登録の処理がすでに進んでいます"))
     try
-      val id = attempt(1)
-      SyncConfig.savePairing(p.url, id, p.token, newAccount = p.kind == "account")
-      discard()
-      id
-    catch
-      case e: RegistrationRejected =>
-        discard()
-        throw e
-  }
+      val p = begin(id, url, kind, code, name)
+      finish(id, p, Try(send(p))).getOrElse(throw IllegalStateException("登録をやめました"))
+    finally release(id)
+
 
 /** The server refused an upload because the user's storage quota is full.
   * This persists until the quota is raised, so it is not retried with backoff.
@@ -304,10 +458,11 @@ object SyncClient:
 /** Builds and uploads encrypted batches through the outbox (`sync_outbox`).
   *
   * Building a batch claims its seq, stores the ciphertext and records the
-  * source progress (change-counter watermark, archive file handed over) in
-  * one transaction. Sending deletes the row only after the server accepted
-  * it. A crash at any point therefore neither reuses a seq for other bytes
-  * nor counts data as sent that the server does not have.
+  * source progress (change-counter watermark, archive part handed over) in
+  * one small transaction; the ciphertext is sealed before, outside it.
+  * Sending deletes the row only after the server accepted it. A crash at
+  * any point therefore neither reuses a seq for other bytes nor counts data
+  * as sent that the server does not have.
   *
   * Rows carry a constraint class: "small" rows go out with the small-stream
   * job, "raw" rows only with the raw-log job (unmetered network).
@@ -316,6 +471,13 @@ object SyncClient:
 object Uploader:
   private val MaxRows = 5000
   private val MaxPlain = 4 * 1024 * 1024
+  /** Archive files are sent in parts of this size, one batch each. */
+  private val ArchivePart = 3 * 1024 * 1024
+  /** No more archive parts of a class are sealed while the outbox holds
+    * more than this of that class unsent: the outbox does not grow
+    * without bound next to the archive.
+    */
+  private val MaxOutboxBytes = 64L * 1024 * 1024
   val Small = "small"
   val Raw = "raw"
 
@@ -326,25 +488,46 @@ object Uploader:
     Option(legacyPendingDir.listFiles()).toSeq.flatten.foreach(_.delete())
     legacyPendingDir.delete()
 
-  /** Moves state of versions before registration-keyed sync into `run`'s registration. */
-  private def adoptLegacy(run: SyncRun): Unit =
+  /** Discards the sync state of versions before the outbox, and rebuilds.
+    *
+    * That state (pending files in `sync-pending/`, unprefixed `seq:`, `up:`
+    * and `updated:` rows) does not say which registration it belongs to:
+    * an older version could unpair from server A, register with B and keep
+    * A's pending blobs and marks. So none of it is sent or trusted. Pending
+    * blobs are deleted unsent; the `up:` and `updated:` marks are dropped,
+    * so every archive file and editable table is sealed again from the
+    * source data for `run`'s registration.
+    *
+    * Only the seq numbers are kept, as a floor: each stream continues above
+    * the highest legacy counter and pending file, so no new batch reuses a
+    * slot an older version may have filled (a `409` would block the stream).
+    * Skipped seqs are harmless gaps. Nothing older than this version is ever
+    * sent.
+    */
+  private def discardLegacy(run: SyncRun): Unit =
     val files = Option(legacyPendingDir.listFiles()).toSeq.flatten
-    val pending = files.flatMap { f =>
+    // Only the names `<stream>-<seq>.bin` are used; the contents are never read.
+    val pendingFloors = files.flatMap { f =>
       val n = f.getName.stripSuffix(".bin")
       val i = n.lastIndexOf('-')
-      if i <= 0 then None
-      else Try((n.take(i), n.drop(i + 1).toLong, Files.readAllBytes(f.toPath))).toOption
-        // A file cut short by a crash would only be refused or fail to decrypt.
-        .filter(_._3.length > Crypto.Magic.length + 12 + 16)
+      if i <= 0 then None else n.drop(i + 1).toLongOption.map(seq => n.take(i) -> (seq + 1))
     }
-    AshidoriApp.db.adoptLegacySync(run.reg, run.deviceId, pending)
+    AshidoriApp.db.discardLegacySync(run.reg, pendingFloors)
+    // After the floors are committed: a crash before this only repeats it.
     deleteLegacyPending()
-
-  private def seal(run: SyncRun, stream: String, plain: Array[Byte]): Long => Array[Byte] =
-    seq => Crypto.seal(run.batchKey, Crypto.aad(run.deviceId, stream, seq), plain)
 
   private def jsonl(records: Seq[ujson.Value]): Array[Byte] =
     Crypto.gzip(records.map(ujson.write(_)).mkString("", "\n", "\n").getBytes(UTF_8))
+
+  /** Seals `plain` for the stream's next seq of `run`'s registration (outside
+    * any transaction), then stores it with `progress` in one small transaction.
+    */
+  private def enqueue(run: SyncRun, cls: String, stream: String, plain: Array[Byte], progress: Seq[(String, Long)],
+                      remove: Seq[String] = Nil): Unit =
+    val db = AshidoriApp.db
+    val seq = db.nextSeq(run.reg, stream)
+    val blob = Crypto.seal(run.batchKey, Crypto.aad(run.deviceId, stream, seq), plain)
+    db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove)
 
   /** Upload the small streams. Returns the number of batches sent.
     * Editable data (places, check-ins, corrections) plus the archived
@@ -353,7 +536,7 @@ object Uploader:
     * day is archived, not row by row.
     */
   def uploadSmall(run: SyncRun): Int =
-    adoptLegacy(run)
+    discardLegacy(run)
     var sent = flush(run, Small)
     for stream <- Seq("places", "checkins", "overrides") do
       val table = if stream == "overrides" then "mode_overrides" else stream
@@ -365,45 +548,88 @@ object Uploader:
 
   /** One `status` record per run: how this device is doing, for the others. */
   private def uploadStatus(run: SyncRun): Int =
-    AshidoriApp.db.enqueueBatches(run.reg, run.deviceId, Small,
-      Seq(DeviceStatus.Stream -> seal(run, DeviceStatus.Stream, jsonl(Seq(StatusReport.current().toJson)))), Nil)
+    enqueue(run, Small, DeviceStatus.Stream, jsonl(Seq(StatusReport.current().toJson)), Nil)
     flush(run, Small)
 
   /** Raw GNSS / IMU archives: large, so only on unmetered networks. */
   def uploadRawLogs(run: SyncRun): Int =
-    adoptLegacy(run)
+    discardLegacy(run)
     flush(run, Raw) + uploadArchive(run, ashidori.core.Archive.RawTables, Raw)
 
-  /** Sends archived files not sent yet, as `archive` batches of ≤3 MiB chunks.
+  /** Identifies one version of an archive file by size and modification time
+    * (files are replaced by rename, never rewritten in place).
+    */
+  private def generation(f: File): Long =
+    val h = java.security.MessageDigest.getInstance("SHA-256").digest(s"${f.length}/${f.lastModified}".getBytes(UTF_8))
+    java.nio.ByteBuffer.wrap(h, 0, 8).getLong & Long.MaxValue
+
+  /** Reads part `i` of `f` (at most [[ArchivePart]] bytes) without reading the rest. */
+  private def readPart(f: File, i: Long, size: Long): Array[Byte] =
+    Using.resource(java.io.RandomAccessFile(f, "r")) { raf =>
+      val off = i * ArchivePart
+      val buf = new Array[Byte](math.min(ArchivePart.toLong, size - off).toInt)
+      raf.seek(off)
+      raf.readFully(buf)
+      buf
+    }
+
+  /** Sends archived files not sent yet, as `archive` batches of ≤3 MiB parts.
     * A month file is skipped when every day it merged was already sent.
-    * All chunks of a file and its handed-over mark are one transaction.
+    *
+    * Each part is read, encoded and sealed on its own, then committed with
+    * its seq and the file's next part (`uppart:`) in a small transaction, and
+    * sent. The file counts as handed over (`up:`) only with its last part. A
+    * run that stopped part-way resumes at the recorded part, if the file is
+    * still the same generation (`upgen:`); a file that changed meanwhile
+    * starts over from part 0 with new seqs, and its records carry the new
+    * `gen`.
     */
   private def uploadArchive(run: SyncRun, tables: Seq[ashidori.core.Archive.TableDef], cls: String): Int =
     val db = AshidoriApp.db
     var sent = 0
-    def key(t: ashidori.core.Archive.TableDef, name: String) = s"${run.reg}|up:${t.name}/$name"
-    for t <- tables; f <- AshidoriApp.archive.archivedFiles(t) do
+    def key(kind: String, t: ashidori.core.Archive.TableDef, name: String) = s"${run.reg}|$kind:${t.name}/$name"
+    val files = for t <- tables; f <- AshidoriApp.archive.archivedFiles(t) yield (t, f)
+    val it = files.iterator
+    var full = false
+    while it.hasNext && !full do
+      val (t, f) = it.next()
       run.checkStopped()
       val name = f.getName
+      val (up, genKey, partKey) = (key("up", t, name), key("upgen", t, name), key("uppart", t, name))
       val isMonth = name.length == "YYYY-MM.parquet".length
       val alreadyCovered =
-        db.syncValue(key(t, name)) != 0 ||
+        db.syncValue(up) != 0 ||
           (isMonth && {
             val month = java.time.YearMonth.parse(name.take(7))
-            (1 to month.lengthOfMonth).forall(d => db.syncValue(key(t, s"${month.atDay(d)}.parquet")) != 0)
+            (1 to month.lengthOfMonth).forall(d => db.syncValue(key("up", t, s"${month.atDay(d)}.parquet")) != 0)
           })
-      if !alreadyCovered then
-        val bytes = Files.readAllBytes(f.toPath)
-        val chunks = bytes.grouped(3 * 1024 * 1024).toVector
-        // Each chunk is encoded and sealed only when its turn comes in the transaction.
-        val batches = chunks.zipWithIndex.map { (chunk, i) =>
-          "archive" -> { (seq: Long) =>
-            seal(run, "archive", jsonl(Seq(ujson.Obj("file" -> s"${t.name}/$name", "part" -> i, "parts" -> chunks.size,
-              "data" -> java.util.Base64.getEncoder.encodeToString(chunk)))))(seq)
-          }
-        }
-        db.enqueueBatches(run.reg, run.deviceId, cls, batches, Seq(key(t, name) -> 1L))
-        sent += flush(run, cls)
+      var done = alreadyCovered
+      while !done && !full do
+        run.checkStopped()
+        val size = f.length
+        val gen = generation(f)
+        val parts = (size + ArchivePart - 1) / ArchivePart
+        // Resume only within the same generation of the file.
+        val part = if db.syncValue(genKey) == gen then db.syncValue(partKey) else 0L
+        if !f.exists then done = true // merged into a month file or deleted meanwhile
+        else if part >= parts then
+          db.updateSync(Seq(up -> 1L), Seq(genKey, partKey))
+          done = true
+        else if db.outboxBytes(run.reg, cls) > MaxOutboxBytes then
+          Log.w(s"outbox over ${MaxOutboxBytes >> 20} MiB: archive upload paused")
+          full = true
+        else
+          val chunk = readPart(f, part, size)
+          // Changed while reading: start over with the new generation.
+          if generation(f) == gen then
+            val last = part + 1 == parts
+            val plain = jsonl(Seq(ujson.Obj("file" -> s"${t.name}/$name", "gen" -> java.lang.Long.toHexString(gen),
+              "part" -> ujson.Num(part.toDouble), "parts" -> ujson.Num(parts.toDouble),
+              "data" -> java.util.Base64.getEncoder.encodeToString(chunk))))
+            if last then enqueue(run, cls, "archive", plain, Seq(up -> 1L), Seq(genKey, partKey))
+            else enqueue(run, cls, "archive", plain, Seq(genKey -> gen, partKey -> (part + 1)))
+            sent += flush(run, cls)
+            done = last
     sent
 
   /** Seals changed rows of an editable table until it is drained, sending as it goes. */
@@ -418,8 +644,7 @@ object Uploader:
       var size = 0
       val batch = rows.takeWhile { (_, o) => size += ujson.write(o).length + 1; size <= MaxPlain }
       val use = if batch.isEmpty then rows.take(1) else batch
-      db.enqueueBatches(run.reg, run.deviceId, Small, Seq(stream -> seal(run, stream, jsonl(use.map(_._2)))),
-        Seq(mark -> use.map(_._1).max))
+      enqueue(run, Small, stream, jsonl(use.map(_._2)), Seq(mark -> use.map(_._1).max))
       sent += flush(run, Small)
       rows = db.rowsChangedAfter(table, db.syncValue(mark), MaxRows)
     sent

@@ -36,6 +36,9 @@
 
   // Coarse rate limits in front of the precise D1 counters (src/ratelimit.ts):
   // per Cloudflare location, 60-second windows, looser than the D1 limits.
+  // RL_ACCOUNT is required when REGISTRATION is "open" (without it,
+  // self-registration is refused with 503); without the others, their
+  // checks pass with a warning.
   // namespace_id must be unique within the Cloudflare account; change these
   // if another Worker of the account already uses them.
   "ratelimits": [

@@ -69,11 +69,25 @@ export function isUniqueTokenError(e: unknown): boolean {
 
 export type RegisterResult = { deviceId: string; created: boolean } | "invalid" | "too many devices";
 
+/** `created_by` of a code issued by an admin: "admin:<email>", or "admin" (before migration 0002). */
+const ADMIN_ISSUED = "(created_by = 'admin' OR created_by LIKE 'admin:%')";
+
+/**
+ * The device that issued a code, NULL only for codes issued by an admin.
+ * `issuer_device_id` is NULL also for a code that a Worker older than
+ * migration 0005 inserted (while the migration and the deploy overlap), if
+ * the trigger of 0005 did not fill it in; such a code names its issuing
+ * device in `created_by`. NULL alone therefore never means "admin".
+ */
+const ISSUER = `COALESCE(issuer_device_id, CASE WHEN ${ADMIN_ISSUED} THEN NULL ELSE created_by END)`;
+
 // A code is usable if unused, unexpired, of an active user (or legacy), and
-// its issuing device (if any) is not revoked. ?2 is the current time.
+// its issuing device (unless an admin issued it) exists and is not revoked.
+// ?2 is the current time.
 const CODE_USABLE = `used_at IS NULL AND expires_at > ?2
   AND (user_id IS NULL OR user_id IN (SELECT id FROM users WHERE status = 'active'))
-  AND (issuer_device_id IS NULL OR issuer_device_id IN (SELECT id FROM devices WHERE revoked_at IS NULL))`;
+  AND (CASE WHEN ${ISSUER} IS NULL THEN ${ADMIN_ISSUED}
+       ELSE ${ISSUER} IN (SELECT id FROM devices WHERE revoked_at IS NULL) END)`;
 // Devices ever registered for the code's user (revoked ones included); `IS` so that NULL counts the legacy devices.
 const USER_DEVICES = "(SELECT COUNT(*) FROM devices WHERE user_id IS pairing_codes.user_id)";
 
@@ -140,6 +154,12 @@ export async function registerWithCode(
   }
   if (consumed.results.length > 0) return { deviceId, created: true };
 
+  // Not consumed. A concurrent request with the same token and code may have
+  // consumed the code after our first lookup: then this is a retry of that
+  // registration, not an error.
+  const raced = await earlier();
+  if (raced) return raced;
+
   // Not consumed. Only to a caller who holds a usable code, tell that the user has too many devices.
   const full = await db
     .prepare(`SELECT 1 FROM pairing_codes WHERE code_hash = ?1 AND ${CODE_USABLE} AND ${USER_DEVICES} >= ?3`)
@@ -197,13 +217,13 @@ export async function revokeDevice(db: D1Database, id: string, scope: DeviceScop
   const stmts =
     scope === "all"
       ? [
-          db.prepare("DELETE FROM pairing_codes WHERE issuer_device_id = ?1 AND used_at IS NULL").bind(id),
+          db.prepare(`DELETE FROM pairing_codes WHERE ${ISSUER} = ?1 AND used_at IS NULL`).bind(id),
           db.prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1").bind(id, now),
         ]
       : [
           db
             .prepare(
-              `DELETE FROM pairing_codes WHERE issuer_device_id = ?1 AND used_at IS NULL
+              `DELETE FROM pairing_codes WHERE ${ISSUER} = ?1 AND used_at IS NULL
                  AND EXISTS (SELECT 1 FROM devices WHERE id = ?1 AND user_id IS ?2)`,
             )
             .bind(id, scope.userId),

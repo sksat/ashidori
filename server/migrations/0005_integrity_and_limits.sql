@@ -1,5 +1,12 @@
 -- Storage integrity, usage counters and limits, safer pairing, revisions of
 -- shared check-ins, and cheaper rate-limit counters.
+--
+-- Backward compatible with the Worker of migration 0003: the deploy workflow
+-- applies migrations before it deploys, so that Worker keeps serving for a
+-- while on this schema (and again after a rollback). Every new NOT NULL
+-- column therefore has a default, and the triggers below fill in what that
+-- Worker does not write (the issuer of a pairing code, the expiry of a
+-- rate-limit counter).
 
 -- ---- Batches: immutable R2 keys ----
 -- New blobs are stored under a key of their own,
@@ -92,16 +99,28 @@ CREATE INDEX users_self_unused ON users (created_at)
   WHERE created_by = 'self' AND batch_count = 0 AND checkin_count = 0;
 
 -- ---- Pairing codes: the issuing device ----
--- NULL for codes issued by an admin. A code is accepted only while its
--- issuing device is not revoked, and revoking a device deletes its unused codes.
+-- NULL for codes issued by an admin (created_by 'admin' or 'admin:<email>').
+-- A code is accepted only while its issuing device is not revoked, and
+-- revoking a device deletes its unused codes.
 ALTER TABLE pairing_codes ADD COLUMN issuer_device_id TEXT;
 UPDATE pairing_codes SET issuer_device_id = created_by WHERE created_by IN (SELECT id FROM devices);
 CREATE INDEX pairing_codes_issuer ON pairing_codes (issuer_device_id);
+-- The older Worker inserts codes without issuer_device_id; its device-issued
+-- codes have the device id in created_by. The server also derives the issuer
+-- from created_by when issuer_device_id is NULL (src/devices.ts), so a NULL
+-- left by any other path is not taken for an admin-issued code either.
+CREATE TRIGGER pairing_codes_issuer_fill AFTER INSERT ON pairing_codes
+  WHEN NEW.issuer_device_id IS NULL AND NEW.created_by <> 'admin' AND NEW.created_by NOT LIKE 'admin:%'
+BEGIN
+  UPDATE pairing_codes SET issuer_device_id = NEW.created_by WHERE code_hash = NEW.code_hash;
+END;
 
 -- ---- Shared check-ins: revisions ----
--- rev: the client's revision of the entry (e.g. its last change time in ms).
--- A PUT or DELETE with a rev not above the stored one cannot undo a later
--- change. Existing tombstones get the end of the hour they were deleted in.
+-- rev: the client's revision of the entry (e.g. its last change time in ms),
+-- that of the last PUT or DELETE applied, tombstones included. A PUT or a
+-- DELETE applies only if its rev is above the stored one (src/checkins.ts),
+-- so a delayed or replayed older operation, PUT or DELETE, changes nothing.
+-- Existing tombstones get the end of the hour they were deleted in.
 ALTER TABLE shared_checkins ADD COLUMN rev INTEGER NOT NULL DEFAULT 0;
 UPDATE shared_checkins SET rev = deleted_at + 3599999 WHERE deleted_at IS NOT NULL;
 -- 1: removed by an admin. Such an entry stays removed: the owner cannot
@@ -116,8 +135,24 @@ DROP TABLE rate_limits;
 CREATE TABLE rate_limits (
   key          TEXT PRIMARY KEY,
   window_start INTEGER NOT NULL,
-  -- window_start + the window length of the counter's rule.
-  expires_at   INTEGER NOT NULL,
+  -- window_start + the window length of the counter's rule. 0 (the default)
+  -- only while a trigger below replaces it.
+  expires_at   INTEGER NOT NULL DEFAULT 0,
   count        INTEGER NOT NULL
 );
 CREATE INDEX rate_limits_expires_at ON rate_limits (expires_at);
+-- The older Worker writes counters without expires_at (insert), or moves
+-- window_start to a new window without it (update). Such a counter expires
+-- one hour (the longest window of any rule) after its window started, so the
+-- cleanup never deletes it while its window lasts. The current Worker always
+-- sets expires_at above window_start, so these never fire for it.
+CREATE TRIGGER rate_limits_expiry_insert AFTER INSERT ON rate_limits
+  WHEN NEW.expires_at <= NEW.window_start
+BEGIN
+  UPDATE rate_limits SET expires_at = NEW.window_start + 3600000 WHERE key = NEW.key;
+END;
+CREATE TRIGGER rate_limits_expiry_update AFTER UPDATE OF window_start ON rate_limits
+  WHEN NEW.expires_at <= NEW.window_start
+BEGIN
+  UPDATE rate_limits SET expires_at = NEW.window_start + 3600000 WHERE key = NEW.key;
+END;

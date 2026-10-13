@@ -37,7 +37,10 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     * generation is dropped.
     */
   private var gen = 0
-  /** A registration or unpairing request is in flight: the actions are disabled. */
+  /** An unpairing request of this screen is in flight: the actions are
+    * disabled. A registration in flight is app-wide state
+    * ([[Registration.state]]), so a reopened screen sees it too.
+    */
   private var busy = false
   /** A key dialog is open; only one at a time. */
   private var keyDialogOpen = false
@@ -46,8 +49,27 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   /** Buttons that start a request, disabled while [[busy]]. */
   private val actions = mutable.ArrayBuffer.empty[View]
 
-  override def onShow(): Unit = render()
-  override def onDestroy(): Unit = net.shutdown()
+  private var unobserve: () => Unit = () => ()
+  override def onShow(): Unit =
+    unobserve()
+    unobserve = Registration.observe(onRegistration)
+    render()
+  override def onHide(): Unit = unobserve()
+  override def onDestroy(): Unit =
+    unobserve()
+    net.shutdown()
+
+  /** Outcomes of registration attempts, whichever screen instance started them. */
+  private def onRegistration(e: RegistrationEvent): Unit =
+    e match
+      case RegistrationEvent.Changed => render()
+      case RegistrationEvent.Failed(msg) =>
+        toast(msg)
+        render()
+      case RegistrationEvent.Paired(newAccount) =>
+        render()
+        // Self-registered: no other device has a key, so go straight to making one.
+        if newAccount then createKey()
 
   private def async[A](work: => A)(done: Try[A] => Unit): Unit =
     net.execute { () =>
@@ -82,9 +104,9 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       )
     )
     if !SyncConfig.paired then
-      Registration.pending match
-        case Some(p) => body.addView(pendingCard(p))
-        case None    => body.addView(registerCard())
+      val s = Registration.state
+      if s.pending.isDefined || s.sending then body.addView(pendingCard(s))
+      else body.addView(registerCard())
     else if SyncConfig.masterKey.isEmpty then body.addView(keyCard())
     else
       body.addView(statusCard())
@@ -173,43 +195,30 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       go
     )
 
-  /** Stores the request with a new device token, then sends it. One at a time. */
-  private def startRegistration(u: String, kind: String, code: String): Unit =
-    if !busy then
-      Try(Registration.begin(u, kind, code, SyncScheduler.deviceName)).fold(
-        e => { toast(e.getMessage); render() },
-        _ => sendPending()
-      )
-
-  /** Sends the stored request (a first try or a retry with the same token). */
-  private def sendPending(): Unit =
-    if !busy then
-      busy = true
-      render()
-      async(Registration.complete()) { r =>
-        busy = false
-        r.failed.foreach(e => toast(e.getMessage))
-        render()
-        // Self-registered: no other device has a key, so go straight to making one.
-        if r.isSuccess && SyncConfig.newAccount then createKey()
-      }
-
-  /** A registration was sent but not answered (or not sent yet): retry it
-    * with the same token, or give it up.
+  /** Stores the request with a new device token, then sends it. One at a
+    * time, app-wide; the outcome arrives through [[onRegistration]].
     */
-  private def pendingCard(p: PendingRegistration): View =
-    card(
+  private def startRegistration(u: String, kind: String, code: String): Unit =
+    if !busy then Registration.start(u, kind, code, SyncScheduler.deviceName)
+
+  /** A registration being sent, or sent but not answered: wait, retry it
+    * with the same token, or give it up. Giving up also drops the answer of
+    * an attempt still in flight, so it is never disabled.
+    */
+  private def pendingCard(s: RegistrationState): View =
+    val retry = button("もう一度送る")(Registration.retry())
+    retry.setEnabled(!s.sending && !busy)
+    val cancel = outlined("やめる")(Registration.cancel())
+    val head = Seq(
       text("1. 端末を登録", 16f, bold = true),
-      caption(if busy then "サーバに登録しています…"
-        else "登録の応答を受け取れていません。同じ内容でもう一度送ると、サーバで登録済みならその登録を使います。"),
-      target(p.url),
-      caption(if p.kind == "account" then "新しく始める（この端末が最初）" else s"ペアリングコード ${p.code}"),
-      action(button("もう一度送る")(sendPending())),
-      action(outlined("やめる") {
-        Registration.discard()
-        render()
-      })
+      caption(if s.sending then "サーバに登録しています…"
+        else "登録の応答を受け取れていません。同じ内容でもう一度送ると、サーバで登録済みならその登録を使います。")
     )
+    val detail = s.pending.toSeq.flatMap { p =>
+      Seq(target(p.url), caption(if p.kind == "account" then "新しく始める（この端末が最初）" else s"ペアリングコード ${p.code}"))
+    }
+    card((head ++ detail ++ Seq(retry, cancel))*)
+
 
   // --- step 2: the encryption key ---
 
@@ -219,13 +228,13 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       // Self-registered: no other device has a key, so only a new one makes sense.
       card((head ++ Seq(
         caption("鍵を新しく作成し、表示される復旧コードを控えます。"),
-        button("新しい鍵を作る")(createKey())
+        action(button("新しい鍵を作る")(createKey()))
       ))*)
     else
       card((head ++ Seq(
         caption("最初の端末なら鍵を新しく作ります。2台目以降は、最初の端末で控えた復旧コードを入力します。"),
-        button("新しい鍵を作る（最初の端末）")(createKey()),
-        outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode())
+        action(button("新しい鍵を作る（最初の端末）")(createKey())),
+        action(outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode()))
       ))*)
 
   /** Keeps the dialog's content out of screenshots and the recent-apps view while it is open. */
@@ -247,13 +256,22 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     toast("コピーしました。保存したらクリップボードを消してください")
 
   /** Sets the key for the registration the dialog was opened for. */
+  /** The key is written off the main thread; sync is enabled only once the
+    * write is confirmed on disk.
+    */
   private def confirm(key: Array[Byte], reg: String): Unit =
-    if SyncConfig.confirmKey(key, reg) then SyncScheduler.schedule(act)
-    else toast("鍵はすでに設定されているか、登録が変わりました。鍵は変更していません")
-    render()
+    setBusy(true)
+    async(SyncConfig.confirmKey(key, reg)) { r =>
+      setBusy(false)
+      r match
+        case scala.util.Success(true) => SyncScheduler.schedule(act)
+        case scala.util.Success(false) => toast("鍵はすでに設定されているか、登録が変わりました。鍵は変更していません")
+        case scala.util.Failure(e) => toast(s"鍵を保存できませんでした。同期は始めていません: ${e.getMessage}")
+      render()
+    }
 
   private def createKey(): Unit =
-    if !keyDialogOpen && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
+    if !keyDialogOpen && !busy && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
       keyDialogOpen = true
       val reg = SyncConfig.registration
       val key = Crypto.newMasterKey()
@@ -285,7 +303,7 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       d.show()
 
   private def enterRecoveryCode(): Unit =
-    if !keyDialogOpen && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
+    if !keyDialogOpen && !busy && SyncConfig.paired && SyncConfig.masterKey.isEmpty then
       keyDialogOpen = true
       val reg = SyncConfig.registration
       // Hidden, kept out of suggestions and autofill; the eye icon shows it.

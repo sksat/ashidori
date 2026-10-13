@@ -3,8 +3,8 @@
 // 1. Workers Rate Limiting bindings (RL_* in wrangler.jsonc): counted per
 //    Cloudflare location, eventually consistent, 60-second windows, and
 //    without any D1 access. They turn away floods cheaply, before D1. They are
-//    deliberately looser than the D1 limits and are optional: without a
-//    binding (e.g. a local setup without it) the check passes.
+//    deliberately looser than the D1 limits. See "Edge layer" below for
+//    where they run and what happens without them.
 // 2. Fixed-window counters in D1 (`rate_limits`): precise (one D1 primary)
 //    and the limits the protocol documents. Once a counter has reached its
 //    limit, further hits change no row, so rejected requests cause no D1
@@ -26,6 +26,12 @@ export const RULES = {
   // so it is much stricter than pairing-code registration.
   account: { bucket: "account", limit: 5, windowMs: 60 * 60 * 1000 },
 } satisfies Record<string, RateLimitRule>;
+
+/**
+ * No rule's window may be longer: migration 0005 gives counters written by an
+ * older Worker (without expires_at) this lifetime.
+ */
+export const MAX_RULE_WINDOW_MS = 60 * 60 * 1000;
 
 // ---- Client keys ----
 
@@ -107,16 +113,54 @@ export function clientKey(req: Request): string {
 }
 
 // ---- Edge layer ----
+//
+// Where it runs: before anything that reads D1. Unauthenticated routes
+// (registration, self-registration) check it by client IP first. The
+// authenticated routes that are rate limited (pairing, handle lookup) check
+// it by client IP before the device authentication (a D1 read), and once
+// more by user after it.
+//
+// When a binding is missing or fails:
+// - Missing, for self-registration with REGISTRATION = "open": the route
+//   refuses with 503 (fail closed, see selfRegistrationEdgeReady). Each
+//   success creates a user, and the D1 counter alone would let a flood reach
+//   D1. The admin page shows it.
+// - Missing, elsewhere: the check passes, and a warning is logged once per
+//   isolate and binding. The D1 counters still apply.
+// - Throws at runtime (a transient failure): the check passes, with a warning,
+//   and the D1 counter decides. A failing edge layer must not stop
+//   registration and pairing.
 
-/** True unless the binding says the key is over its limit. Without a binding, or if it fails, true. */
-export async function edgeAllowed(limiter: RateLimit | undefined, key: string): Promise<boolean> {
-  if (!limiter) return true;
+const warnedMissing = new Set<string>();
+
+/** For tests: log the missing-binding warning again. */
+export function resetEdgeWarnings(): void {
+  warnedMissing.clear();
+}
+
+/**
+ * True unless the binding says the key is over its limit. Without the
+ * binding (warned once per isolate), or if it throws, true (see above).
+ */
+export async function edgeAllowed(limiter: RateLimit | undefined, name: string, key: string): Promise<boolean> {
+  if (!limiter) {
+    if (!warnedMissing.has(name)) {
+      warnedMissing.add(name);
+      console.warn(`rate limit binding ${name} is missing; only the D1 counters apply`);
+    }
+    return true;
+  }
   try {
     return (await limiter.limit({ key })).success;
   } catch (e) {
-    console.warn("rate limit binding failed", e);
+    console.warn(`rate limit binding ${name} failed; the D1 counters decide`, e);
     return true;
   }
+}
+
+/** Self-registration needs its edge limiter (RL_ACCOUNT); without it, POST /v1/accounts is 503. */
+export function selfRegistrationEdgeReady(env: { RL_ACCOUNT?: RateLimit }): boolean {
+  return env.RL_ACCOUNT !== undefined;
 }
 
 // ---- D1 layer ----

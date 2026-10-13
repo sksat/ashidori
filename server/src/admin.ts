@@ -5,7 +5,7 @@ import { listRecentCheckins, removeCheckin } from "./checkins";
 import { parseLimits } from "./config";
 import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
-import { clientKey, edgeAllowed, hitRateLimit, RULES } from "./ratelimit";
+import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
   createUser,
   getUser,
@@ -39,6 +39,12 @@ admin.post("/users", async (c) => {
   }
   const parsed = parseNewUser(body);
   if (typeof parsed === "string") return jsonError(c, 400, parsed);
+  // Like every creation, refused while a limit variable is invalid (fail closed).
+  const limits = parseLimits(c.env);
+  if (!limits.ok) {
+    console.error("invalid limit variables; refusing new users:", limits.invalid.join(", "));
+    return jsonError(c, 503, "server misconfigured");
+  }
   try {
     return c.json(await createUser(c.env.DB, parsed, c.get("adminEmail")), 201);
   } catch (e) {
@@ -69,7 +75,7 @@ admin.patch("/users/:id", async (c) => {
 
 // A pairing code for the user's device; the user enters it in the app.
 admin.post("/users/:id/pairing", async (c) => {
-  if (!(await edgeAllowed(c.env.RL_PAIRING, `pairing:admin:${c.get("adminEmail")}`))) {
+  if (!(await edgeAllowed(c.env.RL_PAIRING, "RL_PAIRING", `pairing:admin:${c.get("adminEmail")}`))) {
     return jsonError(c, 429, "too many requests");
   }
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
@@ -126,9 +132,14 @@ admin.get("/", async (c) => {
   const limits = parsed.ok ? parsed.limits : null;
   const quota = limits ? limits.userQuotaBytes : null;
   const usage = await serverUsage(c.env.DB);
-  const limitsText = parsed.ok
-    ? ""
-    : `<p id="misconfig">設定が不正なため、新しい利用者・デバイス・データの作成を停止している: ${parsed.invalid.join(", ")}</p>`;
+  const misconfig: string[] = [];
+  if (!parsed.ok) {
+    misconfig.push(`設定が不正なため、新しい利用者・デバイス・データの作成を停止しています: ${parsed.invalid.join(", ")}`);
+  }
+  if (registrationMode(c.env) === "open" && !selfRegistrationEdgeReady(c.env)) {
+    misconfig.push("レート制限の binding RL_ACCOUNT がないため、アプリからの新規登録を停止しています。");
+  }
+  const limitsText = misconfig.map((m) => `<p class="misconfig">${m}</p>`).join("");
   c.header(
     "Content-Security-Policy",
     `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
@@ -141,7 +152,7 @@ body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0
 #code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em;margin:.2rem 0}
 #pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ccc;padding:.3rem;text-align:left}
-td button{margin-right:.3rem}#err,#misconfig{color:#b00}
+td button{margin-right:.3rem}#err,.misconfig{color:#b00}
 </style></head><body>
 <h1>ashidori admin</h1>
 <p id="err"></p>

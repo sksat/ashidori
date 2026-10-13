@@ -177,10 +177,9 @@ class MainActivity extends AppCompatActivity:
         AshidoriApp.io.execute { () =>
           try
             import net.sksat.ashidori.sync.*
-            Registration.begin(url, "pair", code, "emulator")
-            val id = Registration.complete()
+            val id = Registration.registerBlocking(url, "pair", code, "emulator")
             val key = ashidori.core.sync.Crypto.newMasterKey()
-            SyncConfig.confirmKey(key, SyncConfig.registration)
+            if !SyncConfig.confirmKey(key, SyncConfig.registration) then throw IllegalStateException("key not set")
             Log.i(s"debug sync paired device=$id token=${SyncConfig.token.getOrElse("")} recovery=${ashidori.core.sync.RecoveryCode.encode(key)}")
             val sent = SyncLock.run(SyncRun.current().fold(0)(Uploader.uploadSmall))
             Log.i(s"debug sync uploaded batches=$sent")

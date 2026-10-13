@@ -62,13 +62,17 @@ check-ins that a user explicitly shares with their followers; see
   - A pairing code is 8 characters of Crockford base32, single use, with a TTL of 10 minutes.
   - Every code is bound to a user, and the device registered with it belongs to that user.
   - Codes are created either by an existing device (`POST /v1/pairing`, for the device's own user) or by an admin for a given user (`POST /admin/users/:id/pairing`).
-  - A code created by a device works only while that device is not revoked. Revoking a device also deletes the unused codes it created, in the same transaction.
+  - A code created by a device works only while that device is not revoked. Revoking a device also deletes the unused codes it created, in the same transaction. A code that an older server version stored without its issuing device is checked against the device named in its creator field; it is never taken for an admin's code.
   - A user's first device registers with a code from an admin, or, when registration is open, creates its user with `POST /v1/accounts`. Further devices always pair with a code.
 - Tokens can be revoked per device. A revoked or unknown token gets `401`.
 - An admin can disable a user. The user's device tokens then get `401` and the
   user's unused pairing codes are rejected, until the user is enabled again.
 - **Rate limits**, in two layers:
-  - A Workers Rate Limiting binding in front of D1, per Cloudflare location and 60-second window, eventually consistent: registration and self-registration per client IP, pairing and handle lookups per user. It only turns away floods cheaply.
+  - A Workers Rate Limiting binding in front of D1, per Cloudflare location and 60-second window, eventually consistent. It only turns away floods cheaply, before any D1 access:
+    - Registration and self-registration: per client IP, before the body is read.
+    - Pairing and handle lookups: per client IP before the device token is checked (which reads D1), and once more per user after it.
+    - A missing binding: self-registration with `REGISTRATION = open` is refused with `503 {"error": "server misconfigured"}` (fail closed; the admin page shows why). Elsewhere the check passes, and the server logs a warning once per isolate.
+    - A binding that fails at runtime: the check passes, with a warning, and the D1 counters decide.
   - Precise fixed-window counters in D1, per client IP (IPv4 address, or the /64 prefix of an IPv6 address; IPv4-mapped IPv6 counts as IPv4): registration 10 per 10 minutes (requests with a well-formed body, wrong codes included), pairing 20 per 10 minutes, handle lookups 20 per 10 minutes, self-registration 5 per hour. A rejected request does not write to D1.
   - Over the limit: `429 {"error": "too many requests"}`.
   - Counters are keyed by IP and are deleted by a scheduled job within about 10 minutes after their window has ended.
@@ -78,12 +82,13 @@ check-ins that a user explicitly shares with their followers; see
 `POST /v1/devices/register` and `POST /v1/accounts` are idempotent per token, so
 that a device whose response got lost can retry safely:
 
-1. The device generates a token and stores it, together with the request, before sending.
+1. The device generates a token and stores it, together with the request, confirmed on disk, before sending. Registration is a single app-wide attempt; cancelling drops the answer of an attempt in flight (the server may still have created that device). The master key is confirmed on disk before sync is enabled.
 2. The server stores the hash of that token for the new device and returns `201 {"deviceId": "..."}`. It never generates or returns a token.
 3. A retry with the same token and the same request returns the same device: `200 {"deviceId": "..."}`.
    - Register: the same code, which that device consumed. The device must not be revoked.
    - Accounts: the token is that of the first device of a self-registered user.
-4. A used code with another token gives `401`, like an unknown code. A known token with another code also gives `401`. For `/v1/accounts`, a token that belongs to any other device gives `409 {"error": "token already in use"}`.
+4. This also holds for two identical requests in flight at once (a retry sent before the first response arrived): one creates the device (`201`), the other gets it (`200`), also when the first one took the code's last device slot or the server's last user slot (`MAX_USERS`). Before answering `401`, `403` or `409`, the server checks again whether the request's token now has a device that matches the request.
+5. A used code with another token gives `401`, like an unknown code. A known token with another code also gives `401`. For `/v1/accounts`, a token that belongs to any other device gives `409 {"error": "token already in use"}`.
 
 Consuming the code and creating the device happen in one D1 transaction: both or
 neither. Used codes are kept for a day after they expire; a retry later than
@@ -97,7 +102,7 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/admin/users` | admin | list users with usage (`storageBytes`, `batchCount`, `sharedCheckinCount`) |
-| POST | `/admin/users` | admin | `{name, handle?, email?}` → the created user; `409` if the handle is taken |
+| POST | `/admin/users` | admin | `{name, handle?, email?}` → the created user; `409` if the handle is taken; `503` while a limit variable is invalid |
 | PATCH | `/admin/users/:id` | admin | `{name?, handle?}` (`handle: null` removes it) → the user |
 | POST | `/admin/users/:id/pairing` | admin | → `{code, expiresAt}` for that user |
 | POST | `/admin/users/:id/disable`, `/admin/users/:id/enable` | admin | disable / enable a user |
@@ -106,7 +111,7 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | GET | `/admin/checkins` | admin | the 200 most recently changed shared check-ins (moderation) |
 | POST | `/admin/checkins/:id/delete` | admin | remove a shared check-in for good (leaves a tombstone) |
 | GET | `/v1/info` | – | `{registration: "admin" \| "open"}` |
-| POST | `/v1/accounts` | – | `{token, deviceName?}` → `201 {deviceId}` (retry: `200`); creates a user with this device. `403 {"error": "registration closed"}` unless open; `403 {"error": "registration full"}` at `MAX_USERS` |
+| POST | `/v1/accounts` | – | `{token, deviceName?}` → `201 {deviceId}` (retry: `200`); creates a user with this device. `403 {"error": "registration closed"}` unless open; `403 {"error": "registration full"}` at `MAX_USERS`; `503` without the `RL_ACCOUNT` binding |
 | POST | `/v1/devices/register` | – | `{code, name, token}` → `201 {deviceId}` (retry: `200`); the code is consumed. `401` for an invalid code; `409 {"error": "too many devices"}` at the user's device limit (the code is then not consumed) |
 | POST | `/v1/pairing` | device | → `{code, expiresAt}` for the device's user |
 | GET | `/v1/devices` | device | the user's devices: `[{id, name, createdAt, lastSeenAt, revoked}]` |
@@ -115,8 +120,8 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | GET | `/v1/batches?after=<cursor>&limit=<n>` | device | metadata of the batches of all the user's devices, ordered by a global cursor |
 | GET | `/v1/batches/:deviceId/:stream/:seq` | device | blob of one of the user's devices |
 | PUT | `/v1/checkins/shared/:localId` | user device | share or update a check-in (see below) → `{id, cursor}` |
-| DELETE | `/v1/checkins/shared/:localId?rev=<rev>` | user device | unshare this device's check-in |
-| DELETE | `/v1/checkins/shared/by-id/:id?rev=<rev>` | user device | unshare any of the user's check-ins by its server id |
+| DELETE | `/v1/checkins/shared/:localId?rev=<rev>` | user device | unshare this device's check-in (also one not shared yet) → `{deleted: true}`; `409` stale |
+| DELETE | `/v1/checkins/shared/by-id/:id?rev=<rev>` | user device | unshare any of the user's check-ins by its server id → `{deleted: true}`; `409` stale |
 | GET | `/v1/checkins/feed?after=<cursor>&limit=<n>` | user device | own and followed users' shared check-ins |
 | GET | `/v1/users/lookup?handle=<handle>` | user device | → `{id, handle, name}` of the active user with exactly that handle, else `404` |
 | POST | `/v1/follows` | user device | `{userId}` → `{user: {id, handle, name}, status}`; sends a follow request |
@@ -131,7 +136,7 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 
 - "user device" means a device that belongs to a user. Legacy devices without a user get `403 {"error": "no user"}`.
 - Listings, fetches and revocations only cover the caller's user. A device of another user is reported like a missing one (`404`).
-- While a limit variable of the server is invalid, requests that would create something (a user, a device, a batch, a shared check-in) get `503 {"error": "server misconfigured"}`. Everything else keeps working.
+- While a limit variable of the server is invalid, requests that would create something (a user, also on the admin page, a device, a batch, a shared check-in or its tombstone) get `503 {"error": "server misconfigured"}`. Everything else keeps working, including unsharing an existing entry.
 
 ### Batches
 
@@ -216,11 +221,13 @@ other people. Everything else stays end-to-end encrypted in batches.
   - `venue`: 1–200 characters after trimming. `category`, `place`: ≤ 200 characters. `comment`: ≤ 1000 characters; tabs and line breaks are allowed. Other control characters are rejected. Empty optional fields are stored as null.
   - The body is at most 4 KiB.
   - The server assigns the entry an `id`. Sharing the same `localId` again with a higher `rev` updates the entry (and reshares it if it was unshared). A higher `rev` with unchanged content only records the `rev`.
-  - **Revisions**: the server keeps the highest `rev` of each entry, tombstones included, and refuses a PUT whose `rev` is not above it with `409 {"error": "stale revision"}`. A delayed or retried old PUT therefore cannot undo a later edit or unshare. The one exception is a retry of the PUT that set the current state (same `rev`, same content), which returns `200` with the entry as is. A client that gets `stale revision` treats its change as superseded.
+  - **Revisions**: each entry keeps the `rev` of the last PUT or DELETE applied to it, tombstones included. An operation applies only if its `rev` is above the stored one; the check and the change are one statement. Otherwise it changes nothing and gets `409 {"error": "stale revision"}`, so a delayed or replayed older PUT or DELETE cannot undo a later one. The exceptions are exact retries, which return `200`: a PUT with the same `rev` and content as the current state, and a DELETE with the same `rev` as the current tombstone. A client that gets `stale revision` treats its change as superseded.
   - A new entry beyond the user's `USER_MAX_SHARED_CHECKINS` gets `507 {"error": "too many shared check-ins"}`. Existing entries can still be changed.
-- `DELETE /v1/checkins/shared/:localId?rev=<rev>` unshares this device's entry. The server keeps a tombstone and deletes the content (time, position, venue, category, place, comment). The tombstone's `rev` is the highest of the stored one and `rev`; without `rev`, the server's current time in ms is used. Unsharing twice only raises the `rev`. An unknown id is `404`.
-- `DELETE /v1/checkins/shared/by-id/:id?rev=<rev>` does the same by the server `id`, from any device of the entry's user, for example after the device that shared it was lost and revoked. Another user's entry is `404`.
-- **Removal by an admin is final.** The entry becomes a tombstone that its owner cannot share again under the same `localId`, whatever `rev` it sends (`409 {"error": "removed by an admin"}`). The owner can still share the check-in anew under another local id. This applies to entries removed after this rule was introduced; earlier removals behave like an unshare.
+- `DELETE /v1/checkins/shared/:localId?rev=<rev>` unshares this device's entry: it becomes a tombstone with `rev`, and the server deletes the content (time, position, venue, category, place, comment). Without `rev`, the server's current time in ms is used.
+  - Unsharing a tombstone again with a higher `rev` only raises the `rev`; the cursor stays.
+  - An unknown `localId` gets a tombstone with `rev` as well, so that a first PUT that arrives after the DELETE with a lower `rev` is refused as stale. It counts against `USER_MAX_SHARED_CHECKINS` (`507` at the limit). Followers see it as a deleted entry they never saw shared.
+- `DELETE /v1/checkins/shared/by-id/:id?rev=<rev>` does the same by the server `id`, from any device of the entry's user, for example after the device that shared it was lost and revoked. An unknown id, or another user's entry, is `404`.
+- **Removal by an admin is final.** The entry becomes a tombstone regardless of its `rev`. Its owner cannot share it again under the same `localId`, whatever `rev` it sends (`409 {"error": "removed by an admin"}`). An owner's DELETE of it returns `200` and changes nothing. The owner can still share the check-in anew under another local id. This applies to entries removed after this rule was introduced; earlier removals behave like an unshare.
 - Every entry has `visibility`. It is always `followers` for now. Sharing with selected users, encrypted per recipient with public keys, is expected to add other values without changing the API above.
 
 ### Feed
@@ -282,8 +289,10 @@ by device id.
   - `mode` is the logging mode key (`eco`, `balanced`, `precise`, `max`); `since` is when recording was switched on (0 if off or unknown).
   - `lat`/`lon` are rounded to 1e-6°, `acc` (metres, may be null) to 0.1 m.
 - **Archive** (stream `archive`): the logged signals are not uploaded row by row. The device keeps the current day in SQLite; once a day is over, it writes each table of that day to a Parquet file `<table>/YYYY-MM-DD.parquet`, and once a month is over, it merges the month's day files into `<table>/YYYY-MM.parquet`. Each such file is uploaded once, split into chunks of at most 3 MiB, one batch per chunk:
-  `{file: "<table>/<YYYY-MM-DD or YYYY-MM>.parquet", part, parts, data}`
-  - `data` is base64 of the chunk; concatenating `part` 0 to `parts - 1` of one `file` gives the Parquet file.
+  `{file: "<table>/<YYYY-MM-DD or YYYY-MM>.parquet", gen, part, parts, data}`
+  - `data` is base64 of the chunk; concatenating `part` 0 to `parts - 1` of one (`file`, `gen`) gives the Parquet file.
+  - `gen` identifies the file version (hex, derived from size and modification time). If a file changes while it is being uploaded, it is sent again from part 0 under a new `gen` and new seqs. A reader assembles parts per (`file`, `gen`) and uses a complete generation.
+  - Each part is a separate batch, committed to the outbox and sent on its own.
   - A month file is not uploaded if all its days were uploaded as day files. A restorer combines day and month files of a table and drops exact duplicate rows.
   - Tables and columns (the first column is the time in ms, except where noted):
     - `fixes`: `time, lat, lon, acc, alt, speed, bearing, provider`
@@ -296,6 +305,7 @@ by device id.
     - `nmea`: `time, message`
     - `imu`: `time, elapsedRealtimeNanos, sensor (Accel, Gyro or Mag), x, y, z`
   - The small-stream job uploads `fixes`, `motion`, `battery` and `gnss_status`; the raw-log job uploads `gnss_raw`, `gnss_sat`, `gnss_nav`, `nmea` and `imu`.
+- Seqs of a stream can have gaps (see the upgrade rule under "Upload outbox on the device").
 - Earlier app versions uploaded raw GNSS logs as stream `gnss` (`{file, part, parts, data}` with chunks of the GnssLogger text file) and the signal tables as JSON Lines streams `fixes`, `motion` and `battery`. Servers may still hold such batches.
 
 ### What a backup can restore
@@ -312,8 +322,8 @@ After each successful small-stream upload, a device downloads the latest status 
 - It refreshes `GET /v1/devices` (names, revocations).
 - It walks `GET /v1/batches?after=<cursor>&limit=1000` from a cursor kept on the device, at most 20 pages per run. The cursor is only a fetch position and only moves to cursors of rows actually listed.
 - Per other device it keeps the newest listed `status` seq and, separately, the highest seq that decrypted and parsed.
-- It fetches just the newest blob per device (`GET /v1/batches/:deviceId/status/:seq`) and opens it with the AAD of the source device, `"{deviceId}/status/{seq}"`, using the last record. Blobs of other streams are not downloaded.
-- A network error changes nothing, so the next run tries again. A status that cannot be read (decrypt or parse failure, `404`, over-size) is *unresolved*: it is retried up to 3 times and shown on the device's row until a newer status from that device is read. It is never skipped silently.
+- It fetches just the newest blob per device (`GET /v1/batches/:deviceId/status/:seq`), checks that its size and SHA-256 match the listing (rows without `size` and `sha256` are malformed and fail the page), and opens it with the AAD of the source device, `"{deviceId}/status/{seq}"`, using the last record. Blobs of other streams are not downloaded.
+- A network error changes nothing, so the next run tries again. A status that cannot be read (size or hash mismatch, decrypt or parse failure, `404`, over-size) is *unresolved*: it is retried up to 3 times and shown on the device's row until a newer status from that device is read. It is never skipped silently.
 - Size caps, enforced while reading: a listing page ≤ 1 MiB and ≤ `limit` rows; a status blob ≤ 64 KiB; decompressed status ≤ 64 KiB and ≤ 64 JSON lines; other JSON responses ≤ 1 MiB.
 - The receiving device keeps the latest status per device locally. It may resolve an area name for the position with the platform `Geocoder`, which can contact a network geocoding provider. Nothing derived is uploaded to the sync server.
 
@@ -324,6 +334,9 @@ After each successful small-stream upload, a device downloads the latest status 
 - Rows carry a class, `small` or `raw`; `raw` rows are only sent by the raw-log job, under its network conditions.
 - All sync runs (periodic, "sync now", raw logs, the status download and unpairing) are serialized on the device.
 - Editable streams are tracked by a device-local change counter, not `updatedAt` (equal timestamps or a clock moved back would skip rows). Records still carry `updatedAt`.
+- Encryption happens outside the database transaction; the transaction then commits the outbox row, the seq increment and the progress mark, and refuses if the seq moved meanwhile.
+- Archive enqueueing pauses while a class's unsent outbox exceeds 64 MiB.
+- Upgrade from a version without the outbox: legacy pending blobs are discarded unsent and legacy progress marks are dropped, so all archive files and editable tables are uploaded again under new seqs above anything the old version used. Readers must tolerate duplicate files and rows. No ciphertext sealed by an older version is ever sent.
 - Sync progress is kept per registration (server URL and device id). Unpairing cancels and waits for running jobs, then clears all progress and unsent batches, so a new registration uploads everything again and never sends ciphertext bound to the old device id.
 
 ## Network policy on the device

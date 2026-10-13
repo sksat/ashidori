@@ -9,6 +9,7 @@ import {
   parseRev,
   unshareCheckin,
   unshareCheckinById,
+  type UnshareResult,
   upsertCheckin,
 } from "./checkins";
 import { type Limits, parseLimits } from "./config";
@@ -23,7 +24,7 @@ import {
 } from "./follows";
 import { createPairingCode, listDevices, parseDeviceName, registerWithCode, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
-import { clientKey, edgeAllowed, hitRateLimit, RULES } from "./ratelimit";
+import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
   DEVICE_TOKEN_RE,
   floorHour,
@@ -96,7 +97,9 @@ v1.get("/health", (c) => c.json({ ok: true }));
 // the same code and token returns the same device (200).
 v1.post("/devices/register", async (c) => {
   const ip = clientKey(c.req.raw);
-  if (!(await edgeAllowed(c.env.RL_REGISTER, `register:${ip}`))) return jsonError(c, 429, "too many requests");
+  if (!(await edgeAllowed(c.env.RL_REGISTER, "RL_REGISTER", `register:${ip}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   const parsed = await jsonBody(c);
   if (parsed instanceof Response) return parsed;
   const { code: rawCode, name: rawName, token } = parsed.body;
@@ -132,8 +135,15 @@ v1.get("/info", (c) => c.json({ registration: registrationMode(c.env) }));
 // the same token returns the same device (200).
 v1.post("/accounts", async (c) => {
   if (registrationMode(c.env) !== "open") return jsonError(c, 403, "registration closed");
+  // Fail closed without the edge limiter (see ratelimit.ts).
+  if (!selfRegistrationEdgeReady(c.env)) {
+    console.error("REGISTRATION is open but the RL_ACCOUNT binding is missing; refusing self-registration");
+    return jsonError(c, 503, "server misconfigured");
+  }
   const ip = clientKey(c.req.raw);
-  if (!(await edgeAllowed(c.env.RL_ACCOUNT, `account:${ip}`))) return jsonError(c, 429, "too many requests");
+  if (!(await edgeAllowed(c.env.RL_ACCOUNT, "RL_ACCOUNT", `account:${ip}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   const parsed = await jsonBody(c);
   if (parsed instanceof Response) return parsed;
   const { deviceName: rawName, token } = parsed.body;
@@ -156,6 +166,20 @@ v1.post("/accounts", async (c) => {
 // ---- Everything below requires a device token ----
 // A device acts for its user: it sees and manages only that user's devices and
 // batches. Legacy devices (user_id NULL) see each other (`IS` matches NULL).
+
+/** Edge limiter by client IP, before the device authentication reads D1 (see ratelimit.ts). */
+function edgeByIp(binding: "RL_PAIRING" | "RL_LOOKUP", bucket: string): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    if (!(await edgeAllowed(c.env[binding], binding, `${bucket}:ip:${clientKey(c.req.raw)}`))) {
+      return jsonError(c, 429, "too many requests");
+    }
+    await next();
+  };
+}
+
+// Registered before deviceAuth, so they run first.
+v1.use("/pairing", edgeByIp("RL_PAIRING", "pairing"));
+v1.use("/users/lookup", edgeByIp("RL_LOOKUP", "lookup"));
 
 v1.use("/pairing", deviceAuth);
 v1.use("/devices", deviceAuth);
@@ -184,7 +208,7 @@ for (const path of [
 
 v1.post("/pairing", async (c) => {
   const device = c.get("device");
-  if (!(await edgeAllowed(c.env.RL_PAIRING, `pairing:${device.user_id ?? "legacy"}`))) {
+  if (!(await edgeAllowed(c.env.RL_PAIRING, "RL_PAIRING", `pairing:user:${device.user_id ?? "legacy"}`))) {
     return jsonError(c, 429, "too many requests");
   }
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
@@ -326,25 +350,42 @@ v1.put("/checkins/shared/:localId", async (c) => {
   return c.json(r);
 });
 
+function unshareResponse(c: Context<AppEnv>, r: UnshareResult): Response {
+  switch (r) {
+    case "deleted":
+      return c.json({ deleted: true });
+    case "stale":
+      return jsonError(c, 409, "stale revision");
+    case "limit":
+      return jsonError(c, 507, "too many shared check-ins");
+    case "not found":
+      return jsonError(c, 404, "not found");
+  }
+}
+
 // Unshare by server id, from any device of the entry's user.
 v1.delete("/checkins/shared/by-id/:id", async (c) => {
   const rev = parseRev(c.req.query("rev"));
   if (rev === undefined) return jsonError(c, 400, "invalid rev");
   const id = c.req.param("id");
-  if (id.length > 64 || !(await unshareCheckinById(c.env.DB, c.get("device").user_id!, id, rev))) {
-    return jsonError(c, 404, "not found");
-  }
-  return c.json({ deleted: true });
+  if (id.length > 64) return jsonError(c, 404, "not found");
+  return unshareResponse(c, await unshareCheckinById(c.env.DB, c.get("device").user_id!, id, rev));
 });
 
+// Unshare this device's entry; an unknown local id gets a tombstone (see checkins.ts).
 v1.delete("/checkins/shared/:localId", async (c) => {
   const rev = parseRev(c.req.query("rev"));
   if (rev === undefined) return jsonError(c, 400, "invalid rev");
   const localId = c.req.param("localId");
-  if (!LOCAL_ID_RE.test(localId) || !(await unshareCheckin(c.env.DB, c.get("device").id, localId, rev))) {
-    return jsonError(c, 404, "not found");
-  }
-  return c.json({ deleted: true });
+  if (!LOCAL_ID_RE.test(localId)) return jsonError(c, 404, "not found");
+  // With an invalid limit, existing entries can still be unshared, but no new
+  // tombstone is created (503, as for any other creation).
+  const limits = parseLimits(c.env);
+  const device = c.get("device");
+  const max = limits.ok ? limits.limits.userMaxSharedCheckins : 0;
+  const r = await unshareCheckin(c.env.DB, device.user_id!, device.id, localId, rev, max);
+  if (r === "limit" && !limits.ok) return limitsOr503(c) as Response;
+  return unshareResponse(c, r);
 });
 
 v1.get("/checkins/feed", async (c) => {
@@ -360,7 +401,7 @@ v1.get("/checkins/feed", async (c) => {
 
 // Exact match only, and rate limited, which limits bulk probing of handles.
 v1.get("/users/lookup", async (c) => {
-  if (!(await edgeAllowed(c.env.RL_LOOKUP, `lookup:${c.get("device").user_id}`))) {
+  if (!(await edgeAllowed(c.env.RL_LOOKUP, "RL_LOOKUP", `lookup:user:${c.get("device").user_id}`))) {
     return jsonError(c, 429, "too many requests");
   }
   if (!(await hitRateLimit(c.env.DB, RULES.lookup, clientKey(c.req.raw)))) {

@@ -91,6 +91,11 @@ jobs:
           test -n "$D1_DATABASE_ID" || { echo "D1_DATABASE_ID is not set" >&2; exit 1; }
           sed -i "s/00000000-0000-0000-0000-000000000000/$D1_DATABASE_ID/" wrangler.jsonc
 
+      # Migrations run before the deploy, so the previous Worker keeps serving
+      # on the new schema until the deploy completes (or after a failed deploy
+      # or a rollback). Migrations must therefore accept that Worker's writes:
+      # defaults for new NOT NULL columns, triggers for what it does not write
+      # (see "マイグレーションと旧 Worker の同居" in server/README.md).
       - name: Migrate D1
         run: pnpm exec wrangler d1 migrations apply ashidori --remote
 

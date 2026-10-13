@@ -312,3 +312,19 @@ describe("admin API: devices", () => {
     expect((await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).status).toBe(429);
   });
 });
+
+describe("admin user creation with invalid limits", () => {
+  it("is refused with 503, like every other creation", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const headers = { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN_DEV_TOKEN}` };
+    const create = (overrides: Partial<Cloudflare.Env>) =>
+      call("/admin/users", { method: "POST", headers, body: JSON.stringify({ name: "x" }) }, overrides);
+    for (const bad of [{ MAX_USERS: "invalid" }, { USER_QUOTA_BYTES: "0" }]) {
+      const res = await create(bad);
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "server misconfigured" });
+    }
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first()).toEqual({ n: 0 });
+    expect((await create({})).status).toBe(201);
+  });
+});

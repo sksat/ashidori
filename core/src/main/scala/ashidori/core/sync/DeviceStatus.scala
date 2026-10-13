@@ -84,14 +84,19 @@ object DeviceStatus:
     if lines.size > maxLines then throw LimitExceeded("status lines", maxLines)
     lines.lastOption.map(l => fromJson(ujson.read(l)))
 
-/** One row of `GET /v1/batches`. */
-final case class BatchMeta(cursor: Long, deviceId: String, stream: String, seq: Long)
+/** One row of `GET /v1/batches`: where the blob is, and the size and
+  * SHA-256 the server recorded for it.
+  */
+final case class BatchMeta(cursor: Long, deviceId: String, stream: String, seq: Long, size: Long, sha256: String):
+  def candidate: StatusCandidate = StatusCandidate(seq, size, sha256)
 
 object BatchMeta:
   /** Throws on a malformed row (the listing is not trusted). */
   def fromJson(v: ujson.Value): BatchMeta =
-    val b = BatchMeta(v("cursor").num.toLong, v("deviceId").str, v("stream").str, v("seq").num.toLong)
-    require(b.cursor >= 0 && b.seq >= 0 && b.deviceId.matches("[A-Za-z0-9_-]{1,64}") && b.stream.matches("[a-z0-9_-]{1,32}"),
+    val b = BatchMeta(v("cursor").num.toLong, v("deviceId").str, v("stream").str, v("seq").num.toLong,
+      v("size").num.toLong, v("sha256").str)
+    require(b.cursor >= 0 && b.seq >= 0 && b.size >= 0 && b.deviceId.matches("[A-Za-z0-9_-]{1,64}") &&
+      b.stream.matches("[a-z0-9_-]{1,32}") && b.sha256.matches("[0-9a-f]{64}"),
       s"malformed batch metadata: $v")
     b
 
@@ -103,9 +108,21 @@ object BatchMeta:
       .groupMapReduce(_.deviceId)(_.seq)(math.max)
       .filter((d, seq) => known.get(d).forall(seq > _))
 
+/** A listed `status` batch to fetch: its seq, and the size and SHA-256 the
+  * listing gave for it.
+  */
+final case class StatusCandidate(seq: Long, size: Long, sha256: String):
+  /** Why the fetched `blob` is not the listed one, if it is not. A blob that
+    * fails this is not decrypted; it counts as unresolved.
+    */
+  def mismatch(blob: Array[Byte]): Option[String] =
+    if blob.length.toLong != size then Some(s"size ${blob.length} differs from the listed $size")
+    else if !Crypto.sha256Hex(blob).equalsIgnoreCase(sha256) then Some("SHA-256 differs from the listing")
+    else None
+
 /** A `status` batch that was listed but could not be read: wrong key,
-  * damaged, too large or not a status record. Kept until a newer status of
-  * the device is read, and shown on the device's row.
+  * damaged, too large, not the listed blob or not a status record. Kept
+  * until a newer status of the device is read, and shown on the device's row.
   */
 final case class Unresolved(seq: Long, attempts: Int, error: String)
 
@@ -113,34 +130,37 @@ final case class Unresolved(seq: Long, attempts: Int, error: String)
   *
   * `cursor` is only where the listing continues; what was actually read is
   * `authenticated` (device → highest seq that decrypted and parsed). `latest`
-  * remembers the newest listed seq per device, so the cursor may move on
-  * while a fetch is still to be done or retried.
+  * remembers the newest listed batch per device (seq, size, SHA-256), so the
+  * cursor may move on while a fetch is still to be done or retried.
   */
 final case class StatusSyncState(
     cursor: Long,
-    latest: Map[String, Long],
+    latest: Map[String, StatusCandidate],
     authenticated: Map[String, Long],
     unresolved: Map[String, Unresolved]
 ):
   import StatusSyncState.MaxAttempts
 
   /** Takes in one listing page. The cursor only moves to cursors of rows
-    * actually listed, never to a bare `next` value.
+    * actually listed, never to a bare `next` value. A device's candidate is
+    * replaced only by one with a higher seq.
     */
   def listed(items: Seq[BatchMeta], self: String): StatusSyncState =
     val newest = items.filter(b => b.stream == DeviceStatus.Stream && b.deviceId != self)
-      .groupMapReduce(_.deviceId)(_.seq)(math.max)
+      .groupMapReduce(_.deviceId)(_.candidate)((a, b) => if b.seq > a.seq then b else a)
     copy(
       cursor = (items.map(_.cursor) :+ cursor).max,
-      latest = newest.foldLeft(latest) { case (m, (d, s)) => m.updated(d, math.max(s, m.getOrElse(d, -1L))) }
+      latest = newest.foldLeft(latest) { case (m, (d, c)) =>
+        if m.get(d).exists(_.seq >= c.seq) then m else m.updated(d, c)
+      }
     )
 
-  /** Seq to fetch per device: its newest listed status when not read yet,
+  /** Batch to fetch per device: its newest listed status when not read yet,
     * unless that one already failed [[MaxAttempts]] times.
     */
-  def targets: Map[String, Long] =
-    latest.filter { (d, seq) =>
-      seq > authenticated.getOrElse(d, -1L) && !unresolved.get(d).exists(u => u.seq == seq && u.attempts >= MaxAttempts)
+  def targets: Map[String, StatusCandidate] =
+    latest.filter { (d, c) =>
+      c.seq > authenticated.getOrElse(d, -1L) && !unresolved.get(d).exists(u => u.seq == c.seq && u.attempts >= MaxAttempts)
     }
 
   def succeeded(device: String, seq: Long): StatusSyncState =
@@ -163,21 +183,29 @@ object StatusSyncState:
   val empty: StatusSyncState = StatusSyncState(0L, Map.empty, Map.empty, Map.empty)
 
   def toJson(s: StatusSyncState): ujson.Value =
-    def nums(m: Map[String, Long]) = ujson.Obj.from(m.map((k, v) => k -> ujson.Num(v.toDouble)))
     ujson.Obj(
       "cursor" -> ujson.Num(s.cursor.toDouble),
-      "latest" -> nums(s.latest),
-      "authenticated" -> nums(s.authenticated),
+      "latest" -> ujson.Obj.from(s.latest.map((k, c) =>
+        k -> ujson.Obj("seq" -> ujson.Num(c.seq.toDouble), "size" -> ujson.Num(c.size.toDouble), "sha256" -> c.sha256))),
+      "authenticated" -> ujson.Obj.from(s.authenticated.map((k, v) => k -> ujson.Num(v.toDouble))),
       "unresolved" -> ujson.Obj.from(s.unresolved.map((k, u) =>
         k -> ujson.Obj("seq" -> ujson.Num(u.seq.toDouble), "attempts" -> u.attempts, "error" -> u.error)))
     )
 
+  /** State stored before candidates kept the listed size and SHA-256 (a bare
+    * seq per device) has nothing to check a blob against: those candidates
+    * are dropped and the cursor restarts from 0, so the listing gives them again.
+    */
   def fromJson(v: ujson.Value): StatusSyncState =
-    def nums(k: String) = v.obj.get(k).flatMap(_.objOpt).fold(Map.empty[String, Long])(_.toMap.map((d, n) => d -> n.num.toLong))
+    val rawLatest = v.obj.get("latest").flatMap(_.objOpt).fold(Map.empty[String, ujson.Value])(_.toMap)
+    val latest = rawLatest.flatMap { (d, c) =>
+      c.objOpt.map(o => d -> StatusCandidate(o("seq").num.toLong, o("size").num.toLong, o("sha256").str))
+    }
+    val legacy = latest.size != rawLatest.size
     StatusSyncState(
-      v.obj.get("cursor").flatMap(_.numOpt).fold(0L)(_.toLong),
-      nums("latest"),
-      nums("authenticated"),
+      if legacy then 0L else v.obj.get("cursor").flatMap(_.numOpt).fold(0L)(_.toLong),
+      latest,
+      v.obj.get("authenticated").flatMap(_.objOpt).fold(Map.empty[String, Long])(_.toMap.map((d, n) => d -> n.num.toLong)),
       v.obj.get("unresolved").flatMap(_.objOpt).fold(Map.empty[String, Unresolved])(_.toMap.map((d, u) =>
         d -> Unresolved(u("seq").num.toLong, u("attempts").num.toInt, u.obj.get("error").flatMap(_.strOpt).getOrElse(""))))
     )

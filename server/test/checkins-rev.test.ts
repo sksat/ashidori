@@ -5,6 +5,7 @@ import {
   authed,
   CHECKIN,
   feed,
+  follow,
   newDevice,
   newUser,
   postJson,
@@ -71,9 +72,77 @@ describe("revisions of shared check-ins", () => {
     expect((await unshare(a.token, "c1", `?rev=${row!.rev + 1000}`)).status).toBe(200);
     expect((await feed(a.token)).items[0]!.cursor).toBe(cursor);
     expect((await env.DB.prepare("SELECT rev FROM shared_checkins").first<{ rev: number }>())!.rev).toBe(row!.rev + 1000);
-    // A lower rev never lowers it.
-    await unshare(a.token, "c1", "?rev=1");
+    // A lower rev never lowers it, and is stale.
+    expect((await unshare(a.token, "c1", "?rev=1")).status).toBe(409);
     expect((await env.DB.prepare("SELECT rev FROM shared_checkins").first<{ rev: number }>())!.rev).toBe(row!.rev + 1000);
+  });
+
+  it("do not let a replayed DELETE undo a later PUT", async () => {
+    const a = await newDevice("a");
+    const { body } = await share(a.token, "c1", { rev: 10 });
+    expect((await unshare(a.token, "c1", "?rev=20")).status).toBe(200);
+    expect((await share(a.token, "c1", { rev: 30, venue: "again" })).status).toBe(200);
+    const live = (await feed(a.token)).items[0]!;
+    // The DELETE rev=20 is delivered again (e.g. a retry after a lost response).
+    const replay = await unshare(a.token, "c1", "?rev=20");
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toEqual({ error: "stale revision" });
+    expect((await feed(a.token)).items).toEqual([live]);
+    expect(live).toEqual(expect.objectContaining({ id: body.id, deleted: false, venue: "again" }));
+    expect((await env.DB.prepare("SELECT rev FROM shared_checkins").first<{ rev: number }>())!.rev).toBe(30);
+    // The same holds by server id.
+    expect((await unshareById(a.token, body.id, "?rev=20")).status).toBe(409);
+    expect((await feed(a.token)).items).toEqual([live]);
+  });
+
+  it("accept an exact retry of a DELETE, and refuse an equal or older rev on a live entry", async () => {
+    const a = await newDevice("a");
+    const { body } = await share(a.token, "c1", { rev: 10 });
+    // Equal or older than the live entry: stale, nothing changes.
+    for (const rev of [10, 9]) {
+      expect((await unshare(a.token, "c1", `?rev=${rev}`)).status).toBe(409);
+      expect((await unshareById(a.token, body.id, `?rev=${rev}`)).status).toBe(409);
+    }
+    expect((await feed(a.token)).items[0]!.deleted).toBe(false);
+    expect((await unshare(a.token, "c1", "?rev=20")).status).toBe(200);
+    const tomb = (await feed(a.token)).items[0]!;
+    // The same rev again is a retry of the unshare that made this tombstone.
+    expect((await unshare(a.token, "c1", "?rev=20")).status).toBe(200);
+    expect((await unshareById(a.token, body.id, "?rev=20")).status).toBe(200);
+    expect((await feed(a.token)).items).toEqual([tomb]);
+  });
+
+  it("keep a DELETE that arrives before the first PUT", async () => {
+    const alice = await newUser("alice");
+    const bob = await newUser("bob");
+    await follow(bob, alice);
+    // Shared at rev 10 and unshared at rev 20; the PUT is delayed past the DELETE.
+    expect((await unshare(alice.token, "c1", "?rev=20")).status).toBe(200);
+    expect((await share(alice.token, "c1", { rev: 10 })).status).toBe(409);
+    const items = (await feed(bob.token)).items;
+    expect(items).toEqual([expect.objectContaining({ deleted: true, venue: null, lat: null })]);
+    // The tombstone counts, and a later share (higher rev) works.
+    expect((await env.DB.prepare("SELECT checkin_count FROM users WHERE id = ?1").bind(alice.userId).first())).toEqual({
+      checkin_count: 1,
+    });
+    expect((await share(alice.token, "c1", { rev: 30 })).status).toBe(200);
+    expect((await feed(bob.token)).items).toEqual([expect.objectContaining({ id: items[0]!.id, deleted: false })]);
+  });
+
+  it("count a tombstone of an unknown id against the shared check-in limit", async () => {
+    const a = await newDevice("a");
+    const LIMIT = { USER_MAX_SHARED_CHECKINS: "1" };
+    const del = (id: string, rev: number, env: Partial<Cloudflare.Env> = LIMIT) =>
+      authed(a.token, `/v1/checkins/shared/${id}?rev=${rev}`, { method: "DELETE" }, env);
+    expect((await del("c1", 5)).status).toBe(200);
+    const full = await del("c2", 5);
+    expect(full.status).toBe(507);
+    expect(await full.json()).toEqual({ error: "too many shared check-ins" });
+    // An existing entry can still be unshared, also while a limit is invalid;
+    // a new tombstone is then refused like any creation.
+    expect((await del("c1", 6, { USER_MAX_SHARED_CHECKINS: "0" })).status).toBe(200);
+    expect((await del("c3", 6, { USER_MAX_SHARED_CHECKINS: "0" })).status).toBe(503);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM shared_checkins").first())).toEqual({ n: 1 });
   });
 
   it("validate rev on DELETE", async () => {
@@ -90,8 +159,12 @@ describe("revisions of shared check-ins", () => {
       const res = await share(a.token, "c1", { rev });
       expect(res).toEqual({ status: 409, body: { error: "removed by an admin" } });
     }
-    // The owner may still unshare it (a no-op), and share other check-ins.
+    // The owner may still unshare it (a no-op, whatever the rev), and share other check-ins.
+    const before = await env.DB.prepare("SELECT * FROM shared_checkins").first();
     expect((await unshare(a.token, "c1")).status).toBe(200);
+    expect((await unshare(a.token, "c1", "?rev=1")).status).toBe(200);
+    expect((await unshareById(a.token, body.id, `?rev=${Number.MAX_SAFE_INTEGER}`)).status).toBe(200);
+    expect(await env.DB.prepare("SELECT * FROM shared_checkins").first()).toEqual(before);
     expect((await share(a.token, "c2", { rev: 1 })).status).toBe(200);
     expect((await feed(a.token)).items.map((i) => i.deleted)).toEqual([true, false]);
   });

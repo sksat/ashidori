@@ -11,12 +11,15 @@
 // does not see intermediate states. Unshared rows stay as tombstones with
 // their content nulled out.
 //
-// Revisions: every PUT carries the client's `rev` (e.g. the check-in's
-// updatedAt in ms), and the row keeps the highest one, tombstones included.
-// A PUT whose rev is not above the stored one is refused, so a delayed or
-// retried old PUT cannot undo a later edit or unshare. An unshare sets the
-// rev to the given one or, if none, to the server time. Removal by an admin is
-// final for that entry: it cannot be shared again under the same local id.
+// Revisions: every PUT and DELETE carries the client's `rev` (e.g. the
+// check-in's updatedAt in ms; a DELETE without one uses the server time), and
+// the row keeps the rev of the last operation applied, tombstones included.
+// An operation applies only if its rev is above the stored one, decided in
+// the statement that applies it, so a delayed or replayed older PUT or DELETE
+// cannot undo a later one. A DELETE of an unknown local id leaves a
+// tombstone, so that a first PUT arriving after it with a lower rev is
+// refused. Removal by an admin is final for that entry: it cannot be shared
+// again under the same local id.
 //
 // Which authors a feed covers depends on whom the caller follows. The cursor
 // cannot express changes to that set, so feeds carry the caller's
@@ -224,59 +227,120 @@ export async function upsertCheckin(
   return retry ? { id: cur.id, cursor: cur.cursor } : "stale";
 }
 
-// ?2: the hour of the change.
-const TOMBSTONE_SET = `t = NULL, lat = NULL, lon = NULL, venue = NULL, category = NULL, place = NULL,
-  comment = NULL, deleted_at = ?2, updated_at = ?2, cursor = ${NEXT_CURSOR}`;
+export type UnshareResult = "deleted" | "stale" | "limit" | "not found";
 
-/**
- * Tombstones the entries matched by `where` (params from ?3 on) and raises
- * their rev to `rev`. Returns false if nothing matched. Unsharing twice only
- * raises the rev; the cursor stays.
- */
-async function tombstone(
-  db: D1Database,
-  where: string,
-  params: unknown[],
-  rev: number,
-  adminRemoval: boolean,
-): Promise<boolean> {
-  const hour = floorHour(Date.now());
-  const [, , existing] = await db.batch([
-    db.prepare(`UPDATE shared_checkins SET ${TOMBSTONE_SET} WHERE ${where} AND deleted_at IS NULL`).bind(rev, hour, ...params),
-    db
-      .prepare(
-        `UPDATE shared_checkins SET rev = MAX(rev, ?1)${adminRemoval ? ", removed_by_admin = 1" : ""} WHERE ${where}`,
-      )
-      .bind(rev, hour, ...params),
-    // Same numbering as above (?1 and ?2 unused here).
-    db.prepare(`SELECT 1 FROM shared_checkins WHERE ${where}`).bind(rev, hour, ...params),
-  ]);
-  return existing!.results.length > 0;
+// Turns the row into a tombstone (in an UPDATE or an upsert's DO UPDATE,
+// where every expression reads the row as it was before the change). A live
+// entry gets a new cursor and the hour of the change; a tombstone keeps
+// them. ?2: the hour of the change.
+const TOMBSTONE_SET = `t = NULL, lat = NULL, lon = NULL, venue = NULL, category = NULL, place = NULL,
+  comment = NULL,
+  updated_at = CASE WHEN deleted_at IS NULL THEN ?2 ELSE updated_at END,
+  cursor = CASE WHEN deleted_at IS NULL THEN ${NEXT_CURSOR} ELSE cursor END,
+  deleted_at = COALESCE(deleted_at, ?2)`;
+
+interface RevRow {
+  rev: number;
+  deleted_at: number | null;
+  removed_by_admin: number;
 }
 
 /**
- * Unshares a device's check-in, keeping a tombstone with `rev` (default: the
- * server time in ms). Returns false if the device has no such check-in.
+ * Why an unshare with `rev` changed nothing, from the row as it is now:
+ * removed by an admin (final, so the unshare holds: "deleted"), a retry of
+ * the unshare that made the current tombstone (same rev: "deleted"), or
+ * superseded by a later PUT or DELETE ("stale"). Null if there is no row.
  */
-export function unshareCheckin(db: D1Database, deviceId: string, localId: string, rev: number | null): Promise<boolean> {
-  return tombstone(db, "device_id = ?3 AND local_id = ?4", [deviceId, localId], rev ?? Date.now(), false);
+function unshareOutcome(row: RevRow | null, rev: number): UnshareResult | null {
+  if (!row) return null;
+  if (row.removed_by_admin === 1) return "deleted";
+  return row.deleted_at !== null && row.rev === rev ? "deleted" : "stale";
+}
+
+/**
+ * Unshares a device's check-in: the entry becomes a tombstone with `rev`
+ * (default: the server time in ms), if `rev` is above the stored one. One
+ * statement decides and applies it.
+ *
+ * - A rev not above the stored one changes nothing: "deleted" if it retries
+ *   the unshare that made the current tombstone (same rev), else "stale".
+ * - An unknown local id gets a tombstone with `rev`, so that a delayed first
+ *   PUT with a lower rev cannot share the entry afterwards. It counts against
+ *   `maxEntries` like any entry ("limit" when the user is at it).
+ * - An entry removed by an admin stays as it is ("deleted").
+ */
+export async function unshareCheckin(
+  db: D1Database,
+  userId: string,
+  deviceId: string,
+  localId: string,
+  rev: number | null,
+  maxEntries: number,
+): Promise<UnshareResult> {
+  const r = rev ?? Date.now();
+  const row = await db
+    .prepare(
+      `INSERT INTO shared_checkins
+         (id, user_id, device_id, local_id, visibility, updated_at, deleted_at, cursor, rev)
+       SELECT ?3, ?4, ?5, ?6, 'followers', ?2, ?2, ${NEXT_CURSOR}, ?1
+       WHERE EXISTS (SELECT 1 FROM shared_checkins WHERE device_id = ?5 AND local_id = ?6)
+         OR (SELECT checkin_count FROM users WHERE id = ?4) < ?7
+       ON CONFLICT (device_id, local_id) DO UPDATE SET ${TOMBSTONE_SET}, rev = excluded.rev
+       WHERE excluded.rev > shared_checkins.rev AND shared_checkins.removed_by_admin = 0
+       RETURNING id`,
+    )
+    .bind(r, floorHour(Date.now()), crypto.randomUUID(), userId, deviceId, localId, maxEntries)
+    .first();
+  if (row) return "deleted";
+  const cur = await db
+    .prepare("SELECT rev, deleted_at, removed_by_admin FROM shared_checkins WHERE device_id = ?1 AND local_id = ?2")
+    .bind(deviceId, localId)
+    .first<RevRow>();
+  return unshareOutcome(cur, r) ?? "limit";
 }
 
 /**
  * Unshares a check-in by server id, from any device of its user (e.g. after
- * the sharing device was lost and revoked). Returns false if the user has no
- * such check-in.
+ * the sharing device was lost and revoked), under the same revision rule as
+ * unshareCheckin. An unknown id, or another user's, is "not found".
  */
-export function unshareCheckinById(db: D1Database, userId: string, id: string, rev: number | null): Promise<boolean> {
-  return tombstone(db, "id = ?3 AND user_id = ?4", [id, userId], rev ?? Date.now(), false);
+export async function unshareCheckinById(
+  db: D1Database,
+  userId: string,
+  id: string,
+  rev: number | null,
+): Promise<UnshareResult> {
+  const r = rev ?? Date.now();
+  const row = await db
+    .prepare(
+      `UPDATE shared_checkins SET ${TOMBSTONE_SET}, rev = ?1
+       WHERE id = ?3 AND user_id = ?4 AND rev < ?1 AND removed_by_admin = 0
+       RETURNING id`,
+    )
+    .bind(r, floorHour(Date.now()), id, userId)
+    .first();
+  if (row) return "deleted";
+  const cur = await db
+    .prepare("SELECT rev, deleted_at, removed_by_admin FROM shared_checkins WHERE id = ?1 AND user_id = ?2")
+    .bind(id, userId)
+    .first<RevRow>();
+  return unshareOutcome(cur, r) ?? "not found";
 }
 
 /**
- * Admin moderation: removes a check-in by server id. Final: the entry stays
- * removed, whatever rev its owner sends later.
+ * Admin moderation: removes a check-in by server id, whatever its rev. Final:
+ * the entry stays removed, whatever rev its owner sends later.
  */
-export function removeCheckin(db: D1Database, id: string): Promise<boolean> {
-  return tombstone(db, "id = ?3", [id], Date.now(), true);
+export async function removeCheckin(db: D1Database, id: string): Promise<boolean> {
+  const now = Date.now();
+  const row = await db
+    .prepare(
+      `UPDATE shared_checkins SET ${TOMBSTONE_SET}, rev = MAX(rev, ?1), removed_by_admin = 1
+       WHERE id = ?3 RETURNING id`,
+    )
+    .bind(now, floorHour(now), id)
+    .first();
+  return row !== null;
 }
 
 /**

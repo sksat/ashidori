@@ -30,11 +30,17 @@ object SecureStore:
       gen.generateKey()
     }
 
+  /** Stores `value` and returns once it is on disk. Blocking: call off the
+    * main thread. Throws [[java.io.IOException]] when the write failed, so a
+    * caller never goes on (sends a request, enables sync) with a secret that
+    * a crash would lose.
+    */
   def put(name: String, value: Array[Byte]): Unit =
     val c = Cipher.getInstance("AES/GCM/NoPadding")
     c.init(Cipher.ENCRYPT_MODE, wrapKey())
     val blob = c.getIV ++ c.doFinal(value)
-    prefs.edit().putString(name, Base64.encodeToString(blob, Base64.NO_WRAP)).apply()
+    if !prefs.edit().putString(name, Base64.encodeToString(blob, Base64.NO_WRAP)).commit() then
+      throw java.io.IOException(s"秘密情報（$name）を保存できませんでした")
 
   def get(name: String): Option[Array[Byte]] =
     Option(prefs.getString(name, null)).map { s =>
@@ -44,4 +50,6 @@ object SecureStore:
       c.doFinal(blob, 12, blob.length - 12)
     }
 
-  def remove(name: String): Unit = prefs.edit().remove(name).apply()
+  /** Removes `name` and returns once that is on disk; throws like [[put]]. Blocking. */
+  def remove(name: String): Unit =
+    if !prefs.edit().remove(name).commit() then throw java.io.IOException(s"秘密情報（$name）を消去できませんでした")

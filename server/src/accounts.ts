@@ -86,7 +86,11 @@ export async function createAccount(
     if (isUniqueTokenError(e)) return (await earlier()) ?? "token in use";
     throw e;
   }
-  return device.meta.changes > 0 ? { deviceId, created: true } : "full";
+  if (device.meta.changes > 0) return { deviceId, created: true };
+  // Nothing inserted (the server is at MAX_USERS). A concurrent request with
+  // the same token may have created the account after our first lookup (and
+  // with it reached the limit): then this is a retry of that request.
+  return (await earlier()) ?? "full";
 }
 
 // The recheck in every DELETE, so that a user who stored something meanwhile is kept.

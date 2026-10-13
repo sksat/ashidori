@@ -165,14 +165,17 @@ describe("DELETE /v1/checkins/shared/:localId", () => {
     ]);
   });
 
-  it("404s for unknown ids and for other devices' check-ins", async () => {
+  it("404s for invalid ids, and only touches the calling device's entry", async () => {
     const alice = await newUser("alice");
     const a2 = await newDevice("a2", alice.userId);
-    await putCheckin(alice.token, "c1", CHECKIN);
-    expect((await unshare(alice.token, "nope")).status).toBe(404);
+    const { id } = (await (await putCheckin(alice.token, "c1", CHECKIN)).json()) as { id: string };
     expect((await unshare(alice.token, "a.b")).status).toBe(404);
-    expect((await unshare(a2.token, "c1")).status).toBe(404);
-    expect((await feed(alice.token)).items[0]!.deleted).toBe(false);
+    // Another device's local id "c1" is another entry: this leaves a
+    // tombstone for a2's "c1" and does not touch alice's.
+    expect((await unshare(a2.token, "c1")).status).toBe(200);
+    const items = (await feed(alice.token)).items;
+    expect(items.find((i) => i.id === id)!.deleted).toBe(false);
+    expect(items.filter((i) => i.deleted)).toHaveLength(1);
   });
 });
 

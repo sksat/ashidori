@@ -1,7 +1,18 @@
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
-import { clientKey, hitRateLimit, parseIPv6, RULES } from "../src/ratelimit";
-import { authed, fakeLimiter, newDevice, newUser, postJson, register } from "./helpers";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { clientKey, hitRateLimit, MAX_RULE_WINDOW_MS, parseIPv6, resetEdgeWarnings, RULES } from "../src/ratelimit";
+import {
+  ADMIN_DEV_TOKEN,
+  authed,
+  call,
+  fakeLimiter,
+  newDevice,
+  newUser,
+  OPEN,
+  postJson,
+  register,
+  selfRegister,
+} from "./helpers";
 
 const key = (ip: string | null) =>
   clientKey(new Request("https://x/", { headers: ip === null ? {} : { "CF-Connecting-IP": ip } }));
@@ -102,31 +113,140 @@ describe("D1 counters", () => {
   });
 });
 
+/** A D1 binding that counts the statements run through it. */
+function countingDb(): { db: D1Database; count: () => number } {
+  let n = 0;
+  const wrapStmt = (s: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(s, {
+      get(target, prop) {
+        if (prop === "bind") return (...args: unknown[]) => wrapStmt(target.bind(...args));
+        if (prop === "first" || prop === "run" || prop === "all" || prop === "raw") {
+          return (...args: unknown[]) => {
+            n++;
+            return (target[prop] as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  const db = new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => wrapStmt(target.prepare(sql));
+      if (prop === "batch") {
+        return (stmts: D1PreparedStatement[]) => {
+          n++;
+          return target.batch(stmts);
+        };
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { db, count: () => n };
+}
+
 describe("edge rate limiters", () => {
-  it("key pairing by user and lookup by user, before D1", async () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetEdgeWarnings();
+  });
+
+  it("check pairing and lookups by IP before the device authentication, without D1", async () => {
+    const counted = countingDb();
+    // A well-formed token nobody has: authentication would read D1 and give 401.
+    const unknown = "x".repeat(43);
+    for (const [path, binding, key] of [
+      ["/v1/pairing", "RL_PAIRING", "pairing:ip:203.0.113.9"],
+      ["/v1/users/lookup?handle=alice", "RL_LOOKUP", "lookup:ip:203.0.113.9"],
+    ] as const) {
+      const limiter = fakeLimiter(() => false);
+      const res = await authed(
+        unknown,
+        path,
+        { method: path === "/v1/pairing" ? "POST" : "GET", headers: { "CF-Connecting-IP": "203.0.113.9" } },
+        { [binding]: limiter, DB: counted.db },
+      );
+      expect(res.status, path).toBe(429);
+      expect(limiter.keys).toEqual([key]);
+    }
+    expect(counted.count()).toBe(0);
+  });
+
+  it("then check pairing and lookups by user after the authentication", async () => {
     const alice = await newUser("alice", "alice");
     const counters = async () => (await env.DB.prepare("SELECT key, count FROM rate_limits ORDER BY key").all()).results;
     const before = await counters();
-    const pairing = fakeLimiter(() => false);
-    const res = await authed(alice.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: pairing });
+    const ip = { headers: { "CF-Connecting-IP": "203.0.113.9" } };
+    const pairing = fakeLimiter((k) => k.includes(":ip:"));
+    const res = await authed(alice.token, "/v1/pairing", { method: "POST", ...ip }, { RL_PAIRING: pairing });
     expect(res.status).toBe(429);
-    expect(pairing.keys).toEqual([`pairing:${alice.userId}`]);
-    const lookup = fakeLimiter(() => false);
-    const l = await authed(alice.token, "/v1/users/lookup?handle=alice", {}, { RL_LOOKUP: lookup });
+    expect(pairing.keys).toEqual(["pairing:ip:203.0.113.9", `pairing:user:${alice.userId}`]);
+    const lookup = fakeLimiter((k) => k.includes(":ip:"));
+    const l = await authed(alice.token, "/v1/users/lookup?handle=alice", ip, { RL_LOOKUP: lookup });
     expect(l.status).toBe(429);
-    expect(lookup.keys).toEqual([`lookup:${alice.userId}`]);
+    expect(lookup.keys).toEqual(["lookup:ip:203.0.113.9", `lookup:user:${alice.userId}`]);
+    // Refused before the D1 counters.
     expect(await counters()).toEqual(before);
   });
 
-  it("pass when the binding is missing or fails", async () => {
+  it("pass when the binding fails, leaving the decision to the D1 counters", async () => {
     const a = await newDevice();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const broken: RateLimit = {
       async limit() {
         throw new Error("down");
       },
     };
     expect((await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: broken })).status).toBe(201);
-    expect((await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: undefined })).status).toBe(201);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("RL_PAIRING failed"), expect.any(Error));
+    // The D1 counter still applies (20 per 10 minutes per IP; one used above).
+    for (let i = 0; i < 19; i++) await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: broken });
+    expect((await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: broken })).status).toBe(429);
+  });
+
+  it("pass when the pairing or lookup binding is missing, warning once per isolate", async () => {
+    const a = await newUser("a", "aaa");
+    resetEdgeWarnings();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (let i = 0; i < 3; i++) {
+      expect((await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: undefined })).status).toBe(201);
+      expect((await authed(a.token, "/v1/users/lookup?handle=aaa", {}, { RL_LOOKUP: undefined })).status).toBe(200);
+    }
+    const msgs = warn.mock.calls.map((c) => String(c[0]));
+    expect(msgs.filter((m) => m.includes("RL_PAIRING is missing"))).toHaveLength(1);
+    expect(msgs.filter((m) => m.includes("RL_LOOKUP is missing"))).toHaveLength(1);
     expect((await postJson(a.token, "/v1/pairing")).status).toBe(201);
+  });
+
+  it("refuse open self-registration with 503 when its binding is missing, and show it on the admin page", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await selfRegister({ deviceName: "x" }, "192.0.2.1", { ...OPEN, RL_ACCOUNT: undefined });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "server misconfigured" });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first()).toEqual({ n: 0 });
+    // With registration closed, the binding does not matter: 403 as usual.
+    expect((await selfRegister({ deviceName: "x" }, "192.0.2.1", { RL_ACCOUNT: undefined })).status).toBe(403);
+    // A binding that fails at runtime passes (the D1 counter applies).
+    const broken: RateLimit = {
+      async limit() {
+        throw new Error("down");
+      },
+    };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect((await selfRegister({ deviceName: "x" }, "192.0.2.1", { ...OPEN, RL_ACCOUNT: broken })).status).toBe(201);
+
+    const page = async (overrides: Partial<Cloudflare.Env>) => {
+      const headers = new Headers({ Authorization: `Bearer ${ADMIN_DEV_TOKEN}` });
+      return (await call("/admin/", { headers }, overrides)).text();
+    };
+    expect(await page({ ...OPEN, RL_ACCOUNT: undefined })).toContain("RL_ACCOUNT");
+    expect(await page({ ...OPEN })).not.toContain("RL_ACCOUNT");
+    expect(await page({ RL_ACCOUNT: undefined })).not.toContain("RL_ACCOUNT");
+  });
+
+  it("no rule has a window longer than the lifetime migration 0005 gives old counters", () => {
+    for (const r of Object.values(RULES)) expect(r.windowMs).toBeLessThanOrEqual(MAX_RULE_WINDOW_MS);
+    expect(MAX_RULE_WINDOW_MS).toBe(3_600_000);
   });
 });
