@@ -3,10 +3,9 @@ import { deviceAuth } from "./auth";
 import { createPairingCode, listDevices, MAX_DEVICE_NAME, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, hitRateLimit, RULES } from "./ratelimit";
-import { base64UrlEncode, jsonError, normalizePairingCode, randomBytes, sha256Hex } from "./util";
+import { base64UrlEncode, jsonError, normalizePairingCode, randomBytes, readBody, readJson, sha256Hex, TooLarge } from "./util";
 
 export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
-const MAX_JSON_BYTES = 4 * 1024;
 const STREAM_RE = /^[a-z][a-z0-9_]{0,31}$/;
 // Non-negative integer that fits the 12-digit zero-padded R2 key.
 const SEQ_RE = /^(0|[1-9][0-9]{0,11})$/;
@@ -16,42 +15,6 @@ const LIST_MAX_LIMIT = 1000;
 
 export function blobKey(deviceId: string, stream: string, seq: number): string {
   return `b/${deviceId}/${stream}/${String(seq).padStart(12, "0")}`;
-}
-
-class TooLarge extends Error {}
-
-/** Reads the request body, aborting as soon as it exceeds `max` bytes. */
-async function readBody(req: Request, max: number): Promise<Uint8Array> {
-  const declared = req.headers.get("Content-Length");
-  if (declared !== null && Number(declared) > max) throw new TooLarge();
-  if (!req.body) return new Uint8Array(0);
-  const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel();
-      throw new TooLarge();
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const ch of chunks) {
-    out.set(ch, off);
-    off += ch.byteLength;
-  }
-  return out;
-}
-
-async function readJson(req: Request): Promise<unknown> {
-  const ct = req.headers.get("Content-Type") ?? "";
-  if (!/^application\/json\b/i.test(ct)) throw new SyntaxError("content-type");
-  const body = await readBody(req, MAX_JSON_BYTES);
-  return JSON.parse(new TextDecoder().decode(body));
 }
 
 interface BatchRow {
@@ -94,25 +57,31 @@ v1.post("/devices/register", async (c) => {
 
   const now = Date.now();
   const deviceId = crypto.randomUUID();
+  // A code of a disabled user is neither accepted nor consumed. The response is
+  // the same as for an unknown code, so the endpoint does not reveal it.
   const consumed = await c.env.DB.prepare(
     `UPDATE pairing_codes SET used_at = ?2, used_by = ?3
      WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2
-     RETURNING code_hash`,
+       AND (user_id IS NULL OR user_id IN (SELECT id FROM users WHERE status = 'active'))
+     RETURNING user_id`,
   )
     .bind(await sha256Hex(code), now, deviceId)
-    .first();
+    .first<{ user_id: string | null }>();
   if (!consumed) return jsonError(c, 401, "invalid or expired pairing code");
 
+  // The device belongs to the code's user (null only for legacy codes).
   const token = base64UrlEncode(randomBytes(32));
   await c.env.DB.prepare(
-    "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+    "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
   )
-    .bind(deviceId, name, await sha256Hex(token), now)
+    .bind(deviceId, name, await sha256Hex(token), now, consumed.user_id)
     .run();
   return c.json({ deviceId, token }, 201);
 });
 
 // ---- Everything below requires a device token ----
+// A device acts for its user: it sees and manages only that user's devices and
+// batches. Legacy devices (user_id NULL) see each other (`IS` matches NULL).
 
 v1.use("/pairing", deviceAuth);
 v1.use("/devices", deviceAuth);
@@ -124,13 +93,15 @@ v1.post("/pairing", async (c) => {
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
-  return c.json(await createPairingCode(c.env.DB, c.get("device").id), 201);
+  const device = c.get("device");
+  return c.json(await createPairingCode(c.env.DB, device.id, device.user_id), 201);
 });
 
-v1.get("/devices", async (c) => c.json(await listDevices(c.env.DB)));
+v1.get("/devices", async (c) => c.json(await listDevices(c.env.DB, c.get("device").user_id)));
 
 v1.post("/devices/:id/revoke", async (c) => {
-  if (!(await revokeDevice(c.env.DB, c.req.param("id")))) return jsonError(c, 404, "no such device");
+  const scope = { userId: c.get("device").user_id };
+  if (!(await revokeDevice(c.env.DB, c.req.param("id"), scope))) return jsonError(c, 404, "no such device");
   return c.json({ revoked: true });
 });
 
@@ -201,11 +172,15 @@ v1.get("/batches", async (c) => {
   const limit = Math.min(Math.max(Number(limitStr), 1), LIST_MAX_LIMIT);
 
   // Fetch one extra row to know whether there is a next page.
+  // The cursor is global, so a user's listing has gaps where other users'
+  // batches are; clients only rely on it increasing.
   const { results } = await c.env.DB.prepare(
     `SELECT cursor, device_id, stream, seq, size, sha256, created_at
-     FROM batches WHERE cursor > ?1 ORDER BY cursor LIMIT ?2`,
+     FROM batches
+     WHERE cursor > ?1 AND device_id IN (SELECT id FROM devices WHERE user_id IS ?3)
+     ORDER BY cursor LIMIT ?2`,
   )
-    .bind(after, limit + 1)
+    .bind(after, limit + 1, c.get("device").user_id)
     .all<BatchRow>();
   const page = results.slice(0, limit);
   const items = page.map((r) => ({
@@ -225,10 +200,12 @@ v1.get("/batches/:deviceId/:stream/:seq", async (c) => {
   const { deviceId, stream, seq: seqStr } = c.req.param();
   if (!STREAM_RE.test(stream) || !SEQ_RE.test(seqStr)) return jsonError(c, 404, "not found");
   const seq = Number(seqStr);
+  // Another user's batch is indistinguishable from a missing one.
   const meta = await c.env.DB.prepare(
-    "SELECT size, sha256 FROM batches WHERE device_id = ?1 AND stream = ?2 AND seq = ?3",
+    `SELECT b.size, b.sha256 FROM batches b JOIN devices d ON d.id = b.device_id
+     WHERE b.device_id = ?1 AND b.stream = ?2 AND b.seq = ?3 AND d.user_id IS ?4`,
   )
-    .bind(deviceId, stream, seq)
+    .bind(deviceId, stream, seq, c.get("device").user_id)
     .first<{ size: number; sha256: string }>();
   if (!meta) return jsonError(c, 404, "not found");
   const obj = await c.env.BLOBS.get(blobKey(deviceId, stream, seq));

@@ -20,7 +20,7 @@ describe("pairing and registration", () => {
       expires_at: number;
       created_by: string;
     }>();
-    expect(row!.created_by).toBe("admin");
+    expect(row!.created_by).toBe("admin:dev-admin@localhost");
     expect(row!.expires_at - before).toBeGreaterThanOrEqual(10 * 60 * 1000);
     expect(row!.expires_at - before).toBeLessThan(10 * 60 * 1000 + 5000);
     // The code itself is not stored.

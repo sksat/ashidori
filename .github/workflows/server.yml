@@ -72,3 +72,4 @@ jobs:
           pnpm exec wrangler deploy
           --var "CF_ACCESS_TEAM_DOMAIN:${{ vars.CF_ACCESS_TEAM_DOMAIN }}"
           --var "CF_ACCESS_AUD:${{ vars.CF_ACCESS_AUD }}"
+          --var "ADMIN_EMAILS:${{ vars.ADMIN_EMAILS }}"

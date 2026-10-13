@@ -36,7 +36,10 @@
     // Comma-separated list of origins allowed for CORS on /v1/* (future web viewer). Empty = no CORS.
     "CORS_ALLOWED_ORIGINS": "",
     // Only for local development: accept the ADMIN_DEV_TOKEN secret on /admin/*. Never "true" in production.
-    "ALLOW_DEV_ADMIN": "false"
+    "ALLOW_DEV_ADMIN": "false",
+    // Comma-separated e-mail addresses (case-insensitive) of the admins. /admin/* requires a
+    // verified Access JWT whose email is listed here. Empty = nobody (admin API disabled).
+    "ADMIN_EMAILS": ""
   }
 
   // Secrets (not in this file):

@@ -1,6 +1,8 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
+import { vi } from "vitest";
 import app from "../src/index";
+import { base64UrlEncode } from "../src/util";
 
 export const ADMIN_DEV_TOKEN = "dev-admin-token-for-tests";
 export const BASE = "https://ashidori.example";
@@ -22,8 +24,26 @@ export function adminCall(path: string, init: RequestInit = {}): Promise<Respons
   return call(path, { ...init, headers });
 }
 
-export async function issueAdminCode(): Promise<string> {
-  const res = await adminCall("/admin/pairing", { method: "POST" });
+export async function createUser(name: string, email?: string): Promise<string> {
+  const res = await adminCall("/admin/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, email }),
+  });
+  if (res.status !== 201) throw new Error(`create user failed: ${res.status}`);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** The user that devices belong to unless a test says otherwise (created on demand). */
+export async function defaultUserId(): Promise<string> {
+  const row = await env.DB.prepare("SELECT id FROM users WHERE name = 'default'").first<{ id: string }>();
+  return row?.id ?? (await createUser("default"));
+}
+
+/** A pairing code issued from the admin API for `userId` (default: the default user). */
+export async function issueAdminCode(userId?: string): Promise<string> {
+  const id = userId ?? (await defaultUserId());
+  const res = await adminCall(`/admin/users/${id}/pairing`, { method: "POST" });
   if (res.status !== 201) throw new Error(`pairing failed: ${res.status}`);
   return ((await res.json()) as { code: string }).code;
 }
@@ -36,8 +56,8 @@ export function register(code: string, name = "pixel", ip = "192.0.2.1"): Promis
   });
 }
 
-export async function newDevice(name = "pixel"): Promise<{ deviceId: string; token: string }> {
-  const res = await register(await issueAdminCode(), name);
+export async function newDevice(name = "pixel", userId?: string): Promise<{ deviceId: string; token: string }> {
+  const res = await register(await issueAdminCode(userId), name);
   if (res.status !== 201) throw new Error(`register failed: ${res.status}`);
   return (await res.json()) as { deviceId: string; token: string };
 }
@@ -72,4 +92,84 @@ export async function putBatch(
 
 export function blob(text: string): Uint8Array {
   return new TextEncoder().encode(text);
+}
+
+// ---- Cloudflare Access JWTs ----
+
+export const ACCESS_TEAM = "ashidori-test.cloudflareaccess.com";
+export const ACCESS_AUD = "test-aud";
+export const ACCESS_KID = "test-kid";
+export const ADMIN_EMAIL = "admin@example.com";
+/** ADMIN_EMAILS used by accessCall unless overridden (mixed case and spaces on purpose). */
+export const TEST_ADMIN_EMAILS = " Admin@Example.com , second-admin@example.com";
+
+let accessKeys: Promise<{ keyPair: CryptoKeyPair; publicJwk: JsonWebKey }> | null = null;
+
+export async function genRsaKey(): Promise<CryptoKeyPair> {
+  return (await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+}
+
+function keys(): Promise<{ keyPair: CryptoKeyPair; publicJwk: JsonWebKey }> {
+  accessKeys ??= (async () => {
+    const keyPair = await genRsaKey();
+    const publicJwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKey;
+    return { keyPair, publicJwk };
+  })();
+  return accessKeys;
+}
+
+/** Serves the test signing key as the Access certs endpoint. Restore with vi.restoreAllMocks(). */
+export async function mockAccessCerts(): Promise<ReturnType<typeof vi.fn>> {
+  const { publicJwk } = await keys();
+  const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url === `https://${ACCESS_TEAM}/cdn-cgi/access/certs`) {
+      return Response.json({ keys: [{ ...publicJwk, kid: ACCESS_KID, alg: "RS256", use: "sig" }] });
+    }
+    return new Response("unexpected fetch", { status: 500 });
+  });
+  return spy as unknown as ReturnType<typeof vi.fn>;
+}
+
+/**
+ * An Access JWT. `email` defaults to ADMIN_EMAIL; pass `email: undefined` in
+ * `claims` to omit it.
+ */
+export async function makeAccessJwt(
+  claims: Record<string, unknown> = {},
+  opts: { key?: CryptoKey; kid?: string; alg?: string } = {},
+): Promise<string> {
+  const enc = (o: unknown) => base64UrlEncode(new TextEncoder().encode(JSON.stringify(o)));
+  const header = enc({ alg: opts.alg ?? "RS256", kid: opts.kid ?? ACCESS_KID, typ: "JWT" });
+  const now = Math.floor(Date.now() / 1000);
+  const payload = enc({
+    aud: [ACCESS_AUD],
+    iss: `https://${ACCESS_TEAM}`,
+    exp: now + 600,
+    iat: now,
+    email: ADMIN_EMAIL,
+    ...claims,
+  });
+  const sig = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    opts.key ?? (await keys()).keyPair.privateKey,
+    new TextEncoder().encode(`${header}.${payload}`),
+  );
+  return `${header}.${payload}.${base64UrlEncode(new Uint8Array(sig))}`;
+}
+
+/** A request with an Access JWT and the dev token disabled, as in production. */
+export function accessCall(
+  jwt: string,
+  path: string,
+  init: RequestInit = {},
+  envOverrides: Partial<Cloudflare.Env> = {},
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("Cf-Access-Jwt-Assertion", jwt);
+  return call(path, { ...init, headers }, { ALLOW_DEV_ADMIN: "false", ADMIN_EMAILS: TEST_ADMIN_EMAILS, ...envOverrides });
 }

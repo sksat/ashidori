@@ -6,6 +6,8 @@ export interface Env {
   CORS_ALLOWED_ORIGINS: string;
   ALLOW_DEV_ADMIN: string;
   ADMIN_DEV_TOKEN?: string;
+  /** Comma-separated, case-insensitive e-mail addresses of the admins. */
+  ADMIN_EMAILS: string;
 }
 
 export interface DeviceRow {
@@ -15,11 +17,27 @@ export interface DeviceRow {
   created_at: number;
   last_seen_at: number | null;
   revoked_at: number | null;
+  /** NULL for devices registered before accounts existed. */
+  user_id: string | null;
+}
+
+export type UserStatus = "active" | "disabled";
+
+export interface UserRow {
+  id: string;
+  name: string;
+  email: string | null;
+  status: UserStatus;
+  created_at: number;
+  created_by: string;
+  disabled_at: number | null;
 }
 
 export type AppEnv = {
   Bindings: Env;
   Variables: {
     device: DeviceRow;
+    /** E-mail address of the signed-in admin (/admin/* only). */
+    adminEmail: string;
   };
 };

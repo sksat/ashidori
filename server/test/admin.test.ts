@@ -1,75 +1,42 @@
+import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { base64UrlEncode } from "../src/util";
-import { ADMIN_DEV_TOKEN, adminCall, call, newDevice } from "./helpers";
+import {
+  accessCall,
+  ADMIN_DEV_TOKEN,
+  adminCall,
+  call,
+  createUser,
+  genRsaKey,
+  makeAccessJwt,
+  mockAccessCerts,
+  newDevice,
+} from "./helpers";
 
-const TEAM = "ashidori-test.cloudflareaccess.com";
-const AUD = "test-aud";
-const KID = "test-kid";
-
-let keyPair: CryptoKeyPair;
 let otherKeyPair: CryptoKeyPair;
-let publicJwk: JsonWebKey;
-
-async function genKey(): Promise<CryptoKeyPair> {
-  return (await crypto.subtle.generateKey(
-    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
-    true,
-    ["sign", "verify"],
-  )) as CryptoKeyPair;
-}
 
 beforeAll(async () => {
-  keyPair = await genKey();
-  otherKeyPair = await genKey();
-  publicJwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKey;
+  otherKeyPair = await genRsaKey();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function mockCerts(): ReturnType<typeof vi.fn> {
-  const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-    const url = input instanceof Request ? input.url : String(input);
-    if (url === `https://${TEAM}/cdn-cgi/access/certs`) {
-      return Response.json({ keys: [{ ...publicJwk, kid: KID, alg: "RS256", use: "sig" }] });
-    }
-    return new Response("unexpected fetch", { status: 500 });
-  });
-  return spy as unknown as ReturnType<typeof vi.fn>;
-}
-
-async function makeJwt(
-  claims: Record<string, unknown>,
-  opts: { key?: CryptoKey; kid?: string; alg?: string } = {},
-): Promise<string> {
-  const enc = (o: unknown) => base64UrlEncode(new TextEncoder().encode(JSON.stringify(o)));
-  const header = enc({ alg: opts.alg ?? "RS256", kid: opts.kid ?? KID, typ: "JWT" });
-  const now = Math.floor(Date.now() / 1000);
-  const payload = enc({ aud: [AUD], iss: `https://${TEAM}`, exp: now + 600, iat: now, email: "me@example.com", ...claims });
-  const sig = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    opts.key ?? keyPair.privateKey,
-    new TextEncoder().encode(`${header}.${payload}`),
-  );
-  return `${header}.${payload}.${base64UrlEncode(new Uint8Array(sig))}`;
-}
-
-function withJwt(jwt: string, path = "/admin/devices", init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
-  headers.set("Cf-Access-Jwt-Assertion", jwt);
-  return call(path, { ...init, headers }, { ALLOW_DEV_ADMIN: "false" });
-}
+const json = (body: unknown): RequestInit => ({
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
 
 describe("admin auth", () => {
   it("rejects requests without Access, even with the dev token when dev admin is disabled", async () => {
     const prod = { ALLOW_DEV_ADMIN: "false" };
     expect((await call("/admin/devices", {}, prod)).status).toBe(401);
-    expect((await call("/admin/pairing", { method: "POST" }, prod)).status).toBe(401);
+    expect((await call("/admin/users", json({ name: "x" }), prod)).status).toBe(401);
     expect((await call("/admin/", {}, prod)).status).toBe(401);
     const withDev = await call(
-      "/admin/pairing",
-      { method: "POST", headers: { Authorization: `Bearer ${ADMIN_DEV_TOKEN}` } },
+      "/admin/users",
+      { ...json({ name: "x" }), headers: { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN_DEV_TOKEN}` } },
       prod,
     );
     expect(withDev.status).toBe(401);
@@ -86,69 +53,225 @@ describe("admin auth", () => {
     expect(res.status).toBe(401);
   });
 
-  it("accepts a valid Access JWT", async () => {
-    const spy = mockCerts();
-    const res = await withJwt(await makeJwt({}));
+  it("accepts a valid Access JWT of a listed admin, case-insensitively", async () => {
+    const spy = await mockAccessCerts();
+    const res = await accessCall(await makeAccessJwt({ email: "ADMIN@example.COM" }), "/admin/devices");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([]);
-    const pairing = await withJwt(await makeJwt({}), "/admin/pairing", { method: "POST" });
-    expect(pairing.status).toBe(201);
+    const created = await accessCall(await makeAccessJwt(), "/admin/users", json({ name: "alice" }));
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ name: "alice", status: "active", createdBy: "admin@example.com" });
     // Certs are cached.
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
   it("accepts a string aud claim", async () => {
-    mockCerts();
-    expect((await withJwt(await makeJwt({ aud: AUD }))).status).toBe(200);
+    await mockAccessCerts();
+    expect((await accessCall(await makeAccessJwt({ aud: "test-aud" }), "/admin/devices")).status).toBe(200);
+  });
+
+  it("rejects valid JWTs whose email is missing or not in ADMIN_EMAILS", async () => {
+    await mockAccessCerts();
+    const outsider = await makeAccessJwt({ email: "someone@example.com" });
+    for (const path of ["/admin/", "/admin/devices", "/admin/users"]) {
+      expect((await accessCall(outsider, path)).status, path).toBe(403);
+    }
+    expect((await accessCall(outsider, "/admin/users", json({ name: "x" }))).status).toBe(403);
+    expect((await accessCall(await makeAccessJwt({ email: undefined }), "/admin/devices")).status).toBe(403);
+    expect((await accessCall(await makeAccessJwt({ email: "" }), "/admin/devices")).status).toBe(403);
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first<{ n: number }>();
+    expect(n!.n).toBe(0);
+  });
+
+  it("fails closed when ADMIN_EMAILS is empty", async () => {
+    await mockAccessCerts();
+    for (const list of ["", " , "]) {
+      const res = await accessCall(await makeAccessJwt(), "/admin/devices", {}, { ADMIN_EMAILS: list });
+      expect(res.status).toBe(403);
+    }
   });
 
   it("rejects JWTs with bad signature, wrong aud/iss, expiry, unknown kid, or wrong alg", async () => {
-    mockCerts();
+    await mockAccessCerts();
     const now = Math.floor(Date.now() / 1000);
     const cases: Array<Promise<string>> = [
-      makeJwt({}, { key: otherKeyPair.privateKey }),
-      makeJwt({ aud: ["other-aud"] }),
-      makeJwt({ iss: "https://evil.cloudflareaccess.com" }),
-      makeJwt({ exp: now - 3600 }),
-      makeJwt({ nbf: now + 3600 }),
-      makeJwt({}, { kid: "unknown" }),
-      makeJwt({}, { alg: "HS256" }),
+      makeAccessJwt({}, { key: otherKeyPair.privateKey }),
+      makeAccessJwt({ aud: ["other-aud"] }),
+      makeAccessJwt({ iss: "https://evil.cloudflareaccess.com" }),
+      makeAccessJwt({ exp: now - 3600 }),
+      makeAccessJwt({ nbf: now + 3600 }),
+      makeAccessJwt({}, { kid: "unknown" }),
+      makeAccessJwt({}, { alg: "HS256" }),
       Promise.resolve("not.a.jwt"),
       Promise.resolve("garbage"),
     ];
     for (const jwt of await Promise.all(cases)) {
-      const res = await withJwt(jwt);
+      const res = await accessCall(jwt, "/admin/devices");
       expect(res.status, jwt).toBe(403);
     }
   });
 
   it("rejects everything when Access is not configured", async () => {
-    mockCerts();
-    const jwt = await makeJwt({});
-    const res = await call(
-      "/admin/devices",
-      { headers: { "Cf-Access-Jwt-Assertion": jwt } },
-      { ALLOW_DEV_ADMIN: "false", CF_ACCESS_AUD: "", CF_ACCESS_TEAM_DOMAIN: "" },
-    );
+    await mockAccessCerts();
+    const res = await accessCall(await makeAccessJwt(), "/admin/devices", {}, { CF_ACCESS_AUD: "", CF_ACCESS_TEAM_DOMAIN: "" });
     expect(res.status).toBe(403);
   });
 
-  it("rejects cross-origin admin requests", async () => {
-    const res = await adminCall("/admin/pairing", { method: "POST", headers: { Origin: "https://evil.example" } });
+  it("rejects cross-origin state-changing requests", async () => {
+    const res = await adminCall("/admin/users", {
+      ...json({ name: "x" }),
+      headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+    });
     expect(res.status).toBe(403);
+  });
+
+  it("allows cross-site GETs (the redirect back from the Access login) but not cross-site POSTs", async () => {
+    await mockAccessCerts();
+    const jwt = await makeAccessJwt();
+    const page = await accessCall(jwt, "/admin/", { headers: { "Sec-Fetch-Site": "cross-site" } });
+    expect(page.status).toBe(200);
+    const list = await accessCall(jwt, "/admin/devices", {
+      headers: { "Sec-Fetch-Site": "cross-site", Origin: "https://evil.example" },
+    });
+    expect(list.status).toBe(200);
+
+    const post = json({ name: "x" });
+    const crossSite = await accessCall(jwt, "/admin/users", {
+      ...post,
+      headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(crossSite.status).toBe(403);
+    const foreign = await accessCall(jwt, "/admin/users", {
+      ...post,
+      headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+    });
+    expect(foreign.status).toBe(403);
+    const sameOrigin = await accessCall(jwt, "/admin/users", {
+      ...post,
+      headers: { "Content-Type": "application/json", Origin: "https://ashidori.example", "Sec-Fetch-Site": "same-origin" },
+    });
+    expect(sameOrigin.status).toBe(201);
   });
 });
 
-describe("admin API", () => {
-  it("issues codes, lists and revokes devices", async () => {
-    const a = await newDevice("phone");
-    const list = (await (await adminCall("/admin/devices")).json()) as Array<{ id: string; revoked: boolean }>;
-    expect(list).toHaveLength(1);
-    expect(list[0]!.id).toBe(a.deviceId);
+describe("admin API: users", () => {
+  it("creates users with an optional email and validates input", async () => {
+    const res = await adminCall("/admin/users", json({ name: "  Alice ", email: "Alice@Example.com" }));
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({
+      id: expect.any(String),
+      name: "Alice",
+      email: "alice@example.com",
+      status: "active",
+      createdAt: expect.any(Number),
+      createdBy: "dev-admin@localhost",
+      disabledAt: null,
+    });
+    expect((await adminCall("/admin/users", json({ name: "Bob" }))).status).toBe(201);
 
-    const rev = await adminCall(`/admin/devices/${a.deviceId}/revoke`, { method: "POST" });
-    expect(rev.status).toBe(200);
+    expect((await adminCall("/admin/users", json({}))).status).toBe(400);
+    expect((await adminCall("/admin/users", json({ name: "" }))).status).toBe(400);
+    expect((await adminCall("/admin/users", json({ name: "x".repeat(65) }))).status).toBe(400);
+    expect((await adminCall("/admin/users", json({ name: "x", email: "not an email" }))).status).toBe(400);
+    expect((await adminCall("/admin/users", { method: "POST", body: '{"name":"x"}' })).status).toBe(400);
+  });
+
+  it("lists users with device counts and last access", async () => {
+    const alice = await createUser("alice");
+    await createUser("bob");
+    const a1 = await newDevice("a1", alice);
+    await newDevice("a2", alice);
+    await adminCall(`/admin/devices/${a1.deviceId}/revoke`, { method: "POST" });
+
+    const users = (await (await adminCall("/admin/users")).json()) as Array<Record<string, unknown>>;
+    expect(users.map((u) => [u.name, u.deviceCount])).toEqual([
+      ["alice", 1],
+      ["bob", 0],
+    ]);
+    expect(users[0]!.lastSeenAt).toEqual(expect.any(Number));
+    expect(users[1]!.lastSeenAt).toBeNull();
+  });
+
+  it("issues pairing codes bound to a user", async () => {
+    const alice = await createUser("alice");
+    const res = await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" });
+    expect(res.status).toBe(201);
+    const row = await env.DB.prepare("SELECT user_id, created_by FROM pairing_codes").first<{
+      user_id: string;
+      created_by: string;
+    }>();
+    expect(row).toEqual({ user_id: alice, created_by: "admin:dev-admin@localhost" });
+    expect((await adminCall(`/admin/users/nope/pairing`, { method: "POST" })).status).toBe(404);
+    // There are no codes without a user any more.
+    expect((await adminCall("/admin/pairing", { method: "POST" })).status).toBe(404);
+  });
+
+  it("disables and re-enables users", async () => {
+    const alice = await createUser("alice");
+    const a = await newDevice("a", alice);
+    const pending = await (await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).json();
+
+    const dis = await adminCall(`/admin/users/${alice}/disable`, { method: "POST" });
+    expect(dis.status).toBe(200);
+    expect(await dis.json()).toMatchObject({ status: "disabled", disabledAt: expect.any(Number) });
+    // Devices stop working; unused codes are rejected (and not consumed); no new codes.
     expect((await call("/v1/devices", { headers: { Authorization: `Bearer ${a.token}` } })).status).toBe(401);
+    const code = (pending as { code: string }).code;
+    expect(
+      (
+        await call("/v1/devices/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code, name: "b" }),
+        })
+      ).status,
+    ).toBe(401);
+    expect((await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).status).toBe(409);
+    const listed = (await (await adminCall("/admin/users")).json()) as Array<{ status: string }>;
+    expect(listed[0]!.status).toBe("disabled");
+
+    const en = await adminCall(`/admin/users/${alice}/enable`, { method: "POST" });
+    expect(en.status).toBe(200);
+    expect(await en.json()).toMatchObject({ status: "active", disabledAt: null });
+    expect((await call("/v1/devices", { headers: { Authorization: `Bearer ${a.token}` } })).status).toBe(200);
+    // The code issued before disabling still works once re-enabled (it was never consumed).
+    expect(
+      (
+        await call("/v1/devices/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code, name: "b" }),
+        })
+      ).status,
+    ).toBe(201);
+
+    expect((await adminCall(`/admin/users/nope/disable`, { method: "POST" })).status).toBe(404);
+    expect((await adminCall(`/admin/users/nope/enable`, { method: "POST" })).status).toBe(404);
+  });
+});
+
+describe("admin API: devices", () => {
+  it("lists all users' devices (and legacy ones) and revokes any device", async () => {
+    const alice = await createUser("alice");
+    const bob = await createUser("bob");
+    const a = await newDevice("phone", alice);
+    const b = await newDevice("tablet", bob);
+    await env.DB.prepare(
+      "INSERT INTO devices (id, name, token_hash, created_at) VALUES ('legacy', 'old', ?1, ?2)",
+    )
+      .bind("0".repeat(64), Date.now() + 1000)
+      .run();
+
+    const list = (await (await adminCall("/admin/devices")).json()) as Array<Record<string, unknown>>;
+    expect(list.map((d) => [d.id, d.userId, d.userName])).toEqual([
+      [a.deviceId, alice, "alice"],
+      [b.deviceId, bob, "bob"],
+      ["legacy", null, null],
+    ]);
+
+    const rev = await adminCall(`/admin/devices/${b.deviceId}/revoke`, { method: "POST" });
+    expect(rev.status).toBe(200);
+    expect((await call("/v1/devices", { headers: { Authorization: `Bearer ${b.token}` } })).status).toBe(401);
     expect((await adminCall(`/admin/devices/unknown/revoke`, { method: "POST" })).status).toBe(404);
   });
 
@@ -160,9 +283,10 @@ describe("admin API", () => {
   });
 
   it("rate limits pairing code creation", async () => {
+    const alice = await createUser("alice");
     for (let i = 0; i < 20; i++) {
-      expect((await adminCall("/admin/pairing", { method: "POST" })).status).toBe(201);
+      expect((await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).status).toBe(201);
     }
-    expect((await adminCall("/admin/pairing", { method: "POST" })).status).toBe(429);
+    expect((await adminCall(`/admin/users/${alice}/pairing`, { method: "POST" })).status).toBe(429);
   });
 });

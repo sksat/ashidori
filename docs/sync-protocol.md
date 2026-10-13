@@ -10,13 +10,19 @@ check-ins or place names.
 
 ## Deployment model
 
-- One deployment serves one person (a personal server). Several devices belong
-  to that person; there is no multi-user tenancy.
-- Runtime: Cloudflare Workers. D1 stores batch metadata and devices. R2 stores
-  the encrypted batch blobs.
-- Admin routes (`/admin/*`) are protected by Cloudflare Access. The Worker also
-  verifies the `Cf-Access-Jwt-Assertion` JWT (audience `CF_ACCESS_AUD`, issuer
-  `https://<CF_ACCESS_TEAM_DOMAIN>`), so a misconfigured route does not expose them.
+- One deployment serves several users. Every device belongs to exactly one
+  user, and a user's devices share that user's data. Users do not sign in to
+  the web; an admin creates the user and hands them a pairing code.
+- Data is isolated per user: a device only sees the devices and batches of its
+  own user. Devices registered before users existed have no user; they only
+  see each other.
+- Runtime: Cloudflare Workers. D1 stores users, devices and batch metadata. R2
+  stores the encrypted batch blobs.
+- Admin routes (`/admin/*`) are for operators. They are protected by Cloudflare
+  Access, and the Worker also verifies the `Cf-Access-Jwt-Assertion` JWT
+  (audience `CF_ACCESS_AUD`, issuer `https://<CF_ACCESS_TEAM_DOMAIN>`) and
+  requires its `email` to be listed in `ADMIN_EMAILS`, so a misconfigured
+  route or a broad Access policy does not expose them.
 
 ## Keys and encryption
 
@@ -41,9 +47,12 @@ check-ins or place names.
   - The token is compared in constant time against the stored hash.
 - **Pairing**:
   - A pairing code is 8 characters of Crockford base32, single use, with a TTL of 10 minutes.
-  - Codes are created either by an existing device (`POST /v1/pairing`) or from the admin page (`POST /admin/pairing`, behind Access).
-  - The first device is always paired through the admin page.
+  - Every code is bound to a user, and the device registered with it belongs to that user.
+  - Codes are created either by an existing device (`POST /v1/pairing`, for the device's own user) or by an admin for a given user (`POST /admin/users/:id/pairing`).
+  - A user's first device is always paired with a code from an admin.
 - Tokens can be revoked per device. A revoked or unknown token gets `401`.
+- An admin can disable a user. The user's device tokens then get `401` and the
+  user's unused pairing codes are rejected, until the user is enabled again.
 - Pairing and registration are rate limited per IP.
 
 ## HTTP API
@@ -52,16 +61,19 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/admin/pairing` | Access | → `{code, expiresAt}` |
-| GET | `/admin/devices` | Access | list devices |
-| POST | `/admin/devices/:id/revoke` | Access | revoke a device |
+| GET | `/admin/users` | admin | list users |
+| POST | `/admin/users` | admin | `{name, email?}` → the created user |
+| POST | `/admin/users/:id/pairing` | admin | → `{code, expiresAt}` for that user |
+| POST | `/admin/users/:id/disable`, `/admin/users/:id/enable` | admin | disable / enable a user |
+| GET | `/admin/devices` | admin | list all devices with their user |
+| POST | `/admin/devices/:id/revoke` | admin | revoke any device |
 | POST | `/v1/devices/register` | – | `{code, name}` → `{deviceId, token}`; the code is consumed |
-| POST | `/v1/pairing` | device | → `{code, expiresAt}` |
-| GET | `/v1/devices` | device | `[{id, name, createdAt, lastSeenAt, revoked}]` |
-| POST | `/v1/devices/:id/revoke` | device | revoke (including self) |
+| POST | `/v1/pairing` | device | → `{code, expiresAt}` for the device's user |
+| GET | `/v1/devices` | device | the user's devices: `[{id, name, createdAt, lastSeenAt, revoked}]` |
+| POST | `/v1/devices/:id/revoke` | device | revoke one of the user's devices (including self) |
 | PUT | `/v1/batches/:stream/:seq` | device | body: blob (`application/octet-stream`, ≤ 8 MiB) |
-| GET | `/v1/batches?after=<cursor>&limit=<n>` | device | metadata of all devices' batches, ordered by a global cursor |
-| GET | `/v1/batches/:deviceId/:stream/:seq` | device | blob |
+| GET | `/v1/batches?after=<cursor>&limit=<n>` | device | metadata of the batches of all the user's devices, ordered by a global cursor |
+| GET | `/v1/batches/:deviceId/:stream/:seq` | device | blob of one of the user's devices |
 | GET | `/v1/health` | – | `{ok: true}` |
 
 - `stream` matches `^[a-z][a-z0-9_]{0,31}$`. `seq` is a non-negative integer that the device assigns per stream, counting up from 0.
@@ -69,6 +81,8 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
   - The device id comes from the token, never from the URL.
   - The server records `X-Content-SHA256` (hex, required) and verifies it against the body.
 - The list response is `{items: [{cursor, deviceId, stream, seq, size, sha256, createdAt}], next}`. `next` is null at the end.
+  - The cursor is shared by all users, so a user's listing skips values. Clients only rely on it increasing.
+- Listings, fetches and revocations only cover the caller's user. A device of another user is reported like a missing one (`404`).
 - R2 key: `b/{deviceId}/{stream}/{seq as 12-digit zero padded}`.
 
 ## Streams and records (inside the ciphertext)

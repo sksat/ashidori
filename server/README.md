@@ -4,9 +4,34 @@ ashidori の同期サーバです。
 プロトコルは [`docs/sync-protocol.md`](../docs/sync-protocol.md) に従います。
 
 - Cloudflare Workers (Hono) で動きます。
-- D1 にデバイス、ペアリングコード、バッチのメタデータ、rate limit のカウンタを保存します。
+- D1 に利用者、デバイス、ペアリングコード、バッチのメタデータ、rate limit のカウンタを保存します。
 - R2 に暗号化済みのバッチ blob を保存します。サーバは平文を一切扱いません。
-- 1 デプロイ = 1 人用です。その人の複数デバイスが同じデータを共有します。
+- 1 デプロイで複数の利用者を扱えます。データは利用者ごとに分かれ、同じ利用者のデバイスどうしだけが共有します。
+
+## 管理者と利用者
+
+管理者（運用者）と利用者を区別する。
+
+- **管理者**は admin ページ（`/admin/`）を使う。条件は、Cloudflare Access のログインを経て、その JWT の `email` が `ADMIN_EMAILS`（カンマ区切り、大文字小文字を区別しない）に含まれることである。Worker が JWT を検証して照合するため、Access のポリシーが広くても（例: SSO でログインできる全員）一覧にない人は `403` になる。`ADMIN_EMAILS` が空なら admin API はすべて拒否する。
+- **利用者**は web にログインしない。管理者が admin ページで利用者を作成し（名前は必須、メールアドレスは控えとして任意）、その利用者用のペアリングコードを発行して渡す。利用者はアプリにコードを入力して最初のデバイスを登録する。2 台目以降は、アプリから `POST /v1/pairing` でコードを発行して追加する。
+- デバイスはペアリングコードの利用者に属する。デバイスから見えるのは、同じ利用者のデバイスとバッチだけである。他の利用者のバッチは一覧に出ず、取得しようとしても `404` になる。
+- 利用者を停止すると、その利用者のデバイストークンと未使用のペアリングコードは使えなくなる。データは消さない。再開すれば元どおり使える。
+- 利用者の導入前に登録されたデバイス（`user_id` が NULL）は、旧形式のデバイスとしてそのまま動く。旧形式のデバイスどうしはデータを共有し、利用者のデバイスとは分離される。管理者が旧形式のコードを発行することはできない。
+
+### admin API
+
+いずれも上記の管理者認証が必要である。POST は同一オリジンからのみ受け付け、本文がある場合は `Content-Type: application/json` とする。
+
+| Method | Path | 内容 |
+| --- | --- | --- |
+| GET | `/admin/` | admin ページ |
+| GET | `/admin/users` | 利用者の一覧（名前、メールアドレス、状態、作成日時、失効していないデバイス数、デバイスの最終アクセス） |
+| POST | `/admin/users` | `{name, email?}` → 作成した利用者 |
+| POST | `/admin/users/:id/pairing` | その利用者のペアリングコード → `{code, expiresAt}`。停止中の利用者には `409` |
+| POST | `/admin/users/:id/disable` | 利用者を停止する |
+| POST | `/admin/users/:id/enable` | 利用者を再開する |
+| GET | `/admin/devices` | 全デバイスの一覧（`userId`・`userName` 付き。旧形式は `null`） |
+| POST | `/admin/devices/:id/revoke` | 任意のデバイスを失効させる |
 
 ## 開発
 
@@ -24,8 +49,10 @@ pnpm exec tsc --noEmit  # 型チェック
 cp .dev.vars.example .dev.vars
 pnpm exec wrangler d1 migrations apply ashidori --local
 pnpm dev
-# 最初のペアリングコード (ローカルのみ。ALLOW_DEV_ADMIN=true のときだけ有効)
-curl -X POST -H "Authorization: Bearer $ADMIN_DEV_TOKEN" http://localhost:8787/admin/pairing
+# 利用者を作成し、その利用者のペアリングコードを発行する (ローカルのみ。ALLOW_DEV_ADMIN=true のときだけ有効)
+curl -X POST -H "Authorization: Bearer $ADMIN_DEV_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"local"}' http://localhost:8787/admin/users
+curl -X POST -H "Authorization: Bearer $ADMIN_DEV_TOKEN" http://localhost:8787/admin/users/<id>/pairing
 ```
 
 `ALLOW_DEV_ADMIN` は本番では必ず `"false"` (既定値) のままにします。
@@ -43,7 +70,7 @@ GitHub Actions（[`.github/workflows/server.yml`](../.github/workflows/server.ym
 | R2 バケット | `ashidori-blobs` |
 | Worker | `ashidori-sync`（デプロイ用トークンは Worker を作成できないため、事前に作成する） |
 | カスタムドメイン | Worker `ashidori-sync` に任意のホスト名（例: `sync.example.com`）を割り当てる |
-| Access アプリケーション | 上記ホスト名の `/admin` を自分のみに許可する |
+| Access アプリケーション | 上記ホスト名の `/admin` を保護する |
 
 wrangler で作成する場合は次のとおり。カスタムドメインは初回デプロイ後、ダッシュボードの Worker → Settings → Domains & Routes で追加する。
 
@@ -55,10 +82,10 @@ pnpm exec wrangler r2 bucket create ashidori-blobs
 Access アプリケーションは Zero Trust → Access → Applications → Add an application → Self-hosted で作成する。
 
 - Application domain: カスタムドメインのホスト名、path: `admin`（`/admin/*` を保護する）
-- Policy: Allow、Include: 自分のメールアドレスのみ
+- Policy: Allow、Include: 管理者のメールアドレス（管理者の判定は Worker が `ADMIN_EMAILS` で行うため、SSO でログインできる全員などのより広い範囲でもよい）
 - 作成後、**Application Audience (AUD) Tag** と、Zero Trust → Settings の **Team domain**（`<team>.cloudflareaccess.com`）を控える
 
-Worker は `Cf-Access-Jwt-Assertion` を自身でも検証する。検証内容は、`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` の鍵による RS256 署名、`aud`、`iss`、`exp`、`nbf` である。Access の設定漏れで `/admin/*` が公開されることはなく、`CF_ACCESS_*` が空のときは admin API をすべて拒否する。
+Worker は `Cf-Access-Jwt-Assertion` を自身でも検証する。検証内容は、`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` の鍵による RS256 署名、`aud`、`iss`、`exp`、`nbf` である。Access の設定漏れで `/admin/*` が公開されることはなく、`CF_ACCESS_*` または `ADMIN_EMAILS` が空のときは admin API をすべて拒否する。
 
 ### 2. デプロイ用の API トークンを作る
 
@@ -87,6 +114,7 @@ CI 用には、ユーザーではなくアカウントが所有する API トー
 | Secret | `D1_DATABASE_ID` | 環境 `production` | D1 データベースの ID |
 | Variable | `CF_ACCESS_TEAM_DOMAIN` | リポジトリ | Access の Team domain |
 | Variable | `CF_ACCESS_AUD` | リポジトリ | Access アプリケーションの AUD Tag |
+| Variable | `ADMIN_EMAILS` | リポジトリ | 管理者のメールアドレス（カンマ区切り） |
 | Variable | `DEPLOY_SERVER` | リポジトリ | `true`（`true` のときのみデプロイする） |
 
 ```sh
@@ -102,6 +130,7 @@ gh secret set CLOUDFLARE_ACCOUNT_ID --env production
 gh secret set D1_DATABASE_ID --env production
 gh variable set CF_ACCESS_TEAM_DOMAIN --body '<team>.cloudflareaccess.com'
 gh variable set CF_ACCESS_AUD --body '<AUD Tag>'
+gh variable set ADMIN_EMAILS --body '<管理者のメールアドレス>'
 gh variable set DEPLOY_SERVER --body true
 ```
 
@@ -113,13 +142,14 @@ Actions の `server` ワークフローを Run workflow で実行する（`main`
 
 将来の web viewer を別オリジンで動かす場合は、`CORS_ALLOWED_ORIGINS` にそのオリジンをカンマ区切りで書く（例: `"https://viewer.example.com"`）。空なら CORS ヘッダは返さない。CORS は `/v1/*` のみに適用し、`/admin/*` には適用しない。
 
-### 5. 最初のデバイスをペアリングする
+### 5. 利用者を作成し、最初のデバイスをペアリングする
 
 1. ブラウザで `https://<ホスト名>/admin/` を開く（Access のログインを経由する）。
-2. 「発行する」を押すと 8 文字のペアリングコードが表示される。有効期限は 10 分で、1 回のみ使用できる。
-3. アプリの同期設定にサーバ URL とコードを入力する。アプリは `POST /v1/devices/register` を呼び、デバイストークンを受け取る。
+2. 利用者の名前（任意でメールアドレス）を入力して「作成」を押す。
+3. その利用者の「ペアリングコード発行」を押すと 8 文字のコードが表示される。有効期限は 10 分で、1 回のみ使用できる。コードを利用者に渡す。
+4. 利用者はアプリの同期設定にサーバ URL とコードを入力する。アプリは `POST /v1/devices/register` を呼び、デバイストークンを受け取る。
 
-2 台目以降は、既存デバイスから `POST /v1/pairing` でコードを発行することもできる。admin ページではデバイス一覧の確認と失効もできる。
+2 台目以降は、利用者が既存デバイスから `POST /v1/pairing` でコードを発行して追加する。admin ページでは利用者の停止・再開と、デバイスの一覧確認・失効もできる。
 
 ### 手元からデプロイする場合
 
@@ -127,13 +157,15 @@ Actions の `server` ワークフローを Run workflow で実行する（`main`
 
 ```sh
 pnpm exec wrangler d1 migrations apply ashidori --remote
-pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.com --var CF_ACCESS_AUD:<AUD Tag>
+pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.com --var CF_ACCESS_AUD:<AUD Tag> --var ADMIN_EMAILS:<管理者のメールアドレス>
 ```
 
 ## 実装メモ
 
 - **時刻**: API のタイムスタンプ (`createdAt`, `lastSeenAt`, `expiresAt`) はすべて Unix epoch ミリ秒の数値です。
 - **カーソル**: `cursor` は D1 の `INTEGER PRIMARY KEY AUTOINCREMENT` です。単調増加で、再利用されません。`after` の既定値は `0` です。`limit` の既定値は 100、上限は 1000 です。
+  - カーソルは全利用者で共通なので、ある利用者の一覧では値が飛ぶ。クライアントは値が増加することだけに依存する。
+- **利用者による絞り込み**: `/v1/*` は、呼び出したデバイスと `user_id` が同じデバイスだけを対象にする。比較は `IS` で行い、旧形式（NULL）は旧形式どうしで一致する。デバイスの認証時に利用者の状態も確かめ、停止中なら `401` を返す。
 - **トークン**: 32 byte 乱数の base64url (43 文字) です。D1 には SHA-256 hex だけを保存し、照合は constant-time 比較で行います。
 - **ペアリングコード**: Crockford base32 で 8 文字 (40 bit) です。D1 には SHA-256 hex だけを保存します。入力は大文字小文字を区別せず、`-` と空白を無視し、`I`/`L` を `1`、`O` を `0` として扱います。
   - 消費は `UPDATE ... WHERE used_at IS NULL AND expires_at > now RETURNING` の 1 文で行うので、同じコードで 2 台が登録されることはありません。
@@ -142,14 +174,14 @@ pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.co
   - 理由: personal server のリクエスト量では D1 で十分です。結果が強整合で、`wrangler dev` とテストでも同じように動きます。
   - IP ごと (`CF-Connecting-IP`、IPv6 は /64 単位) に、次の上限をかけます。
     - `register`: 10 回 / 10 分。失敗した試行も数えます。
-    - `pairing`: 20 回 / 10 分。`/v1/pairing` と `/admin/pairing` で共通です。
+    - `pairing`: 20 回 / 10 分。`/v1/pairing` と `/admin/users/:id/pairing` で共通です。
   - 上限を超えると `429` を返します。
 - **PUT**: `Content-Type: application/octet-stream` と `X-Content-SHA256` が必須です。
   - 本文は 8 MiB を超えた時点で読み込みを打ち切り、`413` を返します。
   - R2 への put が成功してから D1 にメタデータを insert します。そのため、一覧に出るバッチは必ず blob が存在します。
   - R2 には `sha256` を渡して、R2 側でも整合性を検証させています。
 - **GET blob**: D1 にメタデータがあるものだけを返します。
-- **admin**: `Origin` ヘッダが別オリジンのリクエストは `403` で拒否します (CSRF 対策)。
+- **admin**: GET・HEAD・OPTIONS 以外で、`Origin` ヘッダが別オリジンのリクエストと `Sec-Fetch-Site: cross-site` のリクエストは `403` で拒否する（CSRF 対策）。GET を対象外にするのは、Access のログイン後に `/admin/` へ戻るリダイレクトが cross-site になるためである。GET は状態を変えず、`/admin/*` は CORS ヘッダを返さないため、別オリジンのページは応答を読めない。
 - **セキュリティヘッダ**: 全レスポンスに付けます。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP (`default-src 'none'`、admin ページは nonce 付き)、`Cache-Control: no-store` です。
 
 ### 既知の制限

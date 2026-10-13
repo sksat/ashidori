@@ -1,29 +1,66 @@
 import { Hono } from "hono";
 import { adminAuth } from "./auth";
-import { createPairingCode, listDevices, revokeDevice } from "./devices";
+import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, hitRateLimit, RULES } from "./ratelimit";
-import { base64UrlEncode, jsonError, randomBytes } from "./util";
+import { createUser, getUser, listUsers, parseNewUser, setUserStatus } from "./users";
+import { base64UrlEncode, jsonError, randomBytes, readJson, TooLarge } from "./util";
 
+// Operator API. Every route requires an admin (see adminAuth), which also
+// rejects cross-origin requests. POST bodies, where present, must be JSON,
+// which a cross-site form cannot send without a CORS preflight.
 export const admin = new Hono<AppEnv>();
 
 admin.use("*", adminAuth);
 
-admin.post("/pairing", async (c) => {
+// ---- Users ----
+
+admin.get("/users", async (c) => c.json(await listUsers(c.env.DB)));
+
+admin.post("/users", async (c) => {
+  let body: unknown;
+  try {
+    body = await readJson(c.req.raw);
+  } catch (e) {
+    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
+    return jsonError(c, 400, "invalid JSON body");
+  }
+  const parsed = parseNewUser(body);
+  if (typeof parsed === "string") return jsonError(c, 400, parsed);
+  return c.json(await createUser(c.env.DB, parsed.name, parsed.email, c.get("adminEmail")), 201);
+});
+
+// A pairing code for the user's device; the user enters it in the app.
+admin.post("/users/:id/pairing", async (c) => {
   if (!(await hitRateLimit(c.env.DB, RULES.pairing, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
-  return c.json(await createPairingCode(c.env.DB, "admin"), 201);
+  const user = await getUser(c.env.DB, c.req.param("id"));
+  if (!user) return jsonError(c, 404, "no such user");
+  if (user.status !== "active") return jsonError(c, 409, "user is disabled");
+  return c.json(await createPairingCode(c.env.DB, `admin:${c.get("adminEmail")}`, user.id), 201);
 });
 
-admin.get("/devices", async (c) => c.json(await listDevices(c.env.DB)));
+admin.post("/users/:id/disable", async (c) => {
+  const user = await setUserStatus(c.env.DB, c.req.param("id"), "disabled");
+  return user ? c.json(user) : jsonError(c, 404, "no such user");
+});
+
+admin.post("/users/:id/enable", async (c) => {
+  const user = await setUserStatus(c.env.DB, c.req.param("id"), "active");
+  return user ? c.json(user) : jsonError(c, 404, "no such user");
+});
+
+// ---- Devices (all users, including legacy devices without a user) ----
+
+admin.get("/devices", async (c) => c.json(await listAllDevices(c.env.DB)));
 
 admin.post("/devices/:id/revoke", async (c) => {
-  if (!(await revokeDevice(c.env.DB, c.req.param("id")))) return jsonError(c, 404, "no such device");
+  if (!(await revokeDevice(c.env.DB, c.req.param("id"), "all"))) return jsonError(c, 404, "no such device");
   return c.json({ revoked: true });
 });
 
-// Minimal admin page (behind Access) to issue pairing codes and manage devices.
+// Minimal admin page (behind Access) to manage users and devices.
 admin.get("/", (c) => {
   const nonce = base64UrlEncode(randomBytes(16));
   c.header(
@@ -34,45 +71,76 @@ admin.get("/", (c) => {
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ashidori admin</title>
 <style nonce="${nonce}">
-body{font-family:system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}
-#code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em}
+body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}
+#code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em;margin:.2rem 0}
+#pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ccc;padding:.3rem;text-align:left}
+td button{margin-right:.3rem}#err{color:#b00}
 </style></head><body>
 <h1>ashidori admin</h1>
-<section><h2>ペアリングコード</h2>
-<button id="issue">発行する</button>
-<p id="code"></p><p id="exp"></p></section>
-<section><h2>デバイス</h2><table><thead><tr><th>名前</th><th>作成</th><th>最終アクセス</th><th></th></tr></thead><tbody id="devices"></tbody></table></section>
+<p id="err"></p>
+<section><h2>利用者</h2>
+<p><input id="name" placeholder="名前" maxlength="64"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
+<div id="pairing" hidden><p id="for"></p><p id="code"></p><p id="exp"></p></div>
+<table><thead><tr><th>名前</th><th>メールアドレス</th><th>状態</th><th>デバイス</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
+<section><h2>デバイス</h2>
+<p>利用者が「なし」のデバイスは、利用者の導入前に登録されたものです。</p>
+<table><thead><tr><th>名前</th><th>利用者</th><th>作成</th><th>最終アクセス</th><th></th></tr></thead><tbody id="devices"></tbody></table></section>
 <script nonce="${nonce}">
 const fmt = (t) => t == null ? "-" : new Date(t).toLocaleString();
+const $ = (id) => document.getElementById(id);
+async function api(path, body) {
+  const init = { method: "POST" };
+  if (body !== undefined) { init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(body); }
+  const res = await fetch(path, init);
+  const json = await res.json();
+  $("err").textContent = res.ok ? "" : "エラー: " + json.error;
+  return res.ok ? json : null;
+}
+function row(tbody, values, buttons) {
+  const tr = document.createElement("tr");
+  for (const v of values) { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); }
+  const td = document.createElement("td");
+  for (const [label, onclick] of buttons) {
+    const b = document.createElement("button"); b.textContent = label; b.onclick = onclick; td.appendChild(b);
+  }
+  tr.appendChild(td); tbody.appendChild(tr);
+}
 async function load() {
-  const res = await fetch("/admin/devices");
-  const tbody = document.getElementById("devices");
-  tbody.textContent = "";
-  for (const d of await res.json()) {
-    const tr = document.createElement("tr");
-    for (const v of [d.name + (d.revoked ? " (revoked)" : ""), fmt(d.createdAt), fmt(d.lastSeenAt)]) {
-      const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
-    }
-    const td = document.createElement("td");
-    if (!d.revoked) {
-      const b = document.createElement("button"); b.textContent = "revoke";
-      b.onclick = async () => {
-        if (!confirm("revoke " + d.name + "?")) return;
-        await fetch("/admin/devices/" + encodeURIComponent(d.id) + "/revoke", { method: "POST" });
-        load();
-      };
-      td.appendChild(b);
-    }
-    tr.appendChild(td); tbody.appendChild(tr);
+  const [users, devices] = await Promise.all([
+    fetch("/admin/users").then((r) => r.json()),
+    fetch("/admin/devices").then((r) => r.json()),
+  ]);
+  const ut = $("users"); ut.textContent = "";
+  for (const u of users) {
+    const active = u.status === "active";
+    const buttons = active
+      ? [["ペアリングコード発行", () => issue(u)],
+         ["停止", async () => { if (confirm(u.name + " を停止しますか。この利用者のデバイスは同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
+      : [["再開", async () => { if (await api("/admin/users/" + encodeURIComponent(u.id) + "/enable")) load(); }]];
+    row(ut, [u.name, u.email ?? "-", active ? "有効" : "停止中", String(u.deviceCount), fmt(u.lastSeenAt)], buttons);
+  }
+  const dt = $("devices"); dt.textContent = "";
+  for (const d of devices) {
+    const buttons = d.revoked ? [] : [["失効", async () => {
+      if (confirm(d.name + " を失効させますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
+    }]];
+    row(dt, [d.name + (d.revoked ? " (失効)" : ""), d.userName ?? "なし", fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
   }
 }
-document.getElementById("issue").onclick = async () => {
-  const res = await fetch("/admin/pairing", { method: "POST" });
-  const body = await res.json();
-  if (!res.ok) { document.getElementById("code").textContent = body.error; return; }
-  document.getElementById("code").textContent = body.code.slice(0, 4) + "-" + body.code.slice(4);
-  document.getElementById("exp").textContent = "有効期限: " + fmt(body.expiresAt);
+async function issue(u) {
+  const body = await api("/admin/users/" + encodeURIComponent(u.id) + "/pairing");
+  if (!body) return;
+  $("pairing").hidden = false;
+  $("for").textContent = u.name + " のペアリングコード";
+  $("code").textContent = body.code.slice(0, 4) + "-" + body.code.slice(4);
+  $("exp").textContent = "有効期限: " + fmt(body.expiresAt) + " (1 回のみ使用可)";
+}
+$("create").onclick = async () => {
+  const email = $("email").value.trim();
+  const body = { name: $("name").value.trim() };
+  if (email) body.email = email;
+  if (await api("/admin/users", body)) { $("name").value = ""; $("email").value = ""; load(); }
 };
 load();
 </script></body></html>`);

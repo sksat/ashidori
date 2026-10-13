@@ -78,3 +78,43 @@ export function normalizePairingCode(input: string): string | null {
 }
 
 export const DEVICE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
+// ---- Request bodies ----
+
+const MAX_JSON_BYTES = 4 * 1024;
+
+export class TooLarge extends Error {}
+
+/** Reads the request body, aborting as soon as it exceeds `max` bytes. */
+export async function readBody(req: Request, max: number): Promise<Uint8Array> {
+  const declared = req.headers.get("Content-Length");
+  if (declared !== null && Number(declared) > max) throw new TooLarge();
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw new TooLarge();
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const ch of chunks) {
+    out.set(ch, off);
+    off += ch.byteLength;
+  }
+  return out;
+}
+
+export async function readJson(req: Request): Promise<unknown> {
+  const ct = req.headers.get("Content-Type") ?? "";
+  if (!/^application\/json\b/i.test(ct)) throw new SyntaxError("content-type");
+  const body = await readBody(req, MAX_JSON_BYTES);
+  return JSON.parse(new TextDecoder().decode(body));
+}
