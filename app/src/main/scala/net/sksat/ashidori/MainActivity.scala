@@ -4,7 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.{Gravity, Menu, View, ViewGroup}
+import android.view.{Gravity, View, ViewGroup}
 import android.widget.{FrameLayout, LinearLayout}
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -97,13 +97,6 @@ class MainActivity extends AppCompatActivity:
     super.onCreate(savedInstanceState)
 
     toolbar = MaterialToolbar(this)
-    val settingsItem = toolbar.getMenu.add(Menu.NONE, 1, Menu.NONE, "設定")
-    settingsItem.setIcon(R.drawable.ic_settings)
-    settingsItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
-    toolbar.setOnMenuItemClickListener { item =>
-      push(SettingsScreen(this))
-      true
-    }
     toolbar.setNavigationOnClickListener(_ => pop())
 
     screenHost = FrameLayout(this)
@@ -127,14 +120,16 @@ class MainActivity extends AppCompatActivity:
     for ((id, title, icon), order) <- Seq(
         (MainActivity.TabFeed, "タイムライン", R.drawable.ic_timeline),
         (MainActivity.TabTimeline, "マップ", R.drawable.ic_map),
-        (MainActivity.TabLogger, "ステータス", R.drawable.ic_logger)
+        (MainActivity.TabLogger, "ステータス", R.drawable.ic_logger),
+        (MainActivity.TabSettings, "設定", R.drawable.ic_settings)
       ).zipWithIndex
     do nav.getMenu.add(0, id, order, title).setIcon(icon)
 
     tabs = Map(
       MainActivity.TabTimeline -> TimelineScreen(this, savedInstanceState),
       MainActivity.TabFeed -> FeedScreen(this),
-      MainActivity.TabLogger -> LoggerScreen(this)
+      MainActivity.TabLogger -> LoggerScreen(this),
+      MainActivity.TabSettings -> SettingsScreen(this)
     )
     nav.setOnItemSelectedListener { item =>
       tabId = item.getItemId
@@ -256,7 +251,6 @@ class MainActivity extends AppCompatActivity:
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
 
-  def openSettings(): Unit = push(SettingsScreen(this))
   def openSearch(): Unit = push(SearchScreen(this))
 
   /** A day on the タイムライン tab (日), from the map. */
@@ -292,7 +286,6 @@ class MainActivity extends AppCompatActivity:
     toolbar.setVisibility(if onboarding || !pushed then View.GONE else View.VISIBLE)
     nav.setVisibility(if pushed then View.GONE else View.VISIBLE)
     fab.setVisibility(if !pushed && tabId == MainActivity.TabTimeline then View.VISIBLE else View.GONE)
-    toolbar.getMenu.findItem(1).setVisible(!pushed)
     if pushed then
       toolbar.setNavigationIcon(R.drawable.ic_arrow_back)
       toolbar.setNavigationContentDescription("戻る")
@@ -361,6 +354,7 @@ object MainActivity:
   val TabTimeline = 1
   val TabFeed = 2
   val TabLogger = 4
+  val TabSettings = 5
   val RequiredPermissions: Seq[String] = Seq(
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.POST_NOTIFICATIONS,

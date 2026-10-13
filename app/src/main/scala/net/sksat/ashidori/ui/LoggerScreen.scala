@@ -198,20 +198,9 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val panel = PositioningPanel(act)
   private val sensorPanel = SensorPanel(act)
 
-  /** Settings live here now that tab pages have no top bar. */
-  private val settingsRow =
-    val b = outlined("設定")(act.openSettings())
-    b.setIconResource(R.drawable.ic_settings)
-    b.setStrokeWidth(0)
-    val row = hbox(spacer(0), b)
-    row.setGravity(android.view.Gravity.END)
-    row.setPadding(0, dp(4), dp(8), 0)
-    row
-
   val view: View =
     scroll(
       vbox((Seq(
-        settingsRow,
         card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, notes, spacer(4), start, stopRow),
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
