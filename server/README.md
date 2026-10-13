@@ -33,77 +33,99 @@ curl -X POST -H "Authorization: Bearer $ADMIN_DEV_TOKEN" http://localhost:8787/a
 
 ## デプロイ手順
 
-`wrangler login` 済みであることを前提にします。
+GitHub Actions（[`.github/workflows/server.yml`](../.github/workflows/server.yml)）は `server/` の変更ごとにテストを実行し、`main` ではマイグレーションとデプロイを行う。D1・R2・カスタムドメイン・Access アプリケーションは事前に用意しておく。これらはダッシュボード、wrangler、IaC のいずれで作成してもよい。`wrangler.jsonc` にはルーティングを書かないため、デプロイによってルーティングが変わることはない。
 
-### 1. D1 と R2 を作る
+### 1. リソースを用意する
+
+| リソース | 名前・内容 |
+| --- | --- |
+| D1 データベース | `ashidori` |
+| R2 バケット | `ashidori-blobs` |
+| Worker | `ashidori-sync`（初回デプロイで作成される） |
+| カスタムドメイン | Worker `ashidori-sync` に任意のホスト名（例: `sync.example.com`）を割り当てる |
+| Access アプリケーション | 上記ホスト名の `/admin` を自分のみに許可する |
+
+wrangler で作成する場合は次のとおり。カスタムドメインは初回デプロイ後、ダッシュボードの Worker → Settings → Domains & Routes で追加する。
 
 ```sh
 pnpm exec wrangler d1 create ashidori
 pnpm exec wrangler r2 bucket create ashidori-blobs
 ```
 
-`d1 create` が表示した `database_id` を `wrangler.jsonc` の `d1_databases[0].database_id` に書きます。
+Access アプリケーションは Zero Trust → Access → Applications → Add an application → Self-hosted で作成する。
 
-### 2. マイグレーションを適用する
+- Application domain: カスタムドメインのホスト名、path: `admin`（`/admin/*` を保護する）
+- Policy: Allow、Include: 自分のメールアドレスのみ
+- 作成後、**Application Audience (AUD) Tag** と、Zero Trust → Settings の **Team domain**（`<team>.cloudflareaccess.com`）を控える
+
+Worker は `Cf-Access-Jwt-Assertion` を自身でも検証する。検証内容は、`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` の鍵による RS256 署名、`aud`、`iss`、`exp`、`nbf` である。Access の設定漏れで `/admin/*` が公開されることはなく、`CF_ACCESS_*` が空のときは admin API をすべて拒否する。
+
+### 2. デプロイ用の API トークンを作る
+
+CI 用には、ユーザーではなくアカウントが所有する API トークン（Account API token）を使う。作成者の権限やアカウント所属に依存せず、`cfat_` 接頭辞により漏洩の検出もしやすい。ダッシュボード → 対象アカウント → Manage account → Account API tokens → Create Token で作成する。
+
+| 権限 | 用途（API 上の名称） |
+| --- | --- |
+| Account: Workers Scripts: Edit | Worker のデプロイ（Workers Scripts Write） |
+| Account: D1: Edit | マイグレーションの適用（D1 Write） |
+
+- Zone Resources は選択しない。Workers Scripts と D1 はアカウント単位の権限で、ゾーンでは絞れない。
+- 有効期限を設定し、期限前に作り直す。
+- `CLOUDFLARE_ACCOUNT_ID` を渡すため、アカウントの検索（Memberships・Account Settings）の権限は不要。
+
+### 3. GitHub に登録する
+
+トークンは環境（environment）`production` の secret とし、この環境を使えるブランチを `main` に限定する。PR や他のブランチのワークフローからはトークンを参照できない。
+
+| 種類 | 名前 | 登録先 | 値 |
+| --- | --- | --- | --- |
+| Secret | `CLOUDFLARE_API_TOKEN` | 環境 `production` | 2. のトークン |
+| Secret | `CLOUDFLARE_ACCOUNT_ID` | 環境 `production` | Account ID |
+| Variable | `D1_DATABASE_ID` | リポジトリ | D1 データベースの ID |
+| Variable | `CF_ACCESS_TEAM_DOMAIN` | リポジトリ | Access の Team domain |
+| Variable | `CF_ACCESS_AUD` | リポジトリ | Access アプリケーションの AUD Tag |
+| Variable | `DEPLOY_SERVER` | リポジトリ | `true`（`true` のときのみデプロイする） |
+
+```sh
+# 環境 production を作り、デプロイ元を main に限定する
+gh api -X PUT 'repos/{owner}/{repo}/environments/production' \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST 'repos/{owner}/{repo}/environments/production/deployment-branch-policies' \
+  -f name=main -f type=branch
+
+gh secret set CLOUDFLARE_API_TOKEN --env production
+gh secret set CLOUDFLARE_ACCOUNT_ID --env production
+gh variable set D1_DATABASE_ID --body '<D1 の ID>'
+gh variable set CF_ACCESS_TEAM_DOMAIN --body '<team>.cloudflareaccess.com'
+gh variable set CF_ACCESS_AUD --body '<AUD Tag>'
+gh variable set DEPLOY_SERVER --body true
+```
+
+GitHub Actions の IP アドレスは Azure と共有の広い範囲（7,000 件以上、毎週更新）のため、トークンの IP 制限には使わない。
+
+### 4. デプロイする
+
+Actions の `server` ワークフローを Run workflow で実行する（`main` への push でも実行される）。本番で必要な Worker の secret はない。`ADMIN_DEV_TOKEN` は本番に設定せず、`ALLOW_DEV_ADMIN` は `"false"` のままにする。
+
+将来の web viewer を別オリジンで動かす場合は、`CORS_ALLOWED_ORIGINS` にそのオリジンをカンマ区切りで書く（例: `"https://viewer.example.com"`）。空なら CORS ヘッダは返さない。CORS は `/v1/*` のみに適用し、`/admin/*` には適用しない。
+
+### 5. 最初のデバイスをペアリングする
+
+1. ブラウザで `https://<ホスト名>/admin/` を開く（Access のログインを経由する）。
+2. 「発行する」を押すと 8 文字のペアリングコードが表示される。有効期限は 10 分で、1 回のみ使用できる。
+3. アプリの同期設定にサーバ URL とコードを入力する。アプリは `POST /v1/devices/register` を呼び、デバイストークンを受け取る。
+
+2 台目以降は、既存デバイスから `POST /v1/pairing` でコードを発行することもできる。admin ページではデバイス一覧の確認と失効もできる。
+
+### 手元からデプロイする場合
+
+`wrangler login` した上で、`wrangler.jsonc` の `database_id` を D1 の ID に置き換えて実行する（置き換えはコミットしない）。
 
 ```sh
 pnpm exec wrangler d1 migrations apply ashidori --remote
+pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.com --var CF_ACCESS_AUD:<AUD Tag>
 ```
-
-### 3. カスタムドメインを決める
-
-`wrangler.jsonc` は `workers_dev: false` にしてあります。
-Access で `/admin/*` を守るために、Worker を自分のゾーンのカスタムドメイン (例: `ashidori.example.com`) に割り当てます。
-`wrangler.jsonc` に次を追加します。
-
-```jsonc
-"routes": [{ "pattern": "ashidori.example.com", "custom_domain": true }]
-```
-
-### 4. Cloudflare Access application を作る (`/admin/*`)
-
-Zero Trust ダッシュボード → Access → Applications → Add an application → Self-hosted で作ります。
-
-- Application domain: `ashidori.example.com`、path: `admin` (= `/admin/*` を保護します)
-- Policy: Allow、Include: 自分のメールアドレスだけ
-- 作成後、application の **Application Audience (AUD) Tag** を控えます。
-- チームドメイン (`<team>.cloudflareaccess.com`) は Zero Trust → Settings の Team domain で確認できます。
-
-`wrangler.jsonc` の `vars` に設定します。
-
-```jsonc
-"CF_ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com",
-"CF_ACCESS_AUD": "<AUD tag>"
-```
-
-Worker は `Cf-Access-Jwt-Assertion` を自分でも検証します。
-検証内容は、`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` の鍵による RS256 署名、`aud`、`iss`、`exp`、`nbf` です。
-このため、Access の設定漏れで `/admin/*` がそのまま公開されることはありません。
-`CF_ACCESS_*` が空のとき、admin API はすべて拒否されます。
-
-### 5. secrets / vars
-
-本番で必要な secret はありません。
-`ADMIN_DEV_TOKEN` は本番に設定しないでください。
-
-将来の web viewer を別オリジンで動かす場合は、`CORS_ALLOWED_ORIGINS` にそのオリジンをカンマ区切りで書きます (例: `"https://viewer.example.com"`)。
-空なら CORS ヘッダは一切返しません。
-CORS は `/v1/*` だけに適用し、`/admin/*` には適用しません。
-
-### 6. デプロイ
-
-```sh
-pnpm exec wrangler deploy
-```
-
-### 7. 最初のデバイスをペアリングする
-
-1. ブラウザで `https://ashidori.example.com/admin/` を開きます (Access のログインを経由します)。
-2. 「発行する」を押すと 8 文字のペアリングコードが出ます。有効期限は 10 分で、1 回だけ使えます。
-3. アプリの同期設定にサーバ URL とコードを入力します。アプリは `POST /v1/devices/register` を呼び、デバイストークンを受け取ります。
-
-2 台目以降は、既存デバイスから `POST /v1/pairing` でコードを発行することもできます。
-admin ページではデバイス一覧の確認と revoke もできます。
 
 ## 実装メモ
 
