@@ -155,7 +155,7 @@ describe("pairing and registration", () => {
     expect(before).toMatchObject({ count: 10 });
   });
 
-  it("checks the edge rate limiter first and does not touch D1 when it refuses", async () => {
+  it("checks the edge rate limiter before any D1 write, and writes nothing when it refuses", async () => {
     const limiter = fakeLimiter(() => false);
     const res = await register("ZZZZZZZZ", "x", "2001:db8::1", undefined, { RL_REGISTER: limiter });
     expect(res.status).toBe(429);

@@ -57,7 +57,10 @@ const body = async (r: Response) => ({ status: r.status, body: (await r.json()) 
 const count = async (sql: string) => (await env.DB.prepare(sql).first<{ n: number }>())!.n;
 
 describe("concurrent registration with a pairing code", () => {
-  it("the same code and token: one creates the device, the other gets it (200)", async () => {
+  // Replays the TLC counterexample of formal/tla/Registration_norecheck.cfg
+  // (RetriesAgree): the second request's batch consumes 0 rows because the
+  // first used the code; without the recheck it answered 401 / 409.
+  it("Registration_norecheck: the same code and token: one creates the device, the other gets it (200)", async () => {
     const code = await issueAdminCode();
     const token = newToken();
     const [a, b] = await race(
@@ -70,7 +73,8 @@ describe("concurrent registration with a pairing code", () => {
     expect(await count("SELECT COUNT(*) AS n FROM devices")).toBe(1);
   });
 
-  it("the same code and token at the user's device limit: still 200", async () => {
+  // Registration_norecheck at the device limit: the first request takes the last slot.
+  it("Registration_norecheck: the same code and token at the user's device limit: still 200", async () => {
     await newDevice("existing"); // the default user has 1 device; the limit is 2
     const code = await issueAdminCode();
     const token = newToken();
@@ -112,7 +116,11 @@ describe("concurrent registration with a pairing code", () => {
 describe("concurrent self-registration", () => {
   const token = newToken();
 
-  it("the same token at MAX_USERS: one creates the account, the other gets it (200)", async () => {
+  // Replays the TLC counterexample of formal/tla/Accounts_norecheck.cfg
+  // (RetriesAgree, MaxUsers = 1): the second request's user INSERT inserts 0
+  // rows because the first took the last slot; without the recheck it
+  // answered 403 "registration full".
+  it("Accounts_norecheck: the same token at MAX_USERS: one creates the account, the other gets it (200)", async () => {
     const env1 = { ...OPEN, MAX_USERS: "1" };
     const [a, b] = await race(
       (db) => selfRegister({ deviceName: "pixel", token }, "192.0.2.1", { ...env1, DB: db }),

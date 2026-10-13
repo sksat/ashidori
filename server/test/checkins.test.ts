@@ -144,7 +144,7 @@ describe("DELETE /v1/checkins/shared/:localId", () => {
       id: string;
       cursor: number;
     };
-    expect((await unshare(a.token, "c1")).status).toBe(200);
+    expect((await unshare(a.token, "c1", "?rev=2")).status).toBe(200);
 
     const { items } = await feed(a.token, `?after=${cursor}`);
     expect(items).toEqual([
@@ -155,7 +155,7 @@ describe("DELETE /v1/checkins/shared/:localId", () => {
     expect(row.deleted_at).toEqual(expect.any(Number));
 
     // Unsharing again is a no-op; the cursor stays.
-    expect((await unshare(a.token, "c1")).status).toBe(200);
+    expect((await unshare(a.token, "c1", "?rev=2")).status).toBe(200);
     expect((await feed(a.token, `?after=${items[0]!.cursor}`)).items).toEqual([]);
 
     // Sharing again (with a newer rev) revives the same entry.
@@ -169,10 +169,10 @@ describe("DELETE /v1/checkins/shared/:localId", () => {
     const alice = await newUser("alice");
     const a2 = await newDevice("a2", alice.userId);
     const { id } = (await (await putCheckin(alice.token, "c1", CHECKIN)).json()) as { id: string };
-    expect((await unshare(alice.token, "a.b")).status).toBe(404);
+    expect((await unshare(alice.token, "a.b", "?rev=2")).status).toBe(404);
     // Another device's local id "c1" is another entry: this leaves a
     // tombstone for a2's "c1" and does not touch alice's.
-    expect((await unshare(a2.token, "c1")).status).toBe(200);
+    expect((await unshare(a2.token, "c1", "?rev=2")).status).toBe(200);
     const items = (await feed(alice.token)).items;
     expect(items.find((i) => i.id === id)!.deleted).toBe(false);
     expect(items.filter((i) => i.deleted)).toHaveLength(1);
@@ -262,7 +262,7 @@ describe("admin: shared check-ins", () => {
     await putCheckin(alice.token, "1", { ...CHECKIN, venue: "Old" });
     await putCheckin(alice.token, "2", { ...CHECKIN, venue: "New", comment: "spam" });
     await putCheckin(alice.token, "3", { ...CHECKIN, venue: "Gone" });
-    await unshare(alice.token, "3");
+    await unshare(alice.token, "3", "?rev=2");
 
     const res = await adminCall("/admin/checkins");
     expect(res.status).toBe(200);

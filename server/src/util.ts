@@ -10,6 +10,15 @@ export const HOUR_MS = 60 * 60 * 1000;
  * (upload, last seen) are stored this coarsely, so that they reveal little
  * about when a user is active.
  */
+/**
+ * D1's clock in milliseconds, as an SQL expression. A statement that checks
+ * an expiry or a time window against it decides by the time at which D1 runs
+ * it, not by a time the Worker took earlier (a request may be delayed for any
+ * length of time between the two). Within one statement it has one value.
+ * julianday() rather than unixepoch('subsec'), which needs SQLite 3.42.
+ */
+export const D1_NOW_MS = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
 export function floorHour(ms: number): number {
   return ms - (ms % HOUR_MS);
 }

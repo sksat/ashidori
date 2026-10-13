@@ -11,6 +11,8 @@
 //    writes. Expired counters are deleted by the scheduled cleanup, in bounded
 //    chunks, using the expires_at index.
 
+import { D1_NOW_MS } from "./util";
+
 export interface RateLimitRule {
   bucket: string;
   limit: number;
@@ -165,21 +167,32 @@ export function selfRegistrationEdgeReady(env: { RL_ACCOUNT?: RateLimit }): bool
 
 // ---- D1 layer ----
 
-/** Returns true if the request is allowed. A rejected request changes no row. */
+/**
+ * Returns true if the request is allowed. A rejected request changes no row.
+ *
+ * The window is taken from D1's clock when the statement runs (util.ts
+ * D1_NOW_MS), so a request delayed between the Worker and D1 counts in the
+ * window in which D1 counts it. The stored window only moves forward: a
+ * request whose window is older than the stored one (a Worker of migration
+ * 0005, which still binds its own clock, or a D1 clock that stepped back)
+ * counts in the stored window instead of resetting the counter to its own
+ * (review 6, item 7).
+ */
 export async function hitRateLimit(db: D1Database, rule: RateLimitRule, client: string): Promise<boolean> {
-  const now = Date.now();
-  const windowStart = now - (now % rule.windowMs);
+  // In DO UPDATE SET, every column reference reads the row as it was before.
+  // "WHERE true" lets SQLite parse ON CONFLICT after INSERT ... SELECT.
   const row = await db
     .prepare(
-      `INSERT INTO rate_limits (key, window_start, expires_at, count) VALUES (?1, ?2, ?3, 1)
+      `INSERT INTO rate_limits (key, window_start, expires_at, count)
+       SELECT ?1, w, w + ?2, 1 FROM (SELECT n - n % ?2 AS w FROM (SELECT ${D1_NOW_MS} AS n)) WHERE true
        ON CONFLICT (key) DO UPDATE SET
-         count = CASE WHEN window_start = excluded.window_start THEN count + 1 ELSE 1 END,
-         window_start = excluded.window_start,
-         expires_at = excluded.expires_at
-       WHERE window_start <> excluded.window_start OR count < ?4
+         count = CASE WHEN excluded.window_start > window_start THEN 1 ELSE count + 1 END,
+         window_start = MAX(window_start, excluded.window_start),
+         expires_at = CASE WHEN excluded.window_start >= window_start THEN excluded.expires_at ELSE expires_at END
+       WHERE excluded.window_start > window_start OR count < ?3
        RETURNING count`,
     )
-    .bind(`${rule.bucket}:${client}`, windowStart, windowStart + rule.windowMs, rule.limit)
+    .bind(`${rule.bucket}:${client}`, rule.windowMs, rule.limit)
     .first<{ count: number }>();
   return row !== null;
 }

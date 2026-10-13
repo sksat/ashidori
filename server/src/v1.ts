@@ -1,5 +1,5 @@
 import { Hono, type Context, type MiddlewareHandler } from "hono";
-import { createAccount, registrationMode } from "./accounts";
+import { createAccount, recoverAccount, registrationMode } from "./accounts";
 import { deviceAuth } from "./auth";
 import { committedBlob, MAX_BLOB_BYTES, MIN_BLOB_BYTES, putBatch } from "./batches";
 import {
@@ -22,7 +22,14 @@ import {
   normalizeHandle,
   requestFollow,
 } from "./follows";
-import { createPairingCode, listDevices, parseDeviceName, registerWithCode, revokeDevice } from "./devices";
+import {
+  createPairingCode,
+  listDevices,
+  parseDeviceName,
+  recoverRegistration,
+  registerWithCode,
+  revokeDevice,
+} from "./devices";
 import type { AppEnv } from "./env";
 import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
@@ -38,12 +45,24 @@ import {
 
 export { MAX_BLOB_BYTES };
 const STREAM_RE = /^[a-z][a-z0-9_]{0,31}$/;
-// Non-negative integer that fits the 12-digit zero-padded R2 key.
-const SEQ_RE = /^(0|[1-9][0-9]{0,11})$/;
+/**
+ * The most decimal digits of a seq: it fits the 12-digit zero-padded R2 key.
+ * Shared with the app (docs/protocol-constants.json).
+ */
+export const SEQ_MAX_DIGITS = 12;
+/**
+ * The most decimal digits of a cursor taken as `after` (batches and feed).
+ * Shared with the app, which drops a listed cursor it could not send back
+ * (docs/protocol-constants.json).
+ */
+export const CURSOR_MAX_DIGITS = 15;
+// Non-negative integer without leading zeros, at most SEQ_MAX_DIGITS digits.
+const SEQ_RE = new RegExp(`^(0|[1-9][0-9]{0,${SEQ_MAX_DIGITS - 1}})$`);
+const CURSOR_RE = new RegExp(`^[0-9]{1,${CURSOR_MAX_DIGITS}}$`);
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 const LIST_DEFAULT_LIMIT = 100;
-const LIST_MAX_LIMIT = 1000;
-const FEED_MAX_LIMIT = 500;
+export const LIST_MAX_LIMIT = 1000;
+export const FEED_MAX_LIMIT = 500;
 /** Device (and user) name of a self-registered account when the app sends none. */
 const DEFAULT_DEVICE_NAME = "device";
 
@@ -95,11 +114,14 @@ v1.get("/health", (c) => c.json({ ok: true }));
 // `{code, name, token}`: the client generates the device token and keeps it
 // before sending, so that it can retry after a lost response: a retry with
 // the same code and token returns the same device (200).
+//
+// Result recovery comes before every gate (the rate limits and the limit
+// variables): it only reads, and only a request with the token of the device
+// that consumed this code gets anything from it. Only a new registration is
+// gated. A request with an unknown token, or a known token with another code,
+// falls through to the gates and is counted like any other.
 v1.post("/devices/register", async (c) => {
   const ip = clientKey(c.req.raw);
-  if (!(await edgeAllowed(c.env.RL_REGISTER, "RL_REGISTER", `register:${ip}`))) {
-    return jsonError(c, 429, "too many requests");
-  }
   const parsed = await jsonBody(c);
   if (parsed instanceof Response) return parsed;
   const { code: rawCode, name: rawName, token } = parsed.body;
@@ -109,9 +131,17 @@ v1.post("/devices/register", async (c) => {
   if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
   const name = parseDeviceName(rawName);
   if (name === null) return jsonError(c, 400, "invalid name");
+  const code = normalizePairingCode(rawCode);
+  if (code) {
+    const known = await recoverRegistration(c.env.DB, code, token);
+    if (known !== null) return c.json({ deviceId: known }, 200);
+  }
+
+  if (!(await edgeAllowed(c.env.RL_REGISTER, "RL_REGISTER", `register:${ip}`))) {
+    return jsonError(c, 429, "too many requests");
+  }
   // Counted after validation, before the code is looked at: wrong codes count.
   if (!(await hitRateLimit(c.env.DB, RULES.register, ip))) return jsonError(c, 429, "too many requests");
-  const code = normalizePairingCode(rawCode);
   if (!code) return jsonError(c, 401, "invalid or expired pairing code");
   const limits = limitsOr503(c);
   if (limits instanceof Response) return limits;
@@ -133,7 +163,24 @@ v1.get("/info", (c) => c.json({ registration: registrationMode(c.env) }));
 // has no handle (an admin may set one) and is marked as self-registered.
 // Further devices are paired from this one (POST /v1/pairing). A retry with
 // the same token returns the same device (200).
+//
+// Result recovery comes before every gate (REGISTRATION, the edge binding,
+// the rate limits, MAX_USERS and the limit variables): a client whose
+// response got lost gets its account back (200) even after the operator
+// closed registration. Only the creation of a new user is gated.
 v1.post("/accounts", async (c) => {
+  const parsed = await jsonBody(c);
+  if (parsed instanceof Response) return parsed;
+  const { deviceName: rawName, token } = parsed.body;
+  if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
+  let name: string | null = DEFAULT_DEVICE_NAME;
+  if (rawName !== undefined && rawName !== null && rawName !== "") {
+    name = typeof rawName === "string" ? parseDeviceName(rawName) : null;
+    if (name === null) return jsonError(c, 400, "invalid deviceName");
+  }
+  const known = await recoverAccount(c.env.DB, token);
+  if (known !== null) return c.json({ deviceId: known }, 200);
+
   if (registrationMode(c.env) !== "open") return jsonError(c, 403, "registration closed");
   // Fail closed without the edge limiter (see ratelimit.ts).
   if (!selfRegistrationEdgeReady(c.env)) {
@@ -143,15 +190,6 @@ v1.post("/accounts", async (c) => {
   const ip = clientKey(c.req.raw);
   if (!(await edgeAllowed(c.env.RL_ACCOUNT, "RL_ACCOUNT", `account:${ip}`))) {
     return jsonError(c, 429, "too many requests");
-  }
-  const parsed = await jsonBody(c);
-  if (parsed instanceof Response) return parsed;
-  const { deviceName: rawName, token } = parsed.body;
-  if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
-  let name: string | null = DEFAULT_DEVICE_NAME;
-  if (rawName !== undefined && rawName !== null && rawName !== "") {
-    name = typeof rawName === "string" ? parseDeviceName(rawName) : null;
-    if (name === null) return jsonError(c, 400, "invalid deviceName");
   }
   if (!(await hitRateLimit(c.env.DB, RULES.account, ip))) return jsonError(c, 429, "too many requests");
   const limits = limitsOr503(c);
@@ -287,7 +325,7 @@ v1.put("/batches/:stream/:seq", async (c) => {
 v1.get("/batches", async (c) => {
   const afterStr = c.req.query("after") ?? "0";
   const limitStr = c.req.query("limit") ?? String(LIST_DEFAULT_LIMIT);
-  if (!/^[0-9]{1,15}$/.test(afterStr)) return jsonError(c, 400, "invalid cursor");
+  if (!CURSOR_RE.test(afterStr)) return jsonError(c, 400, "invalid cursor");
   if (!/^[0-9]{1,5}$/.test(limitStr)) return jsonError(c, 400, "invalid limit");
   const after = Number(afterStr);
   const limit = Math.min(Math.max(Number(limitStr), 1), LIST_MAX_LIMIT);
@@ -370,6 +408,7 @@ function unshareResponse(c: Context<AppEnv>, r: UnshareResult): Response {
 // Unshare by server id, from any device of the entry's user.
 v1.delete("/checkins/shared/by-id/:id", async (c) => {
   const rev = parseRev(c.req.query("rev"));
+  if (rev === null) return jsonError(c, 400, "rev is required");
   if (rev === undefined) return jsonError(c, 400, "invalid rev");
   const id = c.req.param("id");
   if (id.length > 64) return jsonError(c, 404, "not found");
@@ -379,6 +418,7 @@ v1.delete("/checkins/shared/by-id/:id", async (c) => {
 // Unshare this device's entry; an unknown local id gets a tombstone (see checkins.ts).
 v1.delete("/checkins/shared/:localId", async (c) => {
   const rev = parseRev(c.req.query("rev"));
+  if (rev === null) return jsonError(c, 400, "rev is required");
   if (rev === undefined) return jsonError(c, 400, "invalid rev");
   const localId = c.req.param("localId");
   if (!LOCAL_ID_RE.test(localId)) return jsonError(c, 404, "not found");
@@ -395,7 +435,7 @@ v1.delete("/checkins/shared/:localId", async (c) => {
 v1.get("/checkins/feed", async (c) => {
   const afterStr = c.req.query("after") ?? "0";
   const limitStr = c.req.query("limit") ?? String(LIST_DEFAULT_LIMIT);
-  if (!/^[0-9]{1,15}$/.test(afterStr)) return jsonError(c, 400, "invalid cursor");
+  if (!CURSOR_RE.test(afterStr)) return jsonError(c, 400, "invalid cursor");
   if (!/^[0-9]{1,5}$/.test(limitStr)) return jsonError(c, 400, "invalid limit");
   const limit = Math.min(Math.max(Number(limitStr), 1), FEED_MAX_LIMIT);
   return c.json(await listFeed(c.env.DB, c.get("device").user_id!, Number(afterStr), limit));

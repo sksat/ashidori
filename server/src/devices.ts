@@ -1,5 +1,5 @@
 import type { DeviceRow } from "./env";
-import { floorHour, generatePairingCode, sha256Hex } from "./util";
+import { D1_NOW_MS, floorHour, generatePairingCode, sha256Hex } from "./util";
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
 /** Used and expired codes are kept this long after expiry (registration retries, auditing). */
@@ -39,17 +39,19 @@ export async function createPairingCode(
   userId: string | null,
   issuerDeviceId: string | null,
 ): Promise<{ code: string; expiresAt: number }> {
-  const now = Date.now();
   const code = generatePairingCode();
-  const expiresAt = now + PAIRING_TTL_MS;
-  await db
+  // Created and expiring by D1's clock, the clock that registration checks
+  // the expiry against (CODE_USABLE).
+  const row = await db
     .prepare(
       `INSERT INTO pairing_codes (code_hash, created_at, expires_at, created_by, user_id, issuer_device_id)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+       SELECT ?1, n, n + ?2, ?3, ?4, ?5 FROM (SELECT ${D1_NOW_MS} AS n)
+       RETURNING expires_at`,
     )
-    .bind(await sha256Hex(code), now, expiresAt, createdBy, userId, issuerDeviceId)
-    .run();
-  return { code, expiresAt };
+    .bind(await sha256Hex(code), PAIRING_TTL_MS, createdBy, userId, issuerDeviceId)
+    .first<{ expires_at: number }>();
+  if (!row) throw new Error("pairing code not stored");
+  return { code, expiresAt: row.expires_at };
 }
 
 /** Scheduled: deletes codes that expired more than PAIRING_KEEP_MS ago, at most `limit`. */
@@ -83,13 +85,46 @@ const ISSUER = `COALESCE(issuer_device_id, CASE WHEN ${ADMIN_ISSUED} THEN NULL E
 
 // A code is usable if unused, unexpired, of an active user (or legacy), and
 // its issuing device (unless an admin issued it) exists and is not revoked.
-// ?2 is the current time.
-const CODE_USABLE = `used_at IS NULL AND expires_at > ?2
+// The expiry is judged by D1's clock when the statement runs, not by a time
+// the Worker read before: a request delayed between the two must not consume
+// a code that has expired meanwhile (review 6, item 7).
+const CODE_USABLE = `used_at IS NULL AND expires_at > ${D1_NOW_MS}
   AND (user_id IS NULL OR user_id IN (SELECT id FROM users WHERE status = 'active'))
   AND (CASE WHEN ${ISSUER} IS NULL THEN ${ADMIN_ISSUED}
        ELSE ${ISSUER} IN (SELECT id FROM devices WHERE revoked_at IS NULL) END)`;
 // Devices ever registered for the code's user (revoked ones included); `IS` so that NULL counts the legacy devices.
 const USER_DEVICES = "(SELECT COUNT(*) FROM devices WHERE user_id IS pairing_codes.user_id)";
+
+/**
+ * What an earlier request with this token got: null if no device has the
+ * token; its device if that device consumed this code and is not revoked;
+ * else "invalid".
+ */
+async function registeredWith(db: D1Database, tokenHash: string, codeHash: string): Promise<RegisterResult | null> {
+  const row = await db
+    .prepare(
+      `SELECT d.id, d.revoked_at, p.code_hash AS matched FROM devices d
+       LEFT JOIN pairing_codes p ON p.used_by = d.id AND p.code_hash = ?2
+       WHERE d.token_hash = ?1`,
+    )
+    .bind(tokenHash, codeHash)
+    .first<{ id: string; revoked_at: number | null; matched: string | null }>();
+  if (!row) return null;
+  return row.matched !== null && row.revoked_at === null ? { deviceId: row.id, created: false } : "invalid";
+}
+
+/**
+ * Result recovery, separate from the permission to create a device: the id
+ * of the device that an earlier request with this code and token created
+ * (not revoked), or null. Changes nothing, so the route answers it before
+ * any gate (rate limits, limit variables): a client whose response got lost
+ * gets its device back whatever has changed since, as long as the device and
+ * the used code exist.
+ */
+export async function recoverRegistration(db: D1Database, code: string, token: string): Promise<string | null> {
+  const r = await registeredWith(db, await sha256Hex(token), await sha256Hex(code));
+  return r !== null && typeof r === "object" ? r.deviceId : null;
+}
 
 /**
  * Registers a device with a pairing code and a client-generated token (only
@@ -109,19 +144,7 @@ export async function registerWithCode(
 ): Promise<RegisterResult> {
   const codeHash = await sha256Hex(r.code);
   const tokenHash = await sha256Hex(r.token);
-
-  const earlier = async (): Promise<RegisterResult | null> => {
-    const row = await db
-      .prepare(
-        `SELECT d.id, d.revoked_at, p.code_hash AS matched FROM devices d
-         LEFT JOIN pairing_codes p ON p.used_by = d.id AND p.code_hash = ?2
-         WHERE d.token_hash = ?1`,
-      )
-      .bind(tokenHash, codeHash)
-      .first<{ id: string; revoked_at: number | null; matched: string | null }>();
-    if (!row) return null;
-    return row.matched !== null && row.revoked_at === null ? { deviceId: row.id, created: false } : "invalid";
-  };
+  const earlier = () => registeredWith(db, tokenHash, codeHash);
 
   const prior = await earlier();
   if (prior) return prior;
@@ -162,8 +185,8 @@ export async function registerWithCode(
 
   // Not consumed. Only to a caller who holds a usable code, tell that the user has too many devices.
   const full = await db
-    .prepare(`SELECT 1 FROM pairing_codes WHERE code_hash = ?1 AND ${CODE_USABLE} AND ${USER_DEVICES} >= ?3`)
-    .bind(codeHash, now, r.maxDevices)
+    .prepare(`SELECT 1 FROM pairing_codes WHERE code_hash = ?1 AND ${CODE_USABLE} AND ${USER_DEVICES} >= ?2`)
+    .bind(codeHash, r.maxDevices)
     .first();
   return full ? "too many devices" : "invalid";
 }

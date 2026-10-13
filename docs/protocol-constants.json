@@ -1,0 +1,13 @@
+{
+  "description": "Numbers of the sync protocol (docs/sync-protocol.md) that the server and the app must agree on. server/test/protocol-constants.test.ts checks the server against this file; the app is to be checked against it as well.",
+  "cursorMaxDigits": 15,
+  "seqMaxDigits": 12,
+  "listMaxLimit": 1000,
+  "feedMaxLimit": 500,
+  "minBlobBytes": 32,
+  "maxBlobBytes": 8388608,
+  "deviceTokenLength": 43,
+  "pairingCodeTtlMs": 600000,
+  "commitDeadlineMs": 3600000,
+  "orphanGraceMs": 86400000
+}

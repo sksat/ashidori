@@ -59,14 +59,27 @@ describe("revisions of shared check-ins", () => {
     expect((await feed(a.token)).items[0]!.deleted).toBe(false);
   });
 
-  it("use the server time for an unshare without rev", async () => {
+  it("require a rev on DELETE (review 6, item 8)", async () => {
+    // A rev the server assigned would differ on each retry: a retried DELETE
+    // would become a new, later operation and could unshare an entry that was
+    // shared again meanwhile (PUT 100, DELETE, PUT 300, the DELETE again).
+    const a = await newDevice("a");
+    const { body } = await share(a.token, "c1", { rev: 100 });
+    for (const res of [await unshare(a.token, "c1"), await unshareById(a.token, body.id), await unshare(a.token, "new")]) {
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "rev is required" });
+    }
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM shared_checkins WHERE deleted_at IS NULL").first()).toEqual({ n: 1 });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM shared_checkins").first()).toEqual({ n: 1 });
+  });
+
+  it("raise the rev of a tombstone without a new cursor, and never lower it", async () => {
     const a = await newDevice("a");
     await share(a.token, "c1", { rev: 1 });
-    const before = Date.now();
-    expect((await unshare(a.token, "c1")).status).toBe(200);
+    expect((await unshare(a.token, "c1", "?rev=500")).status).toBe(200);
     const row = await env.DB.prepare("SELECT rev FROM shared_checkins").first<{ rev: number }>();
-    expect(row!.rev).toBeGreaterThanOrEqual(before);
-    expect((await share(a.token, "c1", { rev: before - 1 })).status).toBe(409);
+    expect(row!.rev).toBe(500);
+    expect((await share(a.token, "c1", { rev: 499 })).status).toBe(409);
     // A second unshare with a higher rev raises it, without a new cursor.
     const cursor = (await feed(a.token)).items[0]!.cursor;
     expect((await unshare(a.token, "c1", `?rev=${row!.rev + 1000}`)).status).toBe(200);
@@ -77,7 +90,10 @@ describe("revisions of shared check-ins", () => {
     expect((await env.DB.prepare("SELECT rev FROM shared_checkins").first<{ rev: number }>())!.rev).toBe(row!.rev + 1000);
   });
 
-  it("do not let a replayed DELETE undo a later PUT", async () => {
+  // Replays the TLC counterexample of formal/tla/SharedCheckin_old.cfg
+  // (LatestWins): PUT 10, DELETE 20, PUT 30, then DELETE 20 again. The
+  // earlier DELETE tombstoned whatever its rev.
+  it("SharedCheckin_old: do not let a replayed DELETE undo a later PUT", async () => {
     const a = await newDevice("a");
     const { body } = await share(a.token, "c1", { rev: 10 });
     expect((await unshare(a.token, "c1", "?rev=20")).status).toBe(200);
@@ -161,7 +177,6 @@ describe("revisions of shared check-ins", () => {
     }
     // The owner may still unshare it (a no-op, whatever the rev), and share other check-ins.
     const before = await env.DB.prepare("SELECT * FROM shared_checkins").first();
-    expect((await unshare(a.token, "c1")).status).toBe(200);
     expect((await unshare(a.token, "c1", "?rev=1")).status).toBe(200);
     expect((await unshareById(a.token, body.id, `?rev=${Number.MAX_SAFE_INTEGER}`)).status).toBe(200);
     expect(await env.DB.prepare("SELECT * FROM shared_checkins").first()).toEqual(before);
@@ -185,22 +200,22 @@ describe("DELETE /v1/checkins/shared/by-id/:id", () => {
     const { body } = await share(lost.token, "c1", { rev: 1 });
     expect((await postJson(alice.token, `/v1/devices/${lost.deviceId}/revoke`)).status).toBe(200);
 
-    const res = await unshareById(alice.token, body.id);
+    const res = await unshareById(alice.token, body.id, "?rev=2");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ deleted: true });
     const items = (await feed(alice.token)).items;
     expect(items).toEqual([expect.objectContaining({ id: body.id, deleted: true, venue: null })]);
     expect(items[0]!.cursor).toBeGreaterThan(body.cursor);
     // Idempotent.
-    expect((await unshareById(alice.token, body.id)).status).toBe(200);
+    expect((await unshareById(alice.token, body.id, "?rev=2")).status).toBe(200);
   });
 
   it("does not let other users unshare", async () => {
     const alice = await newUser("alice");
     const bob = await newUser("bob");
     const { body } = await share(alice.token, "c1", { rev: 1 });
-    expect((await unshareById(bob.token, body.id)).status).toBe(404);
-    expect((await unshareById(alice.token, "nope")).status).toBe(404);
+    expect((await unshareById(bob.token, body.id, "?rev=2")).status).toBe(404);
+    expect((await unshareById(alice.token, "nope", "?rev=2")).status).toBe(404);
     expect((await feed(alice.token)).items[0]!.deleted).toBe(false);
   });
 

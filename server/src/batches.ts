@@ -13,9 +13,10 @@
 //   3. A request that did not commit deletes its own object (best effort).
 //      Objects left behind by a crash between 1 and 2 are found by the
 //      scheduled sweep (sweepOrphanBlobs).
-// Before step 1 the request reads D1's clock (startedAt), and the commit in
-// step 2 also requires D1's clock at that statement to be at most
-// COMMIT_DEADLINE_MS after it. A request delayed longer (between the put and
+// Before step 1 the request reads D1's clock (startedAt, util.ts D1_NOW_MS;
+// both ends of the deadline are read from it, so the Worker's clock plays no
+// part in it), and the commit in step 2 also requires D1's clock at that
+// statement to be at most COMMIT_DEADLINE_MS after it. A request delayed longer (between the put and
 // the commit, or while the statement is in flight) is refused, deletes its
 // own object and answers 503, and the client sends the same blob again. The
 // sweep only deletes objects older than ORPHAN_MIN_AGE_MS by R2's upload
@@ -29,7 +30,7 @@
 
 import type { Limits } from "./config";
 import { readUsage } from "./accounts";
-import { toHex, randomBytes } from "./util";
+import { D1_NOW_MS, toHex, randomBytes } from "./util";
 
 export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
 /** "ASH1" ‖ 12-byte nonce ‖ 16-byte GCM tag: no valid blob is shorter. */
@@ -78,13 +79,6 @@ export interface PutInput {
   body: Uint8Array;
   createdAt: number;
 }
-
-/**
- * D1's clock in milliseconds. Both ends of the commit deadline are read from
- * it, so the Worker's clock plays no part in the deadline. julianday() rather
- * than unixepoch('subsec'), which needs SQLite 3.42.
- */
-const D1_NOW_MS = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 
 /**
  * An upload must commit within this time after it started (by D1's clock),

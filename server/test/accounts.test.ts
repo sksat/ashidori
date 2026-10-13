@@ -183,7 +183,7 @@ describe("POST /v1/accounts", () => {
     expect((await selfRegister({ deviceName: "ok" }, "198.51.100.9")).status).toBe(201);
   });
 
-  it("checks the edge rate limiter by IP before D1", async () => {
+  it("checks the edge rate limiter by IP before any D1 write", async () => {
     const limiter = fakeLimiter(() => false);
     const res = await selfRegister({ deviceName: "x" }, "198.51.100.7", { ...OPEN, RL_ACCOUNT: limiter });
     expect(res.status).toBe(429);

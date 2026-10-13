@@ -213,7 +213,10 @@ describe("admin API: users", () => {
     await newDevice("a2", alice);
     await adminCall(`/admin/devices/${a1.deviceId}/revoke`, { method: "POST" });
 
-    const users = (await (await adminCall("/admin/users")).json()) as Array<Record<string, unknown>>;
+    // By name: both users may have the same created_at (ms), and ties are ordered by the random id.
+    const users = ((await (await adminCall("/admin/users")).json()) as Array<Record<string, unknown>>).sort((x, y) =>
+      String(x.name).localeCompare(String(y.name)),
+    );
     expect(users.map((u) => [u.name, u.deviceCount])).toEqual([
       ["alice", 1],
       ["bob", 0],

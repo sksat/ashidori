@@ -31,6 +31,38 @@ export const UNUSED_ACCOUNT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export type CreateAccountResult = { deviceId: string; created: boolean } | "full" | "token in use";
 
 /**
+ * What an earlier request with this token got: null if no device has the
+ * token; the device if it is the first device of a self-registered user,
+ * created with it, and not revoked; else "token in use".
+ */
+async function accountOf(db: D1Database, tokenHash: string): Promise<CreateAccountResult | null> {
+  // The first device was created together with its user, at the same time.
+  const row = await db
+    .prepare(
+      `SELECT d.id, d.revoked_at, d.created_at, u.created_at AS user_created_at, u.created_by
+       FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?1`,
+    )
+    .bind(tokenHash)
+    .first<{ id: string; revoked_at: number | null; created_at: number; user_created_at: number | null; created_by: string | null }>();
+  if (!row) return null;
+  const same = row.created_by === SELF_REGISTERED && row.user_created_at === row.created_at && row.revoked_at === null;
+  return same ? { deviceId: row.id, created: false } : "token in use";
+}
+
+/**
+ * Result recovery, separate from the permission to create a user: the id of
+ * the device that an earlier self-registration with this token created (the
+ * first device of its self-registered user, not revoked), or null. Changes
+ * nothing, so the route answers it before any gate (REGISTRATION, rate
+ * limits, MAX_USERS, limit variables): a client whose response got lost gets
+ * its account back even if the operator closed registration meanwhile.
+ */
+export async function recoverAccount(db: D1Database, token: string): Promise<string | null> {
+  const r = await accountOf(db, await sha256Hex(token));
+  return r !== null && typeof r === "object" ? r.deviceId : null;
+}
+
+/**
  * Creates a user with its first device, which authenticates with the
  * client-generated `token` (only its hash is stored). One batch: the user
  * never exists without the device. Idempotent per token: if the token
@@ -42,20 +74,7 @@ export async function createAccount(
   a: { token: string; name: string; maxUsers: number },
 ): Promise<CreateAccountResult> {
   const tokenHash = await sha256Hex(a.token);
-
-  const earlier = async (): Promise<CreateAccountResult | null> => {
-    // The first device was created together with its user, at the same time.
-    const row = await db
-      .prepare(
-        `SELECT d.id, d.revoked_at, d.created_at, u.created_at AS user_created_at, u.created_by
-         FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?1`,
-      )
-      .bind(tokenHash)
-      .first<{ id: string; revoked_at: number | null; created_at: number; user_created_at: number | null; created_by: string | null }>();
-    if (!row) return null;
-    const same = row.created_by === SELF_REGISTERED && row.user_created_at === row.created_at && row.revoked_at === null;
-    return same ? { deviceId: row.id, created: false } : "token in use";
-  };
+  const earlier = () => accountOf(db, tokenHash);
 
   const prior = await earlier();
   if (prior) return prior;

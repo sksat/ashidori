@@ -12,8 +12,11 @@
 // their content nulled out.
 //
 // Revisions: every PUT and DELETE carries the client's `rev` (e.g. the
-// check-in's updatedAt in ms; a DELETE without one uses the server time), and
-// the row keeps the rev of the last operation applied, tombstones included.
+// check-in's updatedAt in ms), required for both, and the row keeps the rev
+// of the last operation applied, tombstones included. A DELETE without a rev
+// is refused (400): a rev the server assigned would differ on each retry, so
+// a retried DELETE would be a new, later operation and could unshare an
+// entry shared again since (review 6, item 8).
 // An operation applies only if its rev is above the stored one, decided in
 // the statement that applies it, so a delayed or replayed older PUT or DELETE
 // cannot undo a later one. A DELETE of an unknown local id leaves a
@@ -113,7 +116,7 @@ export function parseCheckin(body: unknown): CheckinInput | string {
   return { rev, t, lat, lon, venue, category, place, comment };
 }
 
-/** A revision from a query string: a non-negative integer, or null if absent; undefined if invalid. */
+/** A revision from a query string: a non-negative integer, or null if absent (refused by the routes); undefined if invalid. */
 export function parseRev(raw: string | undefined): number | null | undefined {
   if (raw === undefined) return null;
   if (!/^(0|[1-9][0-9]{0,15})$/.test(raw)) return undefined;
@@ -258,9 +261,8 @@ function unshareOutcome(row: RevRow | null, rev: number): UnshareResult | null {
 }
 
 /**
- * Unshares a device's check-in: the entry becomes a tombstone with `rev`
- * (default: the server time in ms), if `rev` is above the stored one. One
- * statement decides and applies it.
+ * Unshares a device's check-in: the entry becomes a tombstone with `rev`, if
+ * `rev` is above the stored one. One statement decides and applies it.
  *
  * - A rev not above the stored one changes nothing: "deleted" if it retries
  *   the unshare that made the current tombstone (same rev), else "stale".
@@ -274,10 +276,9 @@ export async function unshareCheckin(
   userId: string,
   deviceId: string,
   localId: string,
-  rev: number | null,
+  r: number,
   maxEntries: number,
 ): Promise<UnshareResult> {
-  const r = rev ?? Date.now();
   const row = await db
     .prepare(
       `INSERT INTO shared_checkins
@@ -308,9 +309,8 @@ export async function unshareCheckinById(
   db: D1Database,
   userId: string,
   id: string,
-  rev: number | null,
+  r: number,
 ): Promise<UnshareResult> {
-  const r = rev ?? Date.now();
   const row = await db
     .prepare(
       `UPDATE shared_checkins SET ${TOMBSTONE_SET}, rev = ?1
