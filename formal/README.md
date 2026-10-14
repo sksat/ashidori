@@ -348,7 +348,7 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 次の三つは、修正前のコードを表す設定（`**所見（修正済み）**`）で反例が出る。
 これらの設定は修正前の振る舞いの再現として残し、期待は反例のままにする。
 モデルの主な設定は現行のコード（`RunReadsOnce`、`UnknownMarkSet`、`WriteReadsBack`、`RecheckClosed` がすべて `TRUE`）を表し、成り立つ。
-修正のコミット：（追記する）
+修正のコミット：6aa4ecd
 
 1. **同期の実行が、解除の印の付いた後の登録を読む**（`RegistrationClient_runread`、`RunRegMatches`）。
    修正前の `SyncRun.current` は端末 ID、トークン、鍵（`masterKey` はその時点の登録で照合）を読んだ後で、`SyncConfig.registration` を改めて読んでいた。
