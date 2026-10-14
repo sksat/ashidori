@@ -79,6 +79,7 @@ object ViewerGate:
       Right(())
     catch
       case e: ashidori.core.sync.CutoverNotReady => Left(e.getMessage + "。")
+      case e: ashidori.core.sync.CutoverUnverified => Left(e.getMessage + "。")
       case e: Exception => Left(s"ほかの端末の状態を確認できませんでした。時間をおいて再度お試しください（${e.getMessage}）。")
 
   /** This device's batch key (never `K` itself), for one grant. */

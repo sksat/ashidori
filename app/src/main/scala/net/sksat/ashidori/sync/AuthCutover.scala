@@ -45,8 +45,9 @@ object AuthCutover:
     *
     * First downloads the other devices' status, which records which of them
     * write ASHM. Throws [[CutoverNotReady]] (「すべての端末のアプリを更新してください」)
-    * while a device that is neither revoked nor a viewer has not shown that;
-    * other failures (network, storage) throw too, and it can be run again.
+    * while a device that is neither revoked nor a viewer has not shown that,
+    * and [[CutoverUnverified]] (「切り替えの記録を確認できません。…」) while a
+    * C exists or may exist but none could be verified; other failures (network, storage) throw too, and it can be run again.
     * See [[Cutover.ensure]].
     */
   def ensureCutover(): CutRef =

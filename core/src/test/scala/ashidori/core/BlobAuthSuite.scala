@@ -218,6 +218,15 @@ class BlobAuthSuite extends munit.FunSuite:
     assert(!s3.required)
     val s4 = s3.refusedCut(CutRef.of(row))
     assertEquals((s4.found, s4.listed(Seq(row)).found), (Vector.empty, Vector.empty))
+    // Only the first-time state has seen nothing of C.
+    assert(!BlobAuthState().cutSeen)
+    assert(Seq(s1, s2, s3, s4, BlobAuthState.Lost).forall(_.cutSeen))
+    // More listed than kept: overflow, through JSON too; an adopted C ends it.
+    val many = (0 to BlobAuthState.MaxFound).map(i => row.copy(cursor = 20L + i, deviceId = s"d$i"))
+    val s5 = BlobAuthState().listed(many)
+    assert(s5.overflow && s5.found.size == BlobAuthState.MaxFound)
+    assertEquals(BlobAuthState.fromJson(BlobAuthState.toJson(s5)), s5)
+    assert(!s5.adopted(c1, rec).overflow)
   }
 
   // --- Persistence --------------------------------------------------------
@@ -479,25 +488,113 @@ class BlobAuthSuite extends munit.FunSuite:
     assert(st.required && !st.lost && st.record.isDefined)
   }
 
+  /** What a server with a leaked batch key can use: the batch key, and a wrong Ka. */
+  private val viewerKeys = BlobKeys(viewerBatchKey, Crypto.authKey(Crypto.newMasterKey()))
+
+  /** A C forged with the batch key only (ASHM with a wrong Ka), in slot (`dev`, `authcut`, `seq`). */
+  private def fakeCut(dev: String, seq: Long): Array[Byte] =
+    val fakeRec = CutoverRecord.encode(CutoverRecord(Vector(CutoverEntry(devA, "places", 99, "0" * 64))))
+    Crypto.seal(viewerKeys, Crypto.aad(dev, CutoverRecord.Stream, seq), Crypto.gzip(fakeRec))
+
   test("ensureCutover uses an existing C, and refuses a listed C that does not verify") {
     val s = Server()
     s.put(devA, "places", 0, ash1(devA, "places", 0))
-    // A C made with the batch key only (a viewer's forgery): ASHM with a wrong Ka.
-    val viewerKeys = BlobKeys(viewerBatchKey, Crypto.authKey(Crypto.newMasterKey()))
-    val fakeRec = CutoverRecord.encode(CutoverRecord(Vector(CutoverEntry(devA, "places", 99, "0" * 64))))
-    val fake = s.put(devB, CutoverRecord.Stream, 0, Crypto.seal(viewerKeys, Crypto.aad(devB, CutoverRecord.Stream, 0), Crypto.gzip(fakeRec)))
     val other = App(devB, s)
     other.devs = Vector(DeviceRow(devB, false, false))
-    other.nextSeq = 1
     val real = Cutover.ensure(other)
-    assertNotEquals(real, CutRef.of(fake))
-    assert(other.state.refused.contains(CutRef.of(fake)))
-    // devA finds devB's C and uses it instead of making one.
+    val fake = s.put("devC", CutoverRecord.Stream, 0, fakeCut("devC", 0))
+    // devA has the fake one to try first, then finds devB's C and uses it instead of making one.
     val app = App(devA, s)
+    app.update(_.listed(Seq(fake)))
     assertEquals(Cutover.ensure(app), real)
+    assert(app.state.refused.contains(CutRef.of(fake)))
     assertEquals(app.nextSeq, 0L)
     assert(app.state.required)
     assertEquals(app.state.record.map(_.entries.map(_.below)), Some(Vector(1L)))
+  }
+
+  test("ensureCutover makes no C while a listed one does not verify") {
+    val s = Server()
+    s.put(devA, "places", 0, ash1(devA, "places", 0))
+    val fake = s.put(devB, CutoverRecord.Stream, 0, fakeCut(devB, 0))
+    val app = App(devA, s)
+    app.devs = Vector(DeviceRow(devA, false, false))
+    val e = intercept[CutoverUnverified](Cutover.ensure(app))
+    assertEquals(e.getMessage, "切り替えの記録を確認できません。ほかの端末で同期してから再試行してください")
+    assert(app.state.refused.contains(CutRef.of(fake)))
+    assertEquals(app.nextSeq, 0L)
+    assert(!app.state.required)
+  }
+
+  test("ensureCutover after a lost state makes no C from a listing that hides it; forged ASH1 stays refused until C is back") {
+    val s = Server()
+    s.put(devA, "places", 0, ash1(devA, "places", 0))
+    val maker = App(devB, s)
+    maker.devs = Vector(DeviceRow(devB, false, false))
+    val ref = Cutover.ensure(maker)
+    // The server shows devA a listing without C (and without devB as a
+    // device), with an ASH1 status forged with a leaked batch key.
+    val shown = Server()
+    shown.put(devA, "places", 0, s.blobs((devA, "places", 0L)))
+    val forgedBlob = Crypto.sealAsh1(viewerBatchKey, Crypto.aad(devB, "status", 0), plain("forged"))
+    shown.put(devB, "status", 0, forgedBlob)
+    val forged = Intake.Item("forged", StreamKey(devB, "status"), 0, forgedBlob)
+    val file = MemFile()
+    file.content = Some("garbage".getBytes(UTF_8))
+    val app = Reader(devA, shown, file)
+    app.devs = Vector(DeviceRow(devA, false, false))
+    assert(app.state.lost)
+    val e = intercept[CutoverUnverified](Cutover.ensure(app))
+    assert(e.getMessage.startsWith("切り替えの記録を確認できません"))
+    assertEquals(app.nextSeq, 0L)
+    assert(shown.rows.forall(_.stream != CutoverRecord.Stream))
+    assert(app.state.lost && app.state.required && app.state.record.isEmpty)
+    assert(Intake.run(app, Seq(forged), names).toMap.apply("forged").isInstanceOf[Intake.Refused])
+    // Also with a C forged over the batch key alone in the listing.
+    val fake = shown.put("devC", CutoverRecord.Stream, 0, fakeCut("devC", 0))
+    intercept[CutoverUnverified](Cutover.ensure(app))
+    assertEquals(app.nextSeq, 0L)
+    assert(app.state.lost && app.state.refused.contains(CutRef.of(fake)))
+    assert(Intake.run(app, Seq(forged), names).toMap.apply("forged").isInstanceOf[Intake.Refused])
+    // The real C listed again: adopted, the lost state ends, and C judges the forgery.
+    shown.put(ref.deviceId, CutoverRecord.Stream, ref.seq, s.blobs((ref.deviceId, CutoverRecord.Stream, ref.seq)))
+    assertEquals(Cutover.ensure(app), ref)
+    assert(!app.state.lost && app.state.record.isDefined)
+    assertEquals(app.nextSeq, 0L)
+    val out = Intake.run(app, Seq(forged), names).toMap.apply("forged")
+    assert(out match { case Intake.Refused(e) => e.getMessage.contains("not in the cut-over record"); case _ => false }, out.toString)
+  }
+
+  test("ensureCutover with a known C makes no other when the listing hides it; the genuine first time still does") {
+    val s = Server()
+    s.put(devA, "places", 0, ash1(devA, "places", 0))
+    val maker = App(devB, s)
+    maker.devs = Vector(DeviceRow(devB, false, false))
+    val ref = Cutover.ensure(maker)
+    val realRow = s.rows.find(_.stream == CutoverRecord.Stream).get
+    val hidden = Server()
+    hidden.put(devA, "places", 0, s.blobs((devA, "places", 0L)))
+    // C named by an authenticated status; C listed in an earlier page; more C listed than kept.
+    val known: Seq[(String, BlobAuthState => BlobAuthState)] = Seq(
+      "named" -> (_.named(ref)),
+      "listed before" -> (_.listed(Seq(realRow))),
+      "listed beyond the kept" -> (_.listed((0 to BlobAuthState.MaxFound).map(i =>
+        BatchMeta(100L + i, s"junk$i", CutoverRecord.Stream, 0, 10, f"$i%064x")))))
+    for (what, f) <- known do
+      val app = App(devA, hidden)
+      app.devs = Vector(DeviceRow(devA, false, false))
+      app.update(f)
+      assert(app.state.cutSeen, what)
+      intercept[CutoverUnverified](Cutover.ensure(app))
+      assertEquals(app.nextSeq, 0L, what)
+      assert(hidden.rows.forall(_.stream != CutoverRecord.Stream), what)
+      assert(app.state.record.isEmpty, what)
+    // The genuine first time: nothing of C seen, not lost, not required.
+    val first = App(devA, hidden)
+    first.devs = Vector(DeviceRow(devA, false, false))
+    assert(!first.state.cutSeen)
+    assertEquals(Cutover.ensure(first).deviceId, devA)
+    assert(first.state.required && !first.state.lost && first.state.record.isDefined)
   }
 
   test("learn: a C named by a status is fetched and verified; a tampered one is not taken") {
@@ -524,7 +621,7 @@ class BlobAuthSuite extends munit.FunSuite:
   // --- One sync run's order (Intake) --------------------------------------
 
   /** An app that also opens received blobs; `listedRows` from the server. */
-  private final class Reader(id: String, srv: Server) extends App(id, srv) with IntakeEnv:
+  private final class Reader(id: String, srv: Server, f: MemFile = MemFile()) extends App(id, srv, f) with IntakeEnv:
     var listingFails = false
     def listedRows(k: StreamKey): Option[Seq[BatchMeta]] =
       Option.when(!listingFails)(server.rows.toSeq.filter(b => b.deviceId == k.deviceId && b.stream == k.stream))
@@ -587,6 +684,49 @@ class BlobAuthSuite extends munit.FunSuite:
     assertEquals(Intake.run(app, Seq(forged), names).toMap.apply("forged"), Intake.Deferred)
     app.file.onReplace = _ => ()
     assert(Intake.run(app, Seq(forged), names).toMap.apply("forged").isInstanceOf[Intake.Refused])
+  }
+
+  test("one run: more C candidates than the fetch limit: ASH1 waits until the real C is verified") {
+    val (s, ref, _, forged) = cutOverWorld()
+    val realRow = s.rows.find(r => r.stream == CutoverRecord.Stream).get
+    assertEquals(CutRef.of(realRow), ref)
+    // Four candidates that do not verify, listed before the real C.
+    val junk = (1 to 4).map(i => s.put(s"junk$i", CutoverRecord.Stream, 0, fakeCut(s"junk$i", 0)))
+    val app = Reader(devA, s)
+    app.update(_.listed(junk :+ realRow))
+    assertEquals(app.state.toFetch.size, 5)
+    // Run 1: the four are tried and refused, the real C is left by the limit: the forgery waits.
+    assertEquals(Intake.run(app, Seq(forged), names).toMap.apply("forged"), Intake.Deferred)
+    assertEquals(app.state.refused.size, 4)
+    assert(!app.state.required)
+    assertEquals(app.state.toFetch, Vector(ref))
+    // Run 2: the real C verifies; the forgery is judged against it.
+    val out = Intake.run(app, Seq(forged), names).toMap.apply("forged")
+    assert(out.isInstanceOf[Intake.Refused], out.toString)
+    assertEquals(app.state.cut, Some(ref))
+    assert(app.state.required && app.state.record.isDefined)
+  }
+
+  test("one run: more C listed than kept: ASH1 waits until a C is verified, also once the kept ones are refused") {
+    val (s, ref, _, forged) = cutOverWorld()
+    val realRow = s.rows.find(r => r.stream == CutoverRecord.Stream).get
+    val junk = (0 to BlobAuthState.MaxFound).map(i => s.put(s"junk$i", CutoverRecord.Stream, 0, fakeCut(s"junk$i", 0)))
+    val app = Reader(devA, s)
+    app.update(_.listed(junk :+ realRow))
+    assert(app.state.overflow)
+    assertEquals(app.state.toFetch.size, BlobAuthState.MaxFound)
+    assert(!app.state.toFetch.contains(ref))
+    assert(BlobAuthStore(DurableMap(app.file)).state("reg").overflow) // on disk
+    // Every kept candidate is tried and refused; the real one was not kept: still waiting.
+    for _ <- 1 to 3 do assertEquals(Intake.run(app, Seq(forged), names).toMap.apply("forged"), Intake.Deferred)
+    assertEquals(app.state.toFetch, Vector.empty)
+    assert(!app.state.required && app.state.overflow)
+    // A later listing (a rescan) brings the rest; the real C verifies and ends the overflow.
+    app.update(_.listed(s.rows.toSeq))
+    val out = Intake.run(app, Seq(forged), names).toMap.apply("forged")
+    assert(out.isInstanceOf[Intake.Refused], out.toString)
+    assertEquals(app.state.cut, Some(ref))
+    assert(!app.state.overflow && app.state.required)
   }
 
   test("an ASH1 accepted before C was known is not grandfathered once it is") {

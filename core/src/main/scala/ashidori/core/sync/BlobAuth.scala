@@ -148,10 +148,14 @@ final class BlobRejected(reason: String) extends RuntimeException(s"ASH1 blob re
   *   the required state is entered.
   * - `found`: `authcut` rows listed and not tried yet; `refused`: those that
   *   did not verify (not listed as found again).
+  * - `overflow`: more `authcut` rows were listed than `found` keeps, so one
+  *   not kept may be the real C. Until a C is adopted, ASH1 waits
+  *   ([[Intake]]) and no C is made ([[Cutover.ensure]]).
   * - `lost`: the stored state could not be read ([[BlobAuthState.Lost]]), so
   *   whether C exists is not known. `required` is set with it, so every ASH1
-  *   not accepted since is refused, until a C is adopted (learned from the
-  *   server, or made by [[Cutover.ensure]]); that clears it.
+  *   not accepted since is refused, until an existing C is fetched, verified
+  *   and adopted; that clears it. [[Cutover.ensure]] does not make a new C
+  *   in this state.
   */
 final case class BlobAuthState(
     required: Boolean = false,
@@ -161,7 +165,8 @@ final case class BlobAuthState(
     legacy: Map[StreamKey, Map[Long, String]] = Map.empty,
     found: Vector[CutRef] = Vector.empty,
     refused: Vector[CutRef] = Vector.empty,
-    lost: Boolean = false
+    lost: Boolean = false,
+    overflow: Boolean = false
 ):
   import BlobAuthState.*
 
@@ -185,17 +190,28 @@ final case class BlobAuthState(
 
   /** C at `ref` was made here, or fetched and verified. The first record stays. */
   def adopted(ref: CutRef, rec: CutoverRecord): BlobAuthState =
-    if record.isDefined then copy(required = true, legacy = Map.empty, found = found.filterNot(_ == ref), lost = false)
+    if record.isDefined then copy(required = true, legacy = Map.empty, found = found.filterNot(_ == ref), lost = false,
+      overflow = false)
     else copy(required = true, cut = Some(ref), record = Some(rec), legacy = Map.empty, found = found.filterNot(_ == ref),
-      lost = false)
+      lost = false, overflow = false)
 
-  /** `authcut` rows of a listing page: kept to be tried while C is not fetched. */
+  /** Whether a C exists or may exist: the state was lost, or a C was named
+    * by a status, listed (verified or not), or listed but not kept. Then
+    * [[Cutover.ensure]] only adopts an existing C and never makes one.
+    */
+  def cutSeen: Boolean = lost || required || cut.isDefined || record.isDefined || found.nonEmpty || refused.nonEmpty ||
+    overflow
+
+  /** `authcut` rows of a listing page: kept to be tried while C is not
+    * fetched, at most [[BlobAuthState.MaxFound]]; more set `overflow`.
+    */
   def listed(rows: Seq[BatchMeta]): BlobAuthState =
     if record.isDefined then this
     else
       val add = rows.filter(_.stream == CutoverRecord.Stream).map(CutRef.of)
         .filterNot(r => found.contains(r) || refused.contains(r) || cut.contains(r)).distinct
-      if add.isEmpty then this else copy(found = (found ++ add).take(MaxFound))
+      if add.isEmpty then this
+      else copy(found = (found ++ add).take(MaxFound), overflow = overflow || found.size + add.size > MaxFound)
 
   /** A listed C that did not verify. */
   def refusedCut(ref: CutRef): BlobAuthState =
@@ -261,7 +277,8 @@ object BlobAuthState:
       key(k, "slots" -> ujson.Arr.from(m.toSeq.sorted.map((q, h) => ujson.Arr(ujson.Num(q.toDouble), h)))))),
     "found" -> ujson.Arr.from(s.found.map(_.toJson)),
     "refused" -> ujson.Arr.from(s.refused.map(_.toJson)),
-    "lost" -> s.lost
+    "lost" -> s.lost,
+    "overflow" -> s.overflow
   )
 
   def fromJson(v: ujson.Value): BlobAuthState = BlobAuthState(
@@ -272,7 +289,8 @@ object BlobAuthState:
     v("legacy").arr.map(o => keyOf(o) -> o("slots").arr.map(a => a(0).num.toLong -> a(1).str).toMap).toMap,
     v("found").arr.flatMap(CutRef.fromJson).toVector,
     v("refused").arr.flatMap(CutRef.fromJson).toVector,
-    v.obj.get("lost").exists(_.bool)
+    v.obj.get("lost").exists(_.bool),
+    v.obj.get("overflow").exists(_.bool)
   )
 
 /** [[BlobAuthState]] of the current registration, kept in its own
@@ -323,7 +341,7 @@ final class BlobAuthStore(map: DurableMap):
 
   /** Applies `f` and returns the new state once it is on disk; throws
     * [[IOException]] otherwise. `required` never goes back to false, and
-    * `lost` only by adopting a C. Writes also when `f` changes nothing while
+    * `lost` and `overflow` only by adopting a C. Writes also when `f` changes nothing while
     * the state is not persisted.
     */
   def update(reg: String)(f: BlobAuthState => BlobAuthState): BlobAuthState = lock.synchronized {
@@ -333,7 +351,8 @@ final class BlobAuthStore(map: DurableMap):
     val after = f(before)
     val next = after.copy(
       required = after.required || before.required,
-      lost = after.lost || (before.lost && after.record.isEmpty))
+      lost = after.lost || (before.lost && after.record.isEmpty),
+      overflow = after.overflow || (before.overflow && after.record.isEmpty))
     if next == before && onDisk then before
     else
       try
@@ -388,6 +407,13 @@ trait CutoverEnv extends CutoverSource:
 /** Some devices of the user have not shown that they write ASHM. */
 final class CutoverNotReady(val devices: Seq[String]) extends RuntimeException("すべての端末のアプリを更新してください")
 
+/** A C exists or may exist (see [[BlobAuthState.cutSeen]]), but none could be
+  * fetched and verified, so none is made: a server that hides the real C
+  * could otherwise get a new one made over blobs it forged.
+  */
+final class CutoverUnverified
+    extends RuntimeException("切り替えの記録を確認できません。ほかの端末で同期してから再試行してください")
+
 object Cutover:
   /** A fetched C for `ref`, checked: the listed SHA-256, ASHM under Ka in its
     * slot, and a well-formed record. Throws otherwise.
@@ -417,9 +443,17 @@ object Cutover:
 
   /** Tries the C this device still has to fetch (named by a status, or
     * listed), at most `max`, until one verifies. Network errors are thrown.
+    *
+    * Returns whether learning is complete for now: a C is verified, or every
+    * candidate was tried and none is left that was not kept (`overflow`).
+    * False when the limit left candidates untried: one of them may be the
+    * real C.
     */
-  def learn(src: CutoverSource, max: Int = 4): Unit =
-    src.state.toFetch.take(max).iterator.map(tryAdopt(src, _)).find(_.isDefined)
+  def learn(src: CutoverSource, max: Int = 4): Boolean =
+    val tried = src.state.toFetch.take(max)
+    tried.iterator.map(tryAdopt(src, _)).find(_.isDefined)
+    val st = src.state
+    st.record.isDefined || (st.toFetch.forall(tried.contains) && !st.overflow)
 
   /** Makes sure C exists and this device is in the required state; returns C.
     * Run by the approving app before the first viewer pairing.
@@ -427,10 +461,14 @@ object Cutover:
     * 1. This device's unsent C (from an earlier call cut short) is sent first.
     * 2. If the state already has a verified C, that is it.
     * 3. Else C named or listed is fetched and, if valid, used.
-    * 4. Else every non-revoked device other than this one and the viewers
+    * 4. Else, if a C exists or may exist ([[BlobAuthState.cutSeen]]: the
+    *    state was lost, a C was named, or one was listed now or before),
+    *    none is made: [[CutoverUnverified]]. Only in the first-time state
+    *    (nothing of C ever seen) is one made.
+    * 5. Else every non-revoked device other than this one and the viewers
     *    must have had an ASHM blob accepted here; otherwise
     *    [[CutoverNotReady]] (the user updates the apps first).
-    * 5. Else C is made from the whole listing, stored for upload, recorded
+    * 6. Else C is made from the whole listing, stored for upload, recorded
     *    as this device's C (required), and sent.
     *
     * Returns only once C is on the server and the required state on disk
@@ -452,6 +490,7 @@ object Cutover:
         val existing = (st.toFetch ++ listedCuts).distinct.iterator.flatMap(r => tryAdopt(env, r).map(_ => r)).nextOption()
         existing.getOrElse {
           val now = env.state
+          if now.cutSeen || listedCuts.nonEmpty then throw CutoverUnverified()
           val missing = env.devices().filter(d => !d.revoked && !d.viewer && d.id != env.selfId && !now.ashmFrom(d.id))
           if missing.nonEmpty then throw CutoverNotReady(missing.map(_.id))
           val rec = CutoverRecord.fromListing(rows)
@@ -507,7 +546,9 @@ trait IntakeEnv extends CutoverSource:
   *  2. the C still to fetch (named, or listed earlier in the run) is learned;
   *  3. only then the ASH1 blobs, against the state that results. If 1. or 2.
   *     could not be stored or fetched completely, or the state is not on disk,
-  *     ASH1 waits for the next run ([[Intake.Deferred]]).
+  *     ASH1 waits for the next run ([[Intake.Deferred]]). So it does while no
+  *     C is verified and a candidate was left untried (the per-run fetch
+  *     limit of [[Cutover.learn]], or more listed than kept).
   *
   * So in one run, the arrival order of C, the status naming it and an ASH1
   * blob does not matter.
@@ -554,7 +595,7 @@ object Intake:
         catch case e: Exception => Refused(e)
     // 2. The C to fetch, then the state on disk (also one whose write failed before).
     try
-      Cutover.learn(env)
+      if !Cutover.learn(env) then settled = false
       env.update(identity)
     catch case _: IOException => settled = false
     // 3. ASH1.
