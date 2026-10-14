@@ -100,11 +100,16 @@ no_forward_secrecy verified
 # Expected result per lemma of crypto/browser_pairing.spthy, per mutation
 # flag ("-" = no flag): <flag> <lemma> <expected>.
 PAIRING_EXPECT="
-- executable verified
+- accepted_key_source verified
+- executable_approve_first verified
+- executable_confirm_first verified
+- executable_two_browsers verified
 - master_key_secrecy verified
+- auth_key_secrecy verified
 - batch_key_secrecy verified
 - grant_agreement verified
-NOCOMMIT executable verified
+NOCOMMIT executable_approve_first verified
+NOCOMMIT master_key_secrecy verified
 NOCOMMIT batch_key_secrecy falsified
 NOGRANTAUTH grant_agreement falsified
 NOGRANTAUTH batch_key_secrecy verified

@@ -19,8 +19,8 @@ begin
  *     and that app show the same words (restriction Equal).
  * Not modelled: cancellation, expiry, restarts (server state, not secrecy).
  *
- * Transcript: th = h(<id, code, c, nA, scope, ttl, pkB, nB>). The words are
- * sas(<id, code, pkB, nB>, <nA, scope, ttl>), an ideal hash of the same
+ * Transcript: th = h(<id, code, c, <nA, scope, ttl>, pkB, nB>). The words
+ * are sas(<id, code, pkB>, nB, <nA, scope, ttl>), an ideal hash of the same
  * fields (c is a function of pkB and nB). Each side fixes its fields before
  * it sends its next message: the browser id, code, pkB, nB before it learns
  * nA, and nA, scope, ttl before it reveals; the app id, code, c, nA, scope,
@@ -51,11 +51,11 @@ begin
  */
 
 builtins: hashing
-functions: pk/1, hseal/3, hopen/3, kdf/1, kauth/1, sas/2, grindA/4, grindB/5
+functions: pk/1, hseal/3, hopen/3, kdf/1, kauth/1, sas/3, grindA/3, grindB/3
 equations:
   hopen(hseal(pk(sk), info, m), sk, info) = m,
-  sas(b, <grindA(b, s, l, t), s, l>) = t,
-  sas(<i, c, p, grindB(i, c, p, a, t)>, a) = t
+  sas(b, n, grindA(b, n, t)) = t,
+  sas(b, grindB(b, a, t), a) = t
 
 restriction Equal:
   "All x y #i. Eq(x, y) @ i ==> x = y"
@@ -82,84 +82,84 @@ rule B_Start:
 #endif
 
 // The user types the code into the app. The app takes the id and the commit
-// the server hands it, then fixes sA, scope and ttl and sends nA = h(sA).
+// the server hands it, then fixes sA, scope and ttl and sends
+// ap = <nA, scope, ttl> with nA = h(sA).
 #ifdef NOCOMMIT
 rule A_Claim:
+    let ap = <h(<'app', ~sA>), $scope, $ttl>
+    in
     [ !App(A, K), UserCode(tid, code), In(<id, pkX, nX>), Fr(~sA) ]
   -->
-    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, ~sA, $scope, $ttl),
-      !ADisplay(tid, sas(<id, code, pkX, nX>, <h(<'app', ~sA>), $scope, $ttl>)),
-      Out(<h(<'app', ~sA>), $scope, $ttl>) ]
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, ~sA, ap),
+      !ADisplay(tid, sas(<id, code, pkX>, nX, ap)),
+      Out(ap) ]
 #else
 rule A_Claim:
+    let ap = <h(<'app', ~sA>), $scope, $ttl>
+    in
     [ !App(A, K), UserCode(tid, code), In(<id, c>), Fr(~sA) ]
   -->
-    [ AWait(tid, K, id, code, c, ~sA, $scope, $ttl), Out(<h(<'app', ~sA>), $scope, $ttl>) ]
+    [ AWait(tid, K, id, code, c, ~sA, ap), Out(ap) ]
 #endif
 
-// The browser takes the first nA, scope and ttl, shows the words, and
-// reveals pkB and nB.
+// The browser takes the first ap, shows the words, and reveals pkB and nB.
 #ifdef NOCOMMIT
 rule B_Reveal:
-    [ BWait(tid, id, code, sk, nB), In(<nA, scope, ttl>) ]
+    [ BWait(tid, id, code, sk, nB), In(ap) ]
   -->
-    [ BShown(tid, id, code, sk, nB, nA, scope, ttl),
-      !BDisplay(tid, sas(<id, code, pk(sk), nB>, <nA, scope, ttl>)) ]
+    [ BShown(tid, id, code, sk, nB, ap), !BDisplay(tid, sas(<id, code, pk(sk)>, nB, ap)) ]
 #else
 rule B_Reveal:
-    [ BWait(tid, id, code, sk, nB), In(<nA, scope, ttl>) ]
+    [ BWait(tid, id, code, sk, nB), In(ap) ]
   -->
-    [ BShown(tid, id, code, sk, nB, nA, scope, ttl),
-      !BDisplay(tid, sas(<id, code, pk(sk), nB>, <nA, scope, ttl>)),
+    [ BShown(tid, id, code, sk, nB, ap), !BDisplay(tid, sas(<id, code, pk(sk)>, nB, ap)),
       Out(<pk(sk), nB>) ]
 
 // The app accepts the reveal only if it opens the commit, and shows the words.
 rule A_Reveal:
-    [ AWait(tid, K, id, code, h(<'commit', pkX, nX>), sA, scope, ttl), In(<pkX, nX>) ]
+    [ AWait(tid, K, id, code, h(<'commit', pkX, nX>), sA, ap), In(<pkX, nX>) ]
   -->
-    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, sA, scope, ttl),
-      !ADisplay(tid, sas(<id, code, pkX, nX>, <h(<'app', sA>), scope, ttl>)) ]
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, sA, ap),
+      !ADisplay(tid, sas(<id, code, pkX>, nX, ap)) ]
 #endif
 
 // The user approves in the app only when the browser shows the same words.
 // The app seals sA and the batch key to the revealed key, with th as info.
 rule A_Approve:
-    let nA = h(<'app', sA>)
-        th = h(<id, code, c, nA, scope, ttl, pkX, nX>)
+    let th = h(<id, code, c, ap, pkX, nX>)
     in
-    [ AShown(tid, K, id, code, c, pkX, nX, sA, scope, ttl), !BDisplay(tid, wB) ]
-  --[ Eq(sas(<id, code, pkX, nX>, <nA, scope, ttl>), wB),
-      Approve(tid, th, kdf(K)) ]->
+    [ AShown(tid, K, id, code, c, pkX, nX, sA, ap), !BDisplay(tid, wB) ]
+  --[ Eq(sas(<id, code, pkX>, nX, ap), wB), Approve(tid, th, kdf(K)) ]->
     [ Out(hseal(pkX, <'grant', th>, <sA, kdf(K)>)) ]
 
 // The user confirms in the browser only when the app shows the same words.
 #ifdef APPONLY
 rule B_Confirm:
-    [ BShown(tid, id, code, sk, nB, nA, scope, ttl) ]
+    [ BShown(tid, id, code, sk, nB, ap) ]
   --[ BConfirm(tid) ]->
-    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl) ]
+    [ BConfirmed(tid, id, code, sk, nB, ap) ]
 #else
 rule B_Confirm:
-    [ BShown(tid, id, code, sk, nB, nA, scope, ttl), !ADisplay(tid, wA) ]
-  --[ Eq(sas(<id, code, pk(sk), nB>, <nA, scope, ttl>), wA), BConfirm(tid) ]->
-    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl) ]
+    [ BShown(tid, id, code, sk, nB, ap), !ADisplay(tid, wA) ]
+  --[ Eq(sas(<id, code, pk(sk)>, nB, ap), wA), BConfirm(tid) ]->
+    [ BConfirmed(tid, id, code, sk, nB, ap) ]
 #endif
 
 // After its own confirmation, the browser opens the grant with its th and
 // keeps the key only if the grant carries the preimage of nA.
 #ifdef NOGRANTAUTH
 rule B_Accept:
-    let th = h(<id, code, h(<'commit', pk(sk), nB>), nA, scope, ttl, pk(sk), nB>)
+    let th = h(<id, code, h(<'commit', pk(sk), nB>), ap, pk(sk), nB>)
     in
-    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl), In(hseal(pk(sk), <'grant', th>, <s, bk>)) ]
+    [ BConfirmed(tid, id, code, sk, nB, ap), In(hseal(pk(sk), <'grant', th>, <s, bk>)) ]
   --[ BAccept(tid, th, bk) ]->
     [ BHolds(tid, sk, bk) ]
 #else
 rule B_Accept:
-    let nA = h(<'app', sA>)
-        th = h(<id, code, h(<'commit', pk(sk), nB>), nA, scope, ttl, pk(sk), nB>)
+    let ap = <h(<'app', sA>), scope, ttl>
+        th = h(<id, code, h(<'commit', pk(sk), nB>), ap, pk(sk), nB>)
     in
-    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl), In(hseal(pk(sk), <'grant', th>, <sA, bk>)) ]
+    [ BConfirmed(tid, id, code, sk, nB, ap), In(hseal(pk(sk), <'grant', th>, <sA, bk>)) ]
   --[ BAccept(tid, th, bk) ]->
     [ BHolds(tid, sk, bk) ]
 #endif
@@ -170,6 +170,12 @@ rule B_Leak:
     [ BHolds(tid, sk, bk) ]
   --[ BLeak(tid) ]->
     [ Out(<sk, bk>) ]
+
+// Helper for the leak rule: a key a browser holds came from an approval or
+// was already known to the attacker.
+lemma accepted_key_source [sources]:
+  "All tid th bk #i. BAccept(tid, th, bk) @ i ==>
+     (Ex #j. KU(bk) @ j & #j < #i) | (Ex t2 th2 #j. Approve(t2, th2, bk) @ j & #j < #i)"
 
 // ---- Sanity: the honest run is possible, in both confirmation orders and
 // ---- for two browsers of one user ----
