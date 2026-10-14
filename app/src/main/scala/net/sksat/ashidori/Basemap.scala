@@ -53,20 +53,24 @@ object Basemap:
   /** Deletes every downloaded file. Blocking. */
   def deleteAll(): Unit = lock.synchronized(store.deleteAll())
 
-  private var style: Option[(Option[String], String)] = None
+  private var style: Option[(Option[String], Option[String])] = None
 
-  /** MapLibre style JSON of the offline map; a plain background without the data. */
-  def styleJson: String = synchronized {
+  /** MapLibre style JSON of the offline map; None without (valid) data. */
+  def styleJson: Option[String] = synchronized {
     val d = dir
     val key = d.map(_.getAbsolutePath)
     style match
       case Some((k, s)) if k == key => s
       case _ =>
         val template = d.flatMap(x => Try(String(Files.readAllBytes(File(x, "style.json").toPath), UTF_8)).toOption)
-        val s = OfflineBasemapStyle.render(template, key.getOrElse(""))
+        val s = template.flatMap(t => OfflineBasemapStyle.render(Some(t), key.getOrElse("")))
+        if d.nonEmpty && s.isEmpty then Log.w("basemap: installed style.json is missing or not local")
         style = Some((key, s))
         s
   }
+
+  /** The offline map can be drawn: its data is installed and valid. */
+  def available: Boolean = styleJson.nonEmpty
 
   /** Credit lines of the downloaded copy (its manifest), for データの出典. */
   def attribution: Seq[String] =

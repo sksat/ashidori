@@ -5,7 +5,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import net.sksat.ashidori.*
 
 /** Status texts and actions of the downloaded offline basemap (簡易地図),
-  * shared by the settings row and the banner on maps without it.
+  * shared by the settings row and the card on maps without it.
   */
 object BasemapUi:
   /** Shown wherever the download is offered. */
@@ -22,6 +22,7 @@ object BasemapUi:
     case BasemapStatus.Running(d, t, _) => s"ダウンロード中 ${percent(d, t)}%"
     case BasemapStatus.Installed(v, _) => s"取得済み v$v"
     case BasemapStatus.Failed(msg, retrying) => s"失敗: $msg" + (if retrying then "（自動で再試行します）" else "")
+    case BasemapStatus.NotPublished => NotPublishedText
 
   def sourceLine(st: BasemapStatus): Option[String] = st match
     case BasemapStatus.Running(_, _, s) => Some(s"取得元: ${s.label}")
@@ -32,12 +33,28 @@ object BasemapUi:
   def summary(st: BasemapStatus): String =
     (Seq(statusLine(st)) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _)).mkString("\n")
 
-  /** Text of the banner on a map drawn without the basemap. */
-  def bannerText(st: BasemapStatus): String = st match
-    case BasemapStatus.Running(d, t, _) => s"簡易地図をダウンロード中 ${percent(d, t)}%"
-    case BasemapStatus.Failed(_, _) => "簡易地図を取得できませんでした（再試行）"
+  val NotPublishedText = "簡易地図は現在配信されていません"
+
+  /** Heading of the card on a map without a base map: why it has none. */
+  def cardTitle(st: BasemapStatus): String = st match
+    case BasemapStatus.Unavailable => "このビルドでは簡易地図を利用できません"
+    case BasemapStatus.Missing => "簡易地図は未取得です"
+    case BasemapStatus.Installed(_, _) => "簡易地図のデータを読み込めません"
+    case BasemapStatus.Waiting(false) => "簡易地図は Wi-Fi 接続時に取得します"
     case BasemapStatus.Waiting(true) => "簡易地図のダウンロード待ち"
-    case _ => s"簡易地図をダウンロード（${Basemap.sizeLabel}・Wi-Fi）"
+    case BasemapStatus.Running(d, t, _) => s"簡易地図をダウンロード中 ${percent(d, t)}%"
+    case BasemapStatus.Failed(_, true) => "簡易地図を取得できませんでした（自動で再試行します）"
+    case BasemapStatus.Failed(_, false) => "簡易地図を取得できませんでした"
+    case BasemapStatus.NotPublished => NotPublishedText
+
+  /** Whether that card offers the download (or a retry) now. */
+  def offersDownload(st: BasemapStatus): Boolean = st match
+    case BasemapStatus.Missing | BasemapStatus.Waiting(false) | BasemapStatus.Failed(_, _) => true
+    case _ => false
+
+  /** Label of the card's download button. */
+  def downloadLabel: String =
+    if Basemap.sizeLabel.isEmpty then "簡易地図をダウンロード" else s"簡易地図をダウンロード（${Basemap.sizeLabel}）"
 
   private def metered(act: MainActivity): Boolean =
     act.getSystemService(classOf[ConnectivityManager]).isActiveNetworkMetered
@@ -56,11 +73,6 @@ object BasemapUi:
         .setNeutralButton("キャンセル", null)
         .show()
 
-  /** The banner on a map without the basemap. */
-  def bannerClicked(act: MainActivity): Unit = BasemapDownload.status match
-    case BasemapStatus.Missing | BasemapStatus.Failed(_, _) => requestDownload(act)
-    case _ => showDialog(act)
-
   /** Status, download / retry and delete. */
   def showDialog(act: MainActivity): Unit =
     val st = BasemapDownload.status
@@ -78,7 +90,7 @@ object BasemapUi:
         b.setNegativeButton("中止して削除", (_, _) => BasemapDownload.delete(act))
         if st == BasemapStatus.Waiting(false) then
           b.setPositiveButton("今すぐダウンロード", (_, _) => requestDownload(act))
-      case BasemapStatus.Failed(_, _) =>
+      case BasemapStatus.Failed(_, _) | BasemapStatus.NotPublished =>
         b.setPositiveButton("再試行", (_, _) => requestDownload(act))
         b.setNegativeButton("削除", (_, _) => BasemapDownload.delete(act))
       case BasemapStatus.Missing =>

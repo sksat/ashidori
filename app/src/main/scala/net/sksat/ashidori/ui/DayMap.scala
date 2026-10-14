@@ -1,5 +1,6 @@
 package net.sksat.ashidori.ui
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.drawable.GradientDrawable
 import android.view.{Gravity, View, ViewGroup}
@@ -14,11 +15,17 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
 import net.sksat.ashidori.*
 import ashidori.core.*
+import ashidori.core.BaseMapPolicy.Outcome
 import Ui.*
 
 /** A still map of one day for the timeline: the route in transport mode
   * colors and the stays, on the chosen base map. Rendered off-screen one at
   * a time and cached; without tiles (offline) the plain sketch stays.
+  *
+  * Without a base map to draw ([[Outcome.NoBasemap]]: the offline map is
+  * needed and not downloaded) MapLibre is not run: the card shows the
+  * sketch, marked 「地図なし」. When the basemap is installed (or removed),
+  * the snapshots of the offline map are dropped and the cards drawn again.
   *
   * Jobs pick their base map right before they start, and a change of
   * 「位置情報を外部サービスに送らない」 drops the queued ones and cancels the
@@ -29,6 +36,39 @@ object DayMap:
   /** The running snapshotter is its handle: referenced until it calls back. */
   private val queue = SnapshotQueue[MapSnapshotter](Settings.gate)
   Settings.gate.onChange(() => AshidoriApp.app.getMainExecutor.execute(() => queue.invalidate().foreach(_.cancel())))
+
+  /** A card's frame; `redraw` picks its base map again. */
+  private final class MapCard(c: Context) extends FrameLayout(c):
+    var redraw: () => Unit = () => ()
+
+  /** Cards built so far, while something still shows them. */
+  private val cards = java.util.Collections.newSetFromMap(java.util.WeakHashMap[MapCard, java.lang.Boolean]())
+  private var basemapVersion = Basemap.installedVersion
+  private val stopBasemap = BasemapDownload.listen { () =>
+    val v = Basemap.installedVersion
+    if v != basemapVersion then
+      basemapVersion = v
+      // Snapshots of the old data (keyed by its version) are stale.
+      val stale = s"${MapStyle.Offline.key}@"
+      cache.snapshot().keySet().asScala.filter(_.startsWith(stale)).foreach(cache.remove)
+      cards.asScala.toSeq.foreach(_.redraw())
+  }
+
+  /** The small 「地図なし」 mark on a sketch drawn in place of a map. */
+  def noMapBadge(c: Context): View =
+    given Ctx = c
+    val t = text("地図なし", 11f, colorAttr = attr.onSurfaceVariant)
+    t.setPadding(dp(6), dp(1), dp(6), dp(2))
+    val bg = GradientDrawable()
+    bg.setCornerRadius(dp(6).toFloat)
+    bg.setColor((color(attr.surface) & 0x00ffffff) | 0xcc000000)
+    t.setBackground(bg)
+    val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      Gravity.BOTTOM | Gravity.END)
+    lp.setMargins(0, 0, dp(8), dp(8))
+    t.setLayoutParams(lp)
+    t.setVisibility(View.GONE)
+    t
 
   def view(act: MainActivity, tl: DayTimeline): Option[View] = view(act, Seq(tl), tl.date.toString)
 
@@ -54,9 +94,11 @@ object DayMap:
     val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays)
     val img = ImageView(act)
     img.setScaleType(ImageView.ScaleType.CENTER_CROP)
-    val frame = FrameLayout(act)
+    val frame = MapCard(act)
     frame.addView(sketch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     frame.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    val badge = noMapBadge(act)
+    frame.addView(badge)
     val bg = GradientDrawable()
     bg.setCornerRadius(dp(12).toFloat)
     bg.setColor(color(attr.surfaceContainerHigh))
@@ -70,59 +112,80 @@ object DayMap:
     def key(style: MapStyle) =
       s"${style.cacheKey}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
     // The snapshot draws the base map's attribution itself.
-    def show(b: Bitmap): Unit = img.setImageBitmap(b)
-    Option(cache.get(key(MapStyle.forSnapshot))) match
-      case Some(b) => show(b)
-      case None =>
-        queue.enqueue { block =>
-          // Rendered while scrolling, without the user asking for that area:
-          // the offline map while 「位置情報を外部サービスに送らない」 is on,
-          // as the setting is now, not when the card was laid out.
-          val style = MapStyle.forSnapshot(block)
-          val density = dm.density
-          // Fit everything with a margin; at least ~400 m across.
-          val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
-          val (lon0, lon1) = (pts.map(_.lon).min, pts.map(_.lon).max)
-          val padLat = math.max((lat1 - lat0) * 0.15, 0.002)
-          val padLon = math.max((lon1 - lon0) * 0.15, 0.0025)
-          val bounds = LatLngBounds.Builder()
-            .include(MLatLng(lat0 - padLat, lon0 - padLon))
-            .include(MLatLng(lat1 + padLat, lon1 + padLon))
-            .build()
-          val builder = style.snapshotBuilder
-            .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths)))
-            .withSource(GeoJsonSource("day-stays", FeatureCollection.fromFeatures(
-              stays.map(s => Feature.fromGeometry(Point.fromLngLat(s.lon, s.lat))).asJava)))
-            .withLayer(LineLayer("day-route-line", "day-route").withProperties(
-              PropertyFactory.lineColor(Expression.toColor(Expression.get("color"))),
-              PropertyFactory.lineWidth(4f),
-              PropertyFactory.lineOpacity(Expression.switchCase(Expression.get("dashed"), Expression.literal(0.45f), Expression.literal(0.95f))),
-              PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-              PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-            ))
-            .withLayer(CircleLayer("day-stays-circle", "day-stays").withProperties(
-              PropertyFactory.circleColor(TrackMap.DefaultLine),
-              PropertyFactory.circleRadius(5f),
-              PropertyFactory.circleStrokeColor("#ffffff"),
-              PropertyFactory.circleStrokeWidth(2f)
-            ))
-          val opts = MapSnapshotter.Options((wPx / density).toInt, (hPx / density).toInt)
-            .withPixelRatio(density)
-            .withRegion(bounds)
-            .withStyleBuilder(builder)
-            .withLogo(false)
-          MapStyle.applyNetworkPolicy(act)
-          val snap = MapSnapshotter(act, opts)
-          snap.start(
-            s => {
-              cache.put(key(style), s.getBitmap)
-              show(s.getBitmap)
-              queue.finished(snap)
-            },
-            (_: String) => queue.finished(snap) // offline or no tiles: keep the sketch
-          )
-          Some(snap)
-        }
+    def show(b: Bitmap): Unit =
+      img.setImageBitmap(b)
+      badge.setVisibility(View.GONE)
+    // No base map: the sketch is the picture.
+    def sketchOnly(): Unit =
+      img.setImageDrawable(null)
+      badge.setVisibility(View.VISIBLE)
+
+    def start(style: MapStyle): Option[MapSnapshotter] =
+      val density = dm.density
+      // Fit everything with a margin; at least ~400 m across.
+      val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
+      val (lon0, lon1) = (pts.map(_.lon).min, pts.map(_.lon).max)
+      val padLat = math.max((lat1 - lat0) * 0.15, 0.002)
+      val padLon = math.max((lon1 - lon0) * 0.15, 0.0025)
+      val bounds = LatLngBounds.Builder()
+        .include(MLatLng(lat0 - padLat, lon0 - padLon))
+        .include(MLatLng(lat1 + padLat, lon1 + padLon))
+        .build()
+      val builder = style.snapshotBuilder
+        .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths)))
+        .withSource(GeoJsonSource("day-stays", FeatureCollection.fromFeatures(
+          stays.map(s => Feature.fromGeometry(Point.fromLngLat(s.lon, s.lat))).asJava)))
+        .withLayer(LineLayer("day-route-line", "day-route").withProperties(
+          PropertyFactory.lineColor(Expression.toColor(Expression.get("color"))),
+          PropertyFactory.lineWidth(4f),
+          PropertyFactory.lineOpacity(Expression.switchCase(Expression.get("dashed"), Expression.literal(0.45f), Expression.literal(0.95f))),
+          PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
+        ))
+        .withLayer(CircleLayer("day-stays-circle", "day-stays").withProperties(
+          PropertyFactory.circleColor(TrackMap.DefaultLine),
+          PropertyFactory.circleRadius(5f),
+          PropertyFactory.circleStrokeColor("#ffffff"),
+          PropertyFactory.circleStrokeWidth(2f)
+        ))
+      val opts = MapSnapshotter.Options((wPx / density).toInt, (hPx / density).toInt)
+        .withPixelRatio(density)
+        .withRegion(bounds)
+        .withStyleBuilder(builder)
+        .withLogo(false)
+      MapStyle.applyNetworkPolicy(act)
+      val snap = MapSnapshotter(act, opts)
+      snap.start(
+        s => {
+          cache.put(key(style), s.getBitmap)
+          show(s.getBitmap)
+          queue.finished(snap)
+        },
+        (_: String) => queue.finished(snap) // offline or no tiles: keep the sketch
+      )
+      Some(snap)
+
+    def render(): Unit = MapStyle.forSnapshot match
+      case Outcome.NoBasemap => sketchOnly()
+      case Outcome.Draw(style) =>
+        Option(cache.get(key(style))) match
+          case Some(b) => show(b)
+          case None =>
+            badge.setVisibility(View.GONE)
+            queue.enqueue { block =>
+              // Rendered while scrolling, without the user asking for that area:
+              // the offline map while 「位置情報を外部サービスに送らない」 is on,
+              // as the setting is now, not when the card was laid out.
+              MapStyle.forSnapshot(block) match
+                case Outcome.Draw(s) => start(s)
+                case Outcome.NoBasemap =>
+                  sketchOnly()
+                  None
+            }
+
+    frame.redraw = () => render()
+    cards.add(frame)
+    render()
     Some(frame)
 
   /** Drop queued work (e.g. the feed reloaded). */

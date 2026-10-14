@@ -127,6 +127,21 @@ class BasemapReleaseSuite extends munit.FunSuite:
     intercept[ResumableDownload.Refused](ResumableDownload.run(FakeHttp(data, status = 404), "u", part, 500))
   }
 
+  test("404 from every source means the archive is not published; anything else is a failure") {
+    def refusal(status: Int) =
+      val part = File(tmpDir(), "a.part")
+      intercept[ResumableDownload.Refused](ResumableDownload.run(FakeHttp(data, status = status), "u", part, data.length))
+    val missing = refusal(404)
+    assertEquals(missing.status, Some(404))
+    assert(BasemapSource.notPublished(Seq(missing, refusal(404))))
+    assert(BasemapSource.notPublished(Seq(refusal(410))))
+    // One source missing the file, the other unreachable or forbidden: worth retrying.
+    assert(!BasemapSource.notPublished(Seq(missing, java.net.UnknownHostException("github.com"))))
+    assert(!BasemapSource.notPublished(Seq(missing, refusal(403))))
+    assert(!BasemapSource.notPublished(Seq(ResumableDownload.Refused("longer than expected"))))
+    assert(!BasemapSource.notPublished(Seq.empty))
+  }
+
   test("download stops when cancelled, keeping the partial file") {
     val dir = tmpDir()
     val part = File(dir, "a.part")

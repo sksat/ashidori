@@ -19,6 +19,8 @@ enum BasemapStatus:
   case Installed(version: String, source: Option[BasemapSource])
   /** `retrying`: WorkManager runs it again later by itself. */
   case Failed(message: String, retrying: Boolean)
+  /** No source has the pinned archive (each answered 404): not published yet. */
+  case NotPublished
 
 /** Downloads the pinned basemap archive once, in the background
   * ([[BasemapWorker]]).
@@ -53,6 +55,9 @@ object BasemapDownload:
   /** Where the installed copy came from. */
   def installedSource: Option[BasemapSource] = BasemapSource.fromKey(prefs.getString("source", ""))
 
+  /** Stored as the error when no source has the archive. */
+  private val NotPublishedError = "not-published"
+
   @volatile private var progress: Option[(Long, Long, BasemapSource)] = None
 
   def status: BasemapStatus =
@@ -67,7 +72,8 @@ object BasemapDownload:
               case None =>
                 val err = prefs.getString("error", "")
                 val queued = prefs.getBoolean("queued", false)
-                if err.nonEmpty then BasemapStatus.Failed(err, queued)
+                if err == NotPublishedError && !queued then BasemapStatus.NotPublished
+                else if err.nonEmpty && err != NotPublishedError then BasemapStatus.Failed(err, queued)
                 else if queued then BasemapStatus.Waiting(prefs.getBoolean("metered", false))
                 else BasemapStatus.Missing
 
@@ -138,6 +144,11 @@ object BasemapDownload:
   private[ashidori] def failed(message: String, retrying: Boolean): Unit =
     progress = None
     prefs.edit().putString("error", message).putBoolean("queued", retrying).commit()
+    changed()
+  /** Every source answered that it has no such file: not retried until asked for. */
+  private[ashidori] def notPublished(): Unit =
+    progress = None
+    prefs.edit().putString("error", NotPublishedError).putBoolean("queued", false).commit()
     changed()
 
 /** HttpURLConnection for [[ResumableDownload]]: a plain GET (no token, no
@@ -210,6 +221,10 @@ class BasemapWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, 
           case _: ResumableDownload.Cancelled =>
             BasemapDownload.reportProgress(None)
             ListenableWorker.Result.retry()
+          case _: NotPublished =>
+            Log.w(s"basemap ${pin.version}: no source has it")
+            BasemapDownload.notPublished()
+            ListenableWorker.Result.failure()
           case e: Exception =>
             Log.w("basemap download failed", e)
             val last = getRunAttemptCount + 1 >= BasemapDownload.MaxAttempts
@@ -246,6 +261,7 @@ class BasemapWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, 
         }
 
     var lastError: Exception = IOException("no source")
+    val errors = scala.collection.mutable.ArrayBuffer.empty[Exception]
     val found = sources.iterator.map { (source, url) =>
       try
         var shown = -1L
@@ -260,18 +276,22 @@ class BasemapWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, 
           // Bytes from either source must be the pinned ones; start over.
           part.delete()
           lastError = BasemapError(s"データの照合に失敗しました（${source.label}）")
+          errors += lastError
           None
       catch
         case e: ResumableDownload.Cancelled => throw e
         case e: Exception =>
           Log.w(s"basemap from ${source.key} failed", e)
           lastError = e
+          errors += e
           None
     }.collectFirst { case Some(r) => r }
-    found.getOrElse(throw lastError)
+    found.getOrElse(throw (if BasemapSource.notPublished(errors.toSeq) then NotPublished() else lastError))
 
 object BasemapWorker:
   val ImportKey = "import"
+  /** No source has the pinned archive. */
+  final class NotPublished extends IOException("not published")
 
 /** A failure with a message for the user. */
 final class BasemapError(message: String) extends IOException(message)

@@ -17,6 +17,7 @@ import org.maplibre.geojson.{Feature, FeatureCollection, LineString, Point}
 import scala.jdk.CollectionConverters.*
 import net.sksat.ashidori.*
 import ashidori.core.*
+import ashidori.core.BaseMapPolicy.Outcome
 
 /** A line on the map with its color (CSS hex). */
 final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine, dashed: Boolean = false)
@@ -32,6 +33,12 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
   * until the user asks for the online one in this view ([[detailed]]): a
   * grant to this view alone ([[SendGate.grant]]), which ends when the view
   * leaves the screen ([[endDetail]]), switches back, or the setting changes.
+  *
+  * Without the on-device map's data ([[Outcome.NoBasemap]]) it draws the
+  * routes and stays on a plain canvas, still panned and zoomed as a map.
+  * With the setting on, a card then offers the download and this view's
+  * online map; with it off (the user chose the offline map), only a small
+  * 「地図なし」 mark shows, and the settings offer the download.
   */
 final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
@@ -48,7 +55,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
   private def detailedFlag: Boolean = Settings.gate.granted(this)
   def detailed: Boolean = detailedFlag
   /** Base map loaded (or loading) on this map. */
-  private var shown: Option[MapStyle] = None
+  private var shown: Option[Outcome[MapStyle]] = None
 
   private var map: Option[(MapLibreMap, Style)] = None
   private var pending: Option[() => Unit] = None
@@ -86,34 +93,77 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     b.setPadding(Ui.dp(12)(using act), Ui.dp(6)(using act), Ui.dp(12)(using act), Ui.dp(6)(using act))
     b
 
-  /** Offers the offline basemap's download while this map shows the offline
-    * map without it (routes and stays on a plain background).
-    */
-  private val basemapBanner =
-    val b = Ui.button("", tonal = true)(BasemapUi.bannerClicked(act))(using act)
+  private def compact(b: com.google.android.material.button.MaterialButton): b.type =
     b.setTextSize(12f)
     b.setMinHeight(0)
     b.setMinimumHeight(0)
     b.setInsetTop(0)
     b.setInsetBottom(0)
     b.setPadding(Ui.dp(12)(using act), Ui.dp(6)(using act), Ui.dp(12)(using act), Ui.dp(6)(using act))
-    b.setVisibility(android.view.View.GONE)
+    b
+
+  // ---- without a base map (setting on): why, and the two ways to a map ----
+  private val noMapTitle = Ui.text("", 13f, bold = true)(using act)
+  private val downloadButton =
+    compact(Ui.button(BasemapUi.downloadLabel)(BasemapUi.requestDownload(act))(using act))
+  private val grantButton =
+    compact(Ui.button(TrackMap.DetailLabel, tonal = true)(setDetailed(true))(using act))
+  /** Shown in place of the detail button while the map has no base map. */
+  private val noMapCard =
+    given Ui.Ctx = act
+    val wrapLp = () =>
+      val lp = android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+      lp.topMargin = Ui.dp(6)
+      lp
+    downloadButton.setLayoutParams(wrapLp())
+    grantButton.setLayoutParams(wrapLp())
+    Ui.tint(grantButton, Ui.color(Ui.attr.surfaceContainerHigh), Ui.color(Ui.attr.onSurface))
+    val card = Ui.vbox(noMapTitle, downloadButton, grantButton)
+    card.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10))
+    val bg = android.graphics.drawable.GradientDrawable()
+    bg.setCornerRadius(Ui.dp(16).toFloat)
+    bg.setColor(Ui.color(Ui.attr.surface))
+    card.setBackground(bg)
+    card.setElevation(Ui.dp(3).toFloat)
+    card.setVisibility(android.view.View.GONE)
+    card
+
+  /** Without a base map and with the setting off: a quiet mark only. */
+  private val noMapBadge =
+    val b = DayMap.noMapBadge(act)
+    val m = Ui.dp(10)(using act)
+    val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.END)
+    lp.setMargins(m, m, m, m)
+    b.setLayoutParams(lp)
     b
 
   /** Basemap version the loaded offline style was drawn from. */
   private var loadedBasemap: Option[String] = None
 
-  private def updateBasemapBanner(): Unit =
-    val st = BasemapDownload.status
-    val missing = shown.contains(MapStyle.Offline) && !Basemap.installed && st != BasemapStatus.Unavailable
-    basemapBanner.setVisibility(if missing then android.view.View.VISIBLE else android.view.View.GONE)
-    if missing then basemapBanner.setText(BasemapUi.bannerText(st))
+  private def noMap: Boolean = shown.contains(Outcome.NoBasemap)
+
+  private def updateNoMap(): Unit =
+    val offer = shown.exists(o => BaseMapPolicy.offerAlternatives(Settings.blockExternalLocation, o))
+    noMapCard.setVisibility(if offer then android.view.View.VISIBLE else android.view.View.GONE)
+    noMapBadge.setVisibility(if noMap && !offer then android.view.View.VISIBLE else android.view.View.GONE)
+    if offer then
+      val st = BasemapDownload.status
+      noMapTitle.setText(BasemapUi.cardTitle(st))
+      downloadButton.setVisibility(if BasemapUi.offersDownload(st) then android.view.View.VISIBLE else android.view.View.GONE)
 
   private def updateDetailButton(): Unit =
-    detailButton.setVisibility(if Settings.blockExternalLocation then android.view.View.VISIBLE else android.view.View.GONE)
+    updateNoMap()
+    val offer = noMapCard.getVisibility == android.view.View.VISIBLE
+    detailButton.setVisibility(if Settings.blockExternalLocation && !offer then android.view.View.VISIBLE else android.view.View.GONE)
+    val online = MapStyle.forView(true) match
+      case Outcome.Draw(s) => s.label
+      case Outcome.NoBasemap => ""
     detailButton.setText(
-      if detailedFlag then s"簡易地図に戻す（${MapStyle.forView(true).label}を表示中）"
-      else "この範囲を詳しい地図で表示（位置情報を送信）")
+      if !detailedFlag then TrackMap.DetailLabel
+      // Back to the offline map, or to none when it is not downloaded.
+      else if Basemap.available then s"簡易地図に戻す（${online}を表示中）"
+      else s"詳しい地図を閉じる（${online}を表示中）")
     // Sending is the exception: mark it with the tertiary (warning) colours.
     given Ui.Ctx = act
     if detailedFlag then Ui.tint(detailButton, Ui.color(Ui.attr.tertiaryContainer), Ui.color(Ui.attr.onTertiaryContainer))
@@ -159,12 +209,13 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.END)
     dlp.setMargins(Ui.dp(76)(using act), Ui.dp(10)(using act), Ui.dp(12)(using act), Ui.dp(14)(using act))
     f.addView(detailButton, dlp)
+    // Where the detail button is, clear of the controls.
+    val clp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.END)
+    clp.setMargins(Ui.dp(64)(using act), Ui.dp(10)(using act), Ui.dp(12)(using act), Ui.dp(14)(using act))
+    f.addView(noMapCard, clp)
+    f.addView(noMapBadge)
     updateDetailButton()
-    // Below the detail button when the controls are at the top.
-    val blp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-      Gravity.TOP | Gravity.CENTER_HORIZONTAL)
-    blp.setMargins(Ui.dp(12)(using act), Ui.dp(if controlsOnTop then 56 else 10)(using act), Ui.dp(12)(using act), 0)
-    f.addView(basemapBanner, blp)
     f
 
   // Follow the logger's fixes; the map never turns GNSS on by itself.
@@ -184,13 +235,18 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
     loadStyle(m, MapStyle.forView(detailedFlag))
   }
 
-  /** Loads a base map and (re)adds our sources and layers on top of it. */
-  private def loadStyle(m: MapLibreMap, ms: MapStyle): Unit =
+  /** Loads a base map (or the plain canvas without one) and (re)adds our
+    * sources and layers on top of it.
+    */
+  private def loadStyle(m: MapLibreMap, base: Outcome[MapStyle]): Unit =
     map = None
-    shown = Some(ms)
-    if ms == MapStyle.Offline then loadedBasemap = Basemap.installedVersion
-    updateBasemapBanner()
-    m.setStyle(ms.builder, (style: Style) => {
+    shown = Some(base)
+    if base == Outcome.Draw(MapStyle.Offline) then loadedBasemap = Basemap.installedVersion
+    updateDetailButton()
+    val builder = base match
+      case Outcome.Draw(ms) => ms.builder
+      case Outcome.NoBasemap => MapStyle.blankBuilder(act)
+    m.setStyle(builder, (style: Style) => {
       for id <- Seq("track", "highlight", "visits", "checkins", "live") do style.addSource(GeoJsonSource(id))
       // From the end of the drawn route to where we are now, updated per fix.
       style.addLayer(
@@ -267,11 +323,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       pending = None
     })
 
-  // The basemap was downloaded or deleted: redraw the offline map with or
-  // without it. Progress only updates the banner.
+  // The basemap was downloaded or deleted: draw the map with or without it
+  // (or a new version of it). Progress only updates the card.
   private val stopBasemap = BasemapDownload.listen { () =>
-    if shown.contains(MapStyle.Offline) && loadedBasemap != Basemap.installedVersion then refreshBaseMap(force = true)
-    updateBasemapBanner()
+    val stale = shown.contains(Outcome.Draw(MapStyle.Offline)) && loadedBasemap != Basemap.installedVersion
+    refreshBaseMap(force = stale)
   }
 
   /** Reloads the base map the policy picks now (after a choice, a setting
@@ -318,16 +374,27 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
       img.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
       img.setContentDescription(ms.label)
       val thumbnail = MapStyle.thumbnailAllowed(ms)
-      // No thumbnail: a tinted panel that says the area would be sent.
+      // No thumbnail: a tinted panel that says the area would be sent, or a
+      // plain one for the offline map without its data.
       val face: android.view.View =
         if thumbnail then img
+        else if ms == MapStyle.Offline then
+          val t = Ui.text("未取得", 13f, colorAttr = Ui.attr.onSurfaceVariant)
+          t.setGravity(Gravity.CENTER)
+          t.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
+          t
         else
           val t = Ui.text("選ぶと表示範囲を送信", 13f, colorAttr = Ui.attr.onTertiaryContainer)
           t.setGravity(Gravity.CENTER)
           t.setBackgroundColor(Ui.color(Ui.attr.tertiaryContainer))
           t
       face.setLayoutParams(android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbH))
-      val selected = ms == (if block then MapStyle.forView(detailedFlag) else MapStyle.current)
+      val selected =
+        if !block then ms == MapStyle.current
+        else MapStyle.forView(detailedFlag) match
+          case Outcome.Draw(s) => ms == s
+          // The offline map, without its data.
+          case Outcome.NoBasemap => ms == MapStyle.Offline
       val card = com.google.android.material.card.MaterialCardView(act)
       card.setRadius(Ui.dp(12).toFloat)
       card.setStrokeWidth(Ui.dp(if selected then 3 else 1))
@@ -539,6 +606,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, controlsOnTop: Boolean = 
 
 object TrackMap:
   val DefaultLine = "#006B5B"
+  /** The explicit request for this view's online map (setting on). */
+  val DetailLabel = "この範囲を詳しい地図で表示（位置情報を送信）"
 
   /** Paths as GeoJSON lines with `color` and `dashed` properties. */
   def lineFeatures(paths: Seq[MapPath]): FeatureCollection =

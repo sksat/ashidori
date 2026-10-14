@@ -5,26 +5,34 @@ package ashidori.core
   * Its sources, glyphs and sprites are under "file://@BASEMAP_DIR@/" (the
   * sources as "pmtiles://file://@BASEMAP_DIR@/<name>.pmtiles"); the app
   * fills in the directory it extracted the downloaded archive to. Before
-  * the download (or without the data), a style with only a background is
-  * used, so a map never falls back to a network style: the app draws its
-  * routes and stays on it.
+  * the download (or without valid data) there is no offline style
+  * ([[BaseMapPolicy.Outcome.NoBasemap]]): snapshots then draw the route
+  * without MapLibre, and an interactive map draws it on [[blank]]. A map
+  * never falls back to a network style.
   */
 object OfflineBasemapStyle:
   val Placeholder = "@BASEMAP_DIR@"
-  /** Land-ish background of the fallback, close to the Protomaps light earth. */
-  val FallbackBackground = "#e2dfda"
 
-  /** `template` is the generated style.json; `dir` an absolute path. */
-  def render(template: Option[String], dir: String): String =
-    template match
-      case Some(t) if t.contains(Placeholder) =>
-        val s = t.replace(Placeholder, dir.stripSuffix("/"))
-        // Never let a style that would fetch from a server pass as offline.
-        if scala.util.Try(remoteUrls(s)).toOption.exists(_.isEmpty) then s else fallback
-      case _ => fallback
+  /** `template` is the generated style.json; `dir` an absolute path. None
+    * without a template, or for one that would fetch from a server.
+    */
+  def render(template: Option[String], dir: String): Option[String] =
+    template.filter(_.contains(Placeholder)).map(_.replace(Placeholder, dir.stripSuffix("/")))
+      // Never let a style that would fetch from a server pass as offline.
+      .filter(s => scala.util.Try(remoteUrls(s)).toOption.exists(_.isEmpty))
 
-  val fallback: String =
-    s"""{"version":8,"name":"ashidori offline (no data)","sources":{},"layers":[{"id":"background","type":"background","paint":{"background-color":"$FallbackBackground"}}]}"""
+  /** A style with only a `background` color (CSS) and no sources: the canvas
+    * of an interactive map without a base map, under the routes and stays
+    * it adds. Not for a map that would draw nothing else.
+    */
+  def blank(background: String): String =
+    ujson.write(ujson.Obj(
+      "version" -> 8,
+      "name" -> "ashidori (no base map)",
+      "sources" -> ujson.Obj(),
+      "layers" -> ujson.Arr(ujson.Obj("id" -> "background", "type" -> "background",
+        "paint" -> ujson.Obj("background-color" -> background)))
+    ))
 
   /** Resource URLs of a style that are not on the device: sources (url,
     * tiles), glyphs and sprite. Attribution links are not fetched.

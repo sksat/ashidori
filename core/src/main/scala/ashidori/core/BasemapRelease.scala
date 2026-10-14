@@ -69,6 +69,16 @@ object BasemapSource:
     Try(ujson.read(info).obj.get("basemap").map(_.arr.flatMap(_.strOpt).filter(BasemapPin.validVersion).toSet))
       .toOption.flatten.getOrElse(Set.empty)
 
+  /** Every source tried answered that it has no such file (404 or 410):
+    * the pinned version is not published (yet), as opposed to a failed
+    * transfer. `errors` has one failure per source tried.
+    */
+  def notPublished(errors: Seq[Throwable]): Boolean =
+    errors.nonEmpty && errors.forall {
+      case r: ResumableDownload.Refused => r.status.exists(c => c == 404 || c == 410)
+      case _ => false
+    }
+
   /** Sources to try, in order. With sync configured, the server comes first
     * if it lists the pinned version, and each is the other's fallback.
     */
@@ -96,8 +106,10 @@ object RangeHttp:
   */
 object ResumableDownload:
   final class Cancelled extends IOException("cancelled")
-  /** The server answered something a retry of the same request will not fix. */
-  final class Refused(msg: String) extends IOException(msg)
+  /** The server answered something a retry of the same request will not
+    * fix; `status` is the HTTP status when that was the answer.
+    */
+  final class Refused(msg: String, val status: Option[Int] = None) extends IOException(msg)
 
   enum Plan:
     /** 206 from where the partial file ends: append. */
@@ -153,7 +165,8 @@ object ResumableDownload:
               part.delete()
               if attempts >= 2 then throw Refused("range not satisfiable")
             case Plan.Fail(r) =>
-              if res.code == 404 || res.code == 410 || res.code == 403 then throw Refused(r) else throw IOException(r)
+              if res.code == 404 || res.code == 410 || res.code == 403 then throw Refused(r, Some(res.code))
+              else throw IOException(r)
         finally res.close()
         val now = if part.isFile then part.length else 0L
         if now == total then done = true

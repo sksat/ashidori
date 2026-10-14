@@ -15,6 +15,7 @@ import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
 import ashidori.core.*
 import ashidori.core.sync.*
+import ashidori.core.BaseMapPolicy.Outcome
 import Ui.*
 
 /** Another device of the user: its last position with the accuracy circle,
@@ -31,6 +32,7 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
 
   private var unobserve: () => Unit = () => ()
   private var unwatch: () => Unit = () => ()
+  private var unwatchBasemap: () => Unit = () => ()
   override def onShow(): Unit =
     unobserve()
     unobserve = PeerStatus.observe(() => render())
@@ -38,11 +40,22 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     // A change of 「位置情報を外部サービスに送らない」 cancels the map and
     // renders it again under the new setting.
     unwatch = Settings.gate.onChange(() => act.runOnUiThread(() => { stopMap(); render() }))
+    unwatchBasemap()
+    // Installed or removed: draw the map with or without it.
+    var version = Basemap.installedVersion
+    unwatchBasemap = BasemapDownload.listen { () =>
+      if Basemap.installedVersion != version then
+        version = Basemap.installedVersion
+        stopMap()
+        render()
+    }
     render()
   override def onHide(): Unit =
     unobserve()
     unwatch()
     unwatch = () => ()
+    unwatchBasemap()
+    unwatchBasemap = () => ()
     stopMap()
 
   private def stopMap(): Unit =
@@ -112,6 +125,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
 
   /** A still map around the position: accuracy circle and a dot in the
     * recording mode's color. Without tiles (offline) it stays blank.
+    * Without a base map to draw ([[Outcome.NoBasemap]]) MapLibre is not run:
+    * the circle and the dot are drawn at the same scale, marked 「地図なし」.
     */
   private def map(f: StatusFix, dotColor: Int): View =
     val dm = act.getResources.getDisplayMetrics
@@ -134,14 +149,24 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     val hex = f"#${dotColor & 0xffffff}%06x"
     // Show the circle with room around it; at least ~600 m across.
     val half = math.max(acc * 2.5, 300.0)
+    // Another device's position: offline map while the setting is on.
+    val style = MapStyle.forSnapshot match
+      case Outcome.Draw(s) => s
+      case Outcome.NoBasemap =>
+        stopMap()
+        frame.addView(PositionSketchView(act, acc / (2 * half), dotColor),
+          FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val badge = DayMap.noMapBadge(act)
+        badge.setVisibility(View.VISIBLE)
+        frame.addView(badge)
+        return frame
     val dLat = half / 111_320.0
     val dLon = half / (111_320.0 * math.cos(math.toRadians(f.lat)))
     val bounds = LatLngBounds.Builder()
       .include(MLatLng(f.lat - dLat, f.lon - dLon))
       .include(MLatLng(f.lat + dLat, f.lon + dLon))
       .build()
-    // Another device's position: offline map while the setting is on.
-    var builder = MapStyle.forSnapshot.snapshotBuilder
+    var builder = style.snapshotBuilder
       .withSource(GeoJsonSource("peer-dot", Point.fromLngLat(f.lon, f.lat)))
     if acc > 0 then
       builder = builder
@@ -182,3 +207,28 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
         lat + r * math.cos(a) / 111_320.0)
     }
     Polygon.fromLngLats(java.util.List.of(pts.asJava))
+
+/** The position without a map: the accuracy circle and the dot at the
+  * center, at the scale the map would have. `accFraction` is the circle's
+  * radius as a fraction of the shorter side (the map fits the same square).
+  */
+final class PositionSketchView(c: android.content.Context, accFraction: Double, dotColor: Int)
+    extends View(c):
+  private given android.content.Context = c
+  private val fill = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+  private val stroke = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+  stroke.setStyle(android.graphics.Paint.Style.STROKE)
+
+  override def onDraw(canvas: android.graphics.Canvas): Unit =
+    val (cx, cy) = (getWidth / 2f, getHeight / 2f)
+    val r = (accFraction * math.min(getWidth, getHeight)).toFloat
+    if r > 0 then
+      fill.setColor((dotColor & 0x00ffffff) | 0x2e000000)
+      canvas.drawCircle(cx, cy, r, fill)
+      stroke.setStrokeWidth(Ui.dp(1.5f).toFloat)
+      stroke.setColor((dotColor & 0x00ffffff) | 0x99000000)
+      canvas.drawCircle(cx, cy, r, stroke)
+    fill.setColor(0xffffffff)
+    canvas.drawCircle(cx, cy, Ui.dp(10).toFloat, fill)
+    fill.setColor(dotColor | 0xff000000)
+    canvas.drawCircle(cx, cy, Ui.dp(8).toFloat, fill)

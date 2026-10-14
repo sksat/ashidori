@@ -4,7 +4,8 @@ import android.content.Context
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
 import net.sksat.ashidori.{AshidoriApp, Basemap, Settings}
-import ashidori.core.BaseMapPolicy
+import ashidori.core.{BaseMapPolicy, OfflineBasemapStyle}
+import ashidori.core.BaseMapPolicy.Outcome
 
 /** Selectable base maps. "簡易地図" is drawn from data in the app and never
   * uses the network; the others fetch tiles of the visible area from their
@@ -29,9 +30,12 @@ enum MapStyle(val key: String, val label: String, val note: String):
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
 
-  /** Style document: a URL, or inline JSON. */
+  /** Style document: a URL, or inline JSON. The policy picks [[Offline]]
+    * only while its data is there ([[Basemap.available]]); should it be gone
+    * meanwhile, the map shows no base map rather than an online one.
+    */
   private def source: Either[String, String] = this match
-    case Offline   => Right(Basemap.styleJson)
+    case Offline   => Right(Basemap.styleJson.getOrElse(MapStyle.blankJson))
     case Standard  => Left("https://tiles.openfreemap.org/styles/liberty")
     case Light     => Left("https://tiles.openfreemap.org/styles/positron")
     case GsiStd    => Right(MapStyle.raster(MapStyle.gsi("std", "png")))
@@ -77,19 +81,31 @@ object MapStyle:
       .orElse(Some(current).filter(_.online)).getOrElse(Standard)
 
   /** Base map of an interactive map; `detailed` if the user asked for the
-    * online map in that view (see [[BaseMapPolicy]]).
+    * online map in that view (see [[BaseMapPolicy]]). [[Outcome.NoBasemap]]
+    * when it would be the offline map and that is not downloaded.
     */
-  def forView(detailed: Boolean): MapStyle =
-    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, lastOnline, Offline, detailed)
+  def forView(detailed: Boolean): Outcome[MapStyle] =
+    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, lastOnline, Offline, Basemap.available, detailed)
 
   /** Base map of a still image (feed, period, other devices), with the
     * setting as it is now (or `block`, as taken right before a job starts).
+    * With [[Outcome.NoBasemap]] the image is drawn without MapLibre.
     */
-  def forSnapshot: MapStyle = forSnapshot(Settings.blockExternalLocation)
-  def forSnapshot(block: Boolean): MapStyle = BaseMapPolicy.snapshot(block, current, Offline)
+  def forSnapshot: Outcome[MapStyle] = forSnapshot(Settings.blockExternalLocation)
+  def forSnapshot(block: Boolean): Outcome[MapStyle] = BaseMapPolicy.snapshot(block, current, Offline, Basemap.available)
 
   /** Whether the picker may render this map's thumbnail at the current view. */
-  def thumbnailAllowed(s: MapStyle): Boolean = BaseMapPolicy.thumbnail(Settings.blockExternalLocation, s, Offline)
+  def thumbnailAllowed(s: MapStyle): Boolean =
+    BaseMapPolicy.thumbnail(Settings.blockExternalLocation, s, Offline, Basemap.available)
+
+  /** Canvas of an interactive map without a base map: its routes and stays
+    * on the app's neutral surface color, as in the feed's sketches.
+    */
+  def blankBuilder(ctx: Context): Style.Builder =
+    given Ui.Ctx = ctx
+    Style.Builder().fromJson(OfflineBasemapStyle.blank(f"#${Ui.color(Ui.attr.surfaceContainerHigh) & 0xffffff}%06x"))
+
+  private def blankJson: String = OfflineBasemapStyle.blank("#e2dfda")
 
   /** Lets MapLibre use the network only when the policy allows it: with
     * the setting on and no view holding a detail grant of the current
