@@ -14,8 +14,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Device credential check before the recovery code is shown again. -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- Scanning a registration link's QR code; asked for when the user starts a scan. -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:name=".AshidoriApp"
@@ -26,10 +29,22 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Registration links of any server, from the server's /pair page:
+                 ashidori://pair?server=<url>&c=<CODE>. The https links
+                 (App Links) of a server set at build time are in
+                 src/applinks/AndroidManifest.xml. singleTask: a link opens
+                 the running app, not a second copy. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="ashidori" android:host="pair" />
             </intent-filter>
         </activity>
 

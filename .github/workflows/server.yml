@@ -43,6 +43,7 @@ jobs:
           USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
           MAX_USERS: ${{ vars.MAX_USERS }}
           MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: node scripts/check-config.ts
 
   # The formal models (formal/README.md) must pass on the same commit.
@@ -88,6 +89,7 @@ jobs:
           USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
           MAX_USERS: ${{ vars.MAX_USERS }}
           MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: node scripts/check-config.ts
 
       - name: Set D1 database id
@@ -115,6 +117,7 @@ jobs:
           USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
           MAX_USERS: ${{ vars.MAX_USERS }}
           MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
         run: |
           pnpm exec wrangler deploy \
             --var "CF_ACCESS_TEAM_DOMAIN:$CF_ACCESS_TEAM_DOMAIN" \
@@ -126,4 +129,5 @@ jobs:
             --var "USER_MAX_DEVICES:$USER_MAX_DEVICES" \
             --var "USER_MAX_SHARED_CHECKINS:$USER_MAX_SHARED_CHECKINS" \
             --var "MAX_USERS:$MAX_USERS" \
-            --var "MAX_TOTAL_BYTES:$MAX_TOTAL_BYTES"
+            --var "MAX_TOTAL_BYTES:$MAX_TOTAL_BYTES" \
+            --var "ANDROID_CERT_SHA256:$ANDROID_CERT_SHA256"

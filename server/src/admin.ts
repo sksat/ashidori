@@ -5,6 +5,7 @@ import { listRecentCheckins, removeCheckin } from "./checkins";
 import { parseLimits } from "./config";
 import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
+import { QR_SCRIPT } from "./qr";
 import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
   createUser,
@@ -150,7 +151,9 @@ admin.get("/", async (c) => {
 <style nonce="${nonce}">
 body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}
 #code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em;margin:.2rem 0}
-#pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}
+#pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}#link{word-break:break-all}
+#pairing .row{display:flex;flex-wrap:wrap;gap:1rem;align-items:center}#pairing .row>div{flex:1 1 16rem}
+#qr svg{display:block;width:12rem;height:12rem}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ccc;padding:.3rem;text-align:left}
 td button{margin-right:.3rem}#err,.misconfig{color:#b00}
 </style></head><body>
@@ -162,7 +165,9 @@ ${limitsText}
 <p>サーバ全体: 利用者 ${usage.userCount}${limits ? ` / ${limits.maxUsers}（自己登録の上限）` : ""}、保存量 <span id="total"></span></p>
 <p><input id="name" placeholder="名前" maxlength="64"> <input id="handle" placeholder="ハンドル (任意)" maxlength="20"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
 <p>ハンドルは英小文字・数字・_ の 3〜20 文字です。他の利用者はハンドルの完全一致で検索し、フォローを申請します。</p>
-<div id="pairing" hidden><p id="for"></p><p id="code"></p><p id="exp"></p></div>
+<div id="pairing" hidden><div class="row"><div id="qr"></div><div><p id="for"></p><p id="code"></p><p id="exp"></p>
+<p>登録リンク: <code id="link"></code> <button id="copy">コピー</button></p></div></div>
+<p>利用者がアプリの「QR コードを読み取る」でこの QR コードを読み取るか、アプリのある端末でリンクを開くと、サーバとコードが入力されます。2 台目以降の端末では、登録後に復旧コードを入力します。復旧コードは QR コードとリンクに含まれません。</p></div>
 <table><thead><tr><th>名前</th><th>ハンドル</th><th>メールアドレス</th><th>作成</th><th>状態</th><th>デバイス</th><th>使用量</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
 <section><h2>デバイス</h2>
 <p>利用者が「なし」のデバイスは、利用者の導入前に登録されたものです。</p>
@@ -170,6 +175,7 @@ ${limitsText}
 <section><h2>共有チェックイン</h2>
 <p>利用者がフォロワーに共有したチェックインです (新しい順、最大 200 件)。</p>
 <table><thead><tr><th>日時</th><th>利用者</th><th>場所</th><th>カテゴリ</th><th>コメント</th><th></th></tr></thead><tbody id="checkins"></tbody></table></section>
+<script nonce="${nonce}">${QR_SCRIPT}</script>
 <script nonce="${nonce}">
 const fmt = (t) => t == null ? "-" : new Date(t).toLocaleString();
 const $ = (id) => document.getElementById(id);
@@ -244,7 +250,20 @@ async function issue(u) {
   $("for").textContent = u.name + " のペアリングコード";
   $("code").textContent = body.code.slice(0, 4) + "-" + body.code.slice(4);
   $("exp").textContent = "有効期限: " + fmt(body.expiresAt) + " (1 回のみ使用可)";
+  // The code goes in the fragment, which browsers never send to the server.
+  const link = location.origin + "/pair#c=" + body.code;
+  $("link").textContent = link;
+  showQr($("qr"), link);
 }
+$("copy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("link").textContent);
+    $("copy").textContent = "コピーしました";
+  } catch {
+    $("copy").textContent = "コピーできませんでした";
+  }
+  setTimeout(() => { $("copy").textContent = "コピー"; }, 2000);
+};
 $("create").onclick = async () => {
   const email = $("email").value.trim();
   const handle = $("handle").value.trim();

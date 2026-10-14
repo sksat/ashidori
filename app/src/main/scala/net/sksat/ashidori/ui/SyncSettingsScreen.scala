@@ -1,6 +1,6 @@
 package net.sksat.ashidori.ui
 
-import android.content.{ClipData, ClipDescription, ClipboardManager, DialogInterface}
+import android.content.{ClipData, ClipDescription, ClipboardManager, DialogInterface, Intent}
 import android.hardware.biometrics.{BiometricManager, BiometricPrompt}
 import android.os.{CancellationSignal, PersistableBundle}
 import android.text.{Editable, InputType, TextWatcher}
@@ -17,15 +17,21 @@ import scala.collection.mutable
 import scala.util.Try
 import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
-import ashidori.core.sync.{Crypto, RecoveryCode, RegistrationEvent, RegistrationState}
+import ashidori.core.sync.{Crypto, PairLink, RecoveryCode, RegistrationEvent, RegistrationState}
 import Ui.*
 
 /** Server sync setup, one step at a time from the persisted state:
   * server URL → registration (request pending until the server answered)
   * → encryption key confirmed → syncing. Sync stays off until the key is
   * confirmed, and a confirmed key is never replaced.
+  *
+  * `link`: a registration link the app was opened with. It, like a link
+  * scanned from a QR code here, only fills in the server and the pairing
+  * code; the user still checks the server and presses 「この端末を登録」. A
+  * link for a server other than the one entered or configured is applied
+  * only after a confirmation naming it.
   */
-final class SyncSettingsScreen(act: MainActivity) extends Screen:
+final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None) extends Screen:
   private given Ctx = act
   override val title = "同期"
   private val net = Executors.newSingleThreadExecutor()
@@ -44,8 +50,16 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
   private var busy = false
   /** A key dialog is open; only one at a time. */
   private var keyDialogOpen = false
-  /** The URL last entered, kept across re-renders (a refused registration re-renders step 1). */
-  private var lastUrl = ""
+  /** The URL last entered, kept across re-renders (a refused registration
+    * re-renders step 1). Starts empty unless the build sets a server.
+    */
+  private var lastUrl = SyncSettingsScreen.DefaultServer
+  /** The pairing code of a registration link, for the server in [[lastUrl]];
+    * dropped when the URL is edited.
+    */
+  private var linkCode: Option[String] = None
+  /** [[link]] is still to be applied (on the first show). */
+  private var linkPending = link.isDefined
   /** Buttons that start a request, disabled while [[busy]]. */
   private val actions = mutable.ArrayBuffer.empty[View]
 
@@ -54,6 +68,9 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     unobserve()
     unobserve = Registration.observe(onRegistration)
     render()
+    if linkPending then
+      linkPending = false
+      link.foreach(openLink)
   override def onHide(): Unit = unobserve()
   override def onDestroy(): Unit =
     unobserve()
@@ -81,6 +98,33 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     }
 
   private def toast(s: String): Unit = Toast.makeText(act, s, Toast.LENGTH_LONG).show()
+
+  /** Debug builds may talk to a local `wrangler dev` over http. */
+  private def debuggable = (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+  /** Fills in step 1 from a registration link (opened or scanned). Never registers by itself. */
+  private def openLink(l: PairLink): Unit =
+    val s = Registration.state
+    if SyncConfig.paired || SyncConfig.unpairing then
+      toast("この端末は登録済みです。登録リンクを使うには、先に同期を解除してください")
+    else if s.pending.isDefined || s.sending then
+      toast("登録の処理中です。登録リンクを使うには、先に現在の登録をやめてください")
+    else
+      def apply(): Unit =
+        lastUrl = l.server
+        linkCode = Some(l.code)
+        render()
+      // The server the user entered (or a build-time one) or configured.
+      val known = Seq(lastUrl, SyncConfig.serverUrl).filter(u => u != null && u.nonEmpty)
+        .flatMap(PairLink.normalizeServer(_, allowHttp = true))
+      if known.contains(l.server) then apply()
+      else
+        MaterialAlertDialogBuilder(act)
+          .setTitle("登録先のサーバの確認")
+          .setMessage(s"この登録リンクは次のサーバへの登録用です。\n\n${l.server}\n\n信頼できるサーバの場合のみ続けてください。")
+          .setNegativeButton("やめる", null)
+          .setPositiveButton("このサーバを使う", (_, _) => apply())
+          .show()
 
   private def action[B <: View](b: B): B =
     b.setEnabled(!busy)
@@ -126,7 +170,7 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     */
   private def registerCard(): View =
     val url = EditText(act)
-    url.setHint("サーバの URL（https://...）")
+    url.setHint("https://…")
     url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI)
     url.setText(if SyncConfig.serverUrl.nonEmpty then SyncConfig.serverUrl else lastUrl)
     val next = vbox()
@@ -137,13 +181,14 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit =
         gen += 1
         lastUrl = s.toString
+        linkCode = None
         next.removeAllViews()
       def afterTextChanged(s: Editable): Unit = ()
     )
+    // From a registration link: the code is known, so straight to its input.
+    if linkCode.isDefined then next.addView(pairingCodeInput(entered))
     val check = button("次へ") {
       val u = entered
-      // Debug builds may talk to a local `wrangler dev` over http.
-      val debuggable = (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
       if !u.startsWith("https://") && !(debuggable && u.startsWith("http://")) then
         toast("https:// で始まる URL を入力してください")
       else
@@ -160,9 +205,15 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
             else next.addView(pairingCodeInput(u))
         }
     }
+    // A scanned link goes through the same checks as an opened one.
+    val scan = action(outlined("QR コードを読み取る")(PairQrUi.scan(act, allowHttp = debuggable)(openLink)))
     card(
       text("1. 端末を登録", 16f, bold = true),
-      caption("同期先のサーバの URL を入力します。"),
+      caption("登録リンクの QR コードを読み取るか、同期先のサーバの URL を入力します。"),
+      scan,
+      caption("カメラを使います。映像は端末内で処理し、送信しません。"),
+      spacer(8),
+      caption("サーバの URL"),
       url,
       check,
       next
@@ -181,10 +232,12 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       caption("登録済みの端末で発行したペアリングコードと、復旧コードを入力します。")
     )
 
-  private def pairingCodeInput(u: String): View =
+  /** `fromLink`: the code of a registration link for this server, filled in. */
+  private def pairingCodeInput(u: String, fromLink: Option[String] = linkCode): View =
     val code = EditText(act)
     code.setHint("ペアリングコード（8文字）")
     code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+    fromLink.foreach(code.setText(_))
     val go = action(button("この端末を登録") {
       val c = code.getText.toString.trim.toUpperCase
       if c.isEmpty then toast("ペアリングコードを入力してください")
@@ -192,7 +245,8 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
     })
     vbox(
       spacer(8),
-      caption("サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
+      caption(if fromLink.isDefined then "登録リンクからサーバとペアリングコードを入力しました。登録先を確認してから登録してください。"
+        else "サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
       code,
       target(u),
       go
@@ -440,13 +494,7 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       list,
       button("別の端末を追加", tonal = true) {
         async(client.createPairing()) {
-          _.fold(e => toast(e.getMessage), { (code, exp) =>
-            MaterialAlertDialogBuilder(act)
-              .setTitle("ペアリングコード")
-              .setMessage(s"$code\n\n新しい端末の ashidori で、このサーバの URL と一緒に入力してください（10分間有効）。そのあと、新しい端末に復旧コードを入力します。")
-              .setPositiveButton("閉じる", null)
-              .show()
-          })
+          _.fold(e => toast(e.getMessage), (code, _) => showPairing(code))
         }
       },
       outlined("復旧コードを表示")(withDeviceCredential(showRecoveryCode())),
@@ -460,6 +508,52 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
       })
     )
 
+  /** A new pairing code and its registration link, also as a QR code. The
+    * link carries the server and the code only, never the recovery code.
+    */
+  private def showPairing(code: String): Unit =
+    val link = PairLink.url(SyncConfig.serverUrl, code)
+    val codeView = text(code.take(4) + "-" + code.drop(4), 28f, bold = true)
+    codeView.setTypeface(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+    codeView.setTextIsSelectable(true)
+    val linkView = text(link, 14f)
+    linkView.setTextIsSelectable(true)
+    val d = MaterialAlertDialogBuilder(act)
+      .setTitle("別の端末を追加")
+      .setView(scroll(padded(vbox(
+        caption("新しい端末の「QR コードを読み取る」でこの QR コードを読み取るか、登録リンクを開きます。サーバの URL とペアリングコードを入力しても登録できます。"),
+        spacer(8),
+        PairQrUi.image(link),
+        spacer(8),
+        caption("登録リンク"),
+        linkView,
+        spacer(12),
+        caption("ペアリングコード（10分間有効、1回のみ）"),
+        codeView,
+        spacer(12),
+        caption("登録後、新しい端末に復旧コードを入力します。復旧コードは QR コードと登録リンクに含まれません。")
+      ), 24, 8)))
+      .setNeutralButton("コピー", null)
+      .setNegativeButton("共有", null)
+      .setPositiveButton("閉じる", null)
+      .create()
+    d.setOnShowListener { _ =>
+      d.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener { _ =>
+        // Marked sensitive: the code admits a device to this user for 10 minutes.
+        val clip = ClipData.newPlainText("ashidori registration link", link)
+        val extras = PersistableBundle()
+        extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+        clip.getDescription.setExtras(extras)
+        act.getSystemService(classOf[ClipboardManager]).setPrimaryClip(clip)
+        toast("登録リンクをコピーしました")
+      }
+      d.getButton(DialogInterface.BUTTON_NEGATIVE).setOnClickListener { _ =>
+        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, link)
+        act.startActivity(Intent.createChooser(send, "登録リンクを共有"))
+      }
+    }
+    d.show()
+
   /** Stops and waits for running sync work, then clears the registration. */
   private def unpair(): Unit =
     if !busy then
@@ -471,3 +565,9 @@ final class SyncSettingsScreen(act: MainActivity) extends Screen:
         SyncScheduler.schedule(act)
         render()
       }
+
+object SyncSettingsScreen:
+  /** The server the URL field starts with: empty unless the build sets the
+    * Gradle property `ashidori.defaultServer` (a personal build).
+    */
+  val DefaultServer: String = BuildConfig.DEFAULT_SERVER_URL

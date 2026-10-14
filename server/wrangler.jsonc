@@ -77,7 +77,11 @@
     // Whole server: users, for self-registration (default 100),
     "MAX_USERS": "",
     // total blob bytes (default 50 GiB).
-    "MAX_TOTAL_BYTES": ""
+    "MAX_TOTAL_BYTES": "",
+    // SHA-256 fingerprints of the app's signing certificates (comma-separated, "AB:CD:..." or
+    // 64 hex digits), served in /.well-known/assetlinks.json so that registration links
+    // (https://<host>/pair#c=<CODE>) open the app. Empty = "[]" (links open the /pair page).
+    "ANDROID_CERT_SHA256": ""
   }
 
   // Secrets (not in this file):

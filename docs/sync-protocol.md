@@ -101,6 +101,23 @@ neither. Used codes are kept for a day after they expire; a retry later than
 that gets `401`. A self-registered account that stored nothing is deleted after
 7 days (see below); a retry after that creates a new account.
 
+### Registration links
+
+A pairing code can be handed over as a link that also names the server:
+
+- `https://<server>/pair#c=<CODE>`: shown with every new code, on the admin page and in the app, as text and as a QR code.
+  - The code is in the **fragment**. Browsers never send the fragment, so opening the link does not put the code in the request line, in a `Referer` or in the server's logs. The server never puts the code in a path or query.
+  - `<CODE>` is exactly the 8 characters the server issued: uppercase Crockford base32 (`^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$`), no hyphen. The fragment is exactly `c=<CODE>`; the path is exactly `/pair`; there is no query.
+- `ashidori://pair?server=<url>&c=<CODE>`: the fallback the `/pair` page offers. `server` is percent-encoded `scheme://host[:port]` (no user info, path, query or fragment; `https` only, `http` also in debug builds); exactly these two parameters, each once.
+- **The recovery code is never part of a link or a QR code.** A link only admits a device to the code's user; the device still needs the recovery code, entered separately, to read anything.
+
+The app parses both forms strictly and refuses anything else, whether the link was opened or scanned from a QR code on the sync setup screen (CameraX and ZXing, on the device; the camera permission is asked for when a scan starts). A link only fills in the server and the code on the sync setup screen: the user checks the server shown there and confirms the registration. A link for a server other than the one already entered or configured needs a confirmation that names that server. An already registered device ignores links. The app has no built-in server: a build may set one with the Gradle property `ashidori.defaultServer`, which fills in the URL field and declares the App Link for that host.
+
+Server side:
+
+- `GET /pair` is a static page (CSP with a per-response nonce, no `connect-src`, as the admin page). It reads the fragment in the browser, shows the server, the code and the QR code of `<origin>/pair#c=<CODE>` (so that a page opened on a PC can be scanned by the app), and links to the `ashidori://` form built from `location.origin`. The QR encoder (qrcode-generator 2.0.4, MIT) is inlined as a nonce script, as on the admin page. It also says where to get the app (GitHub releases) and that the URL and the code can be entered by hand.
+- `GET /.well-known/assetlinks.json` is the Digital Asset Links statement that lets the app handle `https://<server>/pair` (Android App Links, `autoVerify`): `delegate_permission/common.handle_all_urls` for the package `net.sksat.ashidori` with the SHA-256 fingerprints of the app's signing certificates from the variable `ANDROID_CERT_SHA256` (comma-separated). Empty gives `[]`; a malformed value also gives `[]` (logged), and the deploy workflow refuses it. The app declares the App Link only for the host set at build time (`ashidori.defaultServer`), and none without it; other links open the `/pair` page in the browser.
+
 ## HTTP API
 
 All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable status.
@@ -140,6 +157,8 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | GET | `/v1/followers` | user device | accepted followers: `[{id, handle, name, since}]` |
 | DELETE | `/v1/followers/:userId` | user device | remove a follower |
 | GET | `/v1/health` | – | `{ok: true}` |
+| GET | `/pair` | – | HTML page for a registration link (see [Registration links](#registration-links)); the code stays in the fragment |
+| GET | `/.well-known/assetlinks.json` | – | App Links statement from `ANDROID_CERT_SHA256` (`[]` when empty) |
 
 - "user device" means a device that belongs to a user. Legacy devices without a user get `403 {"error": "no user"}`.
 - Listings, fetches and revocations only cover the caller's user. A device of another user is reported like a missing one (`404`).

@@ -10,6 +10,8 @@ java {
 dependencies {
     api(libs.scala3.library)
     api(libs.ujson)
+    // QR codes of registration links (PairQr). Apache License 2.0.
+    implementation(libs.zxing.core)
     testImplementation(libs.munit)
 }
 

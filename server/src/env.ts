@@ -18,6 +18,11 @@ export interface Env {
   USER_MAX_SHARED_CHECKINS: string;
   MAX_USERS: string;
   MAX_TOTAL_BYTES: string;
+  /**
+   * SHA-256 fingerprints of the app's signing certificates, comma-separated,
+   * for /.well-known/assetlinks.json (App Links). Empty = none (see config.ts).
+   */
+  ANDROID_CERT_SHA256: string;
   // Workers Rate Limiting bindings (coarse, per Cloudflare location) checked
   // before the precise D1 counters; optional (see ratelimit.ts).
   RL_REGISTER?: RateLimit;

@@ -219,22 +219,46 @@ class MainActivity extends AppCompatActivity:
     updateStatusChip()
     net.sksat.ashidori.sync.SyncScheduler.schedule(this)
 
-    if !Settings.onboarded then push(OnboardingScreen(this, permissionsOnly = false, onFinish = () => finishOnboarding()))
+    // A recreated activity does not open its launching link again.
+    val fresh = savedInstanceState == null
+    if !Settings.onboarded then
+      push(OnboardingScreen(this, permissionsOnly = false, onFinish = () => finishOnboarding()))
+      if fresh then handleIntent(getIntent)
     else
       nav.setSelectedItemId(MainActivity.TabTimeline)
       // Resume logging after an app update or a force stop.
       if Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
         LoggerService.send(this, LoggerService.ActionStart)
-      handleIntent(getIntent)
+      if fresh then handleIntent(getIntent)
 
   override def onNewIntent(intent: Intent): Unit =
     super.onNewIntent(intent)
     handleIntent(intent)
 
+  /** A registration link that arrived during onboarding, opened when it ends. */
+  private var pendingLink: Option[String] = None
+
   private def handleIntent(intent: Intent): Unit =
     if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded then
       stack.clear()
       nav.setSelectedItemId(MainActivity.TabLogger)
+    if intent.getAction == Intent.ACTION_VIEW then
+      Option(intent.getDataString).foreach { data =>
+        if Settings.onboarded then openPairLink(data) else pendingLink = Some(data)
+      }
+
+  /** Opens the sync setup with a registration link's server and code filled
+    * in (see [[SyncSettingsScreen]]); the user confirms before anything is sent.
+    */
+  private def openPairLink(data: String): Unit =
+    val debuggable = (getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    ashidori.core.sync.PairLink.parse(data, allowHttp = debuggable) match
+      case None =>
+        android.widget.Toast.makeText(this, "登録リンクの形式が正しくありません", android.widget.Toast.LENGTH_LONG).show()
+      case Some(link) =>
+        stack.clear()
+        if tabId == MainActivity.TabSettings then show(tabs(tabId)) else nav.setSelectedItemId(MainActivity.TabSettings)
+        push(SyncSettingsScreen(this, Some(link)))
 
   private def finishOnboarding(): Unit =
     Settings.onboarded = true
@@ -243,6 +267,8 @@ class MainActivity extends AppCompatActivity:
     tabId = MainActivity.TabTimeline
     nav.setSelectedItemId(MainActivity.TabTimeline)
     show(tabs(MainActivity.TabTimeline))
+    pendingLink.foreach(openPairLink)
+    pendingLink = None
 
   private def updateStatusChip(): Unit =
     val badge = nav.getOrCreateBadge(MainActivity.TabLogger)

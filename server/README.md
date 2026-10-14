@@ -40,10 +40,11 @@ Worker の変数（`wrangler.jsonc` の `vars`）は次のとおり。CI では 
 | `USER_MAX_SHARED_CHECKINS` | 空（5000） | 利用者ごとの共有チェックイン数の上限。共有を解除したもの（tombstone）も数える |
 | `MAX_USERS` | 空（100） | サーバ全体の利用者数の上限。自己登録はこの数で止まる。管理者は上限を超えても作成できる |
 | `MAX_TOTAL_BYTES` | 空（50 GiB） | サーバ全体の blob の合計バイト数の上限 |
+| `ANDROID_CERT_SHA256` | 空 | アプリの署名証明書の SHA-256 フィンガープリント（カンマ区切り）。`/.well-known/assetlinks.json` に載せ、登録リンクでアプリが開くようにする。空なら `[]` を返す（「[登録リンクと App Links](#登録リンクと-app-links)」） |
 | `CORS_ALLOWED_ORIGINS` | 空 | `/v1/*` で CORS を許可するオリジン（カンマ区切り）。空なら CORS ヘッダを返さない |
 | `ALLOW_DEV_ADMIN` | `false` | ローカル開発でのみ `true` にする。本番では必ず `false` |
 
-上限の変数（`USER_*`、`MAX_*`）は、空なら既定値を使い、それ以外は正の整数でなければならない。`0`、負の数、`10MiB`、前後に空白のある値などは不正である。不正な値があると、サーバは利用者（admin ページでの作成を含む）・デバイス・バッチ・共有チェックインの新規作成を `503 server misconfigured` で拒否し、admin ページに不正な変数名を表示する。既存のデータの読み出し、保存済みのバッチの再送、既存の共有チェックインの解除は続けて動く。CI はデプロイの前に `scripts/check-config.ts` で `REGISTRATION` と上限の変数を検証し、不正ならデプロイしない。
+上限の変数（`USER_*`、`MAX_*`）は、空なら既定値を使い、それ以外は正の整数でなければならない。`0`、負の数、`10MiB`、前後に空白のある値などは不正である。不正な値があると、サーバは利用者（admin ページでの作成を含む）・デバイス・バッチ・共有チェックインの新規作成を `503 server misconfigured` で拒否し、admin ページに不正な変数名を表示する。既存のデータの読み出し、保存済みのバッチの再送、既存の共有チェックインの解除は続けて動く。CI はデプロイの前に `scripts/check-config.ts` で `REGISTRATION`、上限の変数、`ANDROID_CERT_SHA256` を検証し、不正ならデプロイしない。
 
 ### 自己登録（`REGISTRATION=open`）
 
@@ -212,6 +213,7 @@ CI 用には、ユーザーではなくアカウントが所有する API トー
 | Variable | `ADMIN_EMAILS` | リポジトリ | 管理者のメールアドレス（カンマ区切り） |
 | Variable | `REGISTRATION` | リポジトリ | `admin` または `open`（任意。未設定なら `admin`） |
 | Variable | `USER_QUOTA_BYTES`、`USER_MAX_BATCHES`、`USER_MAX_DEVICES`、`USER_MAX_SHARED_CHECKINS`、`MAX_USERS`、`MAX_TOTAL_BYTES` | リポジトリ | 上限（任意。未設定なら既定値。「[変数](#変数)」を参照） |
+| Variable | `ANDROID_CERT_SHA256` | リポジトリ | アプリの署名証明書の SHA-256 フィンガープリント（任意。「[登録リンクと App Links](#登録リンクと-app-links)」） |
 | Variable | `DEPLOY_SERVER` | リポジトリ | `true`（`true` のときのみデプロイする） |
 
 ```sh
@@ -245,12 +247,36 @@ Actions の `server` ワークフローを Run workflow で実行する（`main`
 
 1. ブラウザで `https://<ホスト名>/admin/` を開く（Access のログインを経由する）。
 2. 利用者の名前（任意でハンドルとメールアドレス）を入力して「作成」を押す。ハンドルは他の利用者がフォローの申請に使う。
-3. その利用者の「ペアリングコード発行」を押すと 8 文字のコードが表示される。有効期限は 10 分で、1 回のみ使用できる。コードを利用者に渡す。
-4. 利用者はアプリの同期設定にサーバ URL とコードを入力する。アプリはデバイストークンを生成して保存し、`POST /v1/devices/register` でサーバに登録する。
+3. その利用者の「ペアリングコード発行」を押すと、8 文字のコード、登録リンク（`https://<ホスト名>/pair#c=<コード>`）、リンクの QR コードが表示される。有効期限は 10 分で、1 回のみ使用できる。QR コードを読み取らせるか、リンク（またはコード）を利用者に渡す。
+4. 利用者はアプリの「QR コードを読み取る」で QR コードを読み取るか、アプリのある端末でリンクを開く。アプリの同期設定にサーバとコードが入るので、登録先を確かめて「この端末を登録」を押す。リンクを使わない場合は、サーバの URL とコードを入力する。アプリはデバイストークンを生成して保存し、`POST /v1/devices/register` でサーバに登録する。
 
-2 台目以降は、利用者が既存デバイスから `POST /v1/pairing` でコードを発行して追加する。admin ページでは利用者の停止・再開と、デバイスの一覧確認・失効もできる。
+2 台目以降は、既存の端末の「別の端末を追加」でコード、登録リンク、その QR コードを発行し（`POST /v1/pairing`）、新しい端末で QR コードを読み取るか、リンクを開く。登録の後、新しい端末に復旧コードを入力する。復旧コードはリンクにも QR コードにも含まれない。admin ページでは利用者の停止・再開と、デバイスの一覧確認・失効もできる。
 
 `REGISTRATION` が `open` なら 1.〜3. は不要で、利用者はアプリで「新しく始める」を選ぶ。
+
+### 登録リンクと App Links
+
+登録リンク `https://<ホスト名>/pair#c=<コード>` は、コードをフラグメントに置くため、ブラウザで開いてもコードはサーバに送られない（形式は [`docs/sync-protocol.md` の Registration links](../docs/sync-protocol.md#registration-links)）。
+
+- アプリが入っていない、または App Links が検証されていない場合は、`GET /pair` のページが開き、コード、「アプリで開く」（`ashidori://pair?...`）、リンクの QR コード、アプリの入手先を表示する。PC で開いた場合は、この QR コードをアプリで読み取る。
+- アプリは、ビルド時に Gradle のプロパティ `ashidori.defaultServer` で指定したホストについてだけ App Links を宣言する。公開のビルドは指定せず、App Links を宣言しない。その場合は `/pair` ページの「アプリで開く」か QR コードを使う。
+- QR コードはブラウザ内で生成する。生成器（qrcode-generator 2.0.4、MIT License）は `src/vendor/qrcode-generator.ts` に原文のまま置き、`/pair` と admin ページに nonce 付きのインラインスクリプトとして埋め込む。CSP は外部のスクリプトを許可しない。
+- App Links の検証には、`/.well-known/assetlinks.json` にアプリ（`net.sksat.ashidori`）の署名証明書の SHA-256 フィンガープリントが必要である。`ANDROID_CERT_SHA256` にカンマ区切りで設定する。空なら `[]` を返し、リンクはブラウザで `/pair` を開く。
+
+フィンガープリントは、リリースの APK に署名した鍵から求める。`keytool` と `apksigner` のどちらの形式でもよい。
+
+```sh
+# 鍵ストアから（現在のリリースはデバッグ鍵で署名している。場所は環境により
+# ~/.android/debug.keystore または ~/.config/.android/debug.keystore）
+keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey \
+  -storepass android -keypass android | grep SHA256
+# 署名済みの APK から
+$ANDROID_HOME/build-tools/<版>/apksigner verify --print-certs app-release.apk | grep SHA-256
+
+gh variable set ANDROID_CERT_SHA256 --body 'AB:CD:...'
+```
+
+署名鍵を替えるときは、移行の間だけ新旧の値をカンマ区切りで並べる。設定後は `https://<ホスト名>/.well-known/assetlinks.json` を開いて確かめ、端末では `adb shell pm verify-app-links --re-verify net.sksat.ashidori` と `adb shell pm get-app-links net.sksat.ashidori` で検証の結果を確かめられる。
 
 ### 手元からデプロイする場合
 
@@ -261,7 +287,7 @@ pnpm exec wrangler d1 migrations apply ashidori --remote
 pnpm exec wrangler deploy --var CF_ACCESS_TEAM_DOMAIN:<team>.cloudflareaccess.com --var CF_ACCESS_AUD:<AUD Tag> --var ADMIN_EMAILS:<管理者のメールアドレス>
 ```
 
-`REGISTRATION` と上限の変数を変える場合は、同じく `--var REGISTRATION:open` のように渡す。事前に `REGISTRATION=open MAX_USERS=20 node scripts/check-config.ts` のように検証できる。
+`REGISTRATION`、上限の変数、`ANDROID_CERT_SHA256` を変える場合は、同じく `--var REGISTRATION:open` のように渡す。事前に `REGISTRATION=open MAX_USERS=20 node scripts/check-config.ts` のように検証できる。
 
 Rate Limiting binding の `namespace_id`（`wrangler.jsonc` の `ratelimits`）はアカウント内で一意でなければならない。同じアカウントの別の Worker が同じ値を使っている場合は変更する。
 
