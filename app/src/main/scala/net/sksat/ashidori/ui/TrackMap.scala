@@ -74,18 +74,29 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private var shown: Option[Outcome[MapStyle]] = None
 
   private var map: Option[(MapLibreMap, Style)] = None
-  /** Work asked for while a style loads or the map view is dropped, run in
-    * order once a style has loaded. Only the latest of each kind is kept
-    * (data, live tail, highlight, camera, a layer's visibility), so it stays
-    * small however long the map is away (e.g. live updates in the background).
+  /** Work asked for while a style loads or the map view is dropped, run
+    * once a style has loaded: the latest update of each kind (data, live
+    * tail, highlight, a layer's visibility), then the last camera intent
+    * (see [[PendingMapUpdates]]). It stays small however long the map is
+    * away (e.g. live updates in the background).
     */
-  private val pending = scala.collection.mutable.LinkedHashMap.empty[String, () => Unit]
-  /** A queued [[setData]] asked to fit the camera (kept when a later one replaces it). */
-  private var fitQueued = false
+  private val pending = PendingMapUpdates[() => Unit, TrackMap.CameraIntent]()
+  /** Points of the latest [[setData]], what a pending fit shows. */
+  private var dataPoints = Seq.empty[LatLng]
 
   /** Queues the latest data again for a new style, unless newer data waits already. */
   private def requeueData(): Unit =
-    if !pending.contains("data") then lastData.foreach(d => pending("data") = d)
+    if !pending.has("data") then lastData.foreach(d => pending.update("data", d))
+
+  /** Asks to move the camera: now, or after the pending updates once a style has loaded. */
+  private def moveCamera(c: TrackMap.CameraIntent): Unit =
+    if map.isDefined then applyCamera(c) else pending.camera(c)
+
+  private def applyCamera(c: TrackMap.CameraIntent): Unit = c match
+    case TrackMap.CameraIntent.FitData => fitTo(dataPoints)
+    case TrackMap.CameraIntent.Show(pts) => fitTo(pts)
+    case TrackMap.CameraIntent.Focus(p, zoom) =>
+      map.foreach((m, _) => m.easeCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(p.lat, p.lon), zoom)))
   var onMarkerClick: (String, String) => Unit = (_, _) => ()
   private var myLocation: Option[Location] = None
   /** Pixels at the bottom covered by an overlay (e.g. a bottom sheet). */
@@ -424,9 +435,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         }
       enableMyLocation(m, style)
       map = Some((m, style))
-      val run = pending.values.toVector
-      pending.clear()
+      val (run, cam) = pending.drain()
       run.foreach(_())
+      cam.foreach(applyCamera)
     })
 
   // The basemap was downloaded or deleted: draw the map with or without it
@@ -613,9 +624,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private def withStyle(kind: String)(f: (MapLibreMap, Style) => Unit): Unit =
     map match
       case Some((m, s)) => f(m, s)
-      case None =>
-        pending.remove(kind)
-        pending(kind) = () => map.foreach((m, s) => f(m, s))
+      case None => pending.update(kind, () => map.foreach((m, s) => f(m, s)))
 
   private def markers(layer: String, ms: Seq[MapMarker]): FeatureCollection =
     FeatureCollection.fromFeatures(ms.map { mk =>
@@ -632,16 +641,15 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   /** Replaces all data. `fit` moves the camera to show everything. */
   def setData(paths: Seq[MapPath], visits: Seq[MapMarker], checkIns: Seq[MapMarker], fit: Boolean = true): Unit =
     lastData = Some(() => setData(paths, visits, checkIns, fit = false))
-    if fit && map.isEmpty then fitQueued = true
+    dataPoints = paths.flatMap(_.points).map(_.latLng) ++ visits.map(_.at) ++ checkIns.map(_.at)
     withStyle("data") { (m, style) =>
       style.getSourceAs[GeoJsonSource]("track").setGeoJson(lines(paths))
       style.getSourceAs[GeoJsonSource]("visits").setGeoJson(markers("visit", visits))
       style.getSourceAs[GeoJsonSource]("checkins").setGeoJson(markers("checkin", checkIns))
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
-      val doFit = fit || fitQueued
-      fitQueued = false
-      if doFit then fitTo(paths.flatMap(_.points).map(_.latLng) ++ visits.map(_.at) ++ checkIns.map(_.at))
     }
+    // The camera separately: a later focus or highlight still wins over this fit.
+    if fit then moveCamera(TrackMap.CameraIntent.FitData)
 
   /** Replaces the live tail (empty to clear). */
   def setLive(points: Seq[Fix]): Unit =
@@ -652,8 +660,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   def highlight(path: Seq[Fix]): Unit =
     withStyle("highlight") { (m, style) =>
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(lines(Seq(MapPath(path))))
-      fitTo(path.map(_.latLng))
     }
+    moveCamera(TrackMap.CameraIntent.Show(path.map(_.latLng)))
 
   /** Where the camera is: centre and zoom (None before the map is ready). */
   def camera: Option[(LatLng, Double)] =
@@ -667,7 +675,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       case None    => initialCamera = Some((p, zoom))
 
   def focus(p: LatLng, zoom: Double = 15): Unit =
-    withStyle("camera")((m, _) => m.easeCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(p.lat, p.lon), zoom)))
+    moveCamera(TrackMap.CameraIntent.Focus(p, zoom))
 
   def setLayerVisible(layer: String, visible: Boolean): Unit =
     val ids = layer match
@@ -779,6 +787,14 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     dropMapView()
 
 object TrackMap:
+  /** Where the camera should go; while the map is not ready only the last one is kept. */
+  enum CameraIntent:
+    /** Show all of the latest data. */
+    case FitData
+    /** Show these points (a highlighted path). */
+    case Show(points: Seq[LatLng])
+    case Focus(at: LatLng, zoom: Double)
+
   val DefaultLine = "#006B5B"
   /** The explicit request for this view's online map (setting on). */
   val DetailLabel = "この範囲を詳しい地図で表示（位置情報を送信）"

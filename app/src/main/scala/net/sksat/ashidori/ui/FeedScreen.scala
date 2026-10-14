@@ -182,20 +182,25 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
     val y = restoreTarget.getOrElse(scroller.getScrollY)
     if y > 0 then out.putInt(FeedScreen.KeyScroll, y)
 
-  /** After a batch: once the loaded content reaches the saved position,
-    * scroll there; until then load on. If the history ends first, stay at
-    * the top rather than put the position on other content.
+  /** After a batch, once it is laid out: if the whole scroll content (days,
+    * footer and padding) now reaches the saved position, scroll there; else
+    * load on. If the history ends first, stay at the top rather than put the
+    * position on other content.
     */
   private def continueRestore(): Unit =
     for y <- restoreTarget do
-      scroller.post { () =>
+      val obs = scroller.getViewTreeObserver
+      lazy val once: android.view.ViewTreeObserver.OnGlobalLayoutListener = () =>
+        scroller.getViewTreeObserver.removeOnGlobalLayoutListener(once)
         if restoreTarget.contains(y) then
-          if items.getHeight >= y + scroller.getHeight then
+          val range = scroller.getChildAt(0).getHeight - (scroller.getHeight - scroller.getPaddingTop - scroller.getPaddingBottom)
+          if range >= y then
             restoreTarget = None
             scroller.scrollTo(0, y)
           else if done then restoreTarget = None
           else loadMore()
-      }
+      obs.addOnGlobalLayoutListener(once)
+      scroller.requestLayout()
 
   override def onShow(): Unit =
     val today = LocalDate.now(AshidoriApp.zone)
