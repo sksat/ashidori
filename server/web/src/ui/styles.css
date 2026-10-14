@@ -207,6 +207,14 @@ time.tt { text-decoration: underline dotted var(--line-strong); text-underline-o
 .attrib a { color: inherit; }
 .mapover { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; z-index: 3; }
 .mapover > div { pointer-events: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; box-shadow: var(--shadow); display: flex; gap: 10px; align-items: center; font-size: 13px; }
+.mappick { position: absolute; top: 12px; right: 64px; width: min(260px, calc(100% - 80px)); max-height: calc(100% - 24px); overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; box-shadow: var(--shadow); font-size: 13px; z-index: 4; }
+.mappick label { display: flex; align-items: center; gap: 10px; min-height: 36px; cursor: pointer; }
+.mappick input { width: 18px; height: 18px; flex: none; accent-color: var(--primary); margin: 0; }
+.mappick input:disabled + span { color: var(--muted); cursor: default; }
+.mappick small { display: block; font-size: 12px; color: var(--muted); }
+.mappick details { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 4px; }
+.mappick summary { cursor: pointer; color: var(--primary); min-height: 32px; display: flex; align-items: center; }
+.mappick details p { margin: 0 0 4px; color: var(--muted); line-height: 1.5; }
 .maplibregl-ctrl-attrib, .maplibregl-ctrl-logo { display: none !important; }
 /* MapLibre makes its container position: relative; keep it filling the map box. */
 .mapview.maplibregl-map { position: absolute; inset: 0; }

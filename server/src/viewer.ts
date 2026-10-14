@@ -5,8 +5,10 @@
 //
 // The viewer decrypts the user's records and holds the batch key in the
 // browser, so its page must not run anything but its own files: no inline
-// scripts or styles, no other origin, and no other script of this origin
-// (the admin page, /pair): scripts only from the viewer's own directories.
+// scripts or styles, no script of another origin, and no other script of
+// this origin (the admin page, /pair): scripts only from the viewer's own
+// directories. The only other origins are the online map providers it may
+// fetch map data from (web/src/map/styles.ts).
 
 import { Hono } from "hono";
 import type { AppEnv } from "./env";
@@ -15,6 +17,14 @@ import type { AppEnv } from "./env";
 interface AssetsEnv {
   ASSETS?: Fetcher;
 }
+
+/**
+ * Where the viewer's online maps come from (web/src/map/styles.ts
+ * ONLINE_ORIGINS): OpenFreeMap's style, TileJSON, tiles, glyphs and
+ * sprites, and GSI's raster tiles. MapLibre fetches all of them, raster
+ * tiles included (refreshExpiredTiles), so only connect-src needs them.
+ */
+export const MAP_ORIGINS = ["https://tiles.openfreemap.org", "https://cyberjapandata.gsi.go.jp"] as const;
 
 /**
  * The viewer's CSP for a page or file served at `origin`. Scripts are
@@ -32,9 +42,9 @@ export function viewerCsp(origin: string): string {
     "style-src 'self'",
     // MapLibre's worker is a same-origin module (web/vite.config.ts).
     `worker-src ${origin}/vendor/`,
-    // The API and the basemap archive (one full download on 「簡易地図を読み込む」,
-    // never Range requests). Nothing of another origin.
-    "connect-src 'self'",
+    // The API, the offline basemap archive (one full download, never Range
+    // requests) and the online map providers.
+    `connect-src 'self' ${MAP_ORIGINS.join(" ")}`,
     // MapLibre's stylesheet uses data: images; decoded tiles may be blob:.
     "img-src 'self' data: blob:",
     "frame-ancestors 'none'",

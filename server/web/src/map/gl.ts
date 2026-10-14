@@ -1,14 +1,19 @@
 // MapLibre GL JS, loaded on demand from the copy under __MAPLIBRE_PATH__
-// (vite.config.ts), with the offline basemap of the server or a plain
-// background. No online tiles (no request to another origin). Routes, stays
-// and the last fix are GeoJSON layers.
+// (vite.config.ts), with a base map: an online style (map/styles.ts), the
+// offline basemap read in this browser (map/basemap.ts), or a plain
+// background. Routes, stays and the last fix are GeoJSON layers.
 
 import type * as ML from "maplibre-gl";
-import type { Basemap } from "./basemap";
 import type { MapContent } from "./content";
 import { boundsOf, highlightBounds } from "./content";
 
 type MapLibre = typeof ML;
+
+/** A base map: the style (a URL or inline) and the protocols it needs. */
+export interface BaseStyle {
+  style: string | ML.StyleSpecification;
+  install?(addProtocol: (name: string, action: ML.AddProtocolAction) => void): void;
+}
 
 let lib: Promise<MapLibre> | null = null;
 
@@ -79,7 +84,7 @@ export class GlMap {
   private constructor(
     private readonly ml: MapLibre,
     private readonly host: HTMLElement,
-    /** A light base map (the offline basemap) under the routes, in both themes. */
+    /** A light base map under the routes (every base map offered is light), in both themes. */
     private readonly light: boolean,
   ) {}
 
@@ -88,14 +93,14 @@ export class GlMap {
     return this.light ? light : token(name, light);
   }
 
-  /** `basemap` null draws a plain background. */
-  static async create(host: HTMLElement, basemap: Basemap | null): Promise<GlMap> {
+  /** `base` null draws a plain background. Rejects if the style cannot be loaded. */
+  static async create(host: HTMLElement, base: BaseStyle | null): Promise<GlMap> {
     const ml = await loadMapLibre();
     ml.setWorkerUrl(`${__MAPLIBRE_PATH__}maplibre-gl-worker.mjs`);
-    if (basemap) basemap.install((name, action) => ml.addProtocol(name, action));
-    const g = new GlMap(ml, host, !!basemap);
-    const style: ML.StyleSpecification =
-      basemap?.style ?? { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": token("--map-land", "#f3f0ea") } }] };
+    base?.install?.((name, action) => ml.addProtocol(name, action));
+    const g = new GlMap(ml, host, !!base);
+    const style: string | ML.StyleSpecification =
+      base?.style ?? { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": token("--map-land", "#f3f0ea") } }] };
     const map = new ml.Map({
       container: host,
       style,
@@ -113,7 +118,20 @@ export class GlMap {
     map.keyboard.disableRotation();
     g.map = map;
     host.querySelector("canvas")?.setAttribute("aria-hidden", "true");
-    await new Promise<void>((resolve) => map.once("load", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        map.once("load", () => resolve());
+        // Before "load", an error without a source is the style's own (offline, blocked).
+        const failed = (e: ML.ErrorEvent & { sourceId?: string }) => {
+          if (!e.sourceId) reject(e.error ?? new Error("map style unavailable"));
+        };
+        map.on("error", failed);
+        map.once("load", () => map.off("error", failed));
+      });
+    } catch (e) {
+      map.remove();
+      throw e;
+    }
     g.addLayers();
     g.ready = true;
     g.apply(true);

@@ -6,13 +6,13 @@
 // Where someone is looking on the map is location data. The viewer
 // therefore never reads the archive in pieces: HTTP Range requests for the
 // tiles in view would tell the server (and Cloudflare's edge) which area is
-// shown. Instead the map starts as a plain canvas, and only the explicit
-// action 「簡易地図を読み込む（約 64 MB）」 downloads the whole archive in one
-// request, the same for every user. It is verified against the pin, kept in
-// Cache Storage, and read locally from then on: tiles, style, glyphs and
-// sprites are slices of a Blob in this browser. A copy already in Cache
-// Storage is verified again and used without asking, since that sends
-// nothing. There are no online tiles.
+// shown. Instead choosing 「簡易地図（端末内）」 (ui/mappanel.ts) downloads
+// the whole archive in one request, the same for every user. It is verified
+// against the pin, kept in Cache Storage, and read locally from then on:
+// tiles, style, glyphs and sprites are slices of a Blob in this browser. A
+// copy already in Cache Storage is verified again and used without asking,
+// since that sends nothing. (The online maps of map/styles.ts are the
+// default; this one is the choice that sends nothing.)
 
 import type { AddProtocolAction, StyleSpecification } from "maplibre-gl";
 import { PMTiles, Protocol, type RangeResponse, type Source } from "pmtiles";
@@ -266,7 +266,7 @@ export function resetBasemap(): void {
 let cachedOnce: Promise<Basemap | null> | null = null;
 
 /**
- * The archive kept in Cache Storage by an earlier 「簡易地図を読み込む」,
+ * The archive kept in Cache Storage by an earlier download,
  * verified again against the pin. Sends no request. A copy that does not
  * match is deleted.
  */
@@ -313,7 +313,7 @@ export class BasemapError extends Error {
 let downloading: Promise<Basemap> | null = null;
 
 /**
- * 「簡易地図を読み込む」: the whole pinned archive in one request, without
+ * Choosing 「簡易地図（端末内）」: the whole pinned archive in one request, without
  * a Range header, verified, then kept in Cache Storage. `progress` gets
  * the bytes received so far.
  */

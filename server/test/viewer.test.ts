@@ -3,13 +3,13 @@ import { describe, expect, it } from "vitest";
 import { viewerCsp } from "../src/viewer";
 import { BASE, call } from "./helpers";
 
-/** The viewer's CSP, exactly: scripts only from its own directories, nothing of another origin. */
+/** The viewer's CSP, exactly: scripts only from its own directories; of other origins, only the map providers' data. */
 const CSP =
   "default-src 'none'; " +
   `script-src ${BASE}/assets/ ${BASE}/vendor/; ` +
   "style-src 'self'; " +
   `worker-src ${BASE}/vendor/; ` +
-  "connect-src 'self'; " +
+  "connect-src 'self' https://tiles.openfreemap.org https://cyberjapandata.gsi.go.jp; " +
   "img-src 'self' data: blob:; " +
   "frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
@@ -38,9 +38,12 @@ describe("web viewer at /", () => {
     const csp = res.headers.get("Content-Security-Policy")!;
     expect(csp).toBe(CSP);
     expect(csp).toBe(viewerCsp(BASE));
-    // No 'self' for scripts (it would allow /admin and /pair), no other origin.
+    // No 'self' for scripts (it would allow /admin and /pair). Another origin
+    // only in connect-src, and only the map providers.
     expect(/script-src[^;]*'self'/.test(csp)).toBe(false);
-    expect(csp).not.toMatch(/https:\/\/(?!ashidori\.example\/)/);
+    for (const d of csp.split("; ").filter((d) => !d.startsWith("connect-src "))) expect(d).not.toMatch(/https:\/\/(?!ashidori\.example\/)/);
+    const others = csp.split("; ").find((d) => d.startsWith("connect-src "))!.split(" ").filter((s) => s.startsWith("https://"));
+    expect(others).toEqual(["https://tiles.openfreemap.org", "https://cyberjapandata.gsi.go.jp"]);
     expect(csp).toContain("frame-ancestors 'none'");
     expect(csp).not.toContain("unsafe-inline");
     expect(csp).not.toContain("unsafe-eval");
