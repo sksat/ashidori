@@ -63,6 +63,9 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
         val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
         write(row(name, wall, e.timestamp, e.values(0), e.values(1), e.values(2)))
         LoggerState.imuSamples += 1
+        if name == "Gyro" then
+          val (x, y, z) = (e.values(0), e.values(1), e.values(2))
+          LoggerState.gyro = Some((wall, math.sqrt(x * x + y * y + z * z).toFloat))
       }
 
   private val measurementCb = new GnssMeasurementsEvent.Callback:

@@ -57,10 +57,18 @@ class LoggerService extends Service:
   /** (provider, interval, batch, minDistance) currently registered */
   private var locReg: Option[(String, Long, Long, Float)] = None
   private var accelReg: Int = 0
+  /** When the accelerometer was turned on; 0 while off. */
+  private var accelSince = 0L
   private var statusRegistered = false
   private var recorder: Option[GnssRecorder] = None
   private var sigMotionArmed = false
   private var lastStepCount = -1f
+  /** Steps since local midnight of [[stepsDay]]: the DB's count at start
+    * (added once read) plus everything counted since.
+    */
+  private var stepsToday = 0
+  private var stepsBaseKnown = false
+  private var stepsDay = java.time.LocalDate.now(AshidoriApp.zone)
   private var lastSpeed = Double.NaN
   private var lastSpeedAt = 0L
 
@@ -99,11 +107,28 @@ class LoggerService extends Service:
         // Steps are cheap (sensor hub) and batched for up to 5 minutes.
         sm.registerListener(sensorListener, s, SensorManager.SENSOR_DELAY_NORMAL, 5 * 60 * 1_000_000, handler)
       }
+      // Today's steps so far, from before this start (off this thread).
+      val midnight = stepsDay.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
+      val day = stepsDay
+      AshidoriApp.io.execute { () =>
+        val base = scala.util.Try(db.steps(midnight, System.currentTimeMillis())).getOrElse(0)
+        handler.post { () =>
+          if stepsDay == day && !stepsBaseKnown then
+            stepsToday += base
+            stepsBaseKnown = true
+            publishStepsToday()
+        }
+      }
+      // While the status screen is open it asks for batched samples early,
+      // so its "now" values are seconds old, not minutes. The screen is on
+      // then anyway; the samples are the same ones delivered later otherwise.
+      LoggerState.flushSensors = () => handler.post(() => sm.flush(sensorListener))
       LoggerState.onMain { LoggerState.running = true }
       tick()
     evaluate(force = true)
 
   override def onDestroy(): Unit =
+    LoggerState.flushSensors = () => ()
     handler.post { () =>
       handler.removeCallbacksAndMessages(null)
       stopRecorder()
@@ -119,6 +144,7 @@ class LoggerService extends Service:
       LoggerState.running = false
       LoggerState.plan = None
       LoggerState.satellites = Vector.empty
+      LoggerState.satellitesAt = 0L
     }
     LoggerState.changed()
     super.onDestroy()
@@ -173,6 +199,7 @@ class LoggerService extends Service:
     LoggerState.onMain {
       LoggerState.plan = Some(p)
       LoggerState.motion = estimator.current
+      LoggerState.motionSince = motionSince
       LoggerState.battery = pct
       LoggerState.drainPctPerHour = drain
     }
@@ -212,7 +239,10 @@ class LoggerService extends Service:
         if wantStatus then lm.registerGnssStatusCallback(exec, statusCallback)
         else
           lm.unregisterGnssStatusCallback(statusCallback)
-          LoggerState.onMain { LoggerState.satellites = Vector.empty }
+          LoggerState.onMain {
+            LoggerState.satellites = Vector.empty
+            LoggerState.satellitesAt = 0L
+          }
         statusRegistered = wantStatus
       catch case e: SecurityException => Log.w("gnss status", e)
 
@@ -241,13 +271,15 @@ class LoggerService extends Service:
             sm.registerListener(sensorListener, s, 1_000_000 / p.accelHz, (p.accelBatchMs * 1000).toInt, handler)
         }
       if p.accelHz == 0 then accumulator.flush().foreach(onWindow)
+      if p.accelHz == 0 then accelSince = 0L
+      else if accelReg == 0 then accelSince = System.currentTimeMillis()
       accelReg = p.accelHz
 
     updatePdr()
     if p.accelHz == 0 && estimator.current == MotionState.Stationary then armSigMotion()
     else disarmSigMotion()
     LoggerState.sensors = SensorState(accelReg, if accelReg > 0 then p.accelBatchMs else 0L, sigMotionArmed, pdrSensors,
-      recorder.map(_.imuHz).getOrElse(0))
+      recorder.map(_.imuHz).getOrElse(0), accelSince)
 
   /** Step detector + rotation vector only while walking indoors: the gyro
     * on some phones cannot batch, so this keeps the CPU awake.
@@ -366,7 +398,11 @@ class LoggerService extends Service:
           if st.hasCarrierFrequencyHz(i) then st.getCarrierFrequencyHz(i) else Float.NaN
         )
       }.toVector
-      LoggerState.onMain { LoggerState.satellites = sats }
+      val at = System.currentTimeMillis()
+      LoggerState.onMain {
+        LoggerState.satellites = sats
+        LoggerState.satellitesAt = at
+      }
       // Indoor/outdoor from what the receiver sees; re-plan when it flips.
       val now = System.currentTimeMillis()
       val snap = GnssSnapshot.of(now, sats.map(x => (x.constellation, x.svid, x.cn0, x.usedInFix, x.band == "L5")))
@@ -380,8 +416,17 @@ class LoggerService extends Service:
       if env != before then evaluate(force = true)
       LoggerState.changed()
 
-  private val sensorListener = new SensorEventListener:
+  private val sensorListener = new android.hardware.SensorEventListener2:
     override def onAccuracyChanged(sensor: Sensor, accuracy: Int): Unit = ()
+    /** After a flush the step counter has delivered everything it held: its
+      * count is current as of now even when no step came (it reports only
+      * on change).
+      */
+    override def onFlushCompleted(sensor: Sensor): Unit =
+      if sensor.getType == Sensor.TYPE_STEP_COUNTER then
+        val now = System.currentTimeMillis()
+        LoggerState.onMain { LoggerState.stepsAt = now }
+        LoggerState.changed()
     override def onSensorChanged(e: SensorEvent): Unit =
       e.sensor.getType match
         case Sensor.TYPE_ACCELEROMETER =>
@@ -402,12 +447,25 @@ class LoggerService extends Service:
             }
         case Sensor.TYPE_STEP_COUNTER =>
           val total = e.values(0)
+          val received = System.currentTimeMillis()
+          val wall = received - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
+          val today = java.time.LocalDate.now(AshidoriApp.zone)
+          if today != stepsDay then
+            stepsDay = today
+            stepsToday = 0
+            stepsBaseKnown = true
+          LoggerState.onMain { LoggerState.stepsAt = received }
           if lastStepCount >= 0 && total >= lastStepCount then
             val d = (total - lastStepCount).toInt
             if d > 0 then
               accumulator.addSteps(d)
               strideRef = strideRef.map((a, n) => (a, n + d))
-              LoggerState.onMain { LoggerState.stepsSession += d }
+              stepsToday += d
+              publishStepsToday()
+              LoggerState.onMain {
+                LoggerState.stepsSession += d
+                LoggerState.recentSteps = (LoggerState.recentSteps :+ (wall, d)).filter(_._1 >= wall - 5 * 60_000)
+              }
               // Steps while "stationary" (accelerometer off) mean we are moving.
               if accelReg == 0 && estimator.current == MotionState.Stationary && d >= 10 then
                 estimator.wake()
@@ -416,12 +474,25 @@ class LoggerService extends Service:
           lastStepCount = total
         case _ => ()
 
+  private def publishStepsToday(): Unit =
+    val n = if stepsBaseKnown then stepsToday else -1
+    LoggerState.onMain { LoggerState.stepsToday = n }
+    LoggerState.changed()
+
   private def onWindow(w: MotionWindow): Unit =
     pendingMotion += w
+    // Written on the same schedule as fixes, not only when a fix arrives:
+    // without fixes (indoors, network off) windows would wait for onDestroy
+    // and be lost if the process is killed.
+    flush()
     val before = estimator.current
     val now = System.currentTimeMillis()
     estimator.update(w, if now - lastSpeedAt < 60_000 then lastSpeed else Double.NaN)
-    LoggerState.onMain { LoggerState.lastWindow = Some(w) }
+    LoggerState.onMain {
+      LoggerState.lastWindow = Some(w)
+      LoggerState.recentWindows = (LoggerState.recentWindows :+ w).filter(_.end >= w.end - 10 * 60_000)
+    }
+    LoggerState.changed()
     if estimator.current != before then
       motionSince = now
       // Settled somewhere: look up nearby venues now so a check-in is instant.

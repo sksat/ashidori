@@ -29,25 +29,13 @@ final class PositioningPanel(act: MainActivity):
     col.setLayoutParams(weighted())
     hbox(accuracy, col)
 
-  // --- satellites ---
-  // The same rows in every state (receiving, acquiring, off); "—" where
-  // there is nothing to show.
-  private def row(label: String): (View, android.widget.TextView) =
-    val l = text(label, 14f, colorAttr = attr.onSurfaceVariant)
-    l.setLayoutParams(android.widget.LinearLayout.LayoutParams(dp(72), android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
-    val v = tabular(oneLine(text("", 15f)))
-    v.setLayoutParams(weighted())
-    val h = hbox(l, v)
-    h.setPadding(0, dp(3), 0, dp(3))
-    (h, v)
-  private val (stateRow, satState) = row("受信")
-  private val (usedRow, satUsed) = row("使用")
-  private val (signalRow, satSignal) = row("信号")
-  /** Why receiving is off, or what to expect; an empty line otherwise. */
-  private val satNote =
-    val t = oneLine(caption(""))
-    t.setPadding(0, dp(2), 0, dp(4))
-    t
+  // --- satellites: 「いま」 then 「履歴」, in one card ---
+  // The same rows in every state (receiving, acquiring, off); 「—」 where
+  // there is nothing to show, and each value's age beside it.
+  private val state = SensorUi.StateLine()
+  private val fixRow = SensorUi.ValueRow("測位")
+  private val usedRow = SensorUi.ValueRow("衛星")
+  private val signalRow = SensorUi.ValueRow("信号")
   /** Fixed cells in a fixed order, one per constellation: a constellation
     * coming into view changes a value, not the layout.
     */
@@ -87,32 +75,49 @@ final class PositioningPanel(act: MainActivity):
     }
   }
   private val skyHelp = caption("中心＝真上・外周＝地平線　● 使用中　◎ L5 も受信")
-  private val satellites = card(text("衛星", 16f, bold = true), spacer(4), stateRow, usedRow, signalRow, satNote,
-    constellations, sky, skyHelp, bars, wake)
+  private val barsHelp = caption("信号強度（C/N0）の強い順・薄い棒は測位に未使用")
 
-  // --- last hour ---
   private val history = GnssHistoryView(act)
   private val historyNote = oneLine(tabular(caption("")))
+  private val rangeGroup = SensorUi.rangeToggle(PositioningPanel.day) { d =>
+    PositioningPanel.day = d
+    loadHistory()
+  }
   /** A color sample and what it means, for the chart's legend. */
   private def swatch(col: Int, label: String, line: Boolean = false): View =
     val v = View(act)
     v.setBackgroundColor(col)
     v.setLayoutParams(android.widget.LinearLayout.LayoutParams(dp(if line then 14 else 10), dp(if line then 3 else 10)))
-    val t = caption(label)
-    t.setPadding(dp(4), 0, dp(12), 0)
-    hbox(v, t)
-  private val hour = card(
-    text("受信状況（直近1時間）", 16f, bold = true),
+    SensorUi.legendItem(v, label)
+  private val satellites = card(
+    text("衛星測位", 16f, bold = true),
+    caption("GNSS 受信機"),
+    SensorUi.section("いま"),
+    state.view,
+    fixRow.view,
+    usedRow.view,
+    signalRow.view,
+    spacer(4),
+    constellations,
+    sky,
+    skyHelp,
+    spacer(6),
+    bars,
+    barsHelp,
+    spacer(6),
+    wake,
+    SensorUi.section("履歴", rangeGroup),
     hbox(
-      swatch(color(attr.primary), "使用衛星数"),
-      swatch(color(attr.tertiary), "信号強度", line = true),
-      swatch(color(attr.secondaryContainer), "屋内")
+      swatch(color(attr.primary), "使用衛星数（棒）"),
+      swatch(color(attr.tertiary), "信号強度（線）", line = true)
     ),
+    hbox(swatch(color(attr.secondaryContainer), "屋内と判定")),
+    spacer(4),
     history,
     historyNote
   )
 
-  val views: Seq[View] = Seq(satellites, hour)
+  val views: Seq[View] = Seq(satellites)
 
   private def sourceLabel(p: String): String = p match
     case "gps"                => "衛星（GNSS）"
@@ -121,6 +126,32 @@ final class PositioningPanel(act: MainActivity):
     case "passive"            => "他アプリの測位"
     case "sim"                => "シミュレーション"
     case other                => other
+
+  // Ages tick every second while shown; the history reloads every minute.
+  private val main = android.os.Handler(android.os.Looper.getMainLooper)
+  private var shown = false
+  private var ticks = 0
+  private val tick: Runnable = () =>
+    if shown then
+      ticks += 1
+      if ticks % 60 == 0 then loadHistory()
+      refresh()
+      main.postDelayed(tick, 1_000)
+
+  def onShow(): Unit =
+    if !shown then
+      shown = true
+      ticks = 0
+      main.postDelayed(tick, 1_000)
+    loadHistory()
+
+  def onHide(): Unit =
+    shown = false
+    main.removeCallbacks(tick)
+  SensorUi.onPause(act)(onHide())
+
+  /** A fix older than this says little about now. */
+  private val StaleMs = 5 * 60_000L
 
   def refresh(): Unit =
     val now = System.currentTimeMillis()
@@ -137,7 +168,7 @@ final class PositioningPanel(act: MainActivity):
         val sec = (now - f.time) / 1000
         val when = if sec < 60 then s"${sec}秒前" else if sec < 3600 then s"${sec / 60}分前" else s"${sec / 3600}時間前"
         // An old fix says little about now: say so instead of looking precise.
-        val stale = sec > 5 * 60
+        val stale = now - f.time > StaleMs
         accuracy.setAlpha(if stale then 0.4f else 1f)
         age.setText(
           when + (if !stale then ""
@@ -152,12 +183,53 @@ final class PositioningPanel(act: MainActivity):
 
     val sats = LoggerState.satellites
     val on = sats.nonEmpty
+    val running = LoggerState.running
+    val gnssOn = LoggerState.plan.exists(_.source == LocationSource.Gnss)
     // The plot and the bars stay in place, empty while nothing is received.
     sky.update(sats)
     bars.update(sats)
-    val gnssOn = LoggerState.plan.exists(_.source == LocationSource.Gnss)
     // Always there; usable only when it would turn the receiver on.
-    wake.setEnabled(!on && !gnssOn && LoggerState.running)
+    wake.setEnabled(!on && !gnssOn && running)
+
+    // State of the receiver, and why.
+    val how = LoggerState.plan.filter(_ => running).fold("")(PositioningPanel.sourceState)
+    if !running then state.set("記録停止中", SensorUi.Tone.Off, "")
+    else if on then state.set("受信中", SensorUi.Tone.Active, how)
+    else if gnssOn then state.set("捕捉中", SensorUi.Tone.Waiting, "屋外では通常数十秒以内")
+    else if LoggerState.environment == Environment.Indoor then
+      state.set("停止中（屋内）", SensorUi.Tone.Off, s"$how・移動開始時に再確認")
+    else if LoggerState.motion == MotionState.Stationary then
+      state.set("停止中（静止）", SensorUi.Tone.Off, s"$how・動くと再開")
+    else state.set("停止中", SensorUi.Tone.Off, how)
+
+    // 測位: the latest position, whatever its source; its age always shown,
+    // in the error color once it is stale.
+    LoggerState.lastFix match
+      case Some(f) =>
+        val stale = now - f.time > StaleMs
+        val acc = if f.hasAccuracy then f"±${f.accuracy}%.0f m" else "±?"
+        val speed = if !stale && f.hasSpeed then f"・${f.speed * 3.6}%.0f km/h" else ""
+        fixRow.set(
+          SensorUi.spans((acc, false), (s"  ${sourceLabel(f.provider)}$speed", true),
+            (if stale then "・古い値" else "", true)),
+          Some(now - f.time), stale = stale)
+      case None => fixRow.none(if running then "測位待ち" else "")
+
+    val satAge = Option(LoggerState.satellitesAt).filter(_ > 0).map(now - _)
+    if on then
+      val used = sats.filter(_.usedInFix).map(s => (s.constellation, s.svid)).distinct.size
+      val seen = sats.map(s => (s.constellation, s.svid)).distinct.size
+      val top4 = sats.map(_.cn0).sorted.reverse.take(4)
+      val mean = if top4.isEmpty then 0f else top4.sum / top4.size
+      usedRow.set(SensorUi.spans((s"$used 機", false), ("  使用", true), (s"・$seen 機", false), ("  捕捉", true)), satAge)
+      signalRow.set(
+        SensorUi.spans((f"$mean%.0f dB-Hz", false),
+          ("  強い4機の平均・" + (if mean >= 35 then "良好" else if mean >= 25 then "やや弱い" else "弱い"), true)),
+        satAge)
+    else
+      val why = if !running then "" else if gnssOn then "捕捉中" else "受信機停止中"
+      usedRow.none(why)
+      signalRow.none(why)
     for ((name, matches), ch) <- constellationKinds.zip(constellationChips) do
       val ss = sats.filter(s => matches(s.constellation))
       if ss.isEmpty then
@@ -171,52 +243,29 @@ final class PositioningPanel(act: MainActivity):
         ch.setText(s"$name $u/$n" + (if l5 > 0 then s"・L5 $l5" else ""))
         ch.setTextColor(color(attr.onSurface))
         ch.setChipBackgroundColor(android.content.res.ColorStateList.valueOf(Constellations.color(ss.head.constellation) & 0x33ffffff))
-    if on then
-      val used = sats.filter(_.usedInFix).map(s => (s.constellation, s.svid)).distinct.size
-      val seen = sats.map(s => (s.constellation, s.svid)).distinct.size
-      val top4 = sats.map(_.cn0).sorted.reverse.take(4)
-      val mean = if top4.isEmpty then 0f else top4.sum / top4.size
-      satState.setText("受信中")
-      satUsed.setText(s"${used} 機（捕捉 ${seen} 機）")
-      satSignal.setText(
-        f"強い4機の平均 ${mean}%.0f dB-Hz" +
-          (if mean >= 35 then "・良好" else if mean >= 25 then "・やや弱い" else "・弱い")
-      )
-      satNote.setText("")
-    else
-      satUsed.setText("—")
-      satSignal.setText("—")
-      if LoggerState.running && gnssOn then
-        // GNSS is on but nothing tracked yet.
-        satState.setText("捕捉中")
-        satNote.setText("ⓘ 屋外では通常数十秒以内")
-      else if LoggerState.running then
-        satState.setText("停止中")
-        satNote.setText(
-          if LoggerState.environment == Environment.Indoor then "ⓘ 屋内のため（移動開始時に再確認）"
-          else "ⓘ 静止中のため（移動開始時に再開）"
-        )
-      else
-        satState.setText("停止中")
-        satNote.setText("")
 
   def loadHistory(): Unit =
     val now = System.currentTimeMillis()
+    val span = if PositioningPanel.day then 24 * 3_600_000L else 3_600_000L
     AshidoriApp.io.execute { () =>
-      val d = AshidoriApp.db.gnssStatus(now - 3_600_000L)
+      val d = AshidoriApp.db.gnssStatus(now - span)
       act.runOnUiThread { () =>
-        history.update(d, now - 3_600_000L, now)
-        val indoorMs = d.sliding(2).collect {
-          case Seq(a, b) if a._2 == Environment.Indoor && b._1.time - a._1.time < 120_000 => b._1.time - a._1.time
-        }.sum
+        history.update(d, now - span, now)
+        val gapMs = 120_000L
+        val pairs = d.sliding(2).collect { case Seq(a, b) if b._1.time - a._1.time < gapMs => (a, b._1.time - a._1.time) }.toVector
+        val onMs = pairs.map(_._2).sum
+        val indoorMs = pairs.collect { case (a, ms) if a._2 == Environment.Indoor => ms }.sum
         historyNote.setText(
-          if d.isEmpty then "受信なし"
-          else s"屋内 約${indoorMs / 60_000}分"
+          if d.isEmpty then "この期間の受信なし"
+          else s"受信 ${fmtDuration(onMs)}・うち屋内 ${fmtDuration(indoorMs)}"
         )
       }
     }
 
 object PositioningPanel:
+  /** History range: false = 1時間, true = 24時間. Kept while the app runs. */
+  var day = false
+
   private def every(ms: Long): String =
     if ms < 60_000 then s"${(ms / 1000.0).toString.stripSuffix(".0")}秒ごと" else s"${ms / 60_000}分ごと"
 

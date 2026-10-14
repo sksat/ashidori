@@ -32,7 +32,9 @@ final case class SensorState(
     /** step detector + rotation vector for indoor dead reckoning */
     pdr: Boolean = false,
     /** raw accelerometer / gyroscope / magnetometer rate in a detail log; 0 = not recording */
-    imuHz: Int = 0
+    imuHz: Int = 0,
+    /** when the accelerometer was last turned on (0 = off) */
+    accelSince: Long = 0L
 )
 
 /** Live state published by the logger service and observed by the UI. All
@@ -49,7 +51,13 @@ object LoggerState:
     */
   @volatile var recentFixes: Vector[Fix] = Vector.empty
   var lastWindow: Option[MotionWindow] = None
+  /** Windows of the last 10 minutes, including ones not yet in the DB. */
+  var recentWindows: Vector[MotionWindow] = Vector.empty
+  /** When [[motion]] last changed. */
+  var motionSince: Long = 0L
   var satellites: Vector[SatSignal] = Vector.empty
+  /** When [[satellites]] last arrived; 0 = never since the receiver turned on. */
+  var satellitesAt: Long = 0L
   var detailFile: Option[String] = None
   var detailStartedAt: Long = 0L
   var drainPctPerHour: Double = Double.NaN
@@ -57,6 +65,21 @@ object LoggerState:
   var fixesToday: Int = 0
   var rawMeasurementsSeen: Long = 0
   var stepsSession: Int = 0
+  /** Step-counter deliveries of the last few minutes: (time of the newest
+    * step in the delivery, steps). Batched by the sensor hub, so the newest
+    * entry can be minutes old unless [[flushSensors]] asked for it.
+    */
+  var recentSteps: Vector[(Long, Int)] = Vector.empty
+  /** When the step counter's count was last known current (a delivery or a
+    * completed flush); 0 = not yet.
+    */
+  var stepsAt: Long = 0L
+  /** Steps since local midnight (DB at service start + counted since); -1 = unknown yet. */
+  var stepsToday: Int = -1
+  /** Latest gyroscope magnitude in rad/s with its time, while a detail log samples it. */
+  @volatile var gyro: Option[(Long, Float)] = None
+  /** Asks the logger to deliver batched sensor samples now (set by the service). */
+  @volatile var flushSensors: () => Unit = () => ()
   @volatile var sensors: SensorState = SensorState()
   /** Raw IMU samples written by detail logs since the service started. */
   @volatile var imuSamples: Long = 0

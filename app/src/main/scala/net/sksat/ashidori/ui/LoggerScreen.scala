@@ -268,16 +268,20 @@ final class LoggerScreen(act: MainActivity) extends Screen:
 
   private var unobserve: () => Unit = () => ()
   override def onShow(): Unit =
+    // onShow comes again on resume without an onHide: observe only once.
+    unobserve()
     unobserve = LoggerState.observe(() => refresh())
     peers.onShow()
     paintModes()
     refresh()
-    panel.loadHistory()
-    sensorPanel.loadHistory()
+    panel.onShow()
+    sensorPanel.onShow()
     loadFiles()
   override def onHide(): Unit =
     unobserve()
     peers.onHide()
+    panel.onHide()
+    sensorPanel.onHide()
     blink.cancel()
 
   private def loadFiles(): Unit =
