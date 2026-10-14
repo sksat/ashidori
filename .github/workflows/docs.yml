@@ -1,0 +1,33 @@
+name: docs
+
+# Checks that the committed SVGs in docs/diagrams match a fresh render of their
+# D2 sources (docs/diagrams/README.md).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/diagrams/**"
+      - "tools/docs/render-diagrams.sh"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/diagrams/**"
+      - "tools/docs/render-diagrams.sh"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  diagrams:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # D2 and the fonts are pinned by SHA-256 in the script, which also
+      # verifies cached copies.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/ashidori-docs
+          key: ashidori-docs-${{ hashFiles('tools/docs/render-diagrams.sh') }}
+      - run: tools/docs/render-diagrams.sh --check

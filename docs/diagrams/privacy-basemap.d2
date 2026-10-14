@@ -1,0 +1,18 @@
+# 簡易地図の取得（docs/privacy.md）
+direction: right
+
+src: 信頼しない取得元 {
+  gh: GitHub Releases
+  sv: "同期サーバ\n任意の配信"
+}
+
+pin: "アプリに固定した版\n大きさと SHA-256"
+check: "大きさと SHA-256\nを照合"
+ok: 端末に保存
+ng: 破棄
+
+src.gh -> check
+src.sv -> check
+pin -> check
+check -> ok: 一致
+check -> ng: 不一致

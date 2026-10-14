@@ -8,14 +8,7 @@
 
 ## 鍵の関係
 
-```mermaid
-flowchart LR
-  R["乱数 32 byte"] --> K["鍵 K"]
-  K -->|"Crockford base32<br/>とチェックサム"| RC["復旧コード"]
-  K -->|"Keystore の鍵で包む"| KS["端末内の保存"]
-  K -->|"HKDF-SHA256"| BK["バッチ鍵"]
-  BK --> G["AES-256-GCM"]
-```
+![鍵の関係：鍵 K から復旧コード、端末内の保存、バッチ鍵を作る](diagrams/encryption-keys.svg)
 
 | 名前 | 作り方 | 用途 |
 | --- | --- | --- |
@@ -31,6 +24,8 @@ flowchart LR
 
 平文は、記録を 1 行 1 件の JSON Lines にして gzip で圧縮したものである。
 これをバッチ鍵で AES-256-GCM により暗号化し、次の形式で送る。
+
+![blob の形式：平文、nonce、バッチ鍵、AAD から AES-256-GCM で暗号文と認証タグを作る](diagrams/encryption-blob.svg)
 
 | 位置 | 長さ | 内容 |
 | --- | --- | --- |

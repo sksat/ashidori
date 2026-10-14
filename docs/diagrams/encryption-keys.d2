@@ -1,0 +1,15 @@
+# 鍵の関係（docs/encryption.md）
+direction: right
+
+rand: 乱数 32 byte
+k: 鍵 K
+code: "復旧コード\nCrockford base32\nとチェックサム"
+store: "端末内の保存\nKeystore の鍵で包む"
+bk: バッチ鍵
+gcm: "AES-256-GCM\nバッチの暗号化"
+
+rand -> k
+k -> code
+k -> store
+k -> bk: "HKDF-SHA256\nashidori batch v1"
+bk -> gcm

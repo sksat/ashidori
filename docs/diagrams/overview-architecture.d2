@@ -1,0 +1,36 @@
+# 全体像（docs/overview.md）
+# 破線は予定または条件付きの経路、太線は平文が出る経路を表す。
+direction: down
+
+classes: {
+  plain: {style.stroke-width: 3}
+  maybe: {style.stroke-dash: 4}
+}
+
+user: 利用者（鍵 K を持つ） {
+  grid-rows: 1
+  p1: 端末 1
+  p2: 端末 2
+  web: Web ブラウザ（予定） {class: maybe}
+}
+
+server: 同期サーバ（Cloudflare） {
+  label.near: top-right
+  workers: Workers
+  d1: "D1\nメタデータ\n共有チェックイン" {shape: cylinder}
+  r2: "R2\n暗号化した記録" {shape: cylinder}
+  admin: "管理ページ\nCloudflare Access"
+  workers -- d1
+  workers -- r2
+  workers <- admin
+}
+
+ext: "外部サービス\n地図タイル、地名、施設検索"
+operator: 運用者 {shape: person}
+follower: フォロワー {shape: person}
+
+user <-> server.workers: 暗号文
+user -> server.workers: 共有チェックイン（平文） {class: plain}
+server.workers -> follower: 平文 {class: plain}
+server.admin <- operator
+user -> ext: 位置（設定と操作による） {class: maybe}
