@@ -32,9 +32,11 @@ CONSTANTS Devs, Users, Owner, Seqs, Shas, Size, Attempts,
           Quota, MaxBatches, MaxTotal, MaxTime,
           Grace,           \* G: the sweep only deletes objects older than this
           Deadline,        \* TRUE: the commit deadline exists (the fix)
-          CommitDeadline   \* D: the longest now - start at which D1 still commits
+          CommitDeadline,  \* D: the longest now - start at which D1 still commits
+          CountTrigger,    \* FALSE (mutation): the commit does not count the batch
+          CheckCaps        \* FALSE (mutation): the commit does not check the limits
 
-ASSUME Deadline => CommitDeadline <= Grace
+\* The design needs D <= G; BatchCommit_dg breaks it on purpose.
 
 VARIABLES
   now,       \* one clock for the Worker, D1 and R2 (no skew modelled)
@@ -81,14 +83,14 @@ Commit(a) ==
          u == Owner[x.dev]
          ok == /\ ~SlotTaken(x.dev, x.seq)
                /\ x.dev \notin revoked
-               /\ ubytes[u] + Size[x.sha] <= Quota
-               /\ ucount[u] + 1 <= MaxBatches
-               /\ total + Size[x.sha] <= MaxTotal
+               /\ (CheckCaps => ubytes[u] + Size[x.sha] <= Quota)
+               /\ (CheckCaps => ucount[u] + 1 <= MaxBatches)
+               /\ (CheckCaps => total + Size[x.sha] <= MaxTotal)
                /\ (Deadline => now - x.start <= CommitDeadline)
      IN IF ok
           THEN /\ rows' = rows \cup {[dev |-> x.dev, seq |-> x.seq, sha |-> x.sha, key |-> a]}
                /\ ubytes' = [ubytes EXCEPT ![u] = @ + Size[x.sha]]
-               /\ ucount' = [ucount EXCEPT ![u] = @ + 1]
+               /\ ucount' = [ucount EXCEPT ![u] = IF CountTrigger THEN @ + 1 ELSE @]
                /\ total' = total + Size[x.sha]
                /\ att' = [att EXCEPT ![a].pc = "done"]
           ELSE /\ att' = [att EXCEPT ![a].pc = "lost"]

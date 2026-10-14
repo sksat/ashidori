@@ -42,18 +42,34 @@ rule Register_Device:
 
 // A device seals a fresh secret payload ~m for the slot (dev, stream, seq),
 // AAD "{deviceId}/{stream}/{seq}", and uploads it.
+// Sanity (-D=NOAAD): the slot is not bound as AAD; slot_binding and
+// no_slot_move must then be falsified.
+#ifdef NOAAD
+rule Seal:
+    [ !Device(U, dev, K), In(<stream, seq>), Fr(~n), Fr(~m) ]
+  --[ Seal(K, dev, stream, seq, ~m) ]->
+    [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, 'noaad', ~m)>) ]
+#else
 rule Seal:
     [ !Device(U, dev, K), In(<stream, seq>), Fr(~n), Fr(~m) ]
   --[ Seal(K, dev, stream, seq, ~m) ]->
     [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, <dev, stream, seq>, ~m)>) ]
+#endif
 
 // A device of the same user downloads the blob the server serves for the
 // slot (dev, stream, seq) it asked for, and opens it with that slot's AAD.
 // Decryption succeeds only for a ciphertext of this shape (AEAD integrity).
+#ifdef NOAAD
+rule Accept:
+    [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, 'noaad', m)>) ]
+  --[ Accept(K, dev, stream, seq, m) ]->
+    [ ]
+#else
 rule Accept:
     [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, <dev, stream, seq>, m)>) ]
   --[ Accept(K, dev, stream, seq, m) ]->
     [ ]
+#endif
 
 // Sanity: the key leaks (a compromised device, a typed-in recovery code on a
 // hostile web page, ...).

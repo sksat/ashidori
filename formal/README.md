@@ -1,21 +1,23 @@
 # 同期プロトコルの形式検証
 
-`docs/sync-protocol.md` の同期プロトコルについて、二つの性質を形式モデルで検査する。
+`docs/sync-protocol.md` の同期プロトコルのうち、壊れると利用者のデータや鍵を失う部分を形式モデルで検査する。
+形式検証そのものは目的ではない。
+各モデルは、実装で起きうる具体的な障害（下の表の「防ぐ障害」）を一つずつ防ぐためにある。
 
 - 悪意あるサーバ管理者が位置ログを読めないこと（Tamarin による暗号モデル）
-- 並行処理と障害のもとで、同期の状態が食い違わないこと（TLA+ と TLC による状態モデル）
+- 並行処理、障害、再起動のもとで、登録、鍵、送信の状態が食い違わないこと（TLA+ と TLC による状態モデル）
 
 暗号モデルはサーバを攻撃者とみなす。
-状態モデルはサーバが仕様どおりに動くと仮定し、通信路とクライアントの障害を網羅する。
+状態モデルはサーバが仕様どおりに動くと仮定し（status 取得のモデルだけは偽の一覧を出すサーバを含む）、通信路とクライアントの障害を網羅する。
 二つは別の前提に立つため、片方の結果をもう片方の前提のもとで読まない。
 
 ## 実行方法
 
 ```sh
 formal/run.sh            # すべて
-formal/run.sh fast       # 時間のかかる TLA+ の設定（run.sh の SLOW_TLA）を除く。CI のプッシュ時とデプロイ前はこれを使い、すべての検査は毎日と手動実行で行う
+formal/run.sh fast       # 時間のかかる TLA+ の設定（run.sh の SLOW_TLA）を除く。CI のプッシュ時とデプロイ前はこれを使い、すべては毎日と手動実行で行う
 formal/run.sh tamarin    # 暗号モデルのみ
-formal/run.sh tla Outbox BatchCommit_fixed   # TLA+ の指定した設定のみ
+formal/run.sh tla Outbox BatchCommit_fixed   # TLA+ の指定した設定のみ（未知の名前はエラー）
 formal/run.sh fetch      # ツールの取得のみ
 ```
 
@@ -23,9 +25,8 @@ Java 17 以上、`curl`、`unzip`、`sha256sum` が必要である。
 Tamarin と Maude は Linux x86_64 向けの配布バイナリを使う。
 ツールは `$ASHIDORI_FORMAL_CACHE`（既定は `~/.cache/ashidori-formal`）に取得し、SHA-256 を照合してから使う。
 ログは同じ場所の `logs/` に残る。
-TLC は設定を一つずつ、ヒープ上限 `-Xmx3g`、ワーカー 4 で実行する。
-環境変数 `TLC_JAVA_OPTS`、`TLC_WORKERS` で変えられる。
-後述の時間の目安は、この既定値で 16 コアの機械で測った値である。
+TLC は設定を一つずつ、ヒープ上限 `-Xmx3g`、ワーカー 4 で実行する（`TLC_JAVA_OPTS`、`TLC_WORKERS` で変えられる）。
+後述の時間は、この既定値で 16 コアの機械で測った値である。
 
 | ツール | 版 | 取得元 |
 |---|---|---|
@@ -33,10 +34,32 @@ TLC は設定を一つずつ、ヒープ上限 `-Xmx3g`、ワーカー 4 で実�
 | Tamarin prover | 1.12.0 | tamarin-prover/tamarin-prover の GitHub release（linux64-ubuntu） |
 | Maude | 3.5.1 | maude-lang/Maude の GitHub release（linux-x86_64） |
 
-`run.sh` は検査ごとに期待する結果を持つ。
-「成り立つ」と期待する性質に加え、「破れる」と期待する健全性確認（鍵の漏洩、修正前の設計）も含む。
-期待どおりの結果が出なければ終了コード 1 で終わる。
-CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.md`、`server/src`、`server/migrations` の変更時に実行する。
+`run.sh` は検査ごとに期待する結果を持ち、期待と違えば終了コード 1 で終わる。
+一件も検査しなかった場合も失敗にする。
+TLA+ の期待は次のいずれかである。
+
+- `pass`：エラーなしで終わる。
+- `inv:名前`、`act:名前`：その名前の不変条件、行動性質が破れる（変異、修正前の設計、実装の問題の再現）。
+- `live:名前`：時相性質が破れる。TLC は破れた時相性質の名前を出さないため、設定の PROPERTY はその一つだけでなければならない（run.sh が確かめる）。
+- `cover:動作,...`：`pass` の設定で、列挙した動作が一度以上起きる（TLC の `-coverage`）。分岐が到達不能なまま成立する空虚な検査を防ぐ。
+- `reach:名前,...`：`Unreached_*`（「この場面は起きない」）を一つだけ検査する設定を作って走らせ、破れることを確かめる。場面に到達できることの証拠である。
+
+CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.md`、`server/src`、`server/migrations`、アプリの `sync/`、`Db.scala`、`ArchiveStore.scala`、`ui/SyncSettingsScreen.scala`、`core` の `sync/` と `SendGate.scala` の変更時に実行する。
+
+## モデルの一覧
+
+| モデル | 防ぐ障害 | 主な性質 |
+|---|---|---|
+| `crypto/batch.spthy`, `batch_privacy.spthy` | サーバ管理者による位置ログの閲覧、別の端末やスロットへの暗号文の付け替え | `payload_secrecy`、`slot_binding`、識別不能性 |
+| `Registration` | 応答を失った端末が再送で別の結果を受け、トークンも端末も失う。期限切れのコードの消費 | `RetriesAgree`、`RecoverUngated`、`CodeIffDevice` |
+| `RegistrationClient` | 保存に失敗した鍵や登録で同期する。取消の失敗で再試行の手段を失う。解除の途中で落ちた後、別の登録が古い鍵を使う | `ReadReturnsPersisted`、`TokenRecoverable`、`NoForeignKey`、`CancelledNoEffect`、`Converges` |
+| `Accounts` | 自己登録の再送が最後の枠や登録の締切で拒否され、作られたアカウントを失う | `RetriesAgree`、`RecoverUngated`、`UsersUnderMax` |
+| `Outbox` | 同じスロットに別の暗号文が送られて 409 で止まる。進捗だけ進んでデータが欠ける。アーカイブの別の世代の部分を混ぜる | `SameSlotSameCiphertext`、`ProgressBacked`、`ArchiveComplete` |
+| `BatchCommit` | 掃除が確定済みの実体を消し、一覧にあるのに取得できないバッチが残る。使用量の計上の狂い | `CommittedHasObject`、`SweepSafe`、`CountersMatch`、`UnderCaps` |
+| `StatusDownload` | 偽の一覧行、範囲外のカーソル、壊れた blob で、正しい status が永久に読まれない | `StatusLive`、`NoSilentSkip`、`AuthOnlyOnSuccess`、`CursorValid` |
+| `StatusRotation` | 保持数を超える偽の行で正しい status が押し出され続ける（F6） | `StatusLive`、`EveryListedTried`、`ReadWithinPasses` |
+| `SharedCheckin` | 古い取消の再送が再共有を消す。遅れた PUT が公開を復活させる | `LatestWins`、`StaleMeansSuperseded` |
+| `FeedResync` | フォロー解除後も表示が残る。新しくフォローした相手の過去分が欠ける | `NoMixedVersions`、`Converges` |
 
 ## 暗号モデル（`crypto/`）
 
@@ -47,12 +70,11 @@ CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.m
 - 端末 ID を決める（同じ ID を二台に与えることもできる）。
 - 端末トークン、ペアリングコード、すべての暗号文を知る。
 - どの端末にどのスロットとしてどの暗号文を渡すか（あるいは渡さないか）を決める。
-- 暗号化する stream と seq も攻撃者が選ぶ。アプリは一つのスロットに一度しか暗号化しないが、これを仮定しないため、同じスロットを二度暗号化する改変アプリも含めて成り立つ。
+- 暗号化する stream と seq も攻撃者が選ぶ。アプリは一つのスロットに一度しか暗号化しないが、これを仮定しない。
 
 信頼するのは、正規のアプリ、乱数生成、復旧コードによる端末間での `K` の受け渡しである。
 AES-256-GCM は理想的な AEAD とし、鍵、nonce、AAD が揃ったときだけ復号できるとする。
 バッチ鍵は `K` から一方向関数で導出する（HKDF のモデル）。
-端末 ID、stream、seq、nonce は平文で公開される値として扱う。
 
 ### 性質と結果
 
@@ -60,305 +82,315 @@ AES-256-GCM は理想的な AEAD とし、鍵、nonce、AAD が揃ったとき�
 
 | 補題 | 内容 | 結果 |
 |---|---|---|
+| `executable` | 正常な暗号化と受理が起こりうる | 成立（到達の確認） |
 | `key_secrecy`, `batch_key_secrecy` | 攻撃者は `K` もバッチ鍵も得られない | 成立 |
 | `payload_secrecy` | 暗号化した位置データを得られない | 成立 |
 | `slot_binding` | `Accept(K, device, stream, seq, m)` の前に、同じ `K` と AAD による `Seal` がある | 成立 |
 | `no_slot_move` | あるスロット用の暗号文は、別のスロットでは受理されない | 成立 |
-| `*_if_key_revealed` | 上の三つから条件を外したもの（健全性確認） | 期待どおり反例あり |
+| `*_if_key_revealed` | 上の三つから条件を外したもの | 期待どおり反例あり |
+| `-D=NOAAD` の `slot_binding`, `no_slot_move` | AAD にスロットを入れない変異 | 期待どおり反例あり |
 | `no_forward_secrecy` | 後から `K` が漏れると、過去の暗号文も読める | そのような実行が存在する |
 | `same_device_id_for_two_devices` | 悪意あるサーバは同じ端末 ID を二台に与えられる | そのような実行が存在する |
 
 `batch_privacy.spthy` は低エントロピーの位置データを対象にした識別不能性（diff-equivalence）である。
 攻撃者が毎回二つの候補 `m0`、`m1` を選び、左の系は `m0`、右の系は `m1` を暗号化する。
-受信端末が復号に成功したかどうかも攻撃者に見えるものとする（失敗した status は再取得されるため）。
+受信端末が復号に成功したかどうかも攻撃者に見えるものとする。
 `K` が漏れない限り二つの系は区別できない（成立）。
 `-D=REVEAL` で `K` を漏らすと区別できる（期待どおり反例あり）。
 
-### 読み取れること
-
 位置ログの秘匿は `K` の秘匿だけに依存し、トークンやペアリングコードの漏洩には依存しない。
-一方で、端末の失効は `K` の失効ではない。
-`K` が一度漏れると、過去と将来のすべてのバッチが読める（前方秘匿性はない）。
-
-AAD が束縛する端末 ID はサーバが割り当てた値である。
-このため `slot_binding` が保証するのは「その ID を割り当てられた、利用者のいずれかの端末が暗号化した」ことまでである。
-悪意あるサーバが二台に同じ ID を与えると、受信側はどちらの端末のデータかを区別できない。
-秘匿性は損なわれない。
+端末の失効は `K` の失効ではなく、`K` が一度漏れると過去と将来のすべてのバッチが読める。
+AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が保証するのは「その ID を割り当てられた、利用者のいずれかの端末が暗号化した」ことまでである。
 
 ## 状態モデル（`tla/`）
 
 暗号文は不透明な値として扱い、同一性だけを追う。
-各モデルには、修正後の設計を表す設定と、修正前の設計や悪意あるサーバを表す健全性確認用の設定がある。
+各モデルには、現行のコードを表す設定、性質を一つ壊す変異の設定、修正前の設計を表す設定がある。
+変異の設定は、その性質が空虚でない（壊せば検出される）ことを示す。
 
-| 設定 | 対象 | 期待 |
-|---|---|---|
-| `Outbox` | アプリの outbox と送信 | 成立（不変条件と活性） |
-| `Outbox_nonatomic` | 行を書いてから seq と進捗を別トランザクションで進める旧方式 | 反例 |
-| `Outbox_archive` | アーカイブファイルの部分送信。送信中にファイルが新しい世代に置き換わる（現行） | 成立（不変条件と活性） |
-| `Outbox_r1` | 大きさをパスから読み、その後に世代と内容を読む修正前の方式（R1） | 反例 |
-| `BatchCommit_fixed` | R2 put → D1 commit と孤立掃除。期限切れの試行の commit を D1 が拒否する（現行） | 成立 |
-| `BatchCommit_current` | commit の期限がない修正前の設計 | 反例（後述） |
-| `Registration` | `POST /v1/devices/register` とクライアントの再試行 | 成立（不変条件と活性） |
-| `Registration_norecheck` | 0 行消費の後に再照合しない旧コード | 反例 |
-| `Registration_applypersist` | トークンを `apply()` で保存する旧クライアント | 反例 |
-| `Registration_client` | 現行のクライアント。取消または解除、保存の失敗、クラッシュまたは応答の消失を各 1 回 | 成立（不変条件と活性） |
-| `Registration_r2` | 試行の照合と保存のあいだに取消が入り込める修正前の方式（R2） | 反例 |
-| `Registration_r3` | 保存に失敗した値がメモリに残り、読める修正前の方式（R3） | 反例 |
-| `Accounts` | `POST /v1/accounts`、`MAX_USERS` 境界の競合 | 成立（不変条件と活性） |
-| `Accounts_norecheck` | 0 行挿入の後に再照合しない旧コード | 反例 |
-| `SharedCheckin` | 共有チェックインの rev 条件付き PUT と DELETE | 成立 |
-| `SharedCheckin_old` | rev を見ずに tombstone にする旧 DELETE | 反例 |
-| `FeedResync` | フィードの差分取得と `followsVersion` による再同期 | 成立（不変条件と活性） |
-| `FeedResync_firstpage` | 版を最初のページでだけ確認するクライアント | 反例 |
-| `StatusDownload` | 他端末の status 取得（現行、正直なサーバ） | 成立（不変条件と活性） |
-| `StatusDownload_hostile` | 現行。別の blob や 404 を 3 回まで返すサーバ | 成立（不変条件と活性） |
-| `StatusDownload_fixed` | 現行。相手 2 台に分けて偽の行を 3 件（大きな seq、同じ seq で別のハッシュ、範囲外のカーソル）出すサーバ | 成立（不変条件と活性） |
-| `StatusDownload_fixed1` | 現行。相手 1 台に偽の行を 3 件出し、別の blob や 404 を 3 回まで返すサーバ | 成立（不変条件と活性） |
-| `StatusDownload_fakes` | 現行。相手 2 台に分けて偽の行を 5 件出すサーバ | 成立（不変条件のみ） |
-| `StatusDownload_manyfakes` | 現行。相手 1 台に、正しい status より新しい偽の行を `MaxCand` を超えて出すサーバ | 活性は反例（検査の範囲の限界、後述） |
-| `StatusDownload_r4` | カーソルを API の範囲と照合しない修正前の方式（R4） | 活性は反例 |
-| `StatusDownload_r5` | 上限回数失敗した候補を再試行しない修正前の方式（R5） | 活性は反例 |
-| `StatusDownload_fakeseq`, `_fakecursor` | 候補を一つだけ持ち、再走査しない修正前の方式。偽の一覧行を一つ出すサーバ | 不変条件は成立、活性は反例（後述） |
+### 設定の一覧
+
+時間は `formal/run.sh all` での実測である。
+「遅い」は `SLOW_TLA` に入っており、`fast` では実行しない。
+`fast` は約 3 分（66 件）、`all` は約 12 分（78 件）かかる。
+活性の検査は状態数のわりに時間がかかるため、安全性と活性を別の設定に分け、活性は小さい境界で検査する設定がある。
+
+| 設定 | 内容 | 期待 | 時間 |
+|---|---|---|---|
+| `Registration` | 現行のサーバ。コード 2 個、攻撃者のトークンで両方のコード（UNIQUE の巻き戻し）。安全性 | 成立、分岐の到達 | 12 秒 |
+| `Registration_full` | 別経路で作った端末があり、使えるコードが残ったまま上限に達する（409）。安全性 | 成立、分岐の到達 | 13 秒 |
+| `Registration_live` | 各要求が応答を得る（攻撃者の要求 1 件） | 成立 | 5 秒 |
+| `Registration_norecheck` | 0 行消費の後に再照合しない（N3） | `RetriesAgree` が破れる | 1 秒 |
+| `Registration_gatefirst` | レート制限などを結果の回復より前に置く | `RecoverUngated` が破れる | 1 秒 |
+| `Registration_expiry` | 期限を DB 実行前に Worker が読んだ時刻で判定する（レビュー 6 の 7） | `CodeIffDevice` が破れる | 1 秒 |
+| `Registration_nounique` | UNIQUE 違反でコードの消費が巻き戻らない | `CodeIffDevice` が破れる | 1 秒 |
+| `RegistrationClient` | 現行のクライアント（後述の二つの所見は修正した形）。取消または解除、書込みの失敗、クラッシュか応答の消失、ゲートの拒否を各 1 回、期限切れ、鍵の設定、同期の実行 | 成立、分岐の到達 | 15 秒 |
+| `RegistrationClient_2faults` | 同じく、クラッシュか応答の消失 2 回 | 成立 | 遅い（25 秒） |
+| `RegistrationClient_live` | 同じく活性（試行の終了と最終的な収束） | 成立 | 遅い（80 秒） |
+| `RegistrationClient_legacy` | 旧版が登録に結び付けずに保存した鍵を起動時に結び付ける | 成立 | 1 秒 |
+| `RegistrationClient_runread` | **所見**：現行の `SyncRun.current` | `RunRegMatches` が破れる | 2 秒 |
+| `RegistrationClient_unknownmark` | **所見**：現行の解除の印の読み方 | `TokenRecoverable` が破れる | 4 秒 |
+| `RegistrationClient_r2` | 照合と保存のあいだに取消が入れる修正前の方式（R2） | `CancelledNoEffect` が破れる | 1 秒 |
+| `RegistrationClient_f2`, `_f2report` | 間に合わなかった取消も保留要求を消す修正前の方式（F2） | `TokenRecoverable`、`FailureReported` が破れる | 1 秒 |
+| `RegistrationClient_r3` | `SharedPreferences.commit()` のまま（R3、F1） | `ReadyPersisted` が破れる | 1 秒 |
+| `RegistrationClient_applypersist` | トークンを保存し終える前に送る（N2） | `TokenRecoverable` が破れる | 1 秒 |
+| `RegistrationClient_unpair` | 鍵を登録に結び付けず、解除の印もない（レビュー 6 の 3） | `NoForeignKey` が破れる | 3 秒 |
+| `RegistrationClient_noresume` | 印の付いた解除を起動時に終わらせない | `Converges` が破れる | 4 秒 |
+| `Accounts` | 現行。トークン 3 個で上限 2 の枠を争う。締切と拒否。安全性 | 成立、分岐の到達 | 11 秒 |
+| `Accounts_other` | 別種の端末のトークン（409）と最後の枠 | 成立、分岐の到達 | 遅い（9 秒） |
+| `Accounts_live` | 各要求が応答を得る（トークン 2 個） | 成立 | 3 秒 |
+| `Accounts_norecheck` | 0 行挿入の後に再照合しない（N3） | `RetriesAgree` が破れる | 1 秒 |
+| `Accounts_gatefirst` | 締切やレート制限を回復より前に置く | `RecoverUngated` が破れる | 1 秒 |
+| `Accounts_closedrace` | **所見**：現行の締切判定 | `RetriesAgree` が破れる | 1 秒 |
+| `Outbox` | 項目 3 個、登録 2 回、障害 1 回。暗号化と DB 確定の間のクラッシュを含む | 成立、到達 | 33 秒 |
+| `Outbox_2faults` | 同じく障害 2 回、安全性のみ | 成立 | 遅い（90 秒） |
+| `Outbox_nonatomic` | 行を書いてから seq と進捗を別トランザクションで進める旧方式 | `SameSlotSameCiphertext` が破れる | 1 秒 |
+| `Outbox_archive` | アーカイブを部分ごとに送る。送信中と送信後に新しい世代に置き換わる | 成立、到達 | 26 秒 |
+| `Outbox_r1` | 大きさをパスから読む修正前の方式（R1） | `ArchiveComplete` が破れる | 1 秒 |
+| `Outbox_late` | **既知の制限**：送信済みのファイルが新しい世代に置き換わる | `ArchiveLatest` が破れる | 1 秒 |
+| `BatchCommit_fixed` | 現行。R2 put → D1 commit と孤立掃除 | 成立 | 10 秒 |
+| `BatchCommit_current` | commit の期限がない修正前の設計 | `CommittedHasObject` が破れる | 1 秒 |
+| `BatchCommit_dg` | 期限を猶予より長くする（D > G） | `CommittedHasObject` が破れる | 1 秒 |
+| `BatchCommit_nocount`, `_nocaps` | 件数を数えない、上限を確かめない | `CountersMatch`、`UnderCaps` が破れる | 1 秒 |
+| `StatusDownload` | 現行、正直なサーバ | 成立 | 遅い（31 秒） |
+| `StatusDownload_hostile` | 別の blob や 404 を 3 回まで返すサーバ | 成立 | 遅い（81 秒） |
+| `StatusDownload_fixed`, `_fixed1` | 偽の行 3 件（大きな seq、同じ seq、範囲外のカーソル）を相手 2 台に、または 1 台に。正しい status は全体で 1 件 | 成立 | 遅い（20 秒、30 秒） |
+| `StatusDownload_fakes` | 偽の行 5 件、不変条件のみ | 成立 | 遅い（80 秒） |
+| `StatusDownload_manyfakes` | 保持数を超える偽の行（ローテーションあり） | 成立 | 遅い（28 秒） |
+| `StatusDownload_manyfakes_pre` | 同じ、ローテーションなし（F6） | `StatusLive` が破れる | 遅い（9 秒） |
+| `StatusDownload_fakeseq`, `_fakecursor` | 候補一つ、再走査なしの修正前の方式（#7） | `StatusLive` が破れる | 4 秒 |
+| `StatusDownload_r4`, `_r5` | カーソルの範囲を確かめない（R4）、使い切った候補を再試行しない（R5） | `StatusLive` が破れる | 2 秒 |
+| `StatusDownload_blob` | 一覧と違う blob を読めたものとして扱う | `AuthOnlyOnSuccess` が破れる | 1 秒 |
+| `StatusRotation_f6` | F6 の例（正しい seq 0 と偽の 1〜8）、`MaxCand = 4`、再走査を 3 実行ごとまで頻繁にする | 成立 | 2 秒 |
+| `StatusRotation_f6real` | 同じ例をアプリの間隔で。正しい status を 3 回失敗させるサーバ | 成立（再走査 4 回以内） | 8 秒 |
+| `StatusRotation_f6pre` | 同じ例、ローテーションなし | `StatusLive` が破れる | 2 秒 |
+| `StatusRotation_pages4`, `_pages5` | 1 ページ 2 行、1 実行 2 ページ（再走査に 1 ページ）、偽の行 4 件と 5 件 | 成立 | 3 秒 |
+| `StatusRotation_2dev` | 相手 2 台に偽の行 5 件ずつ、再試行の予算 1 を共有 | 成立 | 遅い（55 秒） |
+| `StatusRotation_r5` | 使い切った候補を再試行しない | `StatusLive` が破れる | 1 秒 |
+| `SharedCheckin` | 1 端末、rev 1..4 の PUT と DELETE、重複と順序の入れ替え、管理者の削除 | 成立 | 2 秒 |
+| `SharedCheckin_old` | rev を見ずに tombstone にする旧 DELETE（N5） | `LatestWins` が破れる | 1 秒 |
+| `SharedCheckin_skew` | **既知の制限**：時計のずれた 2 端末 | `StaleMeansLaterOp` が破れる | 1 秒 |
+| `FeedResync` | フィードの差分取得と再同期 | 成立 | 約 5 秒 |
+| `FeedResync_firstpage` | 版を最初のページでだけ確かめるクライアント | `NoMixedVersions` が破れる | 1 秒 |
+
+### Registration（サーバ）
+
+`POST /v1/devices/register` の一要求を、D1 の原子的な段階に分ける。
+
+- `SRecoverHit`, `SRecoverMiss`（`recoverRegistration`）：トークンの端末がこのコードを消費しており失効していなければ、すべてのゲートの前に 200 を返す。
+- `SGateRefuse`, `SGatePass`：エッジとD1 のレート制限、制限変数。新規作成だけを 429/503 で拒みうる環境とする（回数に上限）。
+- `SStartKnown`, `SStartNew`（`registerWithCode` の `earlier()`）、`SBatchCreate`, `SBatchUnique`, `SBatchZero`（消費と挿入の `db.batch`）、`SRecheckKnown`, `SRecheckNew`、`SFullCheckFull`, `SFullCheckInvalid`。
+- コードの期限は `SBatch*` の時点の D1 の時計で判定する（`CODE_USABLE` の `D1_NOW_MS`）。
+
+保証すること：トークンごとに端末は一つ（`OneDevicePerToken`）。コードは作った端末にだけ、使える間にだけ消費される（`CodeIffDevice`）。同じトークンとコードの最終応答は一致する（`RetriesAgree`）。回復できる要求はゲートで拒まれない（`RecoverUngated`）。端末 ID はトークンの持ち主にだけ返る（`TokenBound`）。各要求は応答を得る（`Responsive`）。
+
+境界：利用者 1 人、コード 2 個、上限 3 台、正規の要求 2 件と攻撃者の要求 2 件（活性は 1 件）、ゲートの拒否 1 回。
+二つの設定で、上限未満の UNIQUE の巻き戻し（攻撃者が同じトークンで両方のコードを送る）と、使えるコードが残ったままの満員（別経路の端末）に到達する（`cover:`）。
+競合はトークン一つとコード二つの組合せで決まるため、台数を増やしても新しい分岐はない。
+ただし利用者の無効化は発行端末の失効と同じ効果（全コードが使えない）として一つにまとめた。
+使用済みコードの削除（期限の 1 日後）と新しい端末の失効は扱わない（どちらも設計上、再試行を失敗させる）。
+
+### RegistrationClient（クライアント）
+
+`core` の `RegistrationMachine`、`PairingStore`、`DurableMap` と、アプリでの使い方（`Sync.scala` の `Registration`、`SyncConfig`、`SyncRun`）を表す。
+サーバは抽象化し、トークンに端末があればその端末を返す（冪等であることは `Registration` が確かめる）。
+
+- 保存：`DurableMap` を二つ持つ（`C`：登録と解除の印、`S`：トークン、鍵、保留要求）。書込みは `WriteBegin` と `DiskNew`/`DiskOld`/`DiskUnreadable` に分け、その間に何でも読める。読み出しはスナップショットを返し、読み戻せない失敗で変わったキーは不明（無い）として読む。クラッシュでは書込み中のファイルは旧か新のどちらかになる。
+- 試行：`cur` は id、-id、0 のどれか。答えの取り込みも取消も一回の compare-and-set で、勝つのは片方だけである。-id のときの取消は何も変えない（F2）。
+- 解除：印 → 試行の無効化（`local` 上の reset）→ 同期の鍵の取得 → 登録、トークン、鍵、残り（保留要求、同期状態）の消去 → 印の消去。どの段階の間でもクラッシュでき、起動時に印から再開する。印がある間は `savePairing` を拒む。
+- 鍵は設定した登録に結び付け、その登録でだけ使う。旧版の結び付いていない鍵は起動時に現在の登録に結び付ける。
+- 同期の実行（`SyncRun.current`）は同期の鍵の下で端末 ID と鍵を読み、その後で登録を読む。
+
+保証すること：
+
+- `ReadReturnsPersisted`：読み出しは、ディスクにある値だけを返す（書込み中や失敗した値は返さない）。
+- `ReadyPersisted`：同期可能と読めるなら、登録、トークン、鍵がディスクにある。
+- `NoForeignKey`：同期の実行は、自分の登録（サーバと端末 ID）のために設定した鍵だけを使う。
+- `CancelledNoEffect`：取消（または解除）が成功した試行は登録を保存しない。
+- `FailureReported`：利用者が取り消していない試行の失敗は画面に届く。
+- `TokenRecoverable`：クライアントのトークンでサーバに端末ができたら、ディスク上でその端末とペアリング済みか、保留要求にトークンがあるか、利用者がそれを手放した（取消、解除）。
+- `AttemptEnds`（活性、要求ごと）：試行はいずれ終わる。
+- `Converges`（活性、最終状態）：同期可能（鍵がその登録に結び付いている）、確定した拒否、すべてのトークンを手放した、のいずれかに落ち着いて変わらない。一度ペアリングしてから解除して止まる実行は満たさない。
+
+公平性として、利用者はいずれ開始し、再試行し、鍵を入力し、アプリはいずれ再起動するものとする（取消と解除は強制しない）。
+
+境界：トークン 2 個、試行 ID 5 個、取消または解除 1 回、書込みの失敗 1 回、クラッシュか応答の消失 1 回（`_2faults` は 2 回）、ゲートの拒否 1 回。
+活性は試行 ID 7 個、クラッシュ 1 回、同期の実行なしで検査する。
+それぞれの障害が一回あれば到達する競合（取消と保存、解除と同期、書込み失敗と読出し）を網羅する。
+同じ種類の障害を重ねたときに新しい状態が生じるかは検査していない。
+
+### Accounts
+
+`POST /v1/accounts` の一要求を、回復（`recoverAccount`）、締切（`REGISTRATION`）、ゲート、`earlier()`、ユーザと端末の `db.batch`、再照合に分ける。
+保証すること：利用者数は `MAX_USERS` を超えない。アカウントができた後の同じトークンの最終応答はそのアカウントである（`RetriesAgree`、締切後の 200 を含む）。回復できる要求は締切でもゲートでも拒まれない（`RecoverUngated`）。
+`MaxUsers = 2` で、上限未満の UNIQUE の巻き戻しに到達する。
+保証しないこと：締切の判定は Worker が要求ごとに環境変数を読むので、締切の直前に受け付けた複製がアカウントを作る前に、別の複製が 403 を受けることがある（クライアントは諦め、アカウントは 7 日後の掃除で消える）。
 
 ### Outbox
 
-項目 1..3 を最大 2 件ずつバッチにし、登録 2 回、障害 2 回までを網羅する。
-環境操作は、enqueue の前後のクラッシュ、応答の消失、PUT の重複と遅延（解除後に古い PUT が届く場合を含む）、容量不足（507）、解除と再登録、別の端末 ID で暗号化された旧 pending ファイルである。
+項目 1..3 を最大 2 件ずつバッチにし、登録 2 回、障害 1 回（`Outbox_2faults` は 2 回、安全性のみ）までを網羅する。
+バッチは、暗号化（`Seal`、メモリ上、トランザクションの外）と確定（`Commit`、行、seq、進捗を一つのトランザクションで）の二段階である。
+その間のクラッシュで暗号文は失われ、同じ seq が後で別の暗号文に暗号化される（`reach:Unreached_Resealed`）。
+このため `SameSlotSameCiphertext` は「スロットごとに、送られうる暗号文（outbox、送信した要求、サーバ）は同一」と述べる。
 
-- `SameSlotSameCiphertext`：同じ（登録、stream、seq）には常に同じ暗号文が対応する。
-- `ProgressBacked`：送信済みとした進捗の範囲は、outbox か、サーバの確定済みの行のどちらかにある。
-- `OnlySealedSent`：送られる暗号文は、そのスロット用に暗号化されたものだけである。旧 pending は送られない。
-- `NoConflict`：正規のクライアントは 409 を受けない。
-- `Done`（活性）：障害と再登録が止まれば、現在の登録の全データがサーバに届く。
+- `ProgressBacked`：送信済みとした進捗の範囲は、outbox かサーバの確定済みの行にある。
+- `OnlySealedSent`、`NoConflict`：送るのはそのスロット用に暗号化したものだけで、409 を受けない。
+- `ArchiveComplete`：送信済み（`up`）にした世代は、その世代の全部分が outbox かサーバにある。
+- `Done`（活性）：障害と再登録が止まれば、項目と、送信済みにした世代がサーバに届く。
+- `ArchiveLatest`（活性）：ファイルの変更が止まれば、最新の世代がサーバにある。**成り立たない**（`Outbox_late`）。`up` はファイル名ごとの印で世代に結び付かないため、送信済みのファイルが遅れて届いた行で新しい世代に置き換わっても送り直さない。`docs/sync-protocol.md` の「What a backup can restore」に書いた既知の制限であり、アプリは変えていない。
 
-`Archive = TRUE` の設定（`Outbox_archive`、`Outbox_r1`）は、編集可能な項目の代わりにアーカイブファイルを一つ送る。
+`Archive = TRUE` の設定は、編集可能な項目の代わりにアーカイブファイルを一つ送る。
 ファイルは任意の時点で、より大きい世代に置き換わる（アトミックな rename）。
-世代 g は g 個の部分からなり、世代は `MaxGen` まで進む。
-進捗（世代、次の部分）は部分ごとに outbox の行と同じトランザクションで確定し、最後の部分で送信済み（`up`）になる。
-
-- `Snapshot = TRUE`（現行）：ファイルを一度開き、大きさ、世代、すべての部分をその記述子から読む。開いた記述子は rename の後も開いた版を指す。
-- `Snapshot = FALSE`（修正前）：大きさをパスから読み、その後に世代と部分をパスから読む。二つの読み出しのあいだに置き換わると、版が混ざる。
-- `ArchiveComplete`：送信済みになった世代は、その世代の全部分が outbox かサーバにある。
-- `ProgressBacked` は、記録した世代の送信済みの部分にも適用する。
-
-`Outbox_archive` は登録 1 回、障害 3 回まで、世代 3 まで（部分は最大 3 個）で検査する。
-登録 2 回と世代 3 を組み合わせると状態数が 100 倍を超え（約 370 万）、検査に 3 分以上かかるため、解除と再登録は `Outbox` に任せる。
+世代 g は g 個の部分からなる。
+`Snapshot = TRUE`（現行）はファイルを一度開き、大きさ、世代、すべての部分をその記述子から読む。
+`Outbox_archive` は登録 1 回、障害 3 回、世代 3 まで、`Outbox_r1` は修正前の読み方である。
+解除と再登録の組合せは `Outbox` に任せる（世代 3 と組み合わせると状態数が 100 倍を超える）。
 
 ### BatchCommit
 
 端末 3 台（利用者 2 人）、試行 2 件、時刻 0..4 で検査する。
 試行は R2 put と D1 commit のあいだで任意に遅れ、任意の段階で止まる。
 孤立掃除は、一覧と D1 照合の段階と削除の段階に分ける。
-掃除は記録時刻から猶予 `Grace`（`G`）を超えた未参照の実体だけを消す。
-`Deadline = TRUE` では、試行は R2 put の前に開始時刻を取り、D1 は「現在時刻 − 開始時刻 ≤ `CommitDeadline`（`D`）」のときだけ commit する。
-拒否された試行は自分の実体を消し、クライアントは同じ暗号文を新しい試行として送る。
-`ASSUME` で `D ≤ G` を課す。
-`BatchCommit_fixed` は `D = G = 2`、`BatchCommit_current` は期限なしで検査する。
+D1 は「D1 の現在時刻 − 開始時刻 ≤ `D`」のときだけ commit する。
+設計は `D ≤ G` を要する（`BatchCommit_dg` はこれを破って反例を出す）。
 
-- `CommittedHasObject`：確定した行の実体（同じハッシュ）が R2 にある。
-- `SweepSafe`：掃除は確定済みの実体を消さない。
-- `CountersMatch`、`UnderCaps`、`OneRowPerSlot`：使用量カウンタは行の合計に一致し、上限を超えず、スロットごとに行は一つである。
+- `CommittedHasObject`、`SweepSafe`：確定した行の実体は R2 にあり、掃除は確定済みの実体を消さない。
+- `CountersMatch`、`UnderCaps`、`OneRowPerSlot`：使用量は行の合計に一致し、上限を超えず、スロットごとに行は一つ。
 
-### Registration と Accounts
+カウンタはモデル自身が加算するので、SQL のトリガが正しいことはここでは示さない。
+それは `server/test/conformance.test.ts` が実際の migration と SQL で、独立した SUM と COUNT と照合する。
 
-一つの要求を、`earlier()`、消費と挿入のバッチ、再照合という D1 の原子的な段階に分ける。
-同じトークンの要求は、先の要求が処理中でも送れる（応答消失後の再送）。
-攻撃者は自分のトークンで同じコードを試す。
-発行端末の失効、コードの期限切れ、利用者の無効化も起きる。
+### StatusDownload と StatusRotation
 
-- `OneDevicePerToken`：一つのトークンに端末は高々一つである。
-- `RetriesAgree`：同じトークンの要求は、一つが成功したら、完了した他の要求もすべて同じ端末で成功する。
-- `CodeIffDevice`：コードが消費されたのは端末が作られたときだけで、その時点でコードは使用可能だった。
-- `TokenBound`：端末 ID は、その端末のトークンを持つ要求にだけ返る。
-- `TokenRecoverable`：クライアントのトークンで作られた端末には、ペアリング済みか、保存済みのトークンで再試行できる。
-- `Settles`（活性）：クライアントはペアリング済みか、確定した拒否か、利用者がすべてのトークンを放棄した状態のいずれかに至る。
+`StatusDownload` は一覧のカーソル、偽の一覧行、相手 1〜2 台を、1 ページ 1 行、`MaxCand = 2` で扱う。
+ローテーションを入れてから状態数が増えたため、`_fixed` と `_fixed1` は正しい status を全体で 1 件に絞った（2 件では活性の検査が 5 分を超える）。
+`StatusRotation` は一覧が固定された（偽の行も載り続ける）場合の候補の保持、ローテーション、実行ごとの予算を、コードと同じ `MaxCand = 4`、複数行のページで扱う。
 
-`Registration` にはクライアント側の状態機械も含める（`Registration_client`、`_r2`、`_r3`）。
-送信は試行に属し、試行は一度に一つである。
-利用者は進行中の試行を取り消せ、ペアリング済みなら解除（reset）できる。
-応答の取り込みは、試行の照合とペアリングの保存の二段階に分ける。
-ペアリングと鍵の保存は失敗しうる。
-失敗した `commit()` はメモリの値を更新したまま、ディスクには書かない（`SharedPreferences` の実装どおり）。
-クラッシュではメモリを失い、ディスクから読み直す。
+コード（`StatusSyncState`）の要点：
 
-- `CancelSafe = TRUE`（現行）：照合は試行を「進行中」から「保存中」に、取消は「進行中」から「なし」に、どちらも一回の compare-and-set で移す。勝つのは片方だけである。保存中に来た取消は間に合わなかったと報告する。結果には試行 ID が付き、画面は最新の試行の結果にだけ反応する。解除は、応答を保存するのと同じ executor で試行を無効にしてから登録を消す。
-- `CancelSafe = FALSE`（修正前）：照合はロックの中で現在の試行を読むが、取消はそのロックを取らない。照合の後に取消が入っても保存は止まらない。
-- `PersistSafe = TRUE`（現行）：値はディスクに書けてから読めるようになる。失敗した書込みはメモリ上で元に戻す。
-- `PersistSafe = FALSE`（修正前）：失敗した書込みの値がメモリに残り、読める。
+- 端末ごとに、認証済み seq より新しい一覧の行を候補として、まだ試せるものと、上限回数失敗したもの（使い切った候補）を別々に最大 `MaxCand` 件ずつ持つ。
+- ローテーション：今のパスで候補を使い切った seq の範囲（`sweep`）に入る行は、保持でも取得対象でも、範囲外の行の後に回る。範囲外に試せる行が残らないまま再走査が終わるとパスが終わる。範囲より上の成功で範囲は消える。
+- 1 回の実行は、通常の一覧（最大 20 ページ、再走査中は 15）、再走査（残りのページ）、端末ごとに 1 件の取得、使い切った候補の再試行（端末ごとに 1 件、全体で 4 件、待ちの長い順）の順に進む。
 
-追加の性質：
+性質：
 
-- `CancelledNoEffect`：取消（または解除）が成功として返った試行は、登録も鍵も変えず、画面もその結果に反応しない。
-- `ReadyPersisted`：アプリが読む状態で同期可能（ペアリング済みで鍵あり）なら、ペアリングと鍵の両方がディスクにある。
-- `PairedPersisted`：アプリが読むペアリングは、ディスクにあるものと同じである。
-- `TokenRecoverable` は、利用者が放棄したトークン（取消、解除）を除いて検査する。
+- `AuthOnlyOnSuccess`、`ShownIsAuthenticated`、`AuthMonotone`：認証済み seq は一覧どおりの正しい blob を読めたときだけ増える。
+- `NoSilentSkip`：一度でも一覧に出た、認証済み seq より新しい行があれば、その端末には取得対象があるか、問題として表示される。保持中の候補ではなく、一覧に出た行の独立した履歴（`seen`、`listed`）で量化するので、候補から落ちた行も対象になる。
+- `CursorListed`、`CursorValid`、`CandsBounded`。
+- `StatusLive`（活性）：障害が有限回で止まり、同期の実行が続くなら、各端末の最新の正しい status はいずれ読まれる。
+- `EveryListedTried`（活性、`StatusRotation`）：一覧に出た、認証済み seq より新しい行は、いずれ一度は取得される。
+- `ReadWithinPasses`（`StatusRotation_f6real`）：正しい status は再走査 4 回以内に読まれる（障害がなければ 2 回）。
 
-`Registration_client` は、取消または解除を 1 回、保存の失敗を 1 回、クラッシュまたは応答の消失を 1 回、試行 ID を 5 個、正規の要求を 4 件までで検査する。
-状態数を抑えるため、この設定には攻撃者の要求を入れない（`Registration` が扱う）。
-一つの試行が送る要求は一件とする。
-コードは試行の中でもネットワーク障害のあとに再送するが、サーバ側の同時処理は、応答の消失で終わった前の試行の要求でも起きる。
+時間の扱い：`StatusRotation` は 1 回の実行を時間の単位とし、再走査は「望まれて `Gap` 回後」か「`Week` 回後」に始まる。
+`_f6real` はアプリの間隔（1 時間ごとの実行、望まれれば 1 日後、そうでなければ 7 日後）、`_f6` は 3 実行ごとまで頻繁にした敵対的な間隔である。
+使い切った候補は、失敗した次の実行から再試行できるものとし、待ちの長い順を失敗の順で表す（コードは 1 時間から倍々に最長 1 日待つ。順序は概ね同じで、待ちはさらに長い）。
+再試行の 1 日という上限は、次に試すまでの時間の上限ではない。
+再試行の予算（1 回の実行で 4 件）は全端末で共有するので、使い切った候補が多ければ、待ちの終わった候補がさらに何回も待つ。
+`StatusRotation` の活性は、`WF` ではなく「実行が繰り返し始まる」（`[]<><<RunStart>>_vars`）を前提とする含意で書く（TLC がこのモデルの ENABLED の評価に非常に時間がかかるため）。
+
+境界：`StatusRotation` は同じ seq の偽の行（`StatusDownload` が扱う）を含まない。
+偽の行は最初から一覧にあり、増え続けない。
+サーバが正しい行より上に新しい偽の行を足し続ける限り、読むのを遅らせられる（保証の外）。
+相手 2 台の再試行予算の競合は予算 1 で検査した。
+49 台の相手に各 4 件の候補がある規模への一般化の議論はない。
 
 ### SharedCheckin
 
-一つのエントリに対し、rev 1..4 の PUT と DELETE を、重複、順序の入れ替え、PUT より先の DELETE を含めて網羅する。
-管理者の削除はいつでも起きる。
+一つのエントリに対し、端末ごとに単調に増える rev の PUT と DELETE を、重複、順序の入れ替え、PUT より先の DELETE を含めて網羅する。
+rev のない DELETE は 400 で拒まれるので、操作には含めない。
+管理者の削除は rev を `MAX(rev, now)` にして tombstone にし、以後変わらない。
 
-- `LatestWins`：削除されていないエントリの状態は、サーバが受けた操作のうち rev が最大のものの状態と一致する。
-- `NoPhantom`：操作が届く前にエントリは存在しない。
-- `RemovedIsTombstone`、`AdminAbsorbing`：管理者の削除は tombstone で、以後変わらない。
-- `StaleMeansSuperseded`：`stale` を返すのは、より大きい rev の操作が届いているときだけである。完全な再送には `stale` を返さない。
+- `LatestWins`：削除されていないエントリの状態は、届いた操作のうち rev が最大のものの状態と一致する。
+- `NoPhantom`：エントリは操作が届いた後にしか存在しない（`row ≠ None ⇒ delivered ≠ {}`。以前の式は逆向きだった）。
+- `RemovedIsTombstone`、`AdminAbsorbing`。
+- `StaleMeansSuperseded`：`stale` を返すのは、より大きい rev の操作が届いているときだけである。
+- `StaleMeansLaterOp`：`stale` を返すのは、利用者が後から別の操作を出したときだけである。1 端末では成り立つ。時計のずれた 2 端末では、後の操作のほうが小さい rev を持てるので成り立たない（`SharedCheckin_skew`）。同じ rev で内容の違う操作も、後着が `stale` になる。容量超過（507）はモデルにない。
 
 ### FeedResync
 
 自分と他の利用者 2 人のエントリ各一件、1 ページ 1 行、サーバ側の変更 5 回までを検査する。
-変更は共有、編集、取消、フォローの追加と解除、利用者の無効化と再有効化である。
 クライアントの手順は仕様の記述に従う（アプリにはまだ実装がない）。
 
 - `NoMixedVersions`：一つの表示に、異なる `followsVersion` のページが混ざらない。
-- `ConvergedWhenStable`：同期が完了し、その後サーバが変わっていなければ、表示は見えるべき集合と一致する。
-- `Converges`（活性）：サーバの変更が止まれば、表示は見えるべき集合に収束する。
+- `ConvergedWhenStable`、`Converges`：サーバが変わらなければ、表示は見えるべき集合と一致する。
 
-### StatusDownload
+## モデルと実装の対応
 
-1 ページ 1 行で検査する。
-`Fixed = TRUE` が現行の方式である。
+モデルはコードから自動で導いたものではなく、手で書いたものである。
+対応を保つため、次のテストが実装側でモデルの性質と反例を確かめる。
 
-- 端末ごとに、認証済み seq より新しい一覧の行を候補として持つ。行の同一性は（seq、大きさ、ハッシュ）で、同じ seq でも別の行は別の候補になる。まだ試せる候補と上限回数失敗した候補を別々に、それぞれ先頭から `MaxCand`（検査では 2）件まで持つ。失敗した候補を覚えておくので、再走査で同じ行が出ても新しい候補として数え直さない。
-- 候補の順序はコードのリストに合わせる。seq の大きい順で、同じ seq の中では加えた順であり、失敗した候補は末尾に加え直す。
-- 取得するのは、上限回数失敗していない候補のうち先頭のものである。
-- `RetryExhausted = TRUE`（現行）：上限回数失敗した候補も、通常の取得とは別枠で再試行する。コードは 1 時間後から倍々に最長 1 日の間隔で再試行するので、どの候補も 1 日以内に再び試す。モデルでは、上限回数失敗した候補を一巡ごとに一回ずつ再試行し、公平性によって巡回が繰り返される。
-- `CheckCursor = TRUE`（現行）：API が `after` として受け付けない範囲のカーソル（16 桁以上、モデルでは `CursorMax` 超）を持つ行は不正な行で、そのページを拒否する。カーソルはその値を取らない。通常の一覧が失敗しても、再走査と取得は止まらない。修正前はこのカーソルを保存し、以後サーバはその位置からの一覧を拒否し続け、そのエラーで実行が再走査と取得の前に終わっていた。
-- 再走査はカーソル 0 から一覧し直し、一覧の終わりでカーソルをその位置にする。コードは 7 日ごと、または一覧の異常や候補切れの 1 日後に始める。モデルでは任意の時点で始まり、公平性によって繰り返し起こる。
-- コードのカーソルの飛びの規則は行数が `limit` 未満のページにだけ働く。1 ページ 1 行ではすべてのページが満杯なので、この規則はモデルにない。活性は候補の複数保持、再試行、再走査だけで成り立つことを確かめる。
+- `server/test/conformance.test.ts`：実際の migration と SQL に乱数の操作列を流し、`CountersMatch`、`UnderCaps`、`UsersUnderMax`、`LatestWins`、`NoPhantom`、`AdminAbsorbing`、`StaleMeansSuperseded` を確かめ、各分岐（上限、競合、`stale`、`removed`）に到達したことも確かめる。
+- `server/test/tlc-replay.test.ts` ほか：TLC の反例（`BatchCommit_current`、`FeedResync_firstpage`、`Registration_norecheck`、`Accounts_norecheck`、`SharedCheckin_old`）を実際の関数と SQL で再現し、現行のコードでは起きないことを確かめる。
+- `server/test/protocol-constants.test.ts`：モデルが依る定数の関係（`D ≤ G` の余裕、カーソルと seq の範囲）を確かめる。
+- `core` の `DurableMapSuite`、`PairingStoreSuite`、`RegistrationMachineSuite`、`DeviceStatusSuite`：書込み中の読出し（F1）、解除の途中のクラッシュ、F2、ローテーション（F6）を実装の状態機械で確かめる。
 
-悪意あるサーバは、偽の行（`FakeTab` の名前）を一件ずつ一覧に出せる。
-種類は、大きな seq、正しい status と同じ seq で別のハッシュ、大きなカーソル、API の範囲外のカーソルである。
-偽の行は一覧に残り続ける。
-範囲外のカーソルの行だけは、いずれ一覧から消える（攻撃が止まる。R4 は止まった後に回復できるかを問う）。
-別の blob や 404 は、ネットワーク障害と合わせて `MaxNetErr` 回まで返す。
-`Fixed = FALSE` は、候補を一つだけ持ち、大きい seq でしか置き換えず、再走査しない修正前の方式である。
+| モデルの動作 | 実装 |
+|---|---|
+| `Registration`：`SRecover*` / `SGate*` / `SStart*`, `SBatch*`, `SRecheck*`, `SFullCheck*` | `v1.ts` の `/devices/register` / `edgeAllowed`, `hitRateLimit`, `limitsOr503` / `devices.ts` の `registerWithCode`（`earlier`、`db.batch`、`CODE_USABLE`） |
+| `Accounts`：`SRecover*` / `SClosed` / `SBatch*` | `v1.ts` の `/accounts` / `registrationMode` / `accounts.ts` の `createAccount` |
+| `RegistrationClient`：`WriteBegin`, `Disk*`, `Rd` | `DurableMap.write`, `DurableMap.get`（`DurableFile.replace`） |
+| 同：`Start`, `Retry`, `Cancel`, `BeginCheck`…`FinishEnd`, `Drop`, `Reset` | `RegistrationMachine.start`, `retry`, `cancel`, `begin`, `finish`, `reset` |
+| 同：`SaveTok`, `SaveReg`, `KeyWrite`, `Adopt` | `PairingStore.savePairing`, `confirmKey`, `adoptLegacyKey` |
+| 同：`Unpair`, `UMark`…`UUnmarked`, `Resume` | `PairingStore.forget`, `resume`（`SyncConfig.forget`, `resumeUnpair`） |
+| 同：`RunStart`, `RunReg` | `SyncRun.current`（`SmallSyncWorker` の `SyncLock` の下） |
+| `Outbox`：`Seal`, `Commit` / `Send`, `Receive` / `ArchOpen`, `ArchPart` | `Uploader.enqueue`（`Crypto.seal`, `Db.enqueueSealed`）/ `Uploader.flush` / `ArchiveSnapshot.open`, `ArchiveUpload.nextPart`, `uploadArchive` |
+| `BatchCommit`：`Start`, `Put`, `Commit`, `DelOwn` / `SweepScan`, `SweepDelete` | `batches.ts` の `putBatch` / `sweepOrphanBlobs` |
+| `StatusDownload`, `StatusRotation`：`Take`, `Trim`, `Fail`, `Succeed`, `RescanPage`, `RunStart` / 一実行の段階 | `StatusSyncState.take`, `trim`, `failed`, `succeeded`, `rescanned`, `rescanIfDue` / `PeerStatus.pull` |
+| `SharedCheckin`：`Deliver`, `AdminRemove` | `checkins.ts` の `upsertCheckin`, `unshareCheckin`, `unshareCheckinById` / `removeCheckin` |
+| `FeedResync`：`Edit`, `Follow`, `Toggle` / `Fetch` | 共有の PUT と DELETE、`acceptFollow`, `deleteFollow`, `setUserStatus` / 仕様の手順（アプリは未実装） |
 
-- `AuthOnlyOnSuccess`、`ShownIsAuthenticated`：認証済み seq と表示中の status は、一覧どおりの正しい blob を復号できたときにだけ得られる。
-- `AuthMonotone`：認証済み seq は増えるだけである。
-- `NoSilentSkip`：認証済み seq より新しい候補があれば、取得対象が残るか、問題として表示される。失敗を成功として扱わない。
-- `CursorListed`：カーソルと再走査の位置は、実際に一覧に出た行のカーソルにだけ進む。
-- `CursorValid`：保存するカーソルと再走査の位置は、常に `after` として送り返せる。
-- `CandsBounded`：候補は端末ごとに `2 × MaxCand` 件以下である。
-- `StatusLive`（活性）：障害が有限回で止まれば、各端末の最新の正しい status はいずれ認証される。送信元が壊した場合は、問題として表示され続ける。
+## 検査で見つかった問題
 
-偽の行を増やすと状態数が急に増えるため、設定ごとに次の大きさに絞る。
-いずれも 1 ページ 1 行、`MaxCand = 2` である。
-`Uploads` は、他の stream のバッチ、壊れた status、自端末の status の送信を含めるかを選ぶ。
+### このモデルで見つけ、まだコードにある問題
 
-| 設定 | 端末（自端末を含む） | 正しい行 | 偽の行 | 別の blob、404、ネットワーク障害 | 失敗の上限 | `Uploads` | 時間の目安 |
-|---|---|---|---|---|---|---|---|
-| `StatusDownload` | 3 | 3 | なし（正直なサーバ） | 1 | 3 | すべて | 20 秒 |
-| `StatusDownload_hostile` | 3 | 3 | なし | 3 | 3 | すべて | 40 秒 |
-| `StatusDownload_fixed` | 3 | 2 | 3（端末 2 に大きな seq、端末 3 に同じ seq と範囲外のカーソル） | 1 | 3 | なし | 3 分 |
-| `StatusDownload_fixed1` | 2 | 2 | 3（大きな seq、同じ seq、範囲外のカーソル） | 3 | 3 | なし | 3 分 |
-| `StatusDownload_fakes`（不変条件のみ） | 3 | 1 | 5（端末 2 に大きな seq、同じ seq、大きなカーソル、端末 3 に同じ seq と範囲外のカーソル） | 0 | 1 | なし | 30 秒 |
+次の三つは、現行のコードを表す設定（`**所見**`）で反例が出る。
+コードは変えておらず、モデルの主な設定は修正した形（`RunReadsOnce`、`UnknownMarkSet`、`RecheckClosed`）で検査している。
+コードを直したら、その設定の期待を `pass` に変える。
 
-偽の行 4 件以上と相手 2 台を組み合わせた活性の検査は、5 分を超えても終わらなかったため入れていない。
-`StatusDownload_fakes` は、失敗の上限を 1 にし、障害をなくして、偽の行 5 件での安全性だけを確かめる。
+1. **同期の実行が、解除の印の付いた後の登録を読む**（`RegistrationClient_runread`、`RunRegMatches`）。
+   `SyncRun.current` は端末 ID、トークン、鍵（`masterKey` はその時点の登録で照合）を読んだ後で、`SyncConfig.registration` を改めて読む。
+   解除の印は同期の鍵の外で書かれるので、その間に印が付くと、実行は A の鍵と A の端末 ID を持ったまま登録 `""` を得る。
+   その実行は進捗や outbox を `""` の下で数え直し、A のスロットに seq 0 から送って 409 で止まる（解除がジョブを止めるまで）。
+   鍵が他の登録に渡るわけではないが、`SyncRun.reg` と鍵が食い違う。
+   修正案は、登録を一度だけ読み、その値で鍵を照合することである。
+2. **読み戻せなかった印の消去で、新しい登録の保留要求を失う**（`RegistrationClient_unknownmark`、`TokenRecoverable`）。
+   解除の最後の `config.commit(Unpairing -> null)` が失敗して読み戻しもできないと、印は不明となり、`getBoolean(Unpairing, false)` は false を返す。ディスクには印が残りうる。
+   アプリは解除済みとして新しい登録を始め、トークンを保存して送る。
+   サーバが端末を作った後、次の起動で `resume` が印を見て解除をやり直し、`Registration.reset()` と `clearRest` が保留要求を消す。
+   利用者が手放していないトークンを失い、端末はサーバに残る。
+   また、不明な印のまま別の書込み（`savePairing` の `config.commit`）が成功すると、スナップショットの古い値（印あり）がファイルに書き戻され、登録直後に「解除中」に戻る。
+   修正案は、不明な印を「解除中」として読む（または読み戻せるまで書き直す）ことである。
+   発生には書込みの失敗と読み戻しの失敗が重なる必要があり、起こりにくい。
+3. **自己登録の締切と再送の競合**（`Accounts_closedrace`、`RetriesAgree`）。
+   同じトークンの複製 A、B が回復の照会を通り、A がアカウントを作り、運用者が登録を締め切った後に B が締切の判定に来ると、B は 403 を受ける。
+   クライアントは 403 を確定した拒否として保留要求を消し、作られたアカウントを失う。
+   修正案は、締切で拒む直前に回復をもう一度照会することである。
+   応答の消失、並行した再送、締切の操作が重なる必要があり、起こりにくい。
 
-`StatusDownload_manyfakes` は検査の範囲の限界を示す。
-相手 1 台に、正しい status より新しい偽の行を 3 件（`MaxCand` を超える数）出すと、`StatusLive` が破れる。
-上限回数失敗した候補を覚えておける数を超えた偽の行は忘れられ、再走査で新しい候補として戻る。
-モデルでは再走査が取得より先に何度でも起こりうるので、戻った偽の行が正しい status より先に試され続ける。
-コードでは保持数が 4 件で、再走査は高々 1 日 1 回、取得は 1 時間ごとなので、この順序が続くとは考えにくい。
-ただし、それは検査していない。
-## 検査で見つかって直した問題
+### 以前に見つけて直した問題
 
-### 孤立掃除が確定済みの実体を消す（`BatchCommit_current`）
-
-修正前の設計は、24 時間の猶予のあいだに R2 put から D1 commit までが終わると仮定していた。
-この仮定を外すと、TLC は次の反例を出す。
-
-1. 試行が R2 に put する（時刻 0）。
-2. commit が猶予を超えて遅れる（時刻 3）。
-3. 掃除が、その実体を古く未参照と判定する。
-4. 試行が D1 に commit する。
-5. 掃除が実体を消す。一覧には載るが実体のない行が残り、GET は 404 になる。
-
-修正では、D1 が期限切れの試行の commit を拒否する（`server/src/batches.ts`）。
-Worker は R2 put の前に D1 の時刻を開始時刻として読み、INSERT の条件に「D1 側の現在時刻 − 開始時刻 ≤ 期限」を加える。
-現在時刻は Worker の `Date.now()` ではなく、文の実行時に D1 で取る（`julianday('now')` から算出）。文が送られるまでの遅れも期限に含めるためである。
-拒否された試行は自分の実体を消して 503（`Retry-After` 付き）を返し、クライアントは同じ暗号文を再送する。
-期限 `D` は 1 時間、猶予 `G` は 24 時間である。
-掃除が実体を消すのは R2 の記録時刻から `G` を超えた後であり、R2 の記録時刻は開始時刻以降である。
-このため時計のずれを `s` とすると、`D + 2s ≤ G` である限り、掃除が未参照と判定した実体はもう commit されない。
-`s` は 11.5 時間まで許される。
-`BatchCommit_fixed` は、時計を一つとして `D ≤ G` のもとで `CommittedHasObject` と `SweepSafe` が成り立つことを確かめる。
-
-### 偽の一覧行で status の受信が止まる（`StatusDownload_fakeseq`、`_fakecursor`）
-
-修正前の方式でも不変条件は成り立つ（失敗を成功と扱わず、問題として表示する）。
-しかし悪意あるサーバが偽の行を一つ一覧に出すと、その後の正しい status が読まれなくなる。
-
-- 大きな seq：端末 2 の seq 0 を一覧した後、seq 9 の偽の行を出す。候補は seq 9 になり、3 回失敗して取得対象から外れる。候補は大きい seq でしか置き換わらないため、端末 2 の正しい status は以後読まれない。
-- 大きなカーソル：カーソル 9 の偽の行を出す。カーソルは 9 に進み、その後の正しい行（カーソル 2、3）は一覧に出ない。
-
-レビュー #7 で未解決とされた問題である。
-修正では次のようにした（`core` の `StatusSyncState`、`app` の `PeerStatus.pull`）。
-
-- 候補を端末ごとに、まだ試せるものを最大 4 件、上限回数失敗したものを別に最大 4 件持つ。最新の候補が 3 回失敗したら、認証済み seq より新しい次の候補を取得する。失敗した候補は問題として表示し、覚えている限り、一覧に再び出ても再試行しない。
-- 7 日ごと、または一覧の異常や候補切れがあれば 1 日後に、`after=0` から一覧し直す。1 回の実行のページ数の上限は通常の一覧と共有し、続きは次の実行で進める。終わりに達したら、カーソルを再走査の位置にする。
-- ページ内でカーソルが増えていない行と、行数が `limit` 未満のページで直前より 10,000,000 を超えて飛ぶ行の手前で、カーソルを止める。そのページの行は候補には入れ、再走査を求める。満杯のページは常にたどる（正直なサーバのページ先頭にある大きな隙間で一覧が止まらないように）。
-
-`StatusDownload_fixed`、`_fixed1`、`_fakes` は、偽の行が一覧に残り続けるサーバのもとで、不変条件と（`_fakes` 以外は）`StatusLive` が成り立つことを確かめる（大きさは前述の表）。
-偽の seq は、古い候補に切り替えることで迂回する。
-満杯のページで偽のカーソルに進んだ場合、それより小さいカーソルの新しい行は次の再走査で読まれる（最長で再走査の間隔だけ遅れる）。
-偽の行を出し続けるサーバに対して保証するのは、この遅れまでである。
-
-失敗した候補を覚えておく件数（4 件）は、一端末あたりの偽の行の数以上でなければならない。
-少ないと、再走査のたびに忘れた偽の行を新しい候補として試し直す（`StatusDownload_manyfakes`）。
-失敗した候補を、候補が多すぎるときに捨てていた最初の版では、TLC がこの繰り返しのために正しい status が読まれない反例を出した。
-そのため、失敗した候補は別枠で覚える形にした。
-
-### 確認できた修正
-
-修正前の設計を表す設定は、レビューの指摘どおりの反例を出す。
-
-- `Outbox_nonatomic`：行の保存と seq の確定のあいだでクラッシュすると、同じ seq に別の暗号文ができる（REVIEW1 #1）。
-- `Registration_norecheck`、`Accounts_norecheck`：同じトークンの並行要求で、片方が 201、もう片方が 401 または 403 になる（N3）。
-- `Registration_applypersist`：送信後、ディスクへの書込み前にクラッシュすると、サーバだけが端末を作り、トークンが失われる（N2）。
-- `SharedCheckin_old`：PUT rev=10、DELETE rev=20、PUT rev=30、DELETE rev=20 の再送で、rev=30 のまま削除状態になる。未登録 ID への DELETE の後に遅れた PUT が届くと公開される（N5）。
-- `Outbox_r1`：大きさ 1 部分の世代 1 の大きさを読んだ後、ファイルが 2 部分の世代 2 に置き換わる。世代 2 の部分 0 を「全 1 部分の最後」として送り、送信済みにする。世代 2 の部分 1 はどこにもない（R1）。
-- `Registration_r2`：照合を通った後に取消が入り、取消が返った後にペアリングが保存される（R2）。
-- `Registration_r3`：ペアリング後、鍵の `commit()` が失敗する。メモリには鍵が残り、ディスクにはないまま同期可能と読める（R3）。
-- `StatusDownload_r4`：範囲外のカーソルを持つ行を一覧どおりに取り込む。サーバがその行を出さなくなっても、保存したカーソルからの一覧は拒否され続け、再走査も取得も行われない（R4）。
-- `StatusDownload_r5`：正しい最新の status をサーバが 3 回失敗させた後は正しく返しても、候補は上限回数失敗したまま再試行されない（R5）。
-
-修正後の設定では、これらの性質がすべて成り立つ。
+- 孤立掃除が確定済みの実体を消す（`BatchCommit_current`）：D1 が期限切れの試行の commit を拒むようにした。期限 `D` は 1 時間、猶予 `G` は 24 時間で、時計のずれ `s` は `D + 2s ≤ G` の範囲で吸収する。
+- 偽の一覧行で status の受信が止まる（`StatusDownload_fakeseq`、`_fakecursor`）：候補の複数保持、再走査、範囲外のカーソルの拒否（R4）、使い切った候補の再試行（R5）を入れた。
+- 保持数を超える偽の行で正しい status が押し出され続ける（F6、`StatusRotation_f6pre`、`StatusDownload_manyfakes_pre`）：レビューの例（正しい seq 0 と偽の 1〜8）では、偽の 5〜8 を使い切り、再走査で 1〜4 が入って 0 は落ち、次の再走査で同じ状態に戻る。これは 1 時間ごとの取得と 1 日ごとの再走査という実際の間隔でも起こる。ローテーションを入れて直した。
+- 送信の非原子性（`Outbox_nonatomic`）、apply による保存（N2）、0 行の後の再照合漏れ（N3）、rev を見ない DELETE（N5）、アーカイブの世代の混在（R1）、取消と保存の競合（R2）、保存失敗した値の読出し（R3、F1）、間に合わない取消での保留要求の削除（F2）、解除の途中のクラッシュによる古い鍵の使用（レビュー 6 の 3）。いずれも修正前の方式を表す設定が反例を出し、現行の設定では成り立つ。
 
 ## 証明していないこと
 
 ### モデルとコードの差
 
-モデルはコードから自動で導いたものではなく、仕様とコードを読んで手で書いたものである。
-コードがモデルどおりに実装されていることは、このディレクトリでは検査しない。
-
-- 暗号モデルは AES-GCM、HKDF、SHA-256 を理想化している。nonce の衝突、実装の欠陥、サイドチャネルは対象外である。
-- `K` の端末内での扱い（Keystore、画面、クリップボード）、復旧コードの受け渡しの安全性は前提であり、検査していない。
-- 状態モデルは SQL 文を一つの原子的な遷移として扱い、D1 の `batch()` が全体として原子的であることを前提にする。
-- 時刻は単一の時計で、Worker、D1、R2 の時計のずれは扱わない（コードでは `D + 2s ≤ G` の余裕で吸収する）。
-- status 取得の再走査の時期（7 日、1 日）とカーソルの飛びの規則は、モデルでは抽象化している（前述）。
-- 旧形式のキー（`r2_key` が NULL の行）、0005 移行と旧 Worker の同居（N6）、small と raw の区別、レート制限、利用者の削除（7 日後の掃除）、使用済みコードの削除（1 日後）はモデルにない。
-- ペアリングコードの推測（40 ビットとレート制限）は扱わない。登録モデルの攻撃者はコードを知っている場合を含むが、推測の確率は評価しない。
-- 登録の状態機械は、試行、取消、解除、保存の失敗までを扱う。画面の再生成と、画面が状態を描き直す順序は扱わない。
-- `SharedPreferences` は、失敗した `commit()` がメモリだけを更新するものとして扱う。同じファイルの別のキーを後から `apply()` すると、メモリに残った値がディスクに書かれうる。コードは失敗した書込みをメモリ上で元に戻すのでこの値は残らないが、元に戻す処理自体も失敗した場合は、そのキーをプロセスの終わりまで読めない値として扱うだけである。
-- アーカイブのモデルは、ファイルが rename でだけ置き換わり、開いた記述子が開いた版を読み続けることを前提にする（POSIX の rename と unlink の意味）。世代は、`fstat` で得たデバイス、inode、大きさ、更新時刻から作るので、これらがすべて一致する別の版は区別できない。
-- status 取得のモデルは、1 回の実行の中の順序（一覧、再走査、取得、再試行）を固定せず、任意の順序で起こるものとする。ページの予算（20 ページ、再走査に 5 ページを残す）と再試行の予算（1 回の実行で 4 件）はモデルにない。
+- 暗号モデルは AES-GCM、HKDF、SHA-256 を理想化している。nonce の衝突、実装の欠陥、サイドチャネルは対象外である。`K` の端末内での扱いと復旧コードの受け渡しは前提である。
+- 状態モデルは SQL 文と D1 の `batch()` を原子的な遷移として扱う。時計は単一で、Worker、D1、R2 の時計のずれは扱わない（`BatchCommit` は `D + 2s ≤ G` で吸収する）。
+- `RegistrationClient` のサーバは抽象化している。`Registration` は端末の失効、使用済みコードの削除、7 日後の未使用アカウントの削除を扱わない。
+- `RegistrationClient` は画面の描き直しの順序、同じストアへの SharedPreferences 側の書込み（残っているのはネットワーク設定などで、登録と鍵ではない）を扱わない。
+- アーカイブのモデルは、ファイルが rename でだけ置き換わり、開いた記述子が開いた版を読み続けることを前提にする。日ファイルから月ファイルへの統合と、復元したレコードの集合は扱わない。
+- status 取得の時間は抽象化している（前述）。保存した状態の再起動後の復元、通知の順序は扱わない。
 - フィードの取得側はアプリに未実装であり、仕様の手順をモデルにした。
-- 共有チェックインのモデルは、クライアントが変更ごとに真に大きい rev を使うことを前提にする。同じ rev で内容の違う PUT や、PUT と同じ rev の DELETE を送ると、後着の操作は `stale` になる。別端末からの by-id DELETE で時計がずれている場合も同様で、rev の大きい操作が勝つ。
 
 ### 有限の大きさ
 
-TLC は各設定に書いた有限の大きさ（端末 2〜3 台、スロット 1〜2 個、操作や障害が数回）の状態を網羅するだけである。
-これより大きい構成で成り立つことは証明していない。
-とくに status 取得は相手 1〜2 台、偽の行 3 件（活性）または 5 件（不変条件のみ）で検査しており、一覧のカーソルとページの予算を全端末で共有するため、一般の台数と件数に拡張できる議論はない。
-活性は、障害、再登録、サーバ側の変更が有限回で止まることと、各処理が公平に実行されることを仮定する。
-応答を永久に隠すサーバに対して同期が完了することは保証できない。
+TLC は各設定に書いた有限の大きさを網羅するだけである。
+とくに status 取得は相手 1〜2 台、偽の行 8 件（1 台）または 5 件ずつ（2 台）で検査しており、一覧のカーソルとページと再試行の予算を全端末で共有するため、一般の台数と件数に拡張できる議論はない。
+活性は、障害、再登録、サーバ側の変更が有限回で止まることと、各処理（同期のジョブ、利用者の再試行と鍵の入力、アプリの再起動）が繰り返し起こることを仮定する。
 
 ### メタデータ
 
@@ -366,3 +398,22 @@ TLC は各設定に書いた有限の大きさ（端末 2〜3 台、スロット
 端末 ID、stream 名、seq、blob の大きさ、送信時刻、一覧のカーソルは、サーバに見える値として扱う。
 識別不能性も、長さと送信の頻度が等しい二つの履歴についてだけ成り立つ。
 共有チェックインは定義上平文であり、対象外である。
+
+## 残る課題
+
+レビュー 6 の「未モデル化」の表のうち、次は扱っていない（優先順）。
+
+| 優先 | 領域 | 扱っていない理由、次の一歩 |
+|---|---|---|
+| 2 | バックアップからの復元、日と月の統合、遅着データ | 遅着データの制限は `Outbox_late` で示した。世代付きの送信済みの印と、復元したレコード集合の検査は未着手 |
+| 3 | フォロー承認、利用者の分離、停止と再開、端末の失効 | 認可はサーバのテスト（`server/test`）が扱う。効力の及ぶ時点のモデルは未着手 |
+| 4 | 自己登録の 7 日削除、使用済みコードの削除と進行中の要求 | 再試行の有効期限との競合は未検査 |
+| 5 | 複数端末からの共有の取消と再共有 | 時計のずれは `SharedCheckin_skew` で制限として示しただけ。同じ rev、容量超過（507）は未検査 |
+| 6 | カウンタ、旧データ、移行、旧 Worker の同居、設定変更 | カウンタは `conformance.test.ts` が実 SQL で確かめる。移行と同居は未検査 |
+| 7 | レート制限の窓の境界と遅延した要求 | 窓が後退しないこと、拒否で行が変わらないことはコードと SQL で直したが、モデルにはない |
+
+このほか、次は将来の課題とする。
+
+- 位置情報を外部に送らない設定（`SendGate`）のモデル：世代と票（ticket）、表示ごとの許可、スナップショットの待ち行列で、「古い票で自動の送信をしない」「別の表示の許可でオンラインにならない」を検査する。CI のパスには含めた。
+- Tamarin：平文を公開する変異、`batch_privacy` での正常な受信の到達性（`executable` 相当）。
+- 同期の実行全体の順序と、アップロードの失敗が status 取得を止めないこと（コードでは独立にした）。

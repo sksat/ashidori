@@ -63,6 +63,8 @@ CONSTANTS Devs, Self, MaxRows, Limit, MaxNetErr,
           Fixed,      \* TRUE: several candidates and rescans (the code)
           MaxCand,    \* candidates kept per device (Fixed)
           RetryExhausted, CheckCursor,
+          Rotate,     \* TRUE: the rotation (sweep) of the code; FALSE: before it (review F6)
+          CheckBlob,  \* FALSE (mutation): a blob that is not the listed one counts as read
           MaxAttempts, \* failures after which a candidate is exhausted (3 in the app)
           Uploads     \* subset of {"other", "broken", "self"}: devices also upload
                       \* batches of another stream, broken statuses, and the client
@@ -70,6 +72,8 @@ CONSTANTS Devs, Self, MaxRows, Limit, MaxNetErr,
 
 ASSUME MaxAttempts \in Nat \ {0}
 NoUnres == [seq |-> -1, attempts |-> 0]
+NoSweep == [lo |-> 1, hi |-> 0]   \* an empty range: no pass
+Covers(w, q) == w.lo <= q /\ q <= w.hi
 
 \* The fake rows a hostile server may list (device, kind, offset).
 FakeTab ==
@@ -91,17 +95,19 @@ VARIABLES
   cands,     \* client (Fixed): candidates per device, [r: row, fails, rr: retried this round]
   rcur,      \* client (Fixed): rescan position, -1 when none runs
   shown,     \* client: seq of the status shown per device (-1: none)
+  sweep,     \* client (Fixed): per device [lo, hi] of the seqs exhausted in this pass, or NoSweep
   okSeqs,    \* ghost: <<dev, seq>> fetched as the listed, good blob
+  seen,      \* ghost: status rows of the other devices ever taken from a listing page
   neterr
 
-vars == <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, cands, rcur, shown, okSeqs, neterr>>
+vars == <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, cands, rcur, shown, sweep, okSeqs, seen, neterr>>
 
 Init ==
   /\ rows = {} /\ gcur = 0 /\ nseq = [d \in Devs |-> 0] /\ usedF = {}
   /\ cursor = 0
   /\ latest = [d \in Devs |-> -1] /\ auth = [d \in Devs |-> -1] /\ unres = [d \in Devs |-> NoUnres]
   /\ cands = [d \in Devs |-> {}] /\ rcur = -1
-  /\ shown = [d \in Devs |-> -1] /\ okSeqs = {} /\ neterr = 0
+  /\ shown = [d \in Devs |-> -1] /\ sweep = [d \in Devs |-> NoSweep] /\ okSeqs = {} /\ seen = {} /\ neterr = 0
 
 Genuine == {r \in rows : ~r.fake}
 OutOfRange(c) == c > CursorMax
@@ -117,7 +123,7 @@ Upload(d) ==
                               seq |-> IF s = "status" THEN nseq[d] ELSE 0, good |-> g, fake |-> FALSE]}
        /\ nseq' = IF s = "status" THEN [nseq EXCEPT ![d] = @ + 1] ELSE nseq
   /\ gcur' = gcur + 1
-  /\ UNCHANGED <<usedF, cursor, latest, auth, unres, cands, rcur, shown, okSeqs, neterr>>
+  /\ UNCHANGED <<usedF, cursor, latest, auth, unres, cands, rcur, shown, sweep, okSeqs, seen, neterr>>
 
 \* A fake row (never of the client's own device: those are ignored like
 \* its genuine ones). "same" takes the seq of the newest genuine status of
@@ -136,18 +142,20 @@ Fake ==
                                 good |-> FALSE, fake |-> TRUE]}
        /\ usedF' = usedF \cup {f}
        /\ gcur' = IF t.kind \in {"cursor", "bad"} THEN gcur ELSE gcur + 1
-  /\ UNCHANGED <<nseq, cursor, latest, auth, unres, cands, rcur, shown, okSeqs, neterr>>
+  /\ UNCHANGED <<nseq, cursor, latest, auth, unres, cands, rcur, shown, sweep, okSeqs, seen, neterr>>
 
 \* The attack stops: rows with a cursor out of range are no longer listed.
 StopBad ==
   /\ \E r \in rows : OutOfRange(r.cursor)
   /\ rows' = {r \in rows : ~OutOfRange(r.cursor)}
-  /\ UNCHANGED <<gcur, nseq, usedF, cursor, latest, auth, unres, cands, rcur, shown, okSeqs, neterr>>
+  /\ UNCHANGED <<gcur, nseq, usedF, cursor, latest, auth, unres, cands, rcur, shown, sweep, okSeqs, seen, neterr>>
 
 \* One listing page: rows after the cursor, the first Limit by cursor.
 After(c) == {r \in rows : r.cursor > c}
 PageOf(c) == {r \in After(c) : Cardinality({x \in After(c) : x.cursor < r.cursor}) < Limit}
 MaxOf(S) == CHOOSE x \in S : \A y \in S : y <= x
+\* The status rows of other devices on a page (for the ghost `seen`).
+StatusOf(items) == {r \in items : r.stream = "status" /\ r.dev # Self}
 
 \* The code refuses a page with a row out of range (malformed).
 PageOk(c) == CheckCursor => \A r \in PageOf(c) : ~OutOfRange(r.cursor)
@@ -167,7 +175,8 @@ ListOld ==
          st(d) == {r.seq : r \in {x \in items : x.stream = "status" /\ x.dev = d /\ x.dev # Self}}
      IN /\ cursor' = MaxOf({r.cursor : r \in items} \cup {cursor})
         /\ latest' = [d \in Devs |-> IF st(d) # {} /\ MaxOf(st(d)) > latest[d] THEN MaxOf(st(d)) ELSE latest[d]]
-  /\ UNCHANGED <<rows, gcur, nseq, usedF, auth, unres, cands, rcur, shown, okSeqs, neterr>>
+        /\ seen' = seen \cup StatusOf(items)
+  /\ UNCHANGED <<rows, gcur, nseq, usedF, auth, unres, cands, rcur, shown, sweep, okSeqs, neterr>>
 
 TargetsOld == {d \in Devs : latest[d] > auth[d] /\ ~(unres[d].seq = latest[d] /\ unres[d].attempts >= MaxAttempts)}
 
@@ -193,7 +202,7 @@ FetchOld(d) ==
            /\ UNCHANGED neterr
         \/ /\ Hostile /\ neterr < MaxNetErr                  \* another blob, or 404 (bounded)
            /\ neterr' = neterr + 1 /\ Fail(d, q)
-  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, cands, rcur>>
+  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, cands, rcur, sweep, seen>>
 
 ---------------------------------------------------------------------------
 \* The code (Fixed).
@@ -212,13 +221,21 @@ AddLast(S, c) ==
   {IF x.r.seq = c.r.seq THEN [x EXCEPT !.late = FALSE] ELSE x : x \in S}
     \cup {[c EXCEPT !.late = \E x \in S : x.r.seq = c.r.seq]}
 
-\* StatusSyncState.trim: the first MaxCand candidates still to try and,
-\* separately, the first MaxCand exhausted ones (so that a rescan does not
-\* bring them back as new).
+\* The rotation (StatusSyncState.rank): a candidate whose seq lies within
+\* the device's sweep ranks below every other one.
+Cov(c, w) == Rotate /\ Covers(w, c.r.seq)
+BeforeR(a, b, w) == (~Cov(a, w) /\ Cov(b, w)) \/ (Cov(a, w) = Cov(b, w) /\ Before(a, b))
+
+\* StatusSyncState.trim: the best MaxCand candidates still to try (by rank)
+\* and, separately, the first MaxCand exhausted ones (so that a rescan does
+\* not bring them back as new).
 RECURSIVE Keep(_, _)
 Keep(S, n) == IF Cardinality(S) <= n THEN S
               ELSE Keep(S \ {CHOOSE c \in S : \A x \in S : ~Before(c, x)}, n)
-Trim(S) == Keep({c \in S : ~Exhausted(c)}, MaxCand) \cup Keep({c \in S : Exhausted(c)}, MaxCand)
+RECURSIVE KeepR(_, _, _)
+KeepR(S, n, w) == IF Cardinality(S) <= n THEN S
+                  ELSE KeepR(S \ {CHOOSE c \in S : \A x \in S : ~BeforeR(c, x, w)}, n, w)
+Trim(S, w) == KeepR({c \in S : ~Exhausted(c)}, MaxCand, w) \cup Keep({c \in S : Exhausted(c)}, MaxCand)
 
 \* StatusSyncState.take (at most one new row per device and page)
 Take(items) ==
@@ -226,7 +243,8 @@ Take(items) ==
      LET new == {r \in items : r.stream = "status" /\ r.dev = d /\ d # Self /\ r.seq > auth[d]
                                 /\ ~\E c \in cands[d] : c.r = r}
      IN IF new = {} THEN cands[d]
-        ELSE Trim(AddLast(cands[d], [r |-> CHOOSE r \in new : TRUE, fails |-> 0, rr |-> FALSE, late |-> FALSE]))]
+        ELSE Trim(AddLast(cands[d], [r |-> CHOOSE r \in new : TRUE, fails |-> 0, rr |-> FALSE, late |-> FALSE]),
+                  sweep[d])]
 
 \* StatusSyncState.listed (main walk)
 ListFixed ==
@@ -235,15 +253,21 @@ ListFixed ==
   /\ LET items == PageOf(cursor)
      IN /\ cursor' = MaxOf({r.cursor : r \in items} \cup {cursor})
         /\ cands' = Take(items)
-  /\ UNCHANGED <<rows, gcur, nseq, usedF, latest, auth, unres, rcur, shown, okSeqs, neterr>>
+        /\ seen' = seen \cup StatusOf(items)
+  /\ UNCHANGED <<rows, gcur, nseq, usedF, latest, auth, unres, rcur, shown, sweep, okSeqs, neterr>>
 
 \* StatusSyncState.rescanIfDue
 StartRescan ==
   /\ Fixed /\ rcur = -1 /\ ~MainRefused
   /\ rcur' = 0
-  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, cands, shown, okSeqs, neterr>>
+  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, cands, shown, sweep, okSeqs, seen, neterr>>
 
-\* StatusSyncState.rescanned: one page, or the end of the listing.
+Live(d) == {c \in cands[d] : c.r.seq > auth[d] /\ ~Exhausted(c)}
+TargetsFixed == {d \in Devs : Live(d) # {}}
+TargetOf(d) == CHOOSE c \in Live(d) : \A x \in Live(d) : ~BeforeR(x, c, sweep[d])
+
+\* StatusSyncState.rescanned: one page, or the end of the listing. At the
+\* end a device's pass ends if it has no row outside its sweep to try.
 RescanStep ==
   /\ Fixed /\ rcur >= 0 /\ ~RunEnds
   /\ IF After(rcur) # {}
@@ -251,40 +275,56 @@ RescanStep ==
             IN /\ PageOk(rcur)
                /\ rcur' = MaxOf({r.cursor : r \in items})
                /\ cands' = Take(items)
-               /\ UNCHANGED cursor
+               /\ seen' = seen \cup StatusOf(items)
+               /\ UNCHANGED <<cursor, sweep>>
        ELSE /\ cursor' = rcur /\ rcur' = -1
-            /\ UNCHANGED cands
+            /\ sweep' = [d \in Devs |-> IF \E c \in Live(d) : ~Covers(sweep[d], c.r.seq) THEN sweep[d] ELSE NoSweep]
+            /\ UNCHANGED <<cands, seen>>
   /\ UNCHANGED <<rows, gcur, nseq, usedF, latest, auth, unres, shown, okSeqs, neterr>>
 
-Live(d) == {c \in cands[d] : c.r.seq > auth[d] /\ ~Exhausted(c)}
-TargetsFixed == {d \in Devs : Live(d) # {}}
-TargetOf(d) == CHOOSE c \in Live(d) : \A x \in Live(d) : ~Before(x, c)
-
+\* A success above the sweep ends the device's pass.
 SucceedFixed(d, q) ==
+  LET a == IF q > auth[d] THEN q ELSE auth[d] IN
   /\ Succeed(d, q)
   /\ cands' = [cands EXCEPT ![d] = {x \in @ : x.r.seq > q /\ x.r.seq > auth[d]}]
+  /\ sweep' = [sweep EXCEPT ![d] = IF @.hi > a THEN @ ELSE NoSweep]
+\* CheckBlob = FALSE (mutation): another blob is taken as the listed one.
+SucceedUnchecked(d, q) ==
+  /\ auth' = [auth EXCEPT ![d] = IF q > @ THEN q ELSE @]
+  /\ unres' = [unres EXCEPT ![d] = IF @.seq > q THEN @ ELSE NoUnres]
+  /\ shown' = [shown EXCEPT ![d] = q]
+  /\ cands' = [cands EXCEPT ![d] = {x \in @ : x.r.seq > q /\ x.r.seq > auth[d]}]
+  /\ UNCHANGED <<okSeqs, sweep>>
 \* The newest failure stays shown: an older one does not replace it. A
 \* retried exhausted candidate keeps its count and is marked for this round.
+\* A candidate exhausted now widens the device's sweep to its seq.
 FailFixed(d, c) ==
-  LET n == IF c.fails < MaxAttempts THEN c.fails + 1 ELSE MaxAttempts IN
-  /\ cands' = [cands EXCEPT ![d] = Trim(AddLast(@ \ {c}, [c EXCEPT !.fails = n, !.rr = Exhausted(c)]))]
-  /\ unres' = [unres EXCEPT ![d] = IF Problem(d) /\ @.seq > c.r.seq THEN @ ELSE [seq |-> c.r.seq, attempts |-> n]]
-  /\ UNCHANGED <<auth, shown, okSeqs>>
+  LET n == IF c.fails < MaxAttempts THEN c.fails + 1 ELSE MaxAttempts
+      q == c.r.seq
+      w == IF Rotate /\ c.fails + 1 = MaxAttempts
+             THEN IF sweep[d] = NoSweep THEN [lo |-> q, hi |-> q]
+                  ELSE [lo |-> IF q < sweep[d].lo THEN q ELSE sweep[d].lo, hi |-> IF q > sweep[d].hi THEN q ELSE sweep[d].hi]
+             ELSE sweep[d]
+  IN /\ cands' = [cands EXCEPT ![d] = Trim(AddLast(@ \ {c}, [c EXCEPT !.fails = n, !.rr = Exhausted(c)]), w)]
+     /\ sweep' = [sweep EXCEPT ![d] = w]
+     /\ unres' = [unres EXCEPT ![d] = IF Problem(d) /\ @.seq > c.r.seq THEN @ ELSE [seq |-> c.r.seq, attempts |-> n]]
+     /\ UNCHANGED <<auth, shown, okSeqs>>
 
 \* Fetching candidate c of device d.
 FetchCand(d, c) ==
   \/ /\ neterr < MaxNetErr /\ neterr' = neterr + 1      \* network error: nothing changes
-     /\ UNCHANGED <<auth, unres, shown, okSeqs, cands>>
+     /\ UNCHANGED <<auth, unres, shown, okSeqs, cands, sweep>>
   \/ /\ IF c.r.good THEN SucceedFixed(d, c.r.seq) ELSE FailFixed(d, c)  \* the listed blob
      /\ UNCHANGED neterr
   \/ /\ Hostile /\ neterr < MaxNetErr                  \* another blob, or 404 (bounded)
-     /\ neterr' = neterr + 1 /\ FailFixed(d, c)
+     /\ neterr' = neterr + 1
+     /\ IF CheckBlob THEN FailFixed(d, c) ELSE SucceedUnchecked(d, c.r.seq)
 
 FetchFixed(d) ==
   /\ Fixed /\ ~RunEnds
   /\ d \in TargetsFixed
   /\ FetchCand(d, TargetOf(d))
-  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, rcur>>
+  /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, rcur, seen>>
 
 \* StatusSyncState.retries: an exhausted candidate not yet retried in this
 \* round; when all were, a new round starts.
@@ -293,10 +333,11 @@ RetryFetch(d) ==
   /\ Fixed /\ RetryExhausted /\ ~RunEnds
   /\ IF Due(d) # {}
        THEN /\ \E c \in Due(d) : FetchCand(d, c)
-            /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, rcur>>
+            /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, rcur, seen>>
        ELSE /\ \E c \in cands[d] : c.rr
             /\ cands' = [cands EXCEPT ![d] = {[x EXCEPT !.rr = FALSE] : x \in @}]
-            /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, rcur, shown, okSeqs, neterr>>
+            /\ UNCHANGED <<rows, gcur, nseq, usedF, cursor, latest, auth, unres, rcur, shown, sweep, okSeqs, seen,
+                           neterr>>
 
 ---------------------------------------------------------------------------
 
@@ -317,14 +358,14 @@ ShownIsAuthenticated == \A d \in Devs : shown[d] = auth[d]
 \* ... and it only increases.
 AuthMonotone == [][\A d \in Devs : auth'[d] >= auth[d]]_vars
 
-\* Failures are never silently treated as success: a listed candidate that
-\* is not read is still to be fetched (the device has a target), or shown as
-\* a problem.
+\* Failures are never silently treated as success: if a status row newer
+\* than the read seq was ever listed (the independent history `seen`, which
+\* also covers rows the candidates dropped since), the device still has a
+\* row to fetch, or shows a problem.
 NoSilentSkip ==
   \A d \in Devs :
-    IF Fixed
-      THEN (\E c \in cands[d] : c.r.seq > auth[d]) => (d \in TargetsFixed \/ Problem(d))
-      ELSE latest[d] > auth[d] => (d \in TargetsOld \/ Problem(d))
+    (\E r \in seen : r.dev = d /\ r.seq > auth[d]) =>
+      IF Fixed THEN d \in TargetsFixed \/ Problem(d) ELSE d \in TargetsOld \/ Problem(d)
 
 \* The cursor (and a rescan's position) only moves to cursors of rows actually listed.
 CursorListed ==
