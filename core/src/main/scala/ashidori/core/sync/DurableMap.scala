@@ -57,7 +57,8 @@ object DurableFile:
   * back a value that the failed write may have replaced. If it still cannot
   * read the file, a write that does not set every unknown key is refused,
   * since it would have to guess them. A file that does not parse or whose
-  * checksum does not match reads as empty at start.
+  * checksum does not match reads as empty at start; [[View.unreadable]]
+  * tells that apart from a missing file (a first run).
   *
   * The file is owned by this instance: nothing else may write it. Writes
   * are serialized and blocking.
@@ -66,7 +67,21 @@ final class DurableMap(file: DurableFile):
   import DurableMap.*
 
   private val writeLock = Object()
-  @volatile private var state: View = View(readBack().getOrElse(Map.empty), Set.empty)
+  @volatile private var state: View = readBack() match
+    case Some(m) => View(m, Set.empty)
+    case None    => View(Map.empty, Set.empty, unreadable = true)
+
+  /** Reads the file again if it could not be read at start ([[View.unreadable]])
+    * and nothing was written since. True when its records are known now.
+    */
+  def reload(): Boolean = writeLock.synchronized {
+    if !state.unreadable then true
+    else readBack() match
+      case Some(m) =>
+        state = View(m, Set.empty)
+        true
+      case None => false
+  }
 
   /** The records in the file; None when it cannot be read or does not parse. */
   private def readBack(): Option[Map[String, Value]] =
@@ -135,7 +150,7 @@ final class DurableMap(file: DurableFile):
               state = View(before, Set.empty)
               false
             case _ =>
-              state = View(before, state.unknown ++ changed)
+              state = View(before, state.unknown ++ changed, state.unreadable)
               false
           if written then state = View(next, Set.empty)
           else throw e match
@@ -147,9 +162,12 @@ object DurableMap:
   type Value = String | Boolean
 
   /** A snapshot of the records. `values` holds, for an unknown key, its value
-    * before the write that failed; [[get]] does not return it.
+    * before the write that failed; [[get]] does not return it. `unreadable`:
+    * the file existed but could not be read or did not parse at start, and
+    * nothing was written since; the records read as empty, for a caller to
+    * whom that is the safe reading (a first run is a missing file instead).
     */
-  final case class View(values: Map[String, Value], unknown: Set[String]):
+  final case class View(values: Map[String, Value], unknown: Set[String], unreadable: Boolean = false):
     def get(k: String): Option[Value] = if unknown(k) then None else values.get(k)
     def getString(k: String): Option[String] = get(k).collect { case v: String => v }
     def getBoolean(k: String, default: Boolean): Boolean = get(k).collect { case v: Boolean => v }.getOrElse(default)

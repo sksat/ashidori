@@ -143,10 +143,15 @@ final class BlobRejected(reason: String) extends RuntimeException(s"ASH1 blob re
   *   It is named in this device's status.
   * - `record`: the content of C, once fetched and verified (ASHM under Ka).
   * - `minAshm`: per pair, the smallest seq at which an ASHM blob was accepted.
-  * - `legacy`: per pair, ASH1 blobs accepted (seq → SHA-256), the newest
-  *   [[BlobAuthState.MaxLegacy]] per pair.
+  * - `legacy`: per pair, ASH1 blobs accepted before the required state (seq →
+  *   SHA-256), the newest [[BlobAuthState.MaxLegacy]] per pair. Dropped when
+  *   the required state is entered.
   * - `found`: `authcut` rows listed and not tried yet; `refused`: those that
   *   did not verify (not listed as found again).
+  * - `lost`: the stored state could not be read ([[BlobAuthState.Lost]]), so
+  *   whether C exists is not known. `required` is set with it, so every ASH1
+  *   not accepted since is refused, until a C is adopted (learned from the
+  *   server, or made by [[Cutover.ensure]]); that clears it.
   */
 final case class BlobAuthState(
     required: Boolean = false,
@@ -155,7 +160,8 @@ final case class BlobAuthState(
     minAshm: Map[StreamKey, Long] = Map.empty,
     legacy: Map[StreamKey, Map[Long, String]] = Map.empty,
     found: Vector[CutRef] = Vector.empty,
-    refused: Vector[CutRef] = Vector.empty
+    refused: Vector[CutRef] = Vector.empty,
+    lost: Boolean = false
 ):
   import BlobAuthState.*
 
@@ -166,17 +172,22 @@ final case class BlobAuthState(
     copy(minAshm = minAshm.updated(k, minAshm.get(k).fold(seq)(math.min(_, seq))))
 
   def ash1Accepted(k: StreamKey, seq: Long, sha256: String): BlobAuthState =
-    val m = legacy.getOrElse(k, Map.empty).updated(seq, sha256.toLowerCase)
-    copy(legacy = legacy.updated(k, if m.size <= MaxLegacy then m else m.toSeq.sortBy(-_._1).take(MaxLegacy).toMap))
+    if required then this
+    else
+      val m = legacy.getOrElse(k, Map.empty).updated(seq, sha256.toLowerCase)
+      copy(legacy = legacy.updated(k, if m.size <= MaxLegacy then m else m.toSeq.sortBy(-_._1).take(MaxLegacy).toMap))
 
-  /** An accepted ASHM status names `ref`: C exists. */
-  def named(ref: CutRef): BlobAuthState = copy(required = true, cut = cut.orElse(Some(ref)),
+  /** An accepted ASHM status names `ref`: C exists. ASH1 accepted before is
+    * no longer accepted as such (`legacy` is dropped).
+    */
+  def named(ref: CutRef): BlobAuthState = copy(required = true, cut = cut.orElse(Some(ref)), legacy = Map.empty,
     found = if cut.exists(_ != ref) && record.isEmpty && !found.contains(ref) then (found :+ ref).takeRight(MaxFound) else found)
 
   /** C at `ref` was made here, or fetched and verified. The first record stays. */
   def adopted(ref: CutRef, rec: CutoverRecord): BlobAuthState =
-    if record.isDefined then copy(required = true, found = found.filterNot(_ == ref))
-    else copy(required = true, cut = Some(ref), record = Some(rec), found = found.filterNot(_ == ref))
+    if record.isDefined then copy(required = true, legacy = Map.empty, found = found.filterNot(_ == ref), lost = false)
+    else copy(required = true, cut = Some(ref), record = Some(rec), legacy = Map.empty, found = found.filterNot(_ == ref),
+      lost = false)
 
   /** `authcut` rows of a listing page: kept to be tried while C is not fetched. */
   def listed(rows: Seq[BatchMeta]): BlobAuthState =
@@ -195,7 +206,7 @@ final case class BlobAuthState(
 
   /** Whether an ASH1 blob with SHA-256 `sha256` at `seq` of pair `k` may be
     * accepted, in this order:
-    *  1. accepted before (as this very blob): yes;
+    *  1. not required, and accepted before (as this very blob): yes;
     *  2. above the smallest seq at which ASHM of the pair was accepted: no
     *     (also before the required state);
     *  3. not required: yes;
@@ -204,13 +215,18 @@ final case class BlobAuthState(
     *  5. otherwise the digest of the listed rows of the pair below `below`
     *     (`listed`, rows of any pair) must equal C's, and the blob must be
     *     the listed one at `seq`. Without `listed`: [[Verdict.NeedListing]].
+    *
+    * In the required state, a blob accepted before it is judged like any
+    * other (4, 5): nothing accepted only because C was not known yet stays
+    * accepted once it is.
     */
   def ash1Verdict(k: StreamKey, seq: Long, sha256: String, listed: Option[Seq[BatchMeta]] = None): Verdict =
-    if legacy.get(k).flatMap(_.get(seq)).exists(_.equalsIgnoreCase(sha256)) then Verdict.Accept
+    if !required && legacy.get(k).flatMap(_.get(seq)).exists(_.equalsIgnoreCase(sha256)) then Verdict.Accept
     else if minAshm.get(k).exists(seq > _) then Verdict.Reject(s"seq $seq is above ASHM accepted at seq ${minAshm(k)}")
     else if !required then Verdict.Accept
     else record match
-      case None => Verdict.Reject("the cut-over record is not fetched yet")
+      case None => Verdict.Reject(if lost then "the cut-over state was lost; C is not known again yet"
+                                  else "the cut-over record is not fetched yet")
       case Some(r) => r.entry(k) match
         case None => Verdict.Reject("the stream is not in the cut-over record")
         case Some(e) if seq >= e.below => Verdict.Reject(s"seq $seq is at or above the cut-over (${e.below})")
@@ -229,6 +245,9 @@ object BlobAuthState:
   val MaxFound = 8
   val MaxRefused = 64
 
+  /** The state when the stored one cannot be read: required, nothing known. */
+  val Lost: BlobAuthState = BlobAuthState(required = true, lost = true)
+
   private def key(k: StreamKey, field: (String, ujson.Value)) = ujson.Obj("deviceId" -> k.deviceId, "stream" -> k.stream, field)
   private def keyOf(v: ujson.Value) = StreamKey(v("deviceId").str, v("stream").str)
 
@@ -241,7 +260,8 @@ object BlobAuthState:
     "legacy" -> ujson.Arr.from(s.legacy.toSeq.sortBy((k, _) => (k.deviceId, k.stream)).map((k, m) =>
       key(k, "slots" -> ujson.Arr.from(m.toSeq.sorted.map((q, h) => ujson.Arr(ujson.Num(q.toDouble), h)))))),
     "found" -> ujson.Arr.from(s.found.map(_.toJson)),
-    "refused" -> ujson.Arr.from(s.refused.map(_.toJson))
+    "refused" -> ujson.Arr.from(s.refused.map(_.toJson)),
+    "lost" -> s.lost
   )
 
   def fromJson(v: ujson.Value): BlobAuthState = BlobAuthState(
@@ -251,60 +271,84 @@ object BlobAuthState:
     v("minAshm").arr.map(o => keyOf(o) -> o("seq").num.toLong).toMap,
     v("legacy").arr.map(o => keyOf(o) -> o("slots").arr.map(a => a(0).num.toLong -> a(1).str).toMap).toMap,
     v("found").arr.flatMap(CutRef.fromJson).toVector,
-    v("refused").arr.flatMap(CutRef.fromJson).toVector
+    v("refused").arr.flatMap(CutRef.fromJson).toVector,
+    v.obj.get("lost").exists(_.bool)
   )
 
 /** [[BlobAuthState]] of the current registration, kept in its own
   * [[DurableMap]] (nothing else writes it).
   *
   * [[update]] returns once the new state is on disk and throws otherwise;
-  * callers act on a state (e.g. count a blob as read) only after it
-  * returned. When a write fails and its outcome is unknown, the file holds
-  * the old or the new state; the new one is what [[state]] returns until a
-  * write succeeds, since every transition only makes the state stricter or
-  * adds knowledge (reading the old one could forget the required state). At a
-  * restart the file is read as it is.
+  * callers act on a state (e.g. count a blob as read, or hand out a key)
+  * only after it returned.
   *
-  * Residual risk: a file that does not parse at start reads as empty, i.e.
-  * not required, like any [[DurableMap]].
+  * When a write fails, the file may hold the old or the new state. The new
+  * one is what [[state]] returns from then on (every transition only makes
+  * the state stricter or adds knowledge, so reading the old one could forget
+  * the required state), but it is not persisted ([[persisted]] is false):
+  * the next [[update]] writes it even if it changes nothing, and returns
+  * only once that write succeeded. A restart reads the file as it is.
+  *
+  * A file that cannot be read or does not parse at start, or a stored state
+  * that does not parse, is not a first run (a missing file or key is): the
+  * state is [[BlobAuthState.Lost]] (required, so no ASH1 is accepted) until
+  * a C is adopted again. The first [[update]] tries to read the file again.
   */
 final class BlobAuthStore(map: DurableMap):
   private val Key = "state"
   private val lock = Object()
-  @volatile private var cache: Option[(String, BlobAuthState)] = None
+  /** The newest state of a registration while it may not be on disk. */
+  @volatile private var pending: Option[(String, BlobAuthState)] = None
 
-  def state(reg: String): BlobAuthState =
-    cache.filter(_._1 == reg).map(_._2).getOrElse(disk(reg))
+  def state(reg: String): BlobAuthState = current(reg)._1
 
-  private def disk(reg: String): BlobAuthState =
-    map.getString(Key).flatMap(s => Try {
-      val v = ujson.read(s)
-      Option.when(v("reg").str == reg)(BlobAuthState.fromJson(v("state")))
-    }.toOption.flatten).getOrElse(BlobAuthState())
+  /** Whether [[state]] of `reg` is the one on disk (a restart reads the same). */
+  def persisted(reg: String): Boolean = current(reg)._2
+
+  private def current(reg: String): (BlobAuthState, Boolean) =
+    pending.filter(_._1 == reg).fold(disk(reg))(p => (p._2, false))
+
+  /** The stored state of `reg` and whether it is the one on disk. */
+  private def disk(reg: String): (BlobAuthState, Boolean) =
+    val v = map.view
+    if v.unreadable || v.isUnknown(Key) then (BlobAuthState.Lost, false)
+    else v.getString(Key) match
+      case None => (BlobAuthState(), true) // a first run, or cleared
+      case Some(s) =>
+        Try {
+          val js = ujson.read(s)
+          if js("reg").str != reg then BlobAuthState() // another registration's (cleared at unpairing)
+          else BlobAuthState.fromJson(js("state"))
+        }.fold(_ => (BlobAuthState.Lost, false), st => (st, true))
 
   /** Applies `f` and returns the new state once it is on disk; throws
-    * [[IOException]] otherwise. `required` never goes back to false.
+    * [[IOException]] otherwise. `required` never goes back to false, and
+    * `lost` only by adopting a C. Writes also when `f` changes nothing while
+    * the state is not persisted.
     */
   def update(reg: String)(f: BlobAuthState => BlobAuthState): BlobAuthState = lock.synchronized {
     require(reg.nonEmpty, "no registration")
-    val before = state(reg)
+    if map.view.unreadable then map.reload()
+    val (before, onDisk) = current(reg)
     val after = f(before)
-    val next = if before.required && !after.required then after.copy(required = true) else after
-    if next == before then before
+    val next = after.copy(
+      required = after.required || before.required,
+      lost = after.lost || (before.lost && after.record.isEmpty))
+    if next == before && onDisk then before
     else
       try
         map.commit(Key -> ujson.write(ujson.Obj("reg" -> reg, "state" -> BlobAuthState.toJson(next))))
-        cache = Some(reg -> next)
+        pending = None
         next
       catch
         case e: IOException =>
-          cache = if map.view.isUnknown(Key) then Some(reg -> next) else None
+          pending = Some(reg -> next)
           throw e
   }
 
   /** Forgets the state (unpairing). Throws [[IOException]] if that is not on disk. */
   def clear(): Unit = lock.synchronized {
-    cache = None
+    pending = None
     map.clear()
   }
 
@@ -312,10 +356,16 @@ final class BlobAuthStore(map: DurableMap):
 trait CutoverSource:
   def keys: BlobKeys
   def state: BlobAuthState
-  /** Applies `f` to the state and returns once it is on disk; throws [[IOException]] otherwise. */
+  /** Applies `f` to the state and returns once it is on disk, also when `f`
+    * changes nothing ([[BlobAuthStore.update]]); throws [[IOException]] otherwise.
+    */
   def update(f: BlobAuthState => BlobAuthState): BlobAuthState
   /** The blob in the slot of `ref` as the server serves it (at most [[CutoverRecord.MaxBlob]]). */
   def fetch(ref: CutRef): Array[Byte]
+  /** Whether `e` thrown by [[fetch]] ends the run (e.g. a stop) rather than
+    * showing that the C is not valid. Like a network error, it is thrown on.
+    */
+  def aborts(e: Throwable): Boolean = false
 
 /** A device of the user as `GET /v1/devices` lists it. */
 final case class DeviceRow(id: String, revoked: Boolean, viewer: Boolean)
@@ -356,7 +406,7 @@ object Cutover:
     */
   def tryAdopt(src: CutoverSource, ref: CutRef): Option[CutoverRecord] =
     val got = Try(verify(src.keys, ref, src.fetch(ref)))
-    got.failed.toOption.filter(network).foreach(e => throw e)
+    got.failed.toOption.filter(e => network(e) || src.aborts(e)).foreach(e => throw e)
     got.toOption match
       case Some(rec) =>
         src.update(_.adopted(ref, rec).ashmAccepted(StreamKey(ref.deviceId, CutoverRecord.Stream), ref.seq))
@@ -383,8 +433,9 @@ object Cutover:
     * 5. Else C is made from the whole listing, stored for upload, recorded
     *    as this device's C (required), and sent.
     *
-    * Returns only once C is on the server and the required state on disk;
-    * throws otherwise (network, storage), and may then be run again.
+    * Returns only once C is on the server and the required state on disk
+    * (also in 2., where a state whose write failed is written again); throws
+    * otherwise (network, storage), and may then be run again.
     */
   def ensure(env: CutoverEnv): CutRef =
     var sent = env.flush()
@@ -392,6 +443,8 @@ object Cutover:
     st.cut.filter(_ => st.record.isDefined && st.required) match
       case Some(ref) =>
         if ref.deviceId == env.selfId && !sent then throw IOException("the cut-over record is not sent yet")
+        // The state read may be one whose write failed: write it until it is on disk.
+        env.update(identity)
         ref
       case None =>
         val rows = env.listAll()
@@ -437,3 +490,88 @@ object BlobAuth:
           case Verdict.Reject(why)    => throw BlobRejected(why)
           case Verdict.NeedListing(e) => NeedListing(e)
       case None => throw IllegalArgumentException("not a ashidori blob")
+
+/** What [[Intake.run]] needs on top of [[CutoverSource]]. */
+trait IntakeEnv extends CutoverSource:
+  /** The listed rows of pair `k`, for the digest of C; None when they cannot
+    * be read now (next run). Throws [[BlobRejected]] when the listing is too
+    * long to check.
+    */
+  def listedRows(k: StreamKey): Option[Seq[BatchMeta]]
+
+/** The blobs one sync run received, opened in the order the cut-over needs
+  * (docs/design/browser-pairing-v1.md, "blob の認証（v1.1）"):
+  *
+  *  1. every ASHM blob, with its acceptance and the C its content names
+  *     (`names`, e.g. a status's `authcut`) stored;
+  *  2. the C still to fetch (named, or listed earlier in the run) is learned;
+  *  3. only then the ASH1 blobs, against the state that results. If 1. or 2.
+  *     could not be stored or fetched completely, or the state is not on disk,
+  *     ASH1 waits for the next run ([[Intake.Deferred]]).
+  *
+  * So in one run, the arrival order of C, the status naming it and an ASH1
+  * blob does not matter.
+  */
+object Intake:
+  final case class Item[A](id: A, key: StreamKey, seq: Long, blob: Array[Byte])
+
+  sealed trait Result
+  /** Opened, and its acceptance is on disk. `provisional`: ASH1 accepted
+    * before the required state (not authenticated; see [[BlobAuthState]]).
+    */
+  final case class Accepted(plain: Array[Byte], format: BlobFormat, provisional: Boolean) extends Result
+  /** Not usable: not a blob, a failed MAC or GCM, or refused by the cut-over rules. */
+  final case class Refused(error: Exception) extends Result
+  /** Not decided this run (storage, the listing, or the cut-over not settled). */
+  case object Deferred extends Result
+
+  /** Results in the order of `items`. `names` gets the plaintext of an ASHM
+    * blob and returns the C it names; a throw refuses the blob.
+    */
+  def run[A](env: IntakeEnv, items: Seq[Item[A]], names: (A, Array[Byte]) => Option[CutRef]): Vector[(A, Result)] =
+    val out = scala.collection.mutable.Map.empty[Int, Result]
+    var settled = true
+    def store(f: BlobAuthState => BlobAuthState): Boolean =
+      try
+        env.update(f)
+        true
+      catch case _: IOException => false
+    val indexed = items.zipWithIndex
+    for (it, i) <- indexed if !Crypto.format(it.blob).contains(BlobFormat.Ashm) && !Crypto.format(it.blob).contains(BlobFormat.Ash1) do
+      out(i) = Refused(IllegalArgumentException("not a ashidori blob"))
+    // 1. ASHM, and the C it names.
+    for (it, i) <- indexed if Crypto.format(it.blob).contains(BlobFormat.Ashm) do
+      out(i) =
+        try
+          BlobAuth.open(env.state, env.keys, it.key, it.seq, it.blob) match
+            case o: BlobAuth.Opened =>
+              val ref = names(it.id, o.plain)
+              if store(s => ref.fold(o.accept(s))(o.accept(s).named)) then Accepted(o.plain, o.format, false)
+              else
+                settled = false
+                Deferred
+            case BlobAuth.NeedListing(_) => Deferred // not for ASHM
+        catch case e: Exception => Refused(e)
+    // 2. The C to fetch, then the state on disk (also one whose write failed before).
+    try
+      Cutover.learn(env)
+      env.update(identity)
+    catch case _: IOException => settled = false
+    // 3. ASH1.
+    for (it, i) <- indexed if Crypto.format(it.blob).contains(BlobFormat.Ash1) do
+      out(i) =
+        if !settled then Deferred
+        else
+          try
+            val st = env.state
+            val opened = BlobAuth.open(st, env.keys, it.key, it.seq, it.blob) match
+              case o: BlobAuth.Opened => Some(o)
+              case BlobAuth.NeedListing(_) =>
+                env.listedRows(it.key).map(rows => BlobAuth.open(st, env.keys, it.key, it.seq, it.blob, Some(rows))).collect {
+                  case o: BlobAuth.Opened => o
+                }
+            opened match
+              case None => Deferred
+              case Some(o) => if store(o.accept) then Accepted(o.plain, o.format, !st.required) else Deferred
+          catch case e: Exception => Refused(e)
+    indexed.map((it, i) => it.id -> out(i)).toVector

@@ -251,8 +251,10 @@ export async function listAllDevices(db: D1Database): Promise<AdminDeviceView[]>
  * (docs/design/browser-pairing-v1.md, 承認端末の失効). The activation of a
  * pairing checks in its own statement that the approving device is not
  * revoked, so whichever commits first, no viewer approved by a revoked
- * device remains. Returns false if the device does not exist in `scope`.
- * Revoking twice is a no-op.
+ * device remains. The trigger of migration 0008 does the same two updates
+ * on any revocation (also by the Worker of 0006); here they are then no-ops.
+ * Returns false if the device does not exist in `scope`. Revoking twice is a
+ * no-op.
  */
 export async function revokeDevice(db: D1Database, id: string, scope: DeviceScope): Promise<boolean> {
   const now = Date.now();

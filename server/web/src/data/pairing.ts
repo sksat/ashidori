@@ -15,6 +15,15 @@
 // - Expiry: 10 minutes from the create response by a monotonic clock. Past
 //   it nothing is sent; one more GET tells whether the attempt became active.
 // - Results of an attempt that ended (or was replaced) are discarded.
+// - Ending (abort, mismatch, expiry, failure) drops the keys, the grant and
+//   the token here first and tells the UI; only then the abort (or the
+//   revocation of a refused grant) is sent, in the background, with a
+//   timeout, and its failure is ignored. Every request has the attempt's
+//   abort signal and a timeout, so a server that does not answer never holds
+//   anything back.
+// - The viewer cap (409 "too many viewers" on confirm) keeps the attempt:
+//   the UI offers a retry, and an approval the app sends again after a
+//   slot was freed activates it as well.
 //
 // Everything is in memory: nothing goes to localStorage, sessionStorage or
 // IndexedDB, so a reload or a closed tab starts over.
@@ -26,6 +35,8 @@ import type { ViewerSession } from "./session";
 
 export const POLL_MS = 2000;
 export const ATTEMPT_MS = 10 * 60 * 1000;
+/** Each request of an attempt, and the abort or revocation sent after it ended. */
+export const REQUEST_TIMEOUT_MS = 15_000;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_RESPONSE = 16 * 1024;
 
@@ -47,6 +58,12 @@ export type PairingEvent =
   | { kind: "words"; words: string[]; scope: string; ttl: number }
   /** The user confirmed; waiting for the app's approval. */
   | { kind: "waiting" }
+  /**
+   * The user's browsers are at the cap (5): the attempt stays open. Another
+   * browser ended, `retry()` confirms again; the app's approval sent again
+   * also activates it.
+   */
+  | { kind: "limit" }
   | { kind: "done"; session: ViewerSession }
   | { kind: "ended"; reason: EndReason };
 
@@ -62,6 +79,48 @@ export interface PairingDeps {
   random(n: number): Uint8Array;
   keyPair(): Promise<{ keys: CryptoKeyPair; pkB: Uint8Array }>;
   importKey(raw: Uint8Array): Promise<CryptoKey>;
+  /** Timeout of each request (default REQUEST_TIMEOUT_MS). */
+  timeoutMs?: number;
+}
+
+/**
+ * A signal that aborts when `parent` does or after `ms`; `done()` releases
+ * the timer and the listener.
+ */
+export function timeoutSignal(parent: AbortSignal | null, ms: number): { signal: AbortSignal; done(): void } {
+  const c = new AbortController();
+  const onAbort = () => c.abort();
+  if (parent?.aborted) c.abort();
+  else parent?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => c.abort(), ms);
+  return {
+    signal: c.signal,
+    done() {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+/**
+ * A POST that nothing waits for: sent after the local state was dropped,
+ * with a timeout, its failure ignored. Resolves when it is over (for tests).
+ */
+export function postInBackground(f: typeof fetch, url: string, token: string, timeoutMs = REQUEST_TIMEOUT_MS): Promise<void> {
+  const t = timeoutSignal(null, timeoutMs);
+  return f(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    credentials: "omit",
+    cache: "no-store",
+    referrerPolicy: "no-referrer",
+    signal: t.signal,
+  })
+    .then(
+      () => {},
+      () => {},
+    )
+    .finally(() => t.done());
 }
 
 export function browserDeps(): PairingDeps {
@@ -110,9 +169,15 @@ export class PairingAttempt {
   private grant: { bytes: Uint8Array; deviceId: string; expiresAt: number | null } | null = null;
   private confirmed = false;
   private confirmSent = false;
+  /** The confirmation met the viewer cap; set again by retry(). */
+  private limited = false;
   private claimedSeen = false;
   private closed = false;
   private wake: (() => void) | null = null;
+  /** Aborts every request of the attempt once it ended. */
+  private readonly requests = new AbortController();
+  /** A viewer whose grant was refused: revoked once the attempt ended. */
+  private revokeAfter: string | null = null;
 
   constructor(
     private readonly deps: PairingDeps,
@@ -137,8 +202,14 @@ export class PairingAttempt {
       await this.showAndReceive();
     } catch (e) {
       const reason = e instanceof End ? e.reason : "failed";
-      if (!this.closed && reason !== "cancelled" && reason !== "expired") await this.abortQuietly();
+      const tellServer = !this.closed && reason !== "cancelled" && reason !== "expired";
+      const [id, token] = [this.id, this.token];
+      // Locally first: the keys, the grant and the token go, and the UI is told.
       this.finish(reason);
+      const revoke = this.revokeAfter;
+      this.revokeAfter = null;
+      if (revoke) this.revokeInBackground(revoke, token);
+      else if (tellServer) this.abortInBackground(id, token);
     }
   }
 
@@ -150,22 +221,33 @@ export class PairingAttempt {
     this.wake?.();
   }
 
-  /** 「一致しない」: aborts the attempt on the server and drops the keys. */
-  async mismatch(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
+  /** After the viewer cap: confirms again (the user ended another browser). */
+  retry(): void {
+    if (this.closed || !this.limited) return;
+    this.limited = false;
+    this.confirmSent = false;
+    this.emit({ kind: "waiting" });
     this.wake?.();
-    await this.abortQuietly();
-    this.finish("mismatch", true);
   }
 
-  /** Closes the attempt without an event (the page replaced it). */
-  async cancel(): Promise<void> {
+  /** 「一致しない」: drops the keys, then aborts the attempt on the server in the background. */
+  async mismatch(): Promise<void> {
     if (this.closed) return;
+    const [id, token] = [this.id, this.token];
     this.closed = true;
     this.wake?.();
-    await this.abortQuietly();
-    this.drop();
+    this.finish("mismatch", true);
+    this.abortInBackground(id, token);
+  }
+
+  /** Closes the attempt without an event (the page replaced it); the abort follows in the background. */
+  async cancel(): Promise<void> {
+    if (this.closed) return;
+    const [id, token] = [this.id, this.token];
+    this.closed = true;
+    this.wake?.();
+    this.finish("cancelled");
+    this.abortInBackground(id, token);
   }
 
   // ---- steps ----
@@ -225,11 +307,16 @@ export class PairingAttempt {
   /** Waits for the user's decision and the app's approval, then opens the grant. */
   private async showAndReceive(): Promise<void> {
     for (;;) {
-      if (this.confirmed && !this.confirmSent && this.deps.now() < this.deadline) {
+      if (this.confirmed && !this.confirmSent && !this.limited && this.deps.now() < this.deadline) {
         const r = await this.send("POST", `/v1/viewer-pairings/${this.id}/confirm`, undefined, true);
         this.check();
         if (r.status === 200) this.confirmSent = true;
-        else if (r.status !== 0) this.refused(r);
+        else if (r.status === 409 && r.body.error === "too many viewers") {
+          // The attempt stays revealed: keep polling (the app may approve
+          // again once a slot is free) and let the user retry.
+          this.limited = true;
+          this.emit({ kind: "limit" });
+        } else if (r.status !== 0) this.refused(r);
       }
       await this.poll();
       if (this.confirmed && this.grant) return this.receive();
@@ -259,8 +346,9 @@ export class PairingAttempt {
       this.emit({ kind: "done", session }, true);
     } catch (e) {
       if (e instanceof End) throw e;
-      // The key is not used: this browser's registration is ended at once.
-      await this.revokeQuietly(g.deviceId);
+      // The key is not used: this browser's registration is ended, once the
+      // attempt dropped everything (run()).
+      this.revokeAfter = g.deviceId;
       throw new End("failed");
     } finally {
       raw?.fill(0);
@@ -301,7 +389,7 @@ export class PairingAttempt {
       const exp = b.viewerExpiresAt;
       if (typeof b.grant === "string" && !bytes) {
         // A grant of the wrong length is refused like any failed check.
-        if (typeof deviceId === "string" && DEVICE_ID_RE.test(deviceId)) await this.revokeQuietly(deviceId);
+        if (typeof deviceId === "string" && DEVICE_ID_RE.test(deviceId)) this.revokeAfter = deviceId;
         throw new End("failed");
       }
       if (bytes && typeof deviceId === "string" && DEVICE_ID_RE.test(deviceId)) {
@@ -354,64 +442,57 @@ export class PairingAttempt {
   }
 
   /**
-   * A request, with the attempt's token if `auth`. A network error gives
-   * status 0. Every request of the attempt is idempotent on the server, so
-   * the callers send it again after one.
+   * A request, with the attempt's token if `auth`. A network error, a
+   * timeout or the attempt's end gives status 0. Every request of the
+   * attempt is idempotent on the server, so the callers send it again after
+   * one.
    */
   private async send(method: string, path: string, body: unknown, auth: boolean): Promise<Reply> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (auth) headers.Authorization = `Bearer ${this.token}`;
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    let res: Response;
+    const t = timeoutSignal(this.requests.signal, this.deps.timeoutMs ?? REQUEST_TIMEOUT_MS);
     try {
-      res = await this.deps.fetch(this.deps.base + path, {
-        method,
-        headers,
-        credentials: "omit",
-        cache: "no-store",
-        referrerPolicy: "no-referrer",
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      });
-    } catch {
-      return { status: 0, body: {} };
-    }
-    let parsed: Record<string, unknown> = {};
-    try {
-      const text = await res.text();
-      if (text.length > MAX_RESPONSE) return { status: res.status >= 400 ? res.status : 502, body: {} };
-      const j = JSON.parse(text) as unknown;
-      if (j && typeof j === "object" && !Array.isArray(j)) parsed = j as Record<string, unknown>;
-    } catch {
-      // Not JSON: the status decides.
-    }
-    return { status: res.status, body: parsed };
-  }
-
-  private async abortQuietly(): Promise<void> {
-    if (!this.id || !this.token) return;
-    try {
-      await this.deps.fetch(`${this.deps.base}/v1/viewer-pairings/${this.id}/abort`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${this.token}` },
-        credentials: "omit",
-        cache: "no-store",
-      });
-    } catch {
-      // The attempt expires anyway.
+      let res: Response;
+      try {
+        res = await this.deps.fetch(this.deps.base + path, {
+          method,
+          headers,
+          credentials: "omit",
+          cache: "no-store",
+          referrerPolicy: "no-referrer",
+          signal: t.signal,
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        });
+      } catch {
+        return { status: 0, body: {} };
+      }
+      let parsed: Record<string, unknown> = {};
+      try {
+        const text = await res.text();
+        if (text.length > MAX_RESPONSE) return { status: res.status >= 400 ? res.status : 502, body: {} };
+        const j = JSON.parse(text) as unknown;
+        if (j && typeof j === "object" && !Array.isArray(j)) parsed = j as Record<string, unknown>;
+      } catch {
+        // Not JSON (or cut off): the status decides, unless the request was aborted.
+        if (t.signal.aborted) return { status: 0, body: {} };
+      }
+      return { status: res.status, body: parsed };
+    } finally {
+      t.done();
     }
   }
 
-  private async revokeQuietly(deviceId: string): Promise<void> {
-    try {
-      await this.deps.fetch(`${this.deps.base}/v1/devices/${encodeURIComponent(deviceId)}/revoke`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${this.token}` },
-        credentials: "omit",
-        cache: "no-store",
-      });
-    } catch {
-      // The viewer expires anyway, and the app can end it.
-    }
+  /** The abort of an ended attempt; the attempt expires anyway if it is lost. */
+  private abortInBackground(id: string, token: string): void {
+    if (!id || !token) return;
+    void postInBackground(this.deps.fetch, `${this.deps.base}/v1/viewer-pairings/${id}/abort`, token, this.deps.timeoutMs);
+  }
+
+  /** The revocation of a viewer whose grant was refused; it expires anyway, and the app can end it. */
+  private revokeInBackground(deviceId: string, token: string): void {
+    if (!token) return;
+    void postInBackground(this.deps.fetch, `${this.deps.base}/v1/devices/${encodeURIComponent(deviceId)}/revoke`, token, this.deps.timeoutMs);
   }
 
   /** Drops the temporary key pair and the values that only this attempt used. */
@@ -424,6 +505,7 @@ export class PairingAttempt {
   private finish(reason: EndReason, force = false): void {
     const wasClosed = this.closed;
     this.closed = true;
+    this.requests.abort();
     this.drop();
     this.token = "";
     if (reason === "cancelled" && wasClosed && !force) return;

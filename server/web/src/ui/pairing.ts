@@ -40,7 +40,7 @@ export function setPairing(p: Pairing): void {
 type View =
   | { k: "intro" }
   | { k: "code"; code: string | null; claimed: boolean }
-  | { k: "words"; words: string[]; scope: string; ttl: number; waiting: boolean }
+  | { k: "words"; words: string[]; scope: string; ttl: number; waiting: boolean; limit: boolean }
   | { k: "done"; session: ViewerSession }
   | { k: "ended"; reason: EndReason };
 
@@ -95,10 +95,14 @@ function onEvent(attempt: PairingControl, e: PairingEvent): void {
       if (view.k === "code") show({ ...view, claimed: true }, false);
       break;
     case "words":
-      show({ k: "words", words: e.words, scope: e.scope, ttl: e.ttl, waiting: false });
+      show({ k: "words", words: e.words, scope: e.scope, ttl: e.ttl, waiting: false, limit: false });
       break;
     case "waiting":
-      if (view.k === "words") show({ ...view, waiting: true }, false);
+      if (view.k === "words") show({ ...view, waiting: true, limit: false }, false);
+      $<HTMLElement>("#pair-wait")?.focus();
+      break;
+    case "limit":
+      if (view.k === "words") show({ ...view, waiting: true, limit: true }, false);
       $<HTMLElement>("#pair-wait")?.focus();
       break;
     case "done":
@@ -210,7 +214,22 @@ function codeStep(v: Extract<View, { k: "code" }>): HTMLElement {
 }
 
 function wordsStep(v: Extract<View, { k: "words" }>): HTMLElement {
-  const acts = v.waiting
+  const acts = v.limit
+    ? [
+        h(
+          "p",
+          { class: "pstate", id: "pair-wait", tabindex: -1, role: "alert" },
+          icon("alert"),
+          "記録を読めるブラウザが上限（5 台）に達しています。アプリでほかのブラウザを終了してから、再試行してください。",
+        ),
+        h(
+          "div",
+          { class: "formact" },
+          h("button", { class: "btn primary", type: "button", onclick: () => control?.retry() }, "再試行"),
+          h("button", { class: "btn danger", type: "button", onclick: () => void control?.mismatch() }, "中止する"),
+        ),
+      ]
+    : v.waiting
     ? [
         h("p", { class: "pstate", id: "pair-wait", tabindex: -1, role: "status" }, icon("info"), "アプリでの承認を待っています。"),
         h("div", { class: "formact" }, h("button", { class: "btn danger", type: "button", onclick: () => void control?.mismatch() }, "中止する")),

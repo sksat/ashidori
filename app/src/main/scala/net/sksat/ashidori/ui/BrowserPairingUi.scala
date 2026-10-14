@@ -48,12 +48,39 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
     val v = vbox(
       caption(s"・閲覧するページは $host が配信します。サーバの管理者がページを書き換えると、記録を読まれる可能性があります。"),
       caption("・ブラウザに渡す鍵は変わらないため、これまでの記録と、これから同じ鍵で送る記録をすべて読めます。期限はサーバが渡すのをやめるだけで、鍵が持ち出されると期限後も読めます。"),
-      caption("・ブラウザは記録を書いた端末を確かめられません。鍵とサーバを悪用されると、ブラウザに偽の記録を見せられる可能性があります（アプリは偽の記録を受け付けません）。"),
+      caption("・ブラウザは記録を書いた端末を確かめられません。鍵とサーバを悪用されると、ブラウザに偽の記録を見せられる可能性があります。承認の後にまだ同期していない端末のアプリも、偽の記録を受け付ける可能性があります。"),
       caption("・復旧コードとアカウントの鍵はブラウザに渡しません。"),
       caption("・ブラウザの登録は、この画面、ブラウザ自身、サーバの管理者がいつでも終了できます。"),
     )
     v.setVisibility(View.GONE)
     v
+
+  /** Fills `list` with the active browsers, each with 「終了」; `ended` runs after one was ended. */
+  private def loadViewers(list: LinearLayout, ended: () => Unit): Unit =
+    async(client.devices()) { r =>
+      list.removeAllViews()
+      r.fold(
+        e => list.addView(caption(s"取得できませんでした: ${e.getMessage}")),
+        js =>
+          val vs = Viewers.active(js, System.currentTimeMillis())
+          if vs.isEmpty then list.addView(caption("記録を読めるブラウザはありません。"))
+          for v <- vs do
+            val until = Instant.ofEpochMilli(v.expiresAt).atZone(AshidoriApp.zone).format(fmt)
+            val label = vbox(text("ブラウザ", 15f), caption(s"$until まで"))
+            label.setLayoutParams(weighted())
+            val row = hbox(label, outlined("終了") {
+              MaterialAlertDialogBuilder(act)
+                .setTitle("このブラウザの閲覧を終了しますか")
+                .setMessage("ブラウザはサーバから記録を取得できなくなります。すでに取得した記録と、持ち出された鍵は消せません。")
+                .setNegativeButton("キャンセル", null)
+                .setPositiveButton("終了する", (_, _) =>
+                  async(client.request("POST", s"/v1/devices/${v.id}/revoke", "{}".getBytes)) { _ => ended() })
+                .show()
+            })
+            row.setMinimumHeight(dp(48))
+            list.addView(row)
+      )
+    }
 
   /** The card: the opt-in, the active browsers, and 「ブラウザでも見る」. */
   def view(): View =
@@ -62,31 +89,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
       more.setVisibility(if more.getVisibility == View.VISIBLE then View.GONE else View.VISIBLE)
     }
     val list = vbox(caption("読み込み中…"))
-    def load(): Unit =
-      async(client.devices()) { r =>
-        list.removeAllViews()
-        r.fold(
-          e => list.addView(caption(s"取得できませんでした: ${e.getMessage}")),
-          js =>
-            val vs = Viewers.active(js, System.currentTimeMillis())
-            if vs.isEmpty then list.addView(caption("記録を読めるブラウザはありません。"))
-            for v <- vs do
-              val until = Instant.ofEpochMilli(v.expiresAt).atZone(AshidoriApp.zone).format(fmt)
-              val label = vbox(text("ブラウザ", 15f), caption(s"$until まで"))
-              label.setLayoutParams(weighted())
-              val row = hbox(label, outlined("終了") {
-                MaterialAlertDialogBuilder(act)
-                  .setTitle("このブラウザの閲覧を終了しますか")
-                  .setMessage("ブラウザはサーバから記録を取得できなくなります。すでに取得した記録と、持ち出された鍵は消せません。")
-                  .setNegativeButton("キャンセル", null)
-                  .setPositiveButton("終了する", (_, _) =>
-                    async(client.request("POST", s"/v1/devices/${v.id}/revoke", "{}".getBytes)) { _ => load(); onChanged() })
-                  .show()
-              })
-              row.setMinimumHeight(dp(48))
-              list.addView(row)
-        )
-      }
+    def load(): Unit = loadViewers(list, () => { load(); onChanged() })
     load()
     card(
       text("ブラウザでも見る", 16f, bold = true),
@@ -243,6 +246,10 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
           body.addView(text("このブラウザは、これまでの記録と、これから送る記録を読めます。期限はサーバが渡すのをやめるだけで、鍵が持ち出されると期限後も読めます。", 13f))
           if tooMany then
             body.addView(text(s"記録を読めるブラウザが上限（${VP.MaxViewers} 台）に達しています。ほかのブラウザを終了してから、もう一度承認してください。", 13f, colorAttr = attr.error))
+            val others = vbox(caption("読み込み中…"))
+            def reload(): Unit = loadViewers(others, () => { reload(); onChanged() })
+            reload()
+            body.addView(others)
           error.foreach(e => body.addView(caption(s"通信できませんでした（${e.getMessage}）。もう一度承認してください。")))
           setButtons(Some("一致しない" -> (() => step(attempt.mismatch()))), Some("承認" -> (() => step(attempt.approve()))))
         case Phase.Approved(words, _, _) =>

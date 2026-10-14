@@ -3,7 +3,7 @@
 
 import "./ui/styles.css";
 import { Api, ApiError, ListingError } from "./data/api";
-import { DEV_PANEL, Sessions, type ViewerSession } from "./data/session";
+import { DEV_PANEL, Sessions, signOut, type ViewerSession } from "./data/session";
 import { ViewerStore } from "./data/store";
 import type { Ctx, Section, State } from "./ui/context";
 import { renderDevices } from "./ui/devices";
@@ -55,18 +55,15 @@ const ctx: Ctx = {
     void start();
   },
   async unregister() {
-    const s = ctx.session;
-    // A paired browser revokes its own device; the dev stub only forgets the key.
-    if (s?.deviceId) {
-      try {
-        await fetch(`/v1/devices/${encodeURIComponent(s.deviceId)}/revoke`, { method: "POST", headers: { Authorization: `Bearer ${s.token}` }, credentials: "omit" });
-      } catch {
-        // The key is erased anyway; an unrevoked token can be revoked from the app.
-      }
-    }
-    await forget();
-    expired = false;
-    render();
+    // The key and the token go first and the page shows it; a paired
+    // browser then revokes its own device in the background (the dev stub
+    // only forgets the key).
+    await signOut(ctx.session, async () => {
+      const cleared = forget();
+      expired = false;
+      render();
+      await cleared;
+    });
   },
   async signIn(s: ViewerSession) {
     await ctx.sessions.save(s);

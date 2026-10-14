@@ -48,13 +48,25 @@ export function viewerAllowed(method: string, path: string, viewerId: string): b
   return false;
 }
 
-type AuthRow = DeviceRow & { user_status: UserStatus | null; expired: number };
+type AuthRow = DeviceRow & { user_status: UserStatus | null; expired: number; approver_valid: number };
+
+/**
+ * SQL (a condition) for whether the viewer `d` was approved by a device that
+ * is still valid: an unrevoked app device of the viewer's user. Revoking the
+ * approving device revokes its viewers (src/devices.ts, and the trigger of
+ * migration 0008 when the Worker of 0006 revokes); this check refuses a
+ * viewer whose cascade was missed all the same.
+ */
+export const viewerApproverValid = (d: string) =>
+  `EXISTS (SELECT 1 FROM devices a WHERE a.id = ${d}.granted_by AND a.kind = 'device'
+     AND a.revoked_at IS NULL AND a.user_id = ${d}.user_id)`;
 
 /**
  * Looks a device up by its token: an app device by SHA-256(token), a viewer
  * by 'v:' || SHA-256(token). Null if none, if both match (never issued: the
  * pairing refuses a token that a device has), if revoked, expired (judged by
- * D1's clock in the same statement) or of a disabled user.
+ * D1's clock in the same statement) or of a disabled user; a viewer also if
+ * its approving device is not an unrevoked app device of the same user.
  */
 export async function authenticateToken(db: D1Database, token: string): Promise<DeviceRow | null> {
   if (!DEVICE_TOKEN_RE.test(token)) return null;
@@ -63,7 +75,8 @@ export async function authenticateToken(db: D1Database, token: string): Promise<
     .prepare(
       `SELECT d.id, d.name, d.token_hash, d.created_at, d.last_seen_at, d.revoked_at, d.user_id,
          d.kind, d.expires_at, d.granted_by, u.status AS user_status,
-         CASE WHEN d.expires_at IS NOT NULL AND d.expires_at <= ${D1_NOW_MS} THEN 1 ELSE 0 END AS expired
+         CASE WHEN d.expires_at IS NOT NULL AND d.expires_at <= ${D1_NOW_MS} THEN 1 ELSE 0 END AS expired,
+         CASE WHEN ${viewerApproverValid("d")} THEN 1 ELSE 0 END AS approver_valid
        FROM devices d LEFT JOIN users u ON u.id = d.user_id
        WHERE d.token_hash IN (?1, '${VIEWER_HASH_PREFIX}' || ?1)`,
     )
@@ -74,11 +87,13 @@ export async function authenticateToken(db: D1Database, token: string): Promise<
   const expected = row.kind === "viewer" ? VIEWER_HASH_PREFIX + hash : hash;
   // The lookup is by hash; the explicit constant-time comparison is defense in depth.
   if (!timingSafeEqualStr(row.token_hash, expected) || row.revoked_at !== null || row.expired !== 0) return null;
-  // A viewer always has an expiry; one without is never valid.
-  if (row.kind === "viewer" && row.expires_at === null) return null;
+  // A viewer always has an expiry, a user and a valid approving device; one without is never valid.
+  if (row.kind === "viewer" && (row.expires_at === null || row.user_id === null || row.approver_valid !== 1)) {
+    return null;
+  }
   // Devices of a disabled user stop working (legacy devices have no user).
   if (row.user_id !== null && row.user_status !== "active") return null;
-  const { user_status: _s, expired: _e, ...device } = row;
+  const { user_status: _s, expired: _e, approver_valid: _a, ...device } = row;
   return device;
 }
 

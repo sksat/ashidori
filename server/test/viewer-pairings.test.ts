@@ -504,6 +504,55 @@ describe("browser pairing: the approving device", () => {
     expect((await authed(v.T, "/v1/devices")).status).toBe(401);
     expect((await poll(v)).status).toBe(401);
   });
+
+  it("revoked by the Worker of migration 0006 (its SQL): the trigger cascades", async () => {
+    const app = await newUser("yann");
+    const second = await newDevice("tablet", app.userId);
+    const v = await viewer(app.token);
+    const other = await viewer(second.token);
+    const pending = await revealed(app.token);
+    await approve(app.token, pending, newGrant());
+    // revokeDevice of that Worker (user scope), verbatim.
+    await env.DB.batch([
+      env.DB.prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1 AND user_id IS ?3").bind(
+        app.deviceId,
+        Date.now(),
+        app.userId,
+      ),
+    ]);
+    const row = await env.DB.prepare("SELECT revoked_at FROM devices WHERE id = ?1").bind(v.deviceId).first<{ revoked_at: number | null }>();
+    expect(row!.revoked_at).not.toBeNull();
+    expect(await state(pending.id)).toBe("aborted");
+    expect((await authed(v.T, "/v1/devices")).status).toBe(401);
+    expect((await poll(v)).status).toBe(401);
+    expect(await (await confirm(pending)).json()).toEqual({ error: "invalid state", state: "aborted" });
+    // Viewers of another device, and attempts already active, are untouched.
+    expect((await authed(other.T, "/v1/devices")).status).toBe(200);
+    expect(await state(v.id)).toBe("active");
+    expect(await viewerCount(app.userId)).toBe(1);
+  });
+
+  it("a viewer whose approving device is not valid gets 401, even if its own row was missed", async () => {
+    const app = await newUser("yoko");
+    const v = await viewer(app.token);
+    await env.DB.prepare("UPDATE devices SET revoked_at = ?2 WHERE id = ?1").bind(app.deviceId, Date.now()).run();
+    // As if the cascade had been missed.
+    await env.DB.prepare("UPDATE devices SET revoked_at = NULL WHERE id = ?1").bind(v.deviceId).run();
+    expect((await authed(v.T, "/v1/devices")).status).toBe(401);
+    expect((await authed(v.T, "/v1/batches")).status).toBe(401);
+    expect((await poll(v)).status).toBe(401);
+
+    // Approver deleted, or of another user: refused too.
+    const app2 = await newUser("yves");
+    const w = await viewer(app2.token);
+    expect((await authed(w.T, "/v1/devices")).status).toBe(200);
+    const stranger = await newUser("zack");
+    await env.DB.prepare("UPDATE devices SET granted_by = ?2 WHERE id = ?1").bind(w.deviceId, stranger.deviceId).run();
+    expect((await authed(w.T, "/v1/devices")).status).toBe(401);
+    expect((await poll(w)).status).toBe(401);
+    await env.DB.prepare("UPDATE devices SET granted_by = 'gone' WHERE id = ?1").bind(w.deviceId).run();
+    expect((await authed(w.T, "/v1/devices")).status).toBe(401);
+  });
 });
 
 describe("browser pairing: at most 5 active viewers per user", () => {
@@ -518,11 +567,41 @@ describe("browser pairing: at most 5 active viewers per user", () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "too many viewers" });
     expect(await state(b.id)).toBe("revealed");
-    expect(await (await confirm(b)).json()).toEqual({ state: "revealed" });
+    // A re-sent confirmation reports the cap as well.
+    const again = await confirm(b);
+    expect(again.status).toBe(409);
+    expect(await again.json()).toEqual({ error: "too many viewers" });
     // Revoke the oldest viewer and approve again.
     expect((await postJson(app.token, `/v1/devices/${vs[0]!.deviceId}/revoke`)).status).toBe(200);
     expect(await (await approve(app.token, b, grant)).json()).toMatchObject({ state: "active" });
     expect(await viewerCount(app.userId)).toBe(5);
+  });
+
+  it("approve first, then confirm at the cap: confirm reports it, and a re-sent confirm or approve activates later", async () => {
+    for (const retryBy of ["browser", "app"] as const) {
+      const app = await newUser(`zed${retryBy}`);
+      const vs = [];
+      for (let i = 0; i < 5; i++) vs.push(await viewer(app.token));
+      const b = await revealed(app.token);
+      const grant = newGrant();
+      expect(await (await approve(app.token, b, grant)).json()).toEqual({ state: "revealed" });
+      const res = await confirm(b);
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "too many viewers" });
+      expect(await state(b.id)).toBe("revealed");
+      // The app's poll sees the confirmation without activation; its re-sent approval reports the cap too.
+      expect(await (await appPoll(app.token, b)).json()).toMatchObject({ state: "revealed", confirmed: true });
+      const ap = await approve(app.token, b, grant);
+      expect(ap.status).toBe(409);
+      expect(await ap.json()).toEqual({ error: "too many viewers" });
+      // A slot frees up: either side's retry activates.
+      expect((await postJson(app.token, `/v1/devices/${vs[0]!.deviceId}/revoke`)).status).toBe(200);
+      const retry = retryBy === "browser" ? await confirm(b) : await approve(app.token, b, grant);
+      expect(await retry.json()).toMatchObject({ state: "active" });
+      expect(await (await poll(b)).json()).toMatchObject({ state: "active", grant });
+      expect(await (await appPoll(app.token, b)).json()).toMatchObject({ state: "active" });
+      expect(await viewerCount(app.userId)).toBe(5);
+    }
   });
 
   it("expired viewers do not count, and viewers do not count towards USER_MAX_DEVICES", async () => {
@@ -547,7 +626,8 @@ describe("browser pairing: at most 5 active viewers per user", () => {
       pending.push(b);
     }
     const results = await Promise.all(pending.map((b) => confirm(b)));
-    expect(results.every((r) => r.status === 200)).toBe(true);
+    // The confirmations that lost the race report the cap.
+    expect(results.map((r) => r.status).sort()).toEqual([200, 200, 409, 409]);
     expect(await viewerCount(app.userId)).toBe(5);
     const states = await Promise.all(pending.map((b) => state(b.id)));
     expect(states.filter((s) => s === "active")).toHaveLength(2);

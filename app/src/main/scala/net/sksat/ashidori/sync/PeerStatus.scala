@@ -35,9 +35,11 @@ object StatusReport:
 final case class Peer(id: String, name: String, revoked: Boolean, lastSeenAt: Long)
 
 /** The latest status received from a device. `area` is resolved here, on
-  * the receiving device; it is never uploaded.
+  * the receiving device; it is never uploaded. `provisional`: accepted as
+  * ASH1 before the required state of the cut-over, so not authenticated;
+  * dropped once the state is required.
   */
-final case class PeerEntry(seq: Long, fetchedAt: Long, status: DeviceStatus, area: String)
+final case class PeerEntry(seq: Long, fetchedAt: Long, status: DeviceStatus, area: String, provisional: Boolean = false)
 
 /** Status of the user's other devices: downloaded by each small-stream job,
   * whether or not its upload succeeded, and kept in private preferences, tagged with the registration
@@ -84,7 +86,9 @@ object PeerStatus:
     if !current then Map.empty
     else Try(ujson.read(prefs.getString("status", "{}")).obj.toMap.map { (id, e) =>
       id -> PeerEntry(e("seq").num.toLong, e("fetchedAt").num.toLong, DeviceStatus.fromJson(e("status")),
-        e.obj.get("area").flatMap(_.strOpt).getOrElse(""))
+        e.obj.get("area").flatMap(_.strOpt).getOrElse(""),
+        // Stored by a version before the cut-over: accepted without authentication.
+        e.obj.get("provisional").flatMap(_.boolOpt).getOrElse(true))
     }).getOrElse(Map.empty)
 
   /** Listing cursor, listed candidates and read seq per device, unreadable batches. */
@@ -99,7 +103,7 @@ object PeerStatus:
   private def entriesJson(es: Map[String, PeerEntry]): String =
     ujson.write(ujson.Obj.from(es.map((id, e) => id -> ujson.Obj(
       "seq" -> ujson.Num(e.seq.toDouble), "fetchedAt" -> ujson.Num(e.fetchedAt.toDouble),
-      "status" -> e.status.toJson, "area" -> e.area))))
+      "status" -> e.status.toJson, "area" -> e.area, "provisional" -> e.provisional))))
 
   /** Other devices that are not revoked, in the server's order. */
   def others: Vector[Peer] = devices.filter(p => !p.revoked && p.id != SyncConfig.deviceId)
@@ -164,6 +168,10 @@ object PeerStatus:
     * The three steps do not depend on each other: a failing main walk (e.g.
     * a cursor the server refuses) neither stops the rescan nor the fetches,
     * and a due rescan keeps [[RescanPages]] of the page budget.
+    *
+    * The fetched blobs are opened in the order of the cut-over
+    * ([[Intake.run]]): ASHM statuses and the C they name or that was listed
+    * first, on disk, and ASH1 only after that.
     */
   def pull(run: SyncRun): Unit =
     val reg = run.reg
@@ -225,7 +233,7 @@ object PeerStatus:
     // once per run). None: the listing failed (next run); Some(None): it is
     // longer than the budget, so the digest cannot be checked (refused).
     var listedFor = Map.empty[StreamKey, Option[Option[Vector[BatchMeta]]]]
-    def listedRows(k: StreamKey): Option[Option[Vector[BatchMeta]]] =
+    def digestRows(k: StreamKey): Option[Option[Vector[BatchMeta]]] =
       listedFor.getOrElse(k, {
         val rows =
           try Some(AuthCutover.listAll(run, AuthCutover.MaxDigestPages, b => b.deviceId == k.deviceId && b.stream == k.stream))
@@ -237,33 +245,20 @@ object PeerStatus:
         listedFor += k -> rows
         rows
       })
-    /** Opens a status blob as an app (ASHM with its MAC, ASH1 under the
-      * cut-over rules) and stores its acceptance. None: not decided this run
-      * (the listing for the digest, or storing the state, failed).
-      */
-    def openStatus(dev: String, seq: Long, b: Array[Byte]): Option[BlobAuth.Opened] =
-      val k = StreamKey(dev, DeviceStatus.Stream)
-      val opened = BlobAuth.open(AuthCutover.state(reg), run.keys, k, seq, b) match
-        case o: BlobAuth.Opened => Some(o)
-        case BlobAuth.NeedListing(_) =>
-          listedRows(k).map(_.getOrElse(throw BlobRejected("the listing is too long to check the cut-over digest")))
-            .map(rows => BlobAuth.open(AuthCutover.state(reg), run.keys, k, seq, b, Some(rows))).collect {
-              case o: BlobAuth.Opened => o
-            }
-      opened.filter { o =>
-        try
-          AuthCutover.update(reg)(o.accept)
-          true
-        catch
-          case e: java.io.IOException =>
-            Log.w(s"status $dev/$seq: storing its acceptance failed", e)
-            false
-      }
-    def fetch(dev: String, cand: StatusCandidate): Unit =
+    def decode(plain: Array[Byte]): DeviceStatus =
+      DeviceStatus.decode(Crypto.gunzip(plain, DeviceStatus.MaxPlain)).getOrElse(throw IllegalArgumentException("empty status batch"))
+
+    // The normal targets, then exhausted ones that are due, from their own
+    // budget. Both are fetched before any is opened; a retry that a target
+    // of the same device supersedes is then passed over.
+    val targets = st.targets
+    val due = st.retries(now)
+    // Every blob is fetched first. Left: received but unusable; None: not
+    // received (network), next run. A blob that is not the listed one (size
+    // or SHA-256) is not opened.
+    val received = (targets.toVector ++ due.toVector).flatMap { (dev, cand) =>
       run.checkStopped()
       val seq = cand.seq
-      // Left: received but unusable; None: not received (network), next run.
-      // A blob that is not the listed one (size or SHA-256) is not opened.
       val blob: Either[Exception, Option[Array[Byte]]] =
         try
           val b = run.client.getBatch(dev, DeviceStatus.Stream, seq, DeviceStatus.MaxBlob)
@@ -274,44 +269,47 @@ object PeerStatus:
           case e: Exception =>
             Log.w(s"status $dev/$seq not fetched", e)
             Right(None)
-      val at = System.currentTimeMillis()
       blob match
-        case Right(None) => ()
+        case Right(None) => None
         case Left(e) =>
           Log.w(s"status $dev/$seq unreadable", e)
+          st = st.failed(dev, cand, e.getMessage, System.currentTimeMillis())
+          None
+        case Right(Some(b)) => Some(Intake.Item((dev, cand), StreamKey(dev, DeviceStatus.Stream), seq, b))
+    }
+    save(st)
+    // Then they are opened in the order of the cut-over (Intake.run): ASHM
+    // statuses and the C they name (or that was listed) first, on disk, and
+    // only then ASH1. An ASHM status that names C puts this device in the
+    // required state before it counts as read.
+    val env = new AuthCutover.Source(run) with IntakeEnv:
+      def listedRows(k: StreamKey): Option[Seq[BatchMeta]] =
+        digestRows(k).map(_.getOrElse(throw BlobRejected("the listing is too long to check the cut-over digest")))
+    val results = Intake.run(env, received, (_, plain) => decode(plain).authCut)
+    for ((dev, cand), result) <- results if cand.seq > st.authenticated.getOrElse(dev, -1L) do
+      val seq = cand.seq
+      val at = System.currentTimeMillis()
+      result match
+        case Intake.Deferred => Log.w(s"status $dev/$seq: left for the next run (the cut-over state is not settled)")
+        case Intake.Refused(e) =>
+          Log.w(s"status $dev/$seq unreadable", e)
           st = st.failed(dev, cand, e.getMessage, at)
-        case Right(Some(b)) =>
+        case Intake.Accepted(plain, _, provisional) =>
           try
-            openStatus(dev, seq, b).foreach { o =>
-              val plain = Crypto.gunzip(o.plain, DeviceStatus.MaxPlain)
-              val s = DeviceStatus.decode(plain).getOrElse(throw IllegalArgumentException("empty status batch"))
-              // An authenticated status that names C: C exists, so this
-              // device enters the required state, on disk before the status
-              // counts as read.
-              val stored = s.authCut.filter(_ => o.format == BlobFormat.Ashm).forall { ref =>
-                try
-                  AuthCutover.update(reg)(_.named(ref))
-                  true
-                catch
-                  case e: java.io.IOException =>
-                    Log.w(s"status $dev/$seq: storing the named cut-over failed", e)
-                    false
-              }
-              if stored then
-                known += dev -> PeerEntry(seq, at, s, areaFor(s.lastFix, known.get(dev)))
-                st = st.succeeded(dev, seq)
-            }
+            val s = decode(plain)
+            if known.get(dev).forall(_.seq < seq) then
+              known += dev -> PeerEntry(seq, at, s, areaFor(s.lastFix, known.get(dev)), provisional)
+            st = st.succeeded(dev, seq)
           catch
             case e: SyncRun.Stopped => throw e
             case e: Exception =>
               Log.w(s"status $dev/$seq unreadable", e)
               st = st.failed(dev, cand, e.getMessage, at)
-      save(st, Some(known))
-    // The normal targets, then exhausted ones that are due, from their own budget.
-    for (dev, cand) <- st.targets do fetch(dev, cand)
-    for (dev, cand) <- st.retries(now) do fetch(dev, cand)
-    // The cut-over record named by a status or listed, if not fetched yet.
-    AuthCutover.learn(run)
+    // A status accepted as ASH1 before the required state is not
+    // authenticated: once the state is required it is no longer shown, and
+    // the device's next status (ASHM) replaces it.
+    if AuthCutover.state(reg).required then known = known.filterNot(_._2.provisional)
+    save(st, Some(known))
     changed()
 
   /** Area name of the position, reusing the previous one when it barely moved. */

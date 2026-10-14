@@ -46,6 +46,13 @@ class Fake {
   /** Returns active with the grant as soon as one exists, without the browser's confirm. */
   activeBeforeConfirm = false;
   gets = 0;
+  /** Requests whose path this matches never get an answer (only their signal ends them). */
+  hang: (method: string, path: string) => boolean = () => false;
+  /** Signals of the hanging requests, and whether each was aborted. */
+  hung: { path: string; signal: AbortSignal | null }[] = [];
+  /** Active viewers of the user (the cap is 5). */
+  viewers = 0;
+  activateOnGet = true;
 
   deps(extra: Partial<PairingDeps> = {}): PairingDeps {
     return {
@@ -85,7 +92,10 @@ class Fake {
     this.activate();
   }
   activate() {
-    if (this.state === "revealed" && this.grant && (this.confirmed || this.activeBeforeConfirm)) this.state = "active";
+    if (this.state === "revealed" && this.grant && (this.confirmed || this.activeBeforeConfirm) && this.viewers < 5) {
+      this.state = "active";
+      this.viewers++;
+    }
   }
 
   // ---- HTTP ----
@@ -97,6 +107,11 @@ class Fake {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null;
     const auth = headers.get("Authorization")?.replace(/^Bearer /, "") ?? null;
     this.reqs.push({ method, path, body, auth, at: this.clock });
+    if (this.hang(method, path)) {
+      const signal = init?.signal ?? null;
+      this.hung.push({ path, signal });
+      return new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+    }
     const json = (status: number, b: unknown) => new Response(JSON.stringify(b), { status, headers: { "Content-Type": "application/json" } });
     if (path === "/v1/viewer-pairings" && method === "POST") {
       const status = this.createAnswers.shift() ?? 201;
@@ -110,7 +125,8 @@ class Fake {
     const base = `/v1/viewer-pairings/${this.id}`;
     if (path === base && method === "GET") {
       await this.onGet(this, ++this.gets);
-      this.activate();
+      // Stands for the app's approval (sent again after the cap) between polls.
+      if (this.activateOnGet) this.activate();
       const out: Record<string, unknown> = { state: this.state, expiresAt: 1_760_000_600_000 };
       if (this.nA && this.state !== "aborted") Object.assign(out, { nA: toBase64Url(this.nA), scope: this.scope, ttl: this.ttl });
       if (this.state === "active") Object.assign(out, { grant: toBase64Url(this.grant!), deviceId: this.deviceId, viewerExpiresAt: 1_760_003_600_000 });
@@ -128,6 +144,7 @@ class Fake {
       if (this.state !== "revealed" && this.state !== "active") return json(409, { error: "invalid state", state: this.state });
       this.confirmed = true;
       this.activate();
+      if (this.state === "revealed" && this.grant) return json(409, { error: "too many viewers" });
       return json(200, { state: this.state });
     }
     if (path === `${base}/abort`) {
@@ -312,6 +329,8 @@ describe("pairing v1, browser side", () => {
       if (e.kind === "words") void a.mismatch();
     });
     expect(endOf(events)).toBe("mismatch");
+    // The abort is sent in the background, after the keys were dropped.
+    await new Promise((r) => setTimeout(r, 10));
     expect(f.state).toBe("aborted");
     expect(f.reqs.some((r) => r.path.endsWith("/confirm"))).toBe(false);
     expect(events.filter((e) => e.kind === "ended")).toHaveLength(1);
@@ -395,5 +414,161 @@ describe("pairing v1, browser side", () => {
     f.id = "short";
     const { events } = await runAttempt(f, () => {});
     expect(endOf(events)).toBe("failed");
+  });
+});
+
+type Inside = { keys: unknown; token: string; grant: unknown };
+const inside = (a: PairingAttempt) => {
+  const x = a as unknown as Inside;
+  return { keys: x.keys, token: x.token, grant: x.grant };
+};
+const DROPPED = { keys: null, token: "", grant: null };
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("pairing v1: the keys go first, the server is told in the background", () => {
+  it("「一致しない」 with a server that never answers the abort: dropped at once, the abort times out", async () => {
+    const f = new Fake();
+    f.onGet = honestApp;
+    f.hang = (_m, p) => p.endsWith("/abort");
+    let atEnd: ReturnType<typeof inside> | null = null;
+    let mismatched = false;
+    const { events, attempt } = await runAttempt(
+      f,
+      (e, a) => {
+        if (e.kind === "words") void a.mismatch().then(() => (mismatched = true));
+        if (e.kind === "ended") atEnd = inside(a);
+      },
+      { timeoutMs: 30 },
+    );
+    expect(endOf(events)).toBe("mismatch");
+    expect(atEnd).toEqual(DROPPED);
+    expect(inside(attempt)).toEqual(DROPPED);
+    await tick(0);
+    expect(mismatched).toBe(true);
+    // The abort was sent after that, and is still unanswered; its timeout ends it.
+    expect(f.hung.map((x) => x.path)).toEqual([`/v1/viewer-pairings/${f.id}/abort`]);
+    expect(f.hung[0]!.signal!.aborted).toBe(false);
+    await tick(60);
+    expect(f.hung[0]!.signal!.aborted).toBe(true);
+  });
+
+  it("a refused grant: the keys go and the UI is told before the revocation, which a hanging server cannot hold", async () => {
+    const f = new Fake();
+    f.onGet = async (x, n) => {
+      if (n === 1) x.claim();
+      if (n === 2) await x.nonce();
+      if (x.state === "revealed" && !x.grant) await x.approve((_sA, k) => concat([Uint8Array.of(1), rand(32), k]));
+    };
+    f.hang = (_m, p) => p.endsWith("/revoke");
+    let atEnd: ReturnType<typeof inside> | null = null;
+    const { events } = await runAttempt(
+      f,
+      (e, a) => {
+        if (e.kind === "words") a.confirm();
+        if (e.kind === "ended") {
+          atEnd = inside(a);
+          // Not sent yet when the page learns of the end.
+          expect(f.hung).toHaveLength(0);
+        }
+      },
+      { timeoutMs: 30 },
+    );
+    expect(endOf(events)).toBe("failed");
+    expect(atEnd).toEqual(DROPPED);
+    expect(f.hung.map((x) => x.path)).toEqual(["/v1/devices/viewer-1/revoke"]);
+    await tick(60);
+    expect(f.hung[0]!.signal!.aborted).toBe(true);
+  });
+
+  it("every request has a timeout, and ending the attempt aborts the one in flight", async () => {
+    // A GET that never answers times out and is sent again.
+    const f = new Fake();
+    f.onGet = honestApp;
+    let n = 0;
+    f.hang = (m) => m === "GET" && ++n === 1;
+    const { events } = await runAttempt(f, confirmOnWords, { timeoutMs: 20 });
+    expect(endOf(events)).toBe("done");
+    expect(f.hung[0]!.signal!.aborted).toBe(true);
+
+    // 「中止する」 while a GET hangs (with a long timeout): over at once, the GET aborted.
+    const g = new Fake();
+    g.onGet = honestApp;
+    g.hang = (m) => m === "GET" && g.state === "revealed";
+    const started = Date.now();
+    const r = await runAttempt(
+      g,
+      (e, a) => {
+        if (e.kind === "words") setTimeout(() => void a.mismatch(), 20);
+      },
+      { timeoutMs: 60_000 },
+    );
+    expect(endOf(r.events)).toBe("mismatch");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(g.hung.every((x) => x.path.endsWith("/abort") || x.signal!.aborted)).toBe(true);
+  });
+});
+
+describe("pairing v1: at the viewer cap", () => {
+  /** The app approves first; the user presses 「一致する」 on the poll after the approval. */
+  function approveFirst(f: Fake, more: (x: Fake, n: number) => void = () => {}) {
+    let attempt: PairingAttempt | null = null;
+    f.onGet = async (x, n) => {
+      const approved = !!x.grant;
+      await honestApp(x, n);
+      if (approved && !x.confirmed) attempt?.confirm();
+      more(x, n);
+    };
+    return (a: PairingAttempt) => (attempt = a);
+  }
+
+  it("approve → confirm: the browser keeps the attempt and its 「再試行」 activates once a slot is free", async () => {
+    const f = new Fake();
+    f.viewers = 5;
+    // Only the browser's retry activates here.
+    f.activateOnGet = false;
+    const bind = approveFirst(f);
+    const { events } = await runAttempt(f, (e, a) => {
+      bind(a);
+      if (e.kind === "limit") {
+        // The user ends another browser, then retries.
+        f.viewers = 4;
+        setTimeout(() => a.retry(), 0);
+      }
+    });
+    expect(events.map((e) => e.kind)).toEqual(["code", "claimed", "words", "waiting", "limit", "waiting", "done"]);
+    expect(f.reqs.filter((r) => r.path.endsWith("/confirm"))).toHaveLength(2);
+    expect(f.reqs.some((r) => r.path.endsWith("/abort"))).toBe(false);
+  });
+
+  it("approve → confirm: the app's approval sent again after a slot was freed activates without a retry here", async () => {
+    const f = new Fake();
+    f.viewers = 5;
+    let limitAt = -1;
+    // A few polls after the cap, a slot is freed and the app approves again (the server activates).
+    const bind = approveFirst(f, (x, n) => {
+      if (limitAt > 0 && n === limitAt + 3) x.viewers = 4;
+    });
+    const { events } = await runAttempt(f, (e, a) => {
+      bind(a);
+      if (e.kind === "limit") limitAt = f.gets;
+    });
+    expect(endOf(events)).toBe("done");
+    expect(events.some((e) => e.kind === "limit")).toBe(true);
+    expect(f.reqs.filter((r) => r.path.endsWith("/confirm"))).toHaveLength(1);
+  });
+
+  it("confirm → approve at the cap: the browser keeps waiting, and the activation still arrives", async () => {
+    const f = new Fake();
+    f.viewers = 5;
+    f.onGet = async (x, n) => {
+      if (n === 1) x.claim();
+      if (n === 2) await x.nonce();
+      // The app approves only after the browser confirmed, and is refused at first (409 on its side).
+      if (x.state === "revealed" && x.confirmed && !x.grant) await x.approve();
+      if (x.grant && n === 12) x.viewers = 4;
+    };
+    const { events } = await runAttempt(f, confirmOnWords);
+    expect(endOf(events)).toBe("done");
+    expect(events.some((e) => e.kind === "limit")).toBe(false);
   });
 });

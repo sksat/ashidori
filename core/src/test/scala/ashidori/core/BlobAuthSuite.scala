@@ -154,8 +154,9 @@ class BlobAuthSuite extends munit.FunSuite:
     assertEquals(accept(st, places, 1, p1), Left("need listing"))
     val Right((text, after)) = accept(st, places, 1, p1, Some(s.rows.toSeq)): @unchecked
     assertEquals(text, "p1")
-    // Once accepted, it no longer needs the listing.
-    assert(accept(after, places, 1, p1).isRight)
+    // In the required state every ASH1 is judged against C, also one accepted before.
+    assertEquals(after, st)
+    assertEquals(accept(after, places, 1, p1), Left("need listing"))
     assert(accept(st, places, 0, p0, Some(s.rows.toSeq)).isRight)
   }
 
@@ -187,13 +188,15 @@ class BlobAuthSuite extends munit.FunSuite:
     assert(accept(st, places, 1, p1, Some(s.rows.toSeq)).left.exists(_.contains("above ASHM")))
   }
 
-  test("C named but not fetched: every ASH1 not accepted before is refused") {
+  test("C named but not fetched: every ASH1 is refused, also one accepted before") {
     val p0 = ash1(devA, "places", 0, "p0")
     val Right((_, before)) = accept(BlobAuthState(), places, 0, p0): @unchecked
+    assert(accept(before, places, 0, p0).isRight)
     val named = before.named(CutRef(devB, 0, "0" * 64))
     assert(named.required)
-    assertEquals(named.record, None)
-    assert(accept(named, places, 0, p0).isRight) // accepted before the required state
+    assertEquals((named.record, named.legacy), (None, Map.empty))
+    // Accepted only because C was not known yet: not grandfathered.
+    assert(accept(named, places, 0, p0).left.exists(_.contains("not fetched")))
     assert(accept(named, places, 1, ash1(devA, "places", 1)).left.exists(_.contains("not fetched")))
     // ASHM is unaffected.
     assert(accept(named, places, 2, ashm(devA, "places", 2)).isRight)
@@ -229,7 +232,8 @@ class BlobAuthSuite extends munit.FunSuite:
     val st = restarted.state("reg1")
     assertEquals(st, store.state("reg1"))
     assert(st.required)
-    assertEquals((st.minAshm(places), st.legacy(places), st.record), (5L, Map(1L -> "a" * 64), Some(rec)))
+    // ASH1 accepted before the required state is not kept as accepted.
+    assertEquals((st.minAshm(places), st.legacy.get(places), st.record), (5L, None, Some(rec)))
     // Another registration starts empty.
     assertEquals(restarted.state("reg2"), BlobAuthState())
     // A transition cannot clear `required`.
@@ -243,32 +247,121 @@ class BlobAuthSuite extends munit.FunSuite:
     val f = MemFile()
     val store = BlobAuthStore(DurableMap(f))
     store.update("r")(_.ashmAccepted(places, 3))
-    // The write fails and the file stays as it was: the old state is read and the caller is told.
+    assert(store.persisted("r"))
+    // The write fails and the file stays as it was: the caller is told, and
+    // the stricter (new) state is read, but it is not persisted.
     f.onReplace = _ => throw java.io.IOException("disk full")
     intercept[java.io.IOException](store.update("r")(_.named(CutRef(devB, 0, "c" * 64))))
-    assert(!store.state("r").required)
+    assert(store.state("r").required)
+    assert(!store.persisted("r"))
     assert(!BlobAuthStore(DurableMap(f)).state("r").required)
+    f.onReplace = _ => ()
+    store.update("r")(identity)
+    assert(store.persisted("r"))
+    assert(BlobAuthStore(DurableMap(f)).state("r").required)
     // The write fails and the file cannot be read back: either may be on disk,
     // so the stricter (new) state is read until a write succeeds.
-    f.onReplace = b =>
-      f.content = Some(b) // the new content did reach the disk
-      f.unreadable = true
+    val g = MemFile()
+    val other = BlobAuthStore(DurableMap(g))
+    other.update("r")(_.ashmAccepted(places, 3))
+    g.onReplace = b =>
+      g.content = Some(b) // the new content did reach the disk
+      g.unreadable = true
       throw java.io.IOException("lost answer")
-    intercept[java.io.IOException](store.update("r")(_.named(CutRef(devB, 0, "c" * 64))))
-    assert(store.state("r").required)
+    intercept[java.io.IOException](other.update("r")(_.named(CutRef(devB, 0, "c" * 64))))
+    assert(other.state("r").required)
+    assert(!other.persisted("r"))
     // A restart reads the file as it is.
-    f.unreadable = false
-    f.onReplace = _ => ()
-    assert(BlobAuthStore(DurableMap(f)).state("r").required)
+    g.unreadable = false
+    g.onReplace = _ => ()
+    assert(BlobAuthStore(DurableMap(g)).state("r").required)
     // The next write goes ahead and keeps the required state.
-    assert(store.update("r")(_.ashmAccepted(places, 1)).required)
-    assertEquals(BlobAuthStore(DurableMap(f)).state("r").minAshm(places), 1L)
+    assert(other.update("r")(_.ashmAccepted(places, 1)).required)
+    assertEquals(BlobAuthStore(DurableMap(g)).state("r").minAshm(places), 1L)
+  }
+
+  test("a failed save, then the same update again, then a restart: the retry writes it") {
+    val f = MemFile()
+    val store = BlobAuthStore(DurableMap(f))
+    store.update("r")(_.ashmAccepted(places, 3))
+    val ref = CutRef(devB, 0, "c" * 64)
+    f.onReplace = _ => throw java.io.IOException("disk full")
+    intercept[java.io.IOException](store.update("r")(_.named(ref)))
+    // The same update while the state is not persisted is not skipped: it is written, or throws.
+    intercept[java.io.IOException](store.update("r")(_.named(ref)))
+    assert(!store.persisted("r"))
+    f.onReplace = _ => ()
+    assertEquals(store.update("r")(_.named(ref)).cut, Some(ref))
+    assert(store.persisted("r"))
+    val restarted = BlobAuthStore(DurableMap(f)).state("r")
+    assert(restarted.required)
+    assertEquals(restarted.cut, Some(ref))
+    // Once persisted, an update that changes nothing does not write.
+    var writes = 0
+    f.onReplace = _ => writes += 1
+    store.update("r")(_.named(ref))
+    assertEquals(writes, 0)
+  }
+
+  test("a corrupt file at start is not a first run: no ASH1 is accepted until C is adopted again") {
+    val blob = ash1(devB, "places", 0)
+    val kB = StreamKey(devB, "places")
+    val corruptFile = MemFile()
+    corruptFile.content = Some("not json".getBytes(UTF_8))
+    // A file that parses, whose stored state does not.
+    val corruptState = MemFile()
+    DurableMap(corruptState).commit("state" -> "{\"reg\":\"r\",\"state\":{")
+    for f <- Seq(corruptFile, corruptState) do
+      val store = BlobAuthStore(DurableMap(f))
+      val st = store.state("r")
+      assertEquals(st, BlobAuthState.Lost)
+      assert(st.required && st.lost && !store.persisted("r"))
+      assert(accept(st, kB, 0, blob).isLeft)
+      // ASHM is still accepted; recording it writes the lost state, which a restart keeps.
+      val Right((_, s1)) = accept(st, kB, 1, ashm(devB, "places", 1)): @unchecked
+      store.update("r")(_ => s1.copy(required = false, lost = false))
+      val again = BlobAuthStore(DurableMap(f)).state("r")
+      assert(again.required && again.lost)
+      assert(accept(again, kB, 0, blob).isLeft)
+      // Adopting a C ends it: ASH1 below the cut-over and listed as in C is accepted again.
+      val s = Server()
+      val row = s.put(devB, "places", 0, blob)
+      val rec = CutoverRecord.fromListing(Seq(row))
+      val adopted = store.update("r")(_.adopted(CutRef(devA, 0, "e" * 64), rec))
+      assert(adopted.required && !adopted.lost)
+      assert(accept(adopted, kB, 0, blob, Some(Seq(row))).isRight)
+      assert(!BlobAuthStore(DurableMap(f)).state("r").lost)
+  }
+
+  test("a read failure at start: ASH1 is refused; the first update reads the file again") {
+    val f = MemFile()
+    val good = BlobAuthStore(DurableMap(f))
+    val rec = CutoverRecord(Vector(CutoverEntry(devA, "places", 2, "0" * 64)))
+    good.update("r")(_.adopted(CutRef(devA, 0, "b" * 64), rec))
+    f.unreadable = true
+    val store = BlobAuthStore(DurableMap(f))
+    assertEquals(store.state("r"), BlobAuthState.Lost)
+    assert(accept(store.state("r"), StreamKey(devB, "places"), 0, ash1(devB, "places", 0)).isLeft)
+    // Still unreadable: the update writes the lost state rather than a guess of what was there.
+    val other = BlobAuthStore(DurableMap(f))
+    assert(other.update("r")(_.ashmAccepted(places, 9)).lost)
+    // Readable again by the next update of a store that saw the failure: the
+    // state on disk is read and kept, not replaced by the lost one.
+    val f2 = MemFile()
+    BlobAuthStore(DurableMap(f2)).update("r")(_.adopted(CutRef(devA, 0, "b" * 64), rec))
+    f2.unreadable = true
+    val late = BlobAuthStore(DurableMap(f2))
+    assert(late.state("r").lost)
+    f2.unreadable = false
+    val after = late.update("r")(_.ashmAccepted(places, 1))
+    assert(!after.lost && after.required)
+    assertEquals(after.record, Some(rec))
   }
 
   // --- Making and learning C (Cutover) ----------------------------------
 
   /** An app (`self`) against `server`, with its outbox and its state. */
-  private final class App(val selfId: String, val server: Server, file: MemFile = MemFile()) extends CutoverEnv:
+  private class App(val selfId: String, val server: Server, val file: MemFile = MemFile()) extends CutoverEnv:
     val keys: BlobKeys = BlobAuthSuite.this.keys
     val store = BlobAuthStore(DurableMap(file))
     var devs = Vector(DeviceRow(devA, false, false), DeviceRow(devB, false, false))
@@ -278,8 +371,10 @@ class BlobAuthSuite extends munit.FunSuite:
     var listings = 0
     def state: BlobAuthState = store.state("reg")
     def update(f: BlobAuthState => BlobAuthState): BlobAuthState = store.update("reg")(f)
-    def fetch(ref: CutRef): Array[Byte] = server.blobs.getOrElse((ref.deviceId, CutoverRecord.Stream, ref.seq),
-      throw IllegalStateException("404"))
+    var offline = false
+    def fetch(ref: CutRef): Array[Byte] =
+      if offline then throw java.io.IOException("offline")
+      server.blobs.getOrElse((ref.deviceId, CutoverRecord.Stream, ref.seq), throw IllegalStateException("404"))
     def flush(): Boolean =
       if failFlush && outbox.nonEmpty then throw java.io.IOException("offline")
       while outbox.nonEmpty do
@@ -348,6 +443,42 @@ class BlobAuthSuite extends munit.FunSuite:
     assertEquals(app.nextSeq, 1L) // no second C
   }
 
+  test("ensureCutover does not return on a required state that is only cached, also when it reuses C") {
+    val s = Server()
+    s.put(devA, "places", 0, ash1(devA, "places", 0))
+    val file = MemFile()
+    val app = App(devA, s, file)
+    app.devs = Vector(DeviceRow(devA, false, false))
+    file.onReplace = _ => throw java.io.IOException("disk full")
+    intercept[java.io.IOException](Cutover.ensure(app))
+    // The state read has C (required), but it is not on disk: reusing it must still write it.
+    assert(app.state.required && app.state.record.isDefined)
+    intercept[java.io.IOException](Cutover.ensure(app))
+    assert(!BlobAuthStore(DurableMap(file)).state("reg").required)
+    file.onReplace = _ => ()
+    val ref = Cutover.ensure(app)
+    assertEquals(app.nextSeq, 1L)
+    val restarted = BlobAuthStore(DurableMap(file)).state("reg")
+    assert(restarted.required)
+    assertEquals(restarted.cut, Some(ref))
+  }
+
+  test("ensureCutover after a lost state re-learns the existing C") {
+    val s = Server()
+    s.put(devA, "places", 0, ash1(devA, "places", 0))
+    val maker = App(devB, s)
+    maker.devs = Vector(DeviceRow(devB, false, false))
+    val ref = Cutover.ensure(maker)
+    val file = MemFile()
+    file.content = Some("garbage".getBytes(UTF_8))
+    val app = App(devA, s, file)
+    assert(app.state.lost)
+    assertEquals(Cutover.ensure(app), ref)
+    assertEquals(app.nextSeq, 0L)
+    val st = BlobAuthStore(DurableMap(file)).state("reg")
+    assert(st.required && !st.lost && st.record.isDefined)
+  }
+
   test("ensureCutover uses an existing C, and refuses a listed C that does not verify") {
     val s = Server()
     s.put(devA, "places", 0, ash1(devA, "places", 0))
@@ -388,6 +519,92 @@ class BlobAuthSuite extends munit.FunSuite:
     assertEquals(app.state.cut, Some(ref)) // the verified C replaces the bad name
     assertEquals(app.state.record.map(_.entries.size), Some(1))
     assertEquals(app.state.toFetch, Vector.empty)
+  }
+
+  // --- One sync run's order (Intake) --------------------------------------
+
+  /** An app that also opens received blobs; `listedRows` from the server. */
+  private final class Reader(id: String, srv: Server) extends App(id, srv) with IntakeEnv:
+    var listingFails = false
+    def listedRows(k: StreamKey): Option[Seq[BatchMeta]] =
+      Option.when(!listingFails)(server.rows.toSeq.filter(b => b.deviceId == k.deviceId && b.stream == k.stream))
+
+  /** A status-like plaintext that names C (or not), and the reader of it. */
+  private def statusText(cut: Option[CutRef]) = cut.fold("status")(r => "status " + ujson.write(r.toJson))
+  private val names: (String, Array[Byte]) => Option[CutRef] = (_, p) =>
+    val t = String(Crypto.gunzip(p), UTF_8)
+    if t.startsWith("status ") then CutRef.fromJson(ujson.read(t.drop(7))) else None
+
+  /** devB has made C and sends an ASHM status naming it; "ghost" (a device
+    * this reader has never seen) has a forged ASH1 status.
+    */
+  private def cutOverWorld(): (Server, CutRef, Intake.Item[String], Intake.Item[String]) =
+    val s = Server()
+    s.put(devB, "places", 0, ash1(devB, "places", 0))
+    val maker = App(devB, s)
+    maker.devs = Vector(DeviceRow(devB, false, false))
+    val ref = Cutover.ensure(maker)
+    val status = ashm(devB, "status", 0, statusText(Some(ref)))
+    s.put(devB, "status", 0, status)
+    val forged = Crypto.sealAsh1(viewerBatchKey, Crypto.aad("ghost", "status", 0), plain("forged"))
+    s.put("ghost", "status", 0, forged)
+    (s, ref, Intake.Item("status", StreamKey(devB, "status"), 0, status), Intake.Item("forged", StreamKey("ghost", "status"), 0, forged))
+
+  test("one run: C named by a status and a forged ASH1 of an unseen device, in either order: the forgery is refused") {
+    for order <- Seq(true, false) do
+      val (s, ref, status, forged) = cutOverWorld()
+      val app = Reader(devA, s)
+      val items = if order then Seq(forged, status) else Seq(status, forged)
+      val out = Intake.run(app, items, names).toMap
+      assert(out("status").isInstanceOf[Intake.Accepted], s"order $order: ${out("status")}")
+      assert(out("forged").isInstanceOf[Intake.Refused], s"order $order: ${out("forged")}")
+      assertEquals(app.state.cut, Some(ref))
+      assert(app.state.required && app.state.record.isDefined)
+      // On disk before the run ended.
+      assert(BlobAuthStore(DurableMap(app.file)).state("reg").required)
+  }
+
+  test("one run: C only listed (no status yet) is learned before the forged ASH1 is judged") {
+    val (s, _, _, forged) = cutOverWorld()
+    val app = Reader(devA, s)
+    app.update(_.listed(s.rows.toSeq))
+    assert(!app.state.required)
+    val out = Intake.run(app, Seq(forged), names).toMap
+    assert(out("forged").isInstanceOf[Intake.Refused], out("forged").toString)
+    assert(app.state.required)
+  }
+
+  test("one run: while C cannot be fetched or stored, ASH1 waits for the next run") {
+    val (s, _, status, forged) = cutOverWorld()
+    val app = Reader(devA, s)
+    app.offline = true
+    val out = Intake.run(app, Seq(forged, status), names).toMap
+    assert(out("status").isInstanceOf[Intake.Accepted])
+    assertEquals(out("forged"), Intake.Deferred)
+    // Storing fails: ASH1 waits too, also for a state that only failed to write before.
+    app.offline = false
+    app.file.onReplace = _ => throw java.io.IOException("disk full")
+    assertEquals(Intake.run(app, Seq(forged), names).toMap.apply("forged"), Intake.Deferred)
+    app.file.onReplace = _ => ()
+    assert(Intake.run(app, Seq(forged), names).toMap.apply("forged").isInstanceOf[Intake.Refused])
+  }
+
+  test("an ASH1 accepted before C was known is not grandfathered once it is") {
+    val (s, _, status, forged) = cutOverWorld()
+    val app = Reader(devA, s)
+    // Run 1: nothing of the cut-over reached this device; the forgery passes, as provisional.
+    val first = Intake.run(app, Seq(forged), names).toMap.apply("forged")
+    assert(first match { case Intake.Accepted(_, BlobFormat.Ash1, true) => true; case _ => false }, first.toString)
+    // Run 2: the status naming C arrives; the same blob is now refused.
+    val out = Intake.run(app, Seq(status, forged), names).toMap
+    assert(out("forged").isInstanceOf[Intake.Refused], out("forged").toString)
+    // A genuine ASH1 below the cut-over is still accepted (digest of the listing), not provisional.
+    val old = Intake.Item("old", StreamKey(devB, "places"), 0, s.blobs((devB, "places", 0L)))
+    val again = Intake.run(app, Seq(old), names).toMap.apply("old")
+    assert(again match { case Intake.Accepted(_, BlobFormat.Ash1, false) => true; case _ => false }, again.toString)
+    // Without the listing, it waits.
+    app.listingFails = true
+    assertEquals(Intake.run(app, Seq(old), names).toMap.apply("old"), Intake.Deferred)
   }
 
   // --- Status naming C ----------------------------------------------------

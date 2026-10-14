@@ -21,7 +21,7 @@
 // device that claimed the attempt may continue it.
 
 import { Hono, type Context, type MiddlewareHandler } from "hono";
-import { authenticateToken, bearer, deviceAuth, VIEWER_HASH_PREFIX } from "./auth";
+import { authenticateToken, bearer, deviceAuth, VIEWER_HASH_PREFIX, viewerApproverValid } from "./auth";
 import type { AppEnv } from "./env";
 import { clientKey, edgeAllowed, hitRateLimit, RULES } from "./ratelimit";
 import {
@@ -199,6 +199,18 @@ function activation(db: D1Database, id: string): D1PreparedStatement[] {
   ];
 }
 
+/** Whether the user has MAX_ACTIVE_VIEWERS active viewers (D1's clock), as the activation counts them. */
+async function atViewerCap(db: D1Database, userId: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM devices WHERE user_id = ?1 AND kind = 'viewer'
+         AND revoked_at IS NULL AND expires_at > ${D1_NOW_MS}`,
+    )
+    .bind(userId)
+    .first<{ n: number }>();
+  return row!.n >= MAX_ACTIVE_VIEWERS;
+}
+
 function isUniqueError(e: unknown, column: string): boolean {
   return e instanceof Error && e.message.includes(`UNIQUE constraint failed: ${column}`);
 }
@@ -322,7 +334,7 @@ viewerPairings.get("/:id", async (c) => {
     const viewer = await c.env.DB.prepare(
       `SELECT d.expires_at FROM devices d LEFT JOIN users u ON u.id = d.user_id
        WHERE d.id = ?1 AND d.kind = 'viewer' AND d.revoked_at IS NULL AND d.expires_at > ${D1_NOW_MS}
-         AND u.status = 'active'`,
+         AND u.status = 'active' AND ${viewerApproverValid("d")}`,
     )
       .bind(row.device_id)
       .first<{ expires_at: number }>();
@@ -381,8 +393,15 @@ viewerPairings.post("/:id/confirm", async (c) => {
   );
   if (failed) return failed;
   const now = (await load(c.env.DB, row.id))!;
-  if (now.state === "active" || (now.state === "revealed" && now.confirmed_at !== null && !now.expired)) {
-    return c.json({ state: now.state });
+  if (now.state === "active") return c.json({ state: now.state });
+  if (now.state === "revealed" && now.confirmed_at !== null && !now.expired) {
+    if (now.approved_at === null) return c.json({ state: now.state });
+    // Approved and confirmed, not expired, yet not active: the viewer cap (the
+    // order approve → confirm). The attempt stays revealed: confirming again
+    // retries once a slot is free. Otherwise the approving device or its user
+    // is no longer valid, and the attempt will not activate.
+    if (await atViewerCap(c.env.DB, now.user_id!)) return jsonError(c, 409, "too many viewers");
+    return c.json({ error: "invalid state", state: now.state }, 409);
   }
   return refused(c, now);
 });

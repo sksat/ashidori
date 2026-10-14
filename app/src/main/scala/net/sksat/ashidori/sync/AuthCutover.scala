@@ -66,14 +66,6 @@ object AuthCutover:
       try update(reg)(_.listed(items))
       catch case e: Exception => Log.w("noting listed cut-over records failed", e)
 
-  /** Fetches the C still to fetch (named by a status, or listed). Best effort. */
-  def learn(run: SyncRun): Unit =
-    if state(run.reg).toFetch.nonEmpty then
-      try Cutover.learn(Source(run))
-      catch
-        case e: SyncRun.Stopped => throw e
-        case e: Exception => Log.w("fetching the cut-over record failed", e)
-
   /** Every listing row from cursor 0 that `keep` keeps; None when the listing
     * does not end within `maxPages` pages. A page that does not move the
     * cursor on ends the walk (the rows so far are taken as the listing).
@@ -93,13 +85,15 @@ object AuthCutover:
       after = to
     Option.when(done)(out.result())
 
-  private class Source(run: SyncRun) extends CutoverSource:
+  /** The state of `run`'s registration and fetching C (also for [[Intake.run]] in [[PeerStatus.pull]]). */
+  private[sync] class Source(run: SyncRun) extends CutoverSource:
     def keys: BlobKeys = run.keys
     def state: BlobAuthState = AuthCutover.state(run.reg)
     def update(f: BlobAuthState => BlobAuthState): BlobAuthState = AuthCutover.update(run.reg)(f)
     def fetch(ref: CutRef): Array[Byte] =
       run.checkStopped()
       run.client.getBatch(ref.deviceId, CutoverRecord.Stream, ref.seq, CutoverRecord.MaxBlob)
+    override def aborts(e: Throwable): Boolean = e.isInstanceOf[SyncRun.Stopped]
 
   private final class Env(run: SyncRun) extends Source(run) with CutoverEnv:
     def selfId: String = run.deviceId

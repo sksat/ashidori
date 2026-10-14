@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Api } from "../src/data/api";
 import { fromHex } from "../src/data/bytes";
 import { importBatchKey } from "../src/data/crypto";
-import { MemoryStore, Sessions, devSession, parseKeyText } from "../src/data/session";
+import { MemoryStore, Sessions, devSession, parseKeyText, signOut, type ViewerSession } from "../src/data/session";
 import { ViewerStore } from "../src/data/store";
 import { TOKEN, fakeServer, fixtureJson, syncMeta } from "./helpers";
 
@@ -89,5 +89,47 @@ describe("session (dev stub)", () => {
     expect(await persistent.load()).not.toBeNull();
     await sessions.clear();
     expect(await sessions.load()).toBeNull();
+  });
+});
+
+describe("登録の解除 (signOut)", () => {
+  it("forgets the key and the token first; a server that never answers the revocation holds nothing back", async () => {
+    const batchKey = await importBatchKey(fromHex(syncMeta().batchKeyHex));
+    const s: ViewerSession = { token: TOKEN, batchKey, deviceId: "viewer-1", name: "このブラウザ", registeredAt: 0, expiresAt: null, storage: "tab", source: "pairing" };
+    const sessions = new Sessions(new MemoryStore(), new MemoryStore());
+    await sessions.save(s);
+    const calls: { url: string; auth: string | null; signal: AbortSignal | null }[] = [];
+    let forgotten = false;
+    // Never answers; only the request's signal ends it.
+    const hanging = ((url: string, init?: RequestInit) => {
+      expect(forgotten).toBe(true);
+      calls.push({ url, auth: new Headers(init?.headers).get("Authorization"), signal: init?.signal ?? null });
+      return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+    }) as typeof fetch;
+    const { revoked } = await signOut(
+      s,
+      async () => {
+        await sessions.clear();
+        forgotten = true;
+      },
+      { fetch: hanging, timeoutMs: 30 },
+    );
+    expect(await sessions.load()).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ url: "/v1/devices/viewer-1/revoke", auth: `Bearer ${TOKEN}` });
+    expect(calls[0]!.signal!.aborted).toBe(false);
+    await revoked;
+    expect(calls[0]!.signal!.aborted).toBe(true);
+  });
+
+  it("a dev session (no device id) only forgets", async () => {
+    let called = false;
+    const never = (() => {
+      called = true;
+      return Promise.reject(new Error("not expected"));
+    }) as unknown as typeof fetch;
+    const { revoked } = await signOut(null, async () => {}, { fetch: never });
+    await revoked;
+    expect(called).toBe(false);
   });
 });

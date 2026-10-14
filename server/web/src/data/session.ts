@@ -12,7 +12,7 @@
 
 import { fromBase64, fromHex } from "./bytes";
 import { importBatchKey } from "./crypto";
-import { PairingAttempt, browserDeps, type PairingDeps, type PairingEvent } from "./pairing";
+import { PairingAttempt, REQUEST_TIMEOUT_MS, browserDeps, postInBackground, type PairingDeps, type PairingEvent } from "./pairing";
 
 export type KeyStorage = "tab" | "browser";
 
@@ -42,6 +42,8 @@ export interface SessionStore {
 export interface PairingControl {
   /** 「一致する」. */
   confirm(): void;
+  /** 「再試行」 after the viewer cap (the user ended another browser). */
+  retry(): void;
   /** 「一致しない」: aborts and drops the temporary key. */
   mismatch(): Promise<void>;
   /** Leaves the attempt without a result (the page starts another). */
@@ -65,6 +67,33 @@ export function pairingV1(deps: PairingDeps = browserDeps()): Pairing {
       return a;
     },
   };
+}
+
+export interface SignOutOptions {
+  fetch?: typeof fetch;
+  base?: string;
+  timeoutMs?: number;
+}
+
+/**
+ * 登録の解除: `forgetLocally` first (it drops the key, the token and what
+ * was decrypted, and updates the page); then a paired browser asks the
+ * server to revoke its device, in the background with a timeout, ignoring
+ * a failure (the token expires anyway, and the app can end it). Resolves
+ * once the local part is done; `revoked` once the request is over.
+ */
+export async function signOut(
+  session: ViewerSession | null,
+  forgetLocally: () => Promise<void>,
+  opts: SignOutOptions = {},
+): Promise<{ revoked: Promise<void> }> {
+  const deviceId = session?.deviceId ?? null;
+  const token = session?.token ?? "";
+  await forgetLocally();
+  if (!deviceId || !token) return { revoked: Promise.resolve() };
+  const f = opts.fetch ?? fetch.bind(globalThis);
+  const revoked = postInBackground(f, `${opts.base ?? ""}/v1/devices/${encodeURIComponent(deviceId)}/revoke`, token, opts.timeoutMs ?? REQUEST_TIMEOUT_MS);
+  return { revoked };
 }
 
 /** The dev panel exists only in `vite` dev builds (import.meta.env.DEV is false in production bundles). */

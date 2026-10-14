@@ -142,7 +142,16 @@ final class ViewerApproval(api: ViewerPairingApi, batchKey: () => Array[Byte], n
           else done(v.deviceId)
         case _ =>
           (v.pkB, v.nB) match
-            case (Some(pk), Some(n)) => onReveal(pk, n)
+            case (Some(pk), Some(n)) =>
+              onReveal(pk, n) match
+                // Approved here and confirmed in the browser, yet not active:
+                // the viewer cap (approve → confirm). The attempt stays open;
+                // approving again, or the browser's retry, activates it once a
+                // slot is free.
+                case Phase.Approved(words, scope, t) if v.state == "revealed" && v.confirmed =>
+                  phase = Phase.Showing(words, scope, t, tooManyViewers = true)
+                  phase
+                case p => p
             case _ => phase
     catch case r: ViewerPairingApi.Refused => refused(r)
 

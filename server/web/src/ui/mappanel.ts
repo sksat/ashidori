@@ -1,10 +1,10 @@
 // The map component of the mock: the map, a heading, zoom/fit buttons,
-// 「詳しい地図」, the legend (bottom left) and the attribution (bottom
-// right). It starts as a canvas without a base map. The offline basemap is
-// used only once it is in this browser (map/basemap.ts): kept from an
-// earlier visit, or after the explicit 「簡易地図を読み込む（約 64 MB）」,
-// which downloads the whole archive (never the tiles in view). Online tiles
-// only while 「詳しい地図」 is on.
+// the legend (bottom left) and the attribution (bottom right). It starts as
+// a canvas without a base map. The offline basemap is used only once it is
+// in this browser (map/basemap.ts): kept from an earlier visit, or after the
+// explicit 「簡易地図を読み込む（約 64 MB）」, which downloads the whole
+// archive (never the tiles in view). There are no online tiles: the viewer
+// sends no request to another origin (the CSP of src/viewer.ts).
 
 import { approxMB, basemapOffered, cachedBasemap, downloadBasemap, loadedBasemap, onBasemap } from "../map/basemap";
 import { CanvasMap } from "../map/canvas";
@@ -18,9 +18,8 @@ type Renderer = CanvasMap | GlMap;
 const narrow = () => matchMedia("(max-width: 959px)").matches;
 
 /** Turns the trusted attribution snippets (fixed strings in this code) into nodes without innerHTML. */
-function attributionNodes(kind: "offline" | "online" | "none"): (Node | string)[] {
+function attributionNodes(kind: "offline" | "none"): (Node | string)[] {
   if (kind === "none") return [];
-  if (kind === "online") return [h("a", { href: "https://maps.gsi.go.jp/development/ichiran.html", rel: "noreferrer", target: "_blank" }, "地理院タイル")];
   return [h("a", { href: "https://www.openstreetmap.org/copyright", rel: "noreferrer", target: "_blank" }, "© OpenStreetMap contributors"), " · このサーバから配信"];
 }
 
@@ -32,10 +31,8 @@ export class MapPanel {
   private readonly legend: HTMLElement;
   private readonly attrib: HTMLElement;
   private readonly over: HTMLElement;
-  private readonly detailBtn: HTMLButtonElement;
   private renderer: Renderer | null = null;
   private content: MapContent = EMPTY;
-  private detail = false;
   private destroyed = false;
   private generation = 0;
   private readonly unsubscribe: () => void;
@@ -48,8 +45,6 @@ export class MapPanel {
     this.legend = h("div");
     this.attrib = h("p", { class: "attrib" });
     this.over = h("div", { class: "mapover", hidden: true });
-    this.detailBtn = h("button", { type: "button", "aria-pressed": "false", "aria-label": "詳しい地図", "data-tip": "表示中の範囲の地図を国土地理院から取得します" }, icon("layers"));
-    this.detailBtn.addEventListener("click", () => void this.setDetail(!this.detail));
     const btn = (label: string, ic: string, f: () => void) => {
       const b = h("button", { type: "button", "aria-label": label }, icon(ic));
       b.addEventListener("click", f);
@@ -66,7 +61,6 @@ export class MapPanel {
         btn("拡大", "plus", () => this.renderer?.zoomBy(1)),
         btn("縮小", "minus", () => this.renderer?.zoomBy(-1)),
         btn("全体を表示", "fit", () => this.renderer?.fit()),
-        this.detailBtn,
       ),
       this.legend,
       this.attrib,
@@ -94,18 +88,18 @@ export class MapPanel {
   private async upgrade(): Promise<void> {
     const gen = ++this.generation;
     const basemap = loadedBasemap() ?? (await cachedBasemap());
-    if (this.destroyed || gen !== this.generation || this.detail) return;
+    if (this.destroyed || gen !== this.generation) return;
     if (!basemap) {
       this.setAttribution("none");
       await this.offerLoad(gen);
       return;
     }
-    await this.swap(async (stage) => GlMap.create(stage, basemap, false), "offline");
+    await this.swap(async (stage) => GlMap.create(stage, basemap), "offline");
   }
 
   /** 「簡易地図を読み込む（約 64 MB）」 where the attribution goes, if the server serves the pinned archive. */
   private async offerLoad(gen: number): Promise<void> {
-    if (!(await basemapOffered()) || this.destroyed || gen !== this.generation || this.detail || loadedBasemap()) return;
+    if (!(await basemapOffered()) || this.destroyed || gen !== this.generation || loadedBasemap()) return;
     const label = `簡易地図を読み込む（約 ${approxMB()} MB）`;
     const btn = h("button", { class: "btn tonal sm mapload", type: "button" }, icon("map"), label);
     const note = h("span", { class: "sr-only", role: "status" });
@@ -136,17 +130,7 @@ export class MapPanel {
     this.attrib.hidden = false;
   }
 
-  private async setDetail(on: boolean): Promise<void> {
-    this.detail = on;
-    this.detailBtn.setAttribute("aria-pressed", String(on));
-    if (on) await this.swap(async (stage) => GlMap.create(stage, loadedBasemap(), true), "online");
-    else {
-      await this.swap(async (stage) => new CanvasMap(stage), "none");
-      void this.upgrade();
-    }
-  }
-
-  private async swap(make: (stage: HTMLElement) => Promise<Renderer>, attribution: "offline" | "online" | "none"): Promise<void> {
+  private async swap(make: (stage: HTMLElement) => Promise<Renderer>, attribution: "offline" | "none"): Promise<void> {
     const gen = ++this.generation;
     const stage = h("div", { class: "mapview" });
     // Laid out but invisible until ready: MapLibre needs the container's size.
@@ -158,11 +142,6 @@ export class MapPanel {
     } catch (e) {
       stage.remove();
       console.warn("map renderer unavailable", e);
-      if (attribution === "online") {
-        this.detail = false;
-        this.detailBtn.setAttribute("aria-pressed", "false");
-        this.detailBtn.hidden = true;
-      }
       return;
     }
     if (this.destroyed || gen !== this.generation) {
@@ -185,7 +164,7 @@ export class MapPanel {
     this.setAttribution(attribution);
   }
 
-  private setAttribution(kind: "offline" | "online" | "none"): void {
+  private setAttribution(kind: "offline" | "none"): void {
     replace(this.attrib, ...attributionNodes(kind));
     this.attrib.hidden = kind === "none";
   }

@@ -1,7 +1,7 @@
 // MapLibre GL JS, loaded on demand from the copy under __MAPLIBRE_PATH__
-// (vite.config.ts), with the offline basemap of the server or, only after
-// the explicit 「詳しい地図」 action, online tiles (GSI, as one of the app's
-// online maps). Routes, stays and the last fix are GeoJSON layers.
+// (vite.config.ts), with the offline basemap of the server or a plain
+// background. No online tiles (no request to another origin). Routes, stays
+// and the last fix are GeoJSON layers.
 
 import type * as ML from "maplibre-gl";
 import type { Basemap } from "./basemap";
@@ -30,21 +30,6 @@ export function loadMapLibre(): Promise<MapLibre> {
   lib.catch(() => (lib = null));
   return lib;
 }
-
-/** GSI pale tiles: shown only while 「詳しい地図」 is on. */
-export const ONLINE_STYLE: ML.StyleSpecification = {
-  version: 8,
-  sources: {
-    base: {
-      type: "raster",
-      tiles: ["https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      maxzoom: 18,
-    },
-  },
-  layers: [{ id: "base", type: "raster", source: "base" }],
-};
-export const ONLINE_ATTRIBUTION = '<a href="https://maps.gsi.go.jp/development/ichiran.html">地理院タイル</a>';
 
 function token(name: string, fallback: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
@@ -94,7 +79,7 @@ export class GlMap {
   private constructor(
     private readonly ml: MapLibre,
     private readonly host: HTMLElement,
-    /** A light base map (offline or online) under the routes, in both themes. */
+    /** A light base map (the offline basemap) under the routes, in both themes. */
     private readonly light: boolean,
   ) {}
 
@@ -103,22 +88,21 @@ export class GlMap {
     return this.light ? light : token(name, light);
   }
 
-  /** `basemap` null with `online` false draws a plain background. */
-  static async create(host: HTMLElement, basemap: Basemap | null, online: boolean): Promise<GlMap> {
+  /** `basemap` null draws a plain background. */
+  static async create(host: HTMLElement, basemap: Basemap | null): Promise<GlMap> {
     const ml = await loadMapLibre();
     ml.setWorkerUrl(`${__MAPLIBRE_PATH__}maplibre-gl-worker.mjs`);
     if (basemap) basemap.install((name, action) => ml.addProtocol(name, action));
-    const g = new GlMap(ml, host, online || !!basemap);
-    const style: ML.StyleSpecification = online
-      ? ONLINE_STYLE
-      : (basemap?.style ?? { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": token("--map-land", "#f3f0ea") } }] });
+    const g = new GlMap(ml, host, !!basemap);
+    const style: ML.StyleSpecification =
+      basemap?.style ?? { version: 8, sources: {}, layers: [{ id: "bg", type: "background", paint: { "background-color": token("--map-land", "#f3f0ea") } }] };
     const map = new ml.Map({
       container: host,
       style,
       attributionControl: false,
       center: [139.7, 35.68],
       zoom: 9,
-      maxZoom: online ? 18 : 17,
+      maxZoom: 17,
       dragRotate: false,
       pitchWithRotate: false,
       touchPitch: false,

@@ -12,7 +12,7 @@
 // Cache Storage, and read locally from then on: tiles, style, glyphs and
 // sprites are slices of a Blob in this browser. A copy already in Cache
 // Storage is verified again and used without asking, since that sends
-// nothing. Online tiles exist only behind 「詳しい地図」 (gl.ts).
+// nothing. There are no online tiles.
 
 import type { AddProtocolAction, StyleSpecification } from "maplibre-gl";
 import { PMTiles, Protocol, type RangeResponse, type Source } from "pmtiles";

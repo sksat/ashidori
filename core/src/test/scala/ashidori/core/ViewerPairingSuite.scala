@@ -262,6 +262,30 @@ class ViewerPairingSuite extends munit.FunSuite:
     assertEquals(s.grants.distinct.size, 1)
   }
 
+  test("the cap with approve → confirm: the waiting screen offers the approval again, and a free slot activates") {
+    for retryBy <- Seq("app", "browser") do
+      val s = FakeServer()
+      s.viewers = 5
+      val a = ViewerApproval(s, () => batchKey.clone(), () => 0L)
+      a.start("ABCD2345", 3600)
+      s.reveal()
+      a.poll()
+      val words = VP.sasWords(s.browserTh)
+      assertEquals(a.approve(), Phase.Approved(words, "batch-v1", 3600))
+      // The browser confirms at the cap: refused, the attempt stays revealed.
+      intercept[ViewerPairingApi.Refused](s.confirm())
+      assertEquals(s.state, "revealed")
+      assertEquals(a.poll(), Phase.Showing(words, "batch-v1", 3600, true))
+      assertEquals(a.poll(), Phase.Showing(words, "batch-v1", 3600, true))
+      assertEquals(a.approve(), Phase.Showing(words, "batch-v1", 3600, true))
+      s.viewers = 4 // the user ended another browser
+      if retryBy == "app" then assertEquals(a.approve(), Phase.Done("viewer-1", 3600))
+      else
+        s.confirm()
+        assertEquals(a.poll(), Phase.Done("viewer-1", 3600))
+      assertEquals(s.grants.distinct.size, 1)
+  }
+
   test("「一致しない」 aborts the attempt") {
     val s = FakeServer()
     val a = ViewerApproval(s, () => batchKey, () => 0L)
