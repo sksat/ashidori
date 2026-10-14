@@ -36,7 +36,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <!-- Registration links of any server, from the server's /pair page:
-                 ashidori://pair?server=<url>&c=<CODE>. The https links
+                 ashidori://pair?server=<url>&c=<CODE> (pairing code) or
+                 &i=<INVITE> (invite). The https links
                  (App Links) of a server set at build time are in
                  src/applinks/AndroidManifest.xml. singleTask: a link opens
                  the running app, not a second copy. -->

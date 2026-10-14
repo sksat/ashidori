@@ -1,10 +1,12 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  acceptInvite,
   accessCall,
   ADMIN_DEV_TOKEN,
   adminCall,
   call,
+  createInvite,
   createUser,
   genRsaKey,
   makeAccessJwt,
@@ -33,11 +35,11 @@ describe("admin auth", () => {
   it("rejects requests without Access, even with the dev token when dev admin is disabled", async () => {
     const prod = { ALLOW_DEV_ADMIN: "false" };
     expect((await call("/admin/devices", {}, prod)).status).toBe(401);
-    expect((await call("/admin/users", json({ name: "x" }), prod)).status).toBe(401);
+    expect((await call("/admin/invites", json({}), prod)).status).toBe(401);
     expect((await call("/admin/", {}, prod)).status).toBe(401);
     const withDev = await call(
-      "/admin/users",
-      { ...json({ name: "x" }), headers: { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN_DEV_TOKEN}` } },
+      "/admin/invites",
+      { ...json({}), headers: { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN_DEV_TOKEN}` } },
       prod,
     );
     expect(withDev.status).toBe(401);
@@ -59,9 +61,10 @@ describe("admin auth", () => {
     const res = await accessCall(await makeAccessJwt({ email: "ADMIN@example.COM" }), "/admin/devices");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([]);
-    const created = await accessCall(await makeAccessJwt(), "/admin/users", json({ name: "alice" }));
+    const created = await accessCall(await makeAccessJwt(), "/admin/invites", json({}));
     expect(created.status).toBe(201);
-    expect(await created.json()).toMatchObject({ name: "alice", status: "active", createdBy: "admin@example.com" });
+    const invites = await (await accessCall(await makeAccessJwt(), "/admin/invites")).json();
+    expect(invites).toMatchObject([{ status: "pending", createdBy: "admin:admin@example.com" }]);
     // Certs are cached.
     expect(spy).toHaveBeenCalledTimes(1);
   });
@@ -74,10 +77,10 @@ describe("admin auth", () => {
   it("rejects valid JWTs whose email is missing or not in ADMIN_EMAILS", async () => {
     await mockAccessCerts();
     const outsider = await makeAccessJwt({ email: "someone@example.com" });
-    for (const path of ["/admin/", "/admin/devices", "/admin/users"]) {
+    for (const path of ["/admin/", "/admin/devices", "/admin/users", "/admin/invites"]) {
       expect((await accessCall(outsider, path)).status, path).toBe(403);
     }
-    expect((await accessCall(outsider, "/admin/users", json({ name: "x" }))).status).toBe(403);
+    expect((await accessCall(outsider, "/admin/invites", json({}))).status).toBe(403);
     expect((await accessCall(await makeAccessJwt({ email: undefined }), "/admin/devices")).status).toBe(403);
     expect((await accessCall(await makeAccessJwt({ email: "" }), "/admin/devices")).status).toBe(403);
     const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first<{ n: number }>();
@@ -119,8 +122,8 @@ describe("admin auth", () => {
   });
 
   it("rejects cross-origin state-changing requests", async () => {
-    const res = await adminCall("/admin/users", {
-      ...json({ name: "x" }),
+    const res = await adminCall("/admin/invites", {
+      ...json({}),
       headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
     });
     expect(res.status).toBe(403);
@@ -136,18 +139,18 @@ describe("admin auth", () => {
     });
     expect(list.status).toBe(200);
 
-    const post = json({ name: "x" });
-    const crossSite = await accessCall(jwt, "/admin/users", {
+    const post = json({});
+    const crossSite = await accessCall(jwt, "/admin/invites", {
       ...post,
       headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "cross-site" },
     });
     expect(crossSite.status).toBe(403);
-    const foreign = await accessCall(jwt, "/admin/users", {
+    const foreign = await accessCall(jwt, "/admin/invites", {
       ...post,
       headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
     });
     expect(foreign.status).toBe(403);
-    const sameOrigin = await accessCall(jwt, "/admin/users", {
+    const sameOrigin = await accessCall(jwt, "/admin/invites", {
       ...post,
       headers: { "Content-Type": "application/json", Origin: "https://ashidori.example", "Sec-Fetch-Site": "same-origin" },
     });
@@ -156,55 +159,38 @@ describe("admin auth", () => {
 });
 
 describe("admin API: users", () => {
-  it("creates users with an optional email and validates input", async () => {
-    const res = await adminCall("/admin/users", json({ name: "  Alice ", email: "Alice@Example.com" }));
-    expect(res.status).toBe(201);
-    expect(await res.json()).toEqual({
-      id: expect.any(String),
-      name: "Alice",
-      handle: null,
-      email: "alice@example.com",
-      status: "active",
-      createdAt: expect.any(Number),
-      createdBy: "dev-admin@localhost",
-      disabledAt: null,
+  it("no longer creates users: a user is created by its first device", async () => {
+    expect((await adminCall("/admin/users", json({ name: "Alice" }))).status).toBe(404);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first()).toEqual({ n: 0 });
+  });
+
+  it("sets the username of a legacy user and changes it: lowercase, validated, unique", async () => {
+    const legacy = await createUser("Dave", "dave@example.net");
+    await createUser("Carol", undefined, "carol_1");
+    const listed = (await (await adminCall("/admin/users")).json()) as Array<Record<string, unknown>>;
+    expect(listed.find((u) => u.id === legacy)).toMatchObject({
+      username: null,
+      legacyName: "Dave",
+      email: "dave@example.net",
     });
-    expect((await adminCall("/admin/users", json({ name: "Bob" }))).status).toBe(201);
+    expect(listed.find((u) => u.id !== legacy)).toMatchObject({ username: "carol_1", legacyName: null });
 
-    expect((await adminCall("/admin/users", json({}))).status).toBe(400);
-    expect((await adminCall("/admin/users", json({ name: "" }))).status).toBe(400);
-    expect((await adminCall("/admin/users", json({ name: "x".repeat(65) }))).status).toBe(400);
-    expect((await adminCall("/admin/users", json({ name: "x", email: "not an email" }))).status).toBe(400);
-    expect((await adminCall("/admin/users", { method: "POST", body: '{"name":"x"}' })).status).toBe(400);
-  });
-
-  it("sets handles: lowercase, validated, unique", async () => {
-    const res = await adminCall("/admin/users", json({ name: "Carol", handle: " Carol_1 " }));
-    expect(res.status).toBe(201);
-    const carol = (await res.json()) as { id: string; handle: string };
-    expect(carol.handle).toBe("carol_1");
-    for (const handle of ["ab", "x".repeat(21), "has-dash", "ハンドル", 3]) {
-      expect((await adminCall("/admin/users", json({ name: "x", handle }))).status, String(handle)).toBe(400);
+    const patch = (body: unknown) => adminCall(`/admin/users/${legacy}`, { ...json(body), method: "PATCH" });
+    // Uniqueness is case-insensitive (usernames are stored lowercase).
+    const taken = await patch({ username: "Carol_1" });
+    expect(taken.status).toBe(409);
+    expect(await taken.json()).toEqual({ error: "username taken" });
+    for (const username of ["ab", "x".repeat(21), "has-dash", "ユーザ名", 3, null, ""]) {
+      expect((await patch({ username })).status, String(username)).toBe(400);
     }
-    // Uniqueness is case-insensitive (handles are stored lowercase).
-    expect((await adminCall("/admin/users", json({ name: "x", handle: "CAROL_1" }))).status).toBe(409);
-    expect((await adminCall("/admin/users", json({ name: "y", handle: "" }))).status).toBe(201);
-
-    const dave = (await (await adminCall("/admin/users", json({ name: "Dave" }))).json()) as { id: string };
-    const patch = (body: unknown) => adminCall(`/admin/users/${dave.id}`, { ...json(body), method: "PATCH" });
-    expect((await patch({ handle: "Carol_1" })).status).toBe(409);
-    const ok = await patch({ handle: "dave", name: "David" });
+    expect((await patch({})).status).toBe(400);
+    const ok = await patch({ username: " Dave " });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toMatchObject({ name: "David", handle: "dave" });
-    expect(await (await patch({ name: "Dave" })).json()).toMatchObject({ name: "Dave", handle: "dave" });
-    expect(await (await patch({ handle: null })).json()).toMatchObject({ handle: null });
-    expect((await patch({ handle: "x" })).status).toBe(400);
-    expect((await patch({ name: "" })).status).toBe(400);
-    expect((await adminCall("/admin/users/nope", { ...json({ name: "z" }), method: "PATCH" })).status).toBe(404);
-
-    const users = (await (await adminCall("/admin/users")).json()) as Array<{ name: string; handle: string | null }>;
-    expect(users.find((u) => u.name === "Carol")!.handle).toBe("carol_1");
+    expect(await ok.json()).toMatchObject({ id: legacy, username: "dave", legacyName: null });
+    expect(await (await patch({ username: "david" })).json()).toMatchObject({ username: "david" });
+    expect((await adminCall("/admin/users/nope", { ...json({ username: "zed" }), method: "PATCH" })).status).toBe(404);
   });
+
 
   it("lists users with device counts and last access", async () => {
     const alice = await createUser("alice");
@@ -215,9 +201,9 @@ describe("admin API: users", () => {
 
     // By name: both users may have the same created_at (ms), and ties are ordered by the random id.
     const users = ((await (await adminCall("/admin/users")).json()) as Array<Record<string, unknown>>).sort((x, y) =>
-      String(x.name).localeCompare(String(y.name)),
+      String(x.legacyName).localeCompare(String(y.legacyName)),
     );
-    expect(users.map((u) => [u.name, u.deviceCount])).toEqual([
+    expect(users.map((u) => [u.legacyName, u.deviceCount])).toEqual([
       ["alice", 1],
       ["bob", 0],
     ]);
@@ -277,8 +263,8 @@ describe("admin API: users", () => {
 
 describe("admin API: devices", () => {
   it("lists all users' devices (and legacy ones) and revokes any device", async () => {
-    const alice = await createUser("alice");
-    const bob = await createUser("bob");
+    const alice = await createUser("alice", undefined, "alice");
+    const bob = await createUser("bob", undefined, "bob");
     const a = await newDevice("phone", alice);
     const b = await newDevice("tablet", bob);
     await env.DB.prepare(
@@ -288,7 +274,7 @@ describe("admin API: devices", () => {
       .run();
 
     const list = (await (await adminCall("/admin/devices")).json()) as Array<Record<string, unknown>>;
-    expect(list.map((d) => [d.id, d.userId, d.userName])).toEqual([
+    expect(list.map((d) => [d.id, d.userId, d.username])).toEqual([
       [a.deviceId, alice, "alice"],
       [b.deviceId, bob, "bob"],
       ["legacy", null, null],
@@ -316,18 +302,16 @@ describe("admin API: devices", () => {
   });
 });
 
-describe("admin user creation with invalid limits", () => {
-  it("is refused with 503, like every other creation", async () => {
+describe("registration with an invite while a limit is invalid", () => {
+  it("is refused with 503, like every other creation, and leaves the invite unused", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const headers = { "Content-Type": "application/json", Authorization: `Bearer ${ADMIN_DEV_TOKEN}` };
-    const create = (overrides: Partial<Cloudflare.Env>) =>
-      call("/admin/users", { method: "POST", headers, body: JSON.stringify({ name: "x" }) }, overrides);
+    const { code } = await createInvite();
     for (const bad of [{ MAX_USERS: "invalid" }, { USER_QUOTA_BYTES: "0" }]) {
-      const res = await create(bad);
+      const res = await acceptInvite(code, "alice", undefined, "192.0.2.1", bad);
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: "server misconfigured" });
     }
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first()).toEqual({ n: 0 });
-    expect((await create({})).status).toBe(201);
+    expect((await acceptInvite(code, "alice")).status).toBe(201);
   });
 });

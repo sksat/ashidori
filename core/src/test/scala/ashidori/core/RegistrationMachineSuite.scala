@@ -79,3 +79,29 @@ class RegistrationMachineSuite extends munit.FunSuite:
     assertEquals(mem.stored, None)
     assertEquals(mem.pairedWith, None)
   }
+
+  test("an account request keeps its invite and username on disk; older requests read without a username") {
+    val p = PendingRegistration("https://sync.example.net", "account", "7K3M9QXZ0ABCDEFG", "phone", "token", "alice")
+    assertEquals(PendingRegistration.fromBytes(p.toBytes), Some(p))
+    val old = """{"url":"https://sync.example.net","kind":"account","code":"","name":"phone","token":"t"}"""
+    assertEquals(PendingRegistration.fromBytes(old.getBytes("UTF-8")),
+      Some(PendingRegistration("https://sync.example.net", "account", "", "phone", "t", "")))
+  }
+
+  test("a taken username drops the request and is reported as such") {
+    val mem = Mem()
+    val events = LinkedBlockingQueue[RegistrationEvent]()
+    val local = Executors.newSingleThreadExecutor()
+    val sent = LinkedBlockingQueue[PendingRegistration]()
+    val m = RegistrationMachine(mem, p => { sent.put(p); throw UsernameTakenError(p.username) }, () => "token",
+      e => events.put(e), local, Executors.newCachedThreadPool())
+    m.start("https://sync.example.net", "account", "7K3M9QXZ0ABCDEFG", "phone", "alice")
+    val (attempt, name) = next(events) { case RegistrationEvent.UsernameTaken(a, u) => (a, u) }
+    assertEquals(name, "alice")
+    assert(m.isLatest(attempt))
+    assertEquals(sent.poll(1, TimeUnit.SECONDS).username, "alice")
+    drain(local)
+    // Final: the person chooses another username, with a new request.
+    assertEquals(mem.stored, None)
+    assertEquals(mem.pairedWith, None)
+  }

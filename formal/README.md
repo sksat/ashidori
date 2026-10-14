@@ -51,9 +51,11 @@ CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.m
 | モデル | 防ぐ障害 | 主な性質 |
 |---|---|---|
 | `crypto/batch.spthy`, `batch_privacy.spthy` | サーバ管理者による位置ログの閲覧、別の端末やスロットへの暗号文の付け替え | `payload_secrecy`、`slot_binding`、識別不能性 |
+| `crypto/browser_pairing.spthy` | ブラウザのペアリング（予定、[設計](../docs/design/browser-pairing-v1.md)）でサーバが鍵を差し替え、バッチ鍵を得る、偽の鍵をブラウザに渡す | `batch_key_secrecy`、`grant_agreement` |
 | `Registration` | 応答を失った端末が再送で別の結果を受け、トークンも端末も失う。期限切れのコードの消費 | `RetriesAgree`、`RecoverUngated`、`CodeIffDevice` |
 | `RegistrationClient` | 保存に失敗した鍵や登録で同期する。取消の失敗で再試行の手段を失う。解除の途中で落ちた後、別の登録が古い鍵を使う | `ReadReturnsPersisted`、`TokenRecoverable`、`NoForeignKey`、`CancelledNoEffect`、`Converges` |
 | `Accounts` | 自己登録の再送が最後の枠や登録の締切で拒否され、作られたアカウントを失う | `RetriesAgree`、`RecoverUngated`、`UsersUnderMax` |
+| `Invites` | 招待が利用者なしで使用済みになる。一つの招待で二人が登録する。ユーザ名が重複する。再送が別の結果を受ける | `ConsumedHasUser`、`OneUserPerInvite`、`UsernameUnique`、`RetriesAgree` |
 | `Outbox` | 同じスロットに別の暗号文が送られて 409 で止まる。進捗だけ進んでデータが欠ける。アーカイブの別の世代の部分を混ぜる | `SameSlotSameCiphertext`、`ProgressBacked`、`ArchiveComplete` |
 | `BatchCommit` | 掃除が確定済みの実体を消し、一覧にあるのに取得できないバッチが残る。使用量の計上の狂い | `CommittedHasObject`、`SweepSafe`、`CountersMatch`、`UnderCaps` |
 | `StatusDownload` | 偽の一覧行、範囲外のカーソル、壊れた blob で、正しい status が永久に読まれない | `StatusLive`、`NoSilentSkip`、`AuthOnlyOnSuccess`、`CursorValid` |
@@ -102,6 +104,20 @@ AES-256-GCM は理想的な AEAD とし、鍵、nonce、AAD が揃ったとき�
 端末の失効は `K` の失効ではなく、`K` が一度漏れると過去と将来のすべてのバッチが読める。
 AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が保証するのは「その ID を割り当てられた、利用者のいずれかの端末が暗号化した」ことまでである。
 
+`browser_pairing.spthy` は、予定のブラウザのペアリング（[`docs/design/browser-pairing-v1.md`](../docs/design/browser-pairing-v1.md)）のモデルである。
+攻撃者はサーバと通信路で、ページは信頼する。
+利用者は、ブラウザとアプリの 4 語が等しいときだけ、アプリで承認し、ブラウザで確認する。
+4 語は理想化したハッシュであり、後から自分の値を選ぶ者は `grindA`、`grindB` で一致させられるとして、44 bit の切り詰めを表す。
+
+| 補題 | 内容 | 結果 |
+|---|---|---|
+| `executable` | 正常な承認と受け取りが起こりうる | 成立（到達の確認） |
+| `master_key_secrecy`, `batch_key_secrecy` | `K` もバッチ鍵も攻撃者に渡らない | 成立 |
+| `grant_agreement` | ブラウザが受け取った鍵は、アプリがそのブラウザの公開鍵と試行に承認したもの（単射的一致） | 成立 |
+| `-D=NOCOMMIT` の `batch_key_secrecy` | commit なし。サーバはアプリの nonce を見てから自分の値を選ぶ | 期待どおり反例あり |
+| `-D=NOGRANTAUTH` の `grant_agreement` | ブラウザが付与の中の `sA` を確かめない | 期待どおり反例あり |
+| `-D=APPONLY` の `grant_agreement` | ブラウザでの確認を省く（秘匿は成立のまま） | 期待どおり反例あり |
+
 ## 状態モデル（`tla/`）
 
 暗号文は不透明な値として扱い、同一性だけを追う。
@@ -142,6 +158,9 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 | `Accounts_norecheck` | 0 行挿入の後に再照合しない（N3） | `RetriesAgree` が破れる | 1 秒 |
 | `Accounts_gatefirst` | 締切やレート制限を回復より前に置く | `RecoverUngated` が破れる | 1 秒 |
 | `Accounts_closedrace` | **所見（修正済み）**：締切で拒む前に回復を照会し直さない修正前の判定 | `RetriesAgree` が破れる | 1 秒 |
+| `Invites` | 現行。二つのトークンが一つの招待を、二つの招待が一つのユーザ名を争う。再送、取り消し、期限切れ、活性 | 成立、分岐の到達 | 2 秒 |
+| `Invites_open` | 同じく、招待のない登録が同じユーザ名を争う。安全性 | 成立、分岐の到達 | 1 秒 |
+| `Invites_nonatomic` | 招待の消費と、利用者と端末の作成を別のトランザクションにする | `ConsumedHasUser` が破れる | 1 秒 |
 | `Outbox` | 項目 3 個、登録 2 回、障害 1 回。暗号化と DB 確定の間のクラッシュを含む | 成立、到達 | 33 秒 |
 | `Outbox_2faults` | 同じく障害 2 回、安全性のみ | 成立 | 遅い（90 秒） |
 | `Outbox_nonatomic` | 行を書いてから seq と進捗を別トランザクションで進める旧方式 | `SameSlotSameCiphertext` が破れる | 1 秒 |
@@ -227,6 +246,14 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 締切で 403 を返す前に回復を照会し直す（`RecheckClosed`）。
 保証しないこと：締切の判定は Worker が要求ごとに環境変数を読むので、別の複製がアカウントを作る前に、ある複製が 403 を受けることがある。
 アプリは、このプロセスで作って一度も送っていないトークンへの 403 だけを確定した拒否とし、以前に送った可能性のあるトークンは 2 分間、間隔を広げながら送り直す。その間にアカウントができれば、送り直しが回復で 200 を受ける。
+
+### Invites
+
+招待による `POST /v1/accounts` の一要求を、回復、招待の消費と利用者と端末の作成の `db.batch`、再照合に分ける。
+招待のない登録（`Inv = 0`）も同じ batch で表す。締切と `MAX_USERS` は `Accounts` が扱う。
+保証すること：招待は利用者と端末と同時にだけ使用済みになる（`ConsumedHasUser`）。一つの招待からできる利用者は一人（`OneUserPerInvite`）。ユーザ名は一意（`UsernameUnique`）。取り消した招待は使われない（`RevokedUnused`）。同じトークンの応答は一致し、ある複製がアカウントを得たとき別の複製が 401 や 409 で確定的に拒まれることはない（`RetriesAgree`）。
+境界：トークン 3 個（`_open` は招待のない 1 個を加えて 4 個）、トークン 1 の要求の複製 2 件、招待 1 の取り消しと期限切れ。
+非原子的な変異（`Invites_nonatomic`）では、ユーザ名の衝突で招待だけが使用済みのまま残る。同じ変異は `RetriesAgree` も破る（複製の一方が 401 を受けた後、もう一方がアカウントを作る）。
 
 ### Outbox
 
@@ -322,7 +349,7 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 対応を保つため、次のテストが実装側でモデルの性質と反例を確かめる。
 
 - `server/test/conformance.test.ts`：実際の migration と SQL に乱数の操作列を流し、`CountersMatch`、`UnderCaps`、`UsersUnderMax`、`LatestWins`、`NoPhantom`、`AdminAbsorbing`、`StaleMeansSuperseded` を確かめ、各分岐（上限、競合、`stale`、`removed`）に到達したことも確かめる。
-- `server/test/tlc-replay.test.ts` ほか：TLC の反例（`BatchCommit_current`、`FeedResync_firstpage`、`Registration_norecheck`、`Accounts_norecheck`、`Accounts_closedrace`、`SharedCheckin_old`）を実際の関数と SQL で再現し、現行のコードでは起きないことを確かめる。
+- `server/test/tlc-replay.test.ts` ほか：TLC の反例（`BatchCommit_current`、`FeedResync_firstpage`、`Registration_norecheck`、`Accounts_norecheck`、`Accounts_closedrace`、`SharedCheckin_old`）を実際の関数と SQL で再現し、現行のコードでは起きないことを確かめる。`server/test/registration-race.test.ts` は `Invites` の競合（同じ要求の二重送信、一つの招待を争う二つのトークン、一つのユーザ名を争う二つの招待）を実際の D1 で再現する。
 - `server/test/protocol-constants.test.ts`：モデルが依る定数の関係（`D ≤ G` の余裕、カーソルと seq の範囲）を確かめる。
 - `core` の `DurableMapSuite`、`PairingStoreSuite`、`RegistrationMachineSuite`、`DeviceStatusSuite`：書込み中の読出し（F1）、解除の途中のクラッシュ、F2、ローテーション（F6）、`RegistrationClient_runread` と `_unknownmark` の反例（後者は二つの経路）を実装の状態機械で確かめる。
 
@@ -330,6 +357,7 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 |---|---|
 | `Registration`：`SRecover*` / `SGate*` / `SStart*`, `SBatch*`, `SRecheck*`, `SFullCheck*` | `v1.ts` の `/devices/register` / `edgeAllowed`, `hitRateLimit`, `limitsOr503` / `devices.ts` の `registerWithCode`（`earlier`、`db.batch`、`CODE_USABLE`） |
 | `Accounts`：`SRecover*` / `SClosed` / `SBatch*` | `v1.ts` の `/accounts` / `registrationMode` と回復の再照会 / `accounts.ts` の `createAccount` |
+| `Invites`：`SRecover*` / `SBatch*`, `SRecheck*` / `Revoke`, `Expire` | `accounts.ts` の `recoverAccount` / `createAccount`（招待の消費、`INVITE_USABLE`、UNIQUE の巻き戻し）/ `invites.ts` の `revokeInvite`、`expires_at` |
 | `RegistrationClient`：`WriteBegin`, `Disk*`, `Rd` | `DurableMap.write`（`settle`、`DurableFile.replace`）, `DurableMap.get`, `view` |
 | 同：`Start`, `Retry`, `Cancel`, `BeginCheck`…`FinishEnd`, `Drop`, `Reset` | `RegistrationMachine.start`, `retry`, `cancel`, `begin`, `finish`, `reset` |
 | 同：`SaveTok`, `SaveReg`, `KeyWrite`, `Adopt` | `PairingStore.savePairing`, `confirmKey`, `adoptLegacyKey` |

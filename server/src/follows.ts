@@ -1,9 +1,9 @@
-// Follows between users. A user finds another by their exact handle (there is
-// no directory or search, and lookups are rate limited, which limits bulk
-// probing; guessing a handle still reveals that it exists) and sends a follow
-// request. Once the other user accepts it, the follower sees their shared
-// check-ins. Following is one-way; either side can end it (unfollow, remove
-// follower), and declining deletes the request, so it can be sent again.
+// Follows between users. A user finds another by their exact username (there
+// is no directory or search, and lookups are rate limited, which limits bulk
+// probing; guessing a username still reveals that it exists) and sends a
+// follow request. Once the other user accepts it, the follower sees their
+// shared check-ins. Following is one-way; either side can end it (unfollow,
+// remove follower), and declining deletes the request, so it can be sent again.
 //
 // Only users with status 'active' are found, followed or listed.
 //
@@ -13,14 +13,15 @@
 
 import { floorHour } from "./util";
 
-export const HANDLE_RE = /^[a-z0-9_]{3,20}$/;
+/** A username: what users are shown and looked up by (stored in users.handle, lowercase). */
+export const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
 
 export type FollowStatus = "pending" | "accepted";
 
+/** A user as other users see them. `username` is null only for users created before usernames (legacy). */
 export interface UserRef {
   id: string;
-  handle: string | null;
-  name: string;
+  username: string | null;
 }
 
 export interface FollowView extends UserRef {
@@ -32,17 +33,17 @@ export interface FollowingView extends FollowView {
   status: FollowStatus;
 }
 
-/** Lowercases; returns null if the result is not a valid handle. */
-export function normalizeHandle(raw: string): string | null {
+/** Trims and lowercases (usernames are case-insensitive); null if the result is not a valid username. */
+export function normalizeUsername(raw: string): string | null {
   const h = raw.trim().toLowerCase();
-  return HANDLE_RE.test(h) ? h : null;
+  return USERNAME_RE.test(h) ? h : null;
 }
 
-/** Exact, case-insensitive (handles are stored lowercase) lookup of an active user. */
-export async function lookupHandle(db: D1Database, handle: string): Promise<UserRef | null> {
+/** Exact, case-insensitive (usernames are stored lowercase) lookup of an active user. */
+export async function lookupUsername(db: D1Database, username: string): Promise<UserRef | null> {
   return db
-    .prepare("SELECT id, handle, name FROM users WHERE handle = ?1 AND status = 'active'")
-    .bind(handle)
+    .prepare("SELECT id, handle AS username FROM users WHERE handle = ?1 AND status = 'active'")
+    .bind(username)
     .first<UserRef>();
 }
 
@@ -61,7 +62,7 @@ export async function requestFollow(db: D1Database, followerId: string, followee
       .bind(followerId, followeeId, floorHour(Date.now())),
     db
       .prepare(
-        `SELECT u.id, u.handle, u.name, f.status FROM follows f JOIN users u ON u.id = f.followee_id
+        `SELECT u.id, u.handle AS username, f.status FROM follows f JOIN users u ON u.id = f.followee_id
          WHERE f.follower_id = ?1 AND f.followee_id = ?2 AND u.status = 'active'`,
       )
       .bind(followerId, followeeId),
@@ -76,7 +77,7 @@ export async function requestFollow(db: D1Database, followerId: string, followee
 export async function listFollowing(db: D1Database, userId: string): Promise<FollowingView[]> {
   const { results } = await db
     .prepare(
-      `SELECT u.id, u.handle, u.name, f.status, COALESCE(f.accepted_at, f.created_at) AS since
+      `SELECT u.id, u.handle AS username, f.status, COALESCE(f.accepted_at, f.created_at) AS since
        FROM follows f JOIN users u ON u.id = f.followee_id
        WHERE f.follower_id = ?1 AND u.status = 'active'
        ORDER BY since, u.id`,
@@ -90,7 +91,7 @@ export async function listFollowing(db: D1Database, userId: string): Promise<Fol
 export async function listFollowers(db: D1Database, userId: string, status: FollowStatus): Promise<FollowView[]> {
   const { results } = await db
     .prepare(
-      `SELECT u.id, u.handle, u.name, COALESCE(f.accepted_at, f.created_at) AS since
+      `SELECT u.id, u.handle AS username, COALESCE(f.accepted_at, f.created_at) AS since
        FROM follows f JOIN users u ON u.id = f.follower_id
        WHERE f.followee_id = ?1 AND f.status = ?2 AND u.status = 'active'
        ORDER BY since, u.id`,

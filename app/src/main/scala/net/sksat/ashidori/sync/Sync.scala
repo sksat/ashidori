@@ -38,6 +38,9 @@ object SyncConfig:
   def lastSync_=(t: Long): Unit = prefs.edit().putLong("lastSync", t).apply()
   def lastError: String = prefs.getString("lastError", "")
   def lastError_=(s: String): Unit = prefs.edit().putString("lastError", s).apply()
+  /** The user's username as last seen, for display only (empty: unknown, or none yet). */
+  def username: String = prefs.getString("username", "")
+  def username_=(s: String): Unit = prefs.edit().putString("username", s).apply()
 
   def token: Option[String] = store.token
   def masterKey: Option[Array[Byte]] = store.masterKey
@@ -171,7 +174,8 @@ object Registration:
 
   /** Sends `p`; network errors are retried a few times. Blocking, on the network executor.
     *
-    * A 403 to `POST /v1/accounts` is final only for the first request with a
+    * A 403 to `POST /v1/accounts` (only without an invite: the server reads
+    * `REGISTRATION` only then) is final only for the first request with a
     * token made in this process. Otherwise an earlier copy of the request
     * (sent before a lost answer, a crash or a retry) may still be on its way
     * and create the account after the server refused this one (registration
@@ -183,8 +187,11 @@ object Registration:
   private def send(p: PendingRegistration): String =
     val c = SyncClient(p.url, None)
     val deadline = System.nanoTime() + RefusedRetryNanos
+    val invite = Option(p.code).filter(_.nonEmpty)
     def attempt(n: Int, netErrors: Int, copies: Boolean): String =
-      try if p.kind == "account" then c.createAccount(p.name, p.token) else c.register(p.code, p.name, p.token)
+      try
+        if p.kind == "account" then c.createAccount(p.name, p.token, p.username, invite)._1
+        else c.register(p.code, p.name, p.token)
       catch
         case e: java.io.IOException if netErrors < 2 =>
           Log.w(s"registration attempt $n failed", e)
@@ -220,7 +227,9 @@ object Registration:
 
   private def emit(e: RegistrationEvent): Unit = main.post(() => listeners.toVector.foreach(_(e)))
 
-  def start(url: String, kind: String, code: String, name: String): Unit = machine.start(url, kind, code, name)
+  /** `kind` "account" (a new user; `code` the invite or empty, `username` chosen) or "pair" (`code` the pairing code). */
+  def start(url: String, kind: String, code: String, name: String, username: String = ""): Unit =
+    machine.start(url, kind, code, name, username)
   def retry(): Unit = machine.retry()
   /** False, changing nothing, when it came too late (see [[RegistrationMachine.cancel]]). */
   def cancel(): Boolean = machine.cancel()
@@ -296,20 +305,43 @@ final class SyncClient(base: String, token: Option[String]):
     val r = request("GET", "/v1/info")
     if r.code == 200 && Try(r.json("registration").str).toOption.contains("open") then "open" else "admin"
 
-  /** Creates a user with this device as its first device (open registration
-    * only), with the client-chosen `token`; idempotent like [[register]].
-    * Returns the device id. A 403 (registration closed or full) throws
-    * [[SyncClient.AccountRefused]]: final only if no other copy of the
-    * request may reach the server later (see `Registration.send`).
+  /** Creates a user named `username` with this device as its first device,
+    * with the client-chosen `token`: with `invite` on any server, without
+    * one only where registration is open. Idempotent like [[register]].
+    * Returns the device id and the user's username (as the server has it
+    * now; None from a server before usernames). A request stored by an older
+    * version has no username; it is sent without one, and the server
+    * recovers it by the token.
+    *
+    * A 409 for the username throws [[UsernameTakenError]], a 401 (the invite
+    * is unknown, used, expired or revoked) [[RegistrationRejected]]. A 403
+    * (registration closed or full) throws [[SyncClient.AccountRefused]]:
+    * final only if no other copy of the request may reach the server later
+    * (see `Registration.send`).
     */
-  def createAccount(deviceName: String, token: String): String =
-    val r = request("POST", "/v1/accounts", ujson.write(ujson.Obj("deviceName" -> deviceName, "token" -> token)).getBytes(UTF_8))
+  def createAccount(deviceName: String, token: String, username: String, invite: Option[String]): (String, Option[String]) =
+    val body = ujson.Obj("deviceName" -> deviceName, "token" -> token)
+    if username.nonEmpty then body("username") = username
+    invite.foreach(body("invite") = _)
+    val r = request("POST", "/v1/accounts", ujson.write(body).getBytes(UTF_8))
+    def error = Try(r.json("error").str).getOrElse("")
     r.code match
-      case 200 | 201 => r.json("deviceId").str
-      case 403 => throw SyncClient.AccountRefused("このサーバでは新規登録を受け付けていません")
+      case 200 | 201 => (r.json("deviceId").str, r.json.obj.get("username").flatMap(_.strOpt))
+      case 401 if invite.isDefined => throw RegistrationRejected("招待が無効です。期限切れ、使用済み、または取り消された可能性があります")
+      case 409 if error == "username taken" => throw UsernameTakenError(username)
+      case 403 => throw SyncClient.AccountRefused("このサーバでは招待のない登録を受け付けていません")
       case 429 => throw RuntimeException("登録の試行回数が上限に達しました。時間をおいて再度お試しください")
       case c if refused(c) => throw RegistrationRejected(s"登録に失敗しました ($c): ${r.text.take(200)}")
       case c => throw RuntimeException(s"登録に失敗しました ($c): ${r.text.take(200)}")
+
+  /** This device's user: `(registered with a user, its username)`. A legacy
+    * device has no user; a legacy user may have no username yet.
+    */
+  def me(): (Boolean, Option[String]) =
+    val r = request("GET", "/v1/me")
+    if r.code != 200 then throw RuntimeException(s"HTTP ${r.code}")
+    val js = r.json
+    (js.obj.get("userId").exists(!_.isNull), js.obj.get("username").flatMap(_.strOpt))
 
   def createPairing(): (String, Long) =
     val r = request("POST", "/v1/pairing", "{}".getBytes(UTF_8))

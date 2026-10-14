@@ -47,14 +47,56 @@ export function adminCall(path: string, init: RequestInit = {}): Promise<Respons
   return call(path, { ...init, headers });
 }
 
+/**
+ * A user as an admin created it before invites (POST /admin/users, removed):
+ * named `name`, with `handle` as its username if given (else a legacy user
+ * without one). Inserted directly; it has no device yet.
+ */
 export async function createUser(name: string, email?: string, handle?: string): Promise<string> {
-  const res = await adminCall("/admin/users", {
+  const id = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO users (id, name, handle, email, status, created_at, created_by)
+     VALUES (?1, ?2, ?3, ?4, 'active', ?5, 'dev-admin@localhost')`,
+  )
+    .bind(id, name, handle ?? null, email ?? null, Date.now())
+    .run();
+  return id;
+}
+
+/** An invite from the admin API: `{id, code, expiresAt, link}`. */
+export async function createInvite(ttlDays?: number): Promise<{ id: string; code: string; expiresAt: number; link: string }> {
+  const res = await adminCall("/admin/invites", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, email, handle }),
+    body: JSON.stringify(ttlDays === undefined ? {} : { ttlDays }),
   });
-  if (res.status !== 201) throw new Error(`create user failed: ${res.status}`);
-  return ((await res.json()) as { id: string }).id;
+  if (res.status !== 201) throw new Error(`create invite failed: ${res.status}`);
+  return (await res.json()) as { id: string; code: string; expiresAt: number; link: string };
+}
+
+let usernames = 0;
+/** A username no other test user has. */
+export function newUsername(): string {
+  return `u${Date.now().toString(36)}_${(usernames++).toString(36)}`.slice(0, 20);
+}
+
+/** POST /v1/accounts with an invite (any REGISTRATION mode). */
+export function acceptInvite(
+  invite: string,
+  username: string,
+  token = newToken(),
+  ip = "192.0.2.1",
+  envOverrides: Partial<Cloudflare.Env> = {},
+): Promise<Response> {
+  return call(
+    "/v1/accounts",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+      body: JSON.stringify({ token, username, invite, deviceName: "pixel" }),
+    },
+    envOverrides,
+  );
 }
 
 /** The user that devices belong to unless a test says otherwise (created on demand). */
@@ -97,18 +139,24 @@ export function register(
 /** Env with open self-registration (REGISTRATION is "admin" in wrangler.jsonc). */
 export const OPEN: Partial<Cloudflare.Env> = { REGISTRATION: "open" };
 
-/** POST /v1/accounts with `body` as JSON (a fresh token is added unless `body` has one). */
+/**
+ * POST /v1/accounts with `body` as JSON (a fresh token and a fresh username
+ * are added unless `body` has them).
+ */
 export function selfRegister(
   body: Record<string, unknown> = { deviceName: "pixel" },
   ip = "192.0.2.1",
   envOverrides: Partial<Cloudflare.Env> = OPEN,
 ): Promise<Response> {
+  const full = { ...body };
+  if (!("token" in full)) full.token = newToken();
+  if (!("username" in full)) full.username = newUsername();
   return call(
     "/v1/accounts",
     {
       method: "POST",
       headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
-      body: JSON.stringify("token" in body ? body : { ...body, token: newToken() }),
+      body: JSON.stringify(full),
     },
     envOverrides,
   );
@@ -208,16 +256,16 @@ export async function follow(
   if (acc.status !== 200) throw new Error(`accept failed: ${acc.status}`);
 }
 
-/** A user with one device. */
+/** A user with one device; its username is `handle`, else `name` if that is a valid username (else none, legacy). */
 export async function newUser(name: string, handle?: string): Promise<{ userId: string; token: string; deviceId: string }> {
-  const userId = await createUser(name, undefined, handle);
+  const userId = await createUser(name, undefined, handle ?? (/^[a-z0-9_]{3,20}$/.test(name) ? name : undefined));
   return { userId, ...(await newDevice(name, userId)) };
 }
 
 export interface FeedItem {
   id: string;
   cursor: number;
-  user: { id: string; handle: string | null; name: string };
+  user: { id: string; username: string | null };
   t: number | null;
   lat: number | null;
   lon: number | null;

@@ -47,12 +47,12 @@ export type UserStatus = "active" | "disabled";
 export interface UserRow {
   id: string;
   name: string;
-  /** Lowercase; NULL for users that cannot be looked up. */
+  /** The username (the API calls it `username`): lowercase, unique. NULL only for legacy users. */
   handle: string | null;
   email: string | null;
   status: UserStatus;
   created_at: number;
-  /** E-mail address of the admin who created the user, or "self" (self-registered, see accounts.ts). */
+  /** "self" (registered without an invite), "invite:<invite id>", or the e-mail address of the admin who created a legacy user (see accounts.ts). */
   created_by: string;
   disabled_at: number | null;
 }

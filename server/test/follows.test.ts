@@ -12,8 +12,8 @@ import {
   putCheckin,
 } from "./helpers";
 
-function lookup(token: string, handle: string, ip = "192.0.2.1"): Promise<Response> {
-  return authed(token, `/v1/users/lookup?handle=${encodeURIComponent(handle)}`, { headers: { "CF-Connecting-IP": ip } });
+function lookup(token: string, username: string, ip = "192.0.2.1"): Promise<Response> {
+  return authed(token, `/v1/users/lookup?username=${encodeURIComponent(username)}`, { headers: { "CF-Connecting-IP": ip } });
 }
 
 async function getJson<T>(token: string, path: string): Promise<T> {
@@ -23,12 +23,12 @@ async function getJson<T>(token: string, path: string): Promise<T> {
 }
 
 describe("GET /v1/users/lookup", () => {
-  it("finds active users by exact, case-insensitive handle only", async () => {
+  it("finds active users by exact, case-insensitive username only", async () => {
     const alice = await newUser("Alice", "alice");
     const bob = await newUser("Bob", "bob_2");
     const res = await lookup(alice.token, "BOB_2");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ id: bob.userId, handle: "bob_2", name: "Bob" });
+    expect(await res.json()).toEqual({ id: bob.userId, username: "bob_2" });
 
     for (const h of ["bob", "bob_", "b%", "bob_2 x", ""]) {
       expect((await lookup(alice.token, h)).status, h).toBe(404);
@@ -54,17 +54,17 @@ describe("follow requests", () => {
 
     const req = await postJson(bob.token, "/v1/follows", { userId: alice.userId });
     expect(req.status).toBe(200);
-    expect(await req.json()).toEqual({ user: { id: alice.userId, handle: "alice", name: "alice" }, status: "pending" });
+    expect(await req.json()).toEqual({ user: { id: alice.userId, username: "alice" }, status: "pending" });
     // Idempotent.
     expect(await (await postJson(bob.token, "/v1/follows", { userId: alice.userId })).json()).toMatchObject({
       status: "pending",
     });
 
     expect(await getJson(bob.token, "/v1/follows")).toEqual([
-      { id: alice.userId, handle: "alice", name: "alice", status: "pending", since: expect.any(Number) },
+      { id: alice.userId, username: "alice", status: "pending", since: expect.any(Number) },
     ]);
     expect(await getJson(alice.token, "/v1/follow-requests")).toEqual([
-      { id: bob.userId, handle: "bob", name: "bob", since: expect.any(Number) },
+      { id: bob.userId, username: "bob", since: expect.any(Number) },
     ]);
     expect(await getJson(alice.token, "/v1/followers")).toEqual([]);
 
@@ -140,7 +140,7 @@ describe("follow requests", () => {
     const alice = await newUser("alice", "alice");
     const old = await legacyDevice("legacy1");
     const calls: Array<[string, RequestInit]> = [
-      ["/v1/users/lookup?handle=alice", {}],
+      ["/v1/users/lookup?username=alice", {}],
       ["/v1/follows", {}],
       ["/v1/follows", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userId: alice.userId }) }],
       [`/v1/follows/${alice.userId}`, { method: "DELETE" }],

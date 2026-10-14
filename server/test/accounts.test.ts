@@ -5,17 +5,20 @@ import { registrationMode, UNUSED_ACCOUNT_TTL_MS } from "../src/accounts";
 import { configErrors, DEFAULT_LIMITS, parseLimits } from "../src/config";
 import worker from "../src/index";
 import {
+  acceptInvite,
   ADMIN_DEV_TOKEN,
   adminCall,
   authed,
   blob,
   call,
   CHECKIN,
+  createInvite,
   fakeLimiter,
   follow,
   legacyDevice,
   newDevice,
   newToken,
+  newUsername,
   newUser,
   OPEN,
   postJson,
@@ -30,9 +33,9 @@ interface Account {
   token: string;
 }
 
-async function account(deviceName = "pixel", ip = "192.0.2.1"): Promise<Account> {
+async function account(deviceName = "pixel", ip = "192.0.2.1", username = newUsername()): Promise<Account> {
   const token = newToken();
-  const res = await selfRegister({ deviceName, token }, ip);
+  const res = await selfRegister({ deviceName, token, username }, ip);
   if (res.status !== 201) throw new Error(`self-registration failed: ${res.status}`);
   return { ...((await res.json()) as { deviceId: string }), token };
 }
@@ -81,12 +84,14 @@ describe("POST /v1/accounts", () => {
     expect(await userCount()).toBe(0);
   });
 
-  it("creates a self-registered user with this device and the client's token", async () => {
+  it("creates a self-registered user with this device, the client's token and the chosen username", async () => {
     const token = newToken();
-    const res = await selfRegister({ deviceName: "  Pixel 8a ", token });
+    const res = await selfRegister({ deviceName: "  Pixel 8a ", token, username: " Alice_1 " });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { deviceId: string };
-    expect(Object.keys(body)).toEqual(["deviceId"]);
+    const body = (await res.json()) as { deviceId: string; username: string };
+    expect(Object.keys(body)).toEqual(["deviceId", "username"]);
+    // Case-insensitive: stored lowercase.
+    expect(body.username).toBe("alice_1");
 
     const user = await env.DB.prepare(
       `SELECT u.name, u.handle, u.email, u.status, u.created_by, d.name AS device_name, d.token_hash
@@ -95,8 +100,8 @@ describe("POST /v1/accounts", () => {
       .bind(body.deviceId)
       .first<Record<string, unknown>>();
     expect(user).toMatchObject({
-      name: "Pixel 8a",
-      handle: null,
+      name: "alice_1",
+      handle: "alice_1",
       email: null,
       status: "active",
       created_by: "self",
@@ -119,17 +124,26 @@ describe("POST /v1/accounts", () => {
 
   it("returns the same device for a retry with the same token", async () => {
     const token = newToken();
-    const first = await selfRegister({ deviceName: "pixel", token });
+    const first = await selfRegister({ deviceName: "pixel", token, username: "alice" });
     expect(first.status).toBe(201);
     const { deviceId } = (await first.json()) as { deviceId: string };
-    const retry = await selfRegister({ deviceName: "pixel", token });
+    const retry = await selfRegister({ deviceName: "pixel", token, username: "alice" });
     expect(retry.status).toBe(200);
-    expect(await retry.json()).toEqual({ deviceId });
+    expect(await retry.json()).toEqual({ deviceId, username: "alice" });
+    // A request stored by an older app has no username: recovered all the same.
+    const old = await selfRegister({ deviceName: "pixel", token, username: undefined });
+    expect(old.status).toBe(200);
+    expect(await old.json()).toEqual({ deviceId, username: "alice" });
+    // Without an earlier account, the username is required.
+    expect(await (await selfRegister({ username: undefined })).json()).toEqual({ error: "invalid username" });
     expect(await userCount()).toBe(1);
 
-    // Concurrent retries agree too.
+    // Concurrent retries agree too (the username is in both copies: UNIQUE rolls one back).
     const t2 = newToken();
-    const both = await Promise.all([selfRegister({ token: t2 }), selfRegister({ token: t2 })]);
+    const both = await Promise.all([
+      selfRegister({ token: t2, username: "bob" }),
+      selfRegister({ token: t2, username: "bob" }),
+    ]);
     expect(both.map((r) => r.status).sort()).toEqual([200, 201]);
     const ids = await Promise.all(both.map(async (r) => ((await r.json()) as { deviceId: string }).deviceId));
     expect(ids[0]).toBe(ids[1]);
@@ -150,17 +164,33 @@ describe("POST /v1/accounts", () => {
     expect((await selfRegister({ token })).status).toBe(409);
   });
 
-  it("uses a generic name when none is given, and validates it", async () => {
+  it("validates the username, and refuses one that is taken", async () => {
+    for (const username of ["ab", "x".repeat(21), "a-b", "a b", "日本語", "", 42, null]) {
+      const res = await selfRegister({ username }, "192.0.2.4");
+      expect(res.status, String(username)).toBe(400);
+      expect(await res.json()).toEqual({ error: "invalid username" });
+    }
+    expect((await selfRegister({ username: "carol" })).status).toBe(201);
+    // Case-insensitive.
+    const taken = await selfRegister({ username: "CAROL" });
+    expect(taken.status).toBe(409);
+    expect(await taken.json()).toEqual({ error: "username taken" });
+    expect(await userCount()).toBe(1);
+  });
+
+  it("uses a generic device name when none is given, and validates it", async () => {
     for (const b of [{}, { deviceName: "" }, { deviceName: null }]) {
       const res = await selfRegister(b);
       expect(res.status).toBe(201);
       const { deviceId } = (await res.json()) as Account;
       const row = await env.DB.prepare(
-        "SELECT d.name, u.name AS user_name FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ?1",
+        "SELECT d.name, u.name AS user_name, u.handle FROM devices d JOIN users u ON u.id = d.user_id WHERE d.id = ?1",
       )
         .bind(deviceId)
-        .first<{ name: string; user_name: string }>();
-      expect(row).toEqual({ name: "device", user_name: "device" });
+        .first<{ name: string; user_name: string; handle: string }>();
+      expect(row!.name).toBe("device");
+      // The user is named by its username only.
+      expect(row!.user_name).toBe(row!.handle);
     }
     for (const deviceName of ["x".repeat(65), "a\nb", "   ", 42]) {
       expect((await selfRegister({ deviceName }, "192.0.2.2")).status).toBe(400);
@@ -200,12 +230,9 @@ describe("POST /v1/accounts", () => {
     expect(full.status).toBe(403);
     expect(await full.json()).toEqual({ error: "registration full" });
     expect(await count("SELECT user_count AS n FROM server_usage")).toBe(3);
-    // Admins may still create users.
-    expect((await adminCall("/admin/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "late" }),
-    })).status).toBe(201);
+    // An invite still works: the admin decided to invite.
+    const { code } = await createInvite();
+    expect((await acceptInvite(code, "late", undefined, "192.0.2.13", CAP)).status).toBe(201);
     expect(await count("SELECT user_count AS n FROM server_usage")).toBe(4);
   });
 
@@ -387,25 +414,27 @@ describe("storage quota", () => {
   });
 
   it("keeps the counters without summing, and shows them to the admin", async () => {
-    const alice = await newUser("alice");
-    const self = await account("phone");
+    const alice = await newUser("Alice");
+    const self = await account("pixel", "192.0.2.1", "phone");
     await putBatch(alice.token, "fixes", 0, bytes(50));
     await putBatch(self.token, "fixes", 0, bytes(33));
     await putBatch(self.token, "motion", 0, bytes(34));
     await putCheckin(self.token, "c1", CHECKIN);
 
     const users = (await (await adminCall("/admin/users")).json()) as Array<{
-      name: string;
+      username: string | null;
+      legacyName: string | null;
       createdBy: string;
       storageBytes: number;
       batchCount: number;
       sharedCheckinCount: number;
     }>;
     expect(
-      users.map((u) => ({ name: u.name, createdBy: u.createdBy, storageBytes: u.storageBytes, batchCount: u.batchCount, sharedCheckinCount: u.sharedCheckinCount })),
+      users.map((u) => ({ username: u.username, legacyName: u.legacyName, createdBy: u.createdBy, storageBytes: u.storageBytes, batchCount: u.batchCount, sharedCheckinCount: u.sharedCheckinCount })),
     ).toEqual([
-      { name: "alice", createdBy: "dev-admin@localhost", storageBytes: 50, batchCount: 1, sharedCheckinCount: 0 },
-      { name: "phone", createdBy: "self", storageBytes: 67, batchCount: 2, sharedCheckinCount: 1 },
+      // A legacy user (created by an admin before usernames).
+      { username: null, legacyName: "Alice", createdBy: "dev-admin@localhost", storageBytes: 50, batchCount: 1, sharedCheckinCount: 0 },
+      { username: "phone", legacyName: null, createdBy: "self", storageBytes: 67, batchCount: 2, sharedCheckinCount: 1 },
     ]);
     expect(await count("SELECT total_bytes AS n FROM server_usage")).toBe(117);
   });
@@ -417,11 +446,11 @@ describe("storage quota", () => {
       { ...OPEN, USER_QUOTA_BYTES: "1048576" },
     );
     const page = await res.text();
-    expect(page).toContain("新規登録: 公開");
+    expect(page).toContain("登録の方式: 招待または自由な登録");
     expect(page).toContain("const QUOTA = 1048576;");
     expect(page).toContain(`const MAX_TOTAL = ${50 * 1024 ** 3};`);
     const closed = await (await adminCall("/admin/")).text();
-    expect(closed).toContain("新規登録: 管理者のみ");
+    expect(closed).toContain("登録の方式: 招待のみ");
     const broken = await (
       await call("/admin/", { headers: { Authorization: `Bearer ${ADMIN_DEV_TOKEN}` } }, { USER_MAX_DEVICES: "0" })
     ).text();

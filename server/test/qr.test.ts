@@ -38,13 +38,13 @@ describe("vendored QR encoder", () => {
 });
 
 describe("QR codes of registration links", () => {
-  it("the /pair page draws the link of the fragment's code", async () => {
+  it("the /pair page draws the link of the fragment's code or invite", async () => {
     const res = await call("/pair");
     const nonce = nonceOf(res, "");
     const html = await res.text();
     expectQrScript(html, nonce);
     expect(html).toContain('<div id="qr"></div>');
-    expect(html).toContain('showQr(document.getElementById("qr"), location.origin + "/pair#c=" + code)');
+    expect(html).toContain('showQr($("qr"), location.origin + "/pair#" + key + "=" + code)');
     expect(html).toContain("QR コードを読み取る");
   });
 
@@ -53,7 +53,7 @@ describe("QR codes of registration links", () => {
     const nonce = nonceOf(res, "connect-src 'self'; ");
     const html = await res.text();
     expectQrScript(html, nonce);
-    expect(html).toMatch(/<div id="pairing" hidden><div class="row"><div id="qr"><\/div>/);
+    expect(html).toMatch(/<div id="issued" hidden><div class="row"><div id="qr"><\/div>/);
     expect(html).toContain('showQr($("qr"), link)');
   });
 });

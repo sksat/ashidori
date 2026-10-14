@@ -97,6 +97,49 @@ same_device_id_for_two_devices verified
 no_forward_secrecy verified
 "
 
+# Expected result per lemma of crypto/browser_pairing.spthy, per mutation
+# flag ("-" = no flag): <flag> <lemma> <expected>.
+PAIRING_EXPECT="
+- executable verified
+- master_key_secrecy verified
+- batch_key_secrecy verified
+- grant_agreement verified
+NOCOMMIT executable verified
+NOCOMMIT batch_key_secrecy falsified
+NOGRANTAUTH grant_agreement falsified
+NOGRANTAUTH batch_key_secrecy verified
+APPONLY grant_agreement falsified
+APPONLY batch_key_secrecy verified
+"
+
+# Runs crypto/browser_pairing.spthy once per flag of $PAIRING_EXPECT and
+# checks each listed lemma.
+run_tamarin_pairing() {
+  local flag flags f log t0 t1 summary lemma want line got name
+  flags=$(echo "$PAIRING_EXPECT" | awk 'NF {print $1}' | awk '!seen[$0]++')
+  for flag in $flags; do
+    if [ "$flag" = - ]; then log="$LOGS/browser_pairing.log"; name="tamarin pairing"; else log="$LOGS/browser_pairing-$flag.log"; name="tamarin pairing -D=$flag"; fi
+    t0=$(date +%s)
+    # shellcheck disable=SC2046 # no option, or one -D option
+    "$TAMARIN" --with-maude="$MAUDE" $([ "$flag" = - ] || echo "-D=$flag") --prove "$HERE/crypto/browser_pairing.spthy" >"$log" 2>&1 || true
+    t1=$(date +%s)
+    summary=$(sed -n '/summary of summaries/,$p' "$log")
+    if ! grep -q "All wellformedness checks were successful" "$log"; then
+      report "$name (wellformedness)" FAIL $((t1 - t0)) "see $log"
+    fi
+    while read -r f lemma want; do
+      [ "$f" = "$flag" ] || continue
+      line=$(echo "$summary" | grep -E "^ *$lemma \(" || true)
+      got=$(echo "$line" | sed -E 's/.*\): ([a-z]+).*/\1/')
+      if [ "$got" = "$want" ]; then
+        report "$name/$lemma" ok $((t1 - t0)) "$got (expected)"
+      else
+        report "$name/$lemma" FAIL $((t1 - t0)) "got '${got:-none}', expected $want; see $log"
+      fi
+    done <<<"$PAIRING_EXPECT"
+  done
+}
+
 run_tamarin() {
   fetch_tamarin
   local log t0 t1 summary
@@ -149,6 +192,8 @@ run_tamarin() {
       report "$name" FAIL $((t1 - t0)) "got '${got:-none}', expected $want; see $log"
     fi
   done
+
+  run_tamarin_pairing
 }
 
 # ---- TLA+ ----
@@ -183,6 +228,9 @@ Accounts_live Accounts pass
 Accounts_norecheck Accounts inv:RetriesAgree
 Accounts_gatefirst Accounts inv:RecoverUngated
 Accounts_closedrace Accounts inv:RetriesAgree
+Invites Invites pass cover:SRecoverHit,SBatchToken,SBatchInvalid,SBatchTaken,SBatchCreate,SRecheckKnown,SRecheckRefused,Revoke,Expire
+Invites_open Invites pass cover:SBatchCreate,SBatchTaken
+Invites_nonatomic Invites inv:ConsumedHasUser
 Outbox Outbox pass cover:Seal,Commit,Crash,Timeout,Unpair reach:Unreached_Resealed
 Outbox_2faults Outbox pass
 Outbox_nonatomic Outbox inv:SameSlotSameCiphertext

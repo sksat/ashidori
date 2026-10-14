@@ -8,6 +8,7 @@ import { hitRateLimit, RULES } from "../src/ratelimit";
 import { D1_NOW_MS } from "../src/util";
 import {
   adminCall,
+  createUser,
   fakeLimiter,
   issueAdminCode,
   newDevice,
@@ -66,12 +67,7 @@ describe("pairing-code expiry", () => {
   });
 
   it("is set from D1's clock when the code is issued", async () => {
-    const user = await adminCall("/admin/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "u" }),
-    });
-    const { id } = (await user.json()) as { id: string };
+    const id = await createUser("u");
     const res = await adminCall(`/admin/users/${id}/pairing`, { method: "POST" });
     const { expiresAt } = (await res.json()) as { expiresAt: number };
     const row = await env.DB.prepare("SELECT created_at, expires_at FROM pairing_codes").first<{

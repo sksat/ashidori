@@ -17,7 +17,7 @@ import scala.collection.mutable
 import scala.util.Try
 import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
-import ashidori.core.sync.{Crypto, PairLink, RecoveryCode, RegistrationEvent, RegistrationState}
+import ashidori.core.sync.{Crypto, PairLink, RecoveryCode, RegistrationEvent, RegistrationState, Username}
 import Ui.*
 
 /** Server sync setup, one step at a time from the persisted state:
@@ -25,9 +25,16 @@ import Ui.*
   * → encryption key confirmed → syncing. Sync stays off until the key is
   * confirmed, and a confirmed key is never replaced.
   *
+  * Two ways in, named on screen so that it is clear which one happens:
+  *  - 「新しく登録」: this device creates a new user, under a username chosen
+  *    here, with an invite (a link or its QR code) or, where the server
+  *    allows it, without one; then it creates the key.
+  *  - 「この端末を追加」: this device joins an existing user with a pairing
+  *    code; then the recovery code is entered.
+  *
   * `link`: a registration link the app was opened with. It, like a link
   * scanned from a QR code here, only fills in the server and the pairing
-  * code; the user still checks the server and presses 「この端末を登録」. A
+  * code or invite; the user still checks the server shown and confirms. A
   * link for a server other than the one entered or configured is applied
   * only after a confirmation naming it.
   */
@@ -54,10 +61,15 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     * re-renders step 1). Starts empty unless the build sets a server.
     */
   private var lastUrl = SyncSettingsScreen.DefaultServer
-  /** The pairing code of a registration link, for the server in [[lastUrl]];
-    * dropped when the URL is edited.
+  /** A registration link (pairing code or invite) for the server in
+    * [[lastUrl]]; dropped when the URL is edited.
     */
-  private var linkCode: Option[String] = None
+  private var fromLink: Option[PairLink] = None
+  /** The server for which 「新しく登録」 without an invite was chosen; dropped when the URL is edited. */
+  private var newAccountFor: Option[String] = None
+  /** The username input of 「新しく登録」, kept across re-renders, and why the server refused it. */
+  private var usernameDraft = ""
+  private var usernameError: Option[String] = None
   /** [[link]] is still to be applied (on the first show). */
   private var linkPending = link.isDefined
   /** Buttons that start a request, disabled while [[busy]]. */
@@ -86,6 +98,12 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       case RegistrationEvent.Failed(attempt, msg) =>
         if Registration.isLatest(attempt) then toast(msg)
         render()
+      case RegistrationEvent.UsernameTaken(attempt, name) =>
+        // Back to the username, with the reason next to it.
+        if Registration.isLatest(attempt) then
+          usernameDraft = name
+          usernameError = Some("このユーザ名はすでに使われています。別のユーザ名を入力してください")
+        render()
       case RegistrationEvent.Paired(attempt, newAccount) =>
         render()
         // Self-registered: no other device has a key, so go straight to making one.
@@ -112,7 +130,9 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     else
       def apply(): Unit =
         lastUrl = l.server
-        linkCode = Some(l.code)
+        fromLink = Some(l)
+        newAccountFor = None
+        usernameError = None
         render()
       // The server the user entered (or a build-time one) or configured.
       val known = Seq(lastUrl, SyncConfig.serverUrl).filter(u => u != null && u.nonEmpty)
@@ -163,10 +183,11 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
 
   // --- step 1: server and registration ---
 
-  /** Step 1: the server URL first. What follows depends on the server's
-    * registration mode (`/v1/info`): with open registration, a choice between
-    * creating an account and joining from another device; otherwise (or when
-    * the server cannot be asked) the pairing code input.
+  /** Step 1: the server URL first, unless a registration link gave it. What
+    * follows depends on the link, or on the server's registration mode
+    * (`/v1/info`): with open registration, a choice between 「新しく登録」 and
+    * 「この端末を追加」; otherwise (or when the server cannot be asked) the
+    * pairing code input, and a note that registering needs an invite.
     */
   private def registerCard(): View =
     val url = EditText(act)
@@ -181,12 +202,17 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit =
         gen += 1
         lastUrl = s.toString
-        linkCode = None
+        fromLink = None
+        newAccountFor = None
         next.removeAllViews()
       def afterTextChanged(s: Editable): Unit = ()
     )
-    // From a registration link: the code is known, so straight to its input.
-    if linkCode.isDefined then next.addView(pairingCodeInput(entered))
+    // From a registration link: what it is for is known, so straight to its step.
+    fromLink match
+      case Some(l) if l.invite => next.addView(newAccountInput(entered, Some(l.code)))
+      case Some(l) => next.addView(pairingCodeInput(entered, Some(l.code)))
+      case None if newAccountFor.contains(entered) => next.addView(newAccountInput(entered, None))
+      case None => ()
     val check = button("次へ") {
       val u = entered
       if !u.startsWith("https://") && !(debuggable && u.startsWith("http://")) then
@@ -194,6 +220,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       else
         gen += 1
         val g = gen
+        fromLink = None
+        newAccountFor = None
         next.removeAllViews()
         next.addView(caption("サーバに問い合わせています…"))
         async(SyncClient(u, None).registration()) { r =>
@@ -202,14 +230,16 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
             next.removeAllViews()
             // Network errors fall back to the pairing code, which works on every server.
             if r.toOption.contains("open") then next.addView(startChoice(u, next))
-            else next.addView(pairingCodeInput(u))
+            else
+              next.addView(pairingCodeInput(u, None))
+              next.addView(caption("このサーバに新しく登録するには、サーバの管理者から受け取った招待のリンクを開くか、その QR コードを読み取ります。"))
         }
     }
     // A scanned link goes through the same checks as an opened one.
     val scan = action(outlined("QR コードを読み取る")(PairQrUi.scan(act, allowHttp = debuggable)(openLink)))
     card(
       text("1. 端末を登録", 16f, bold = true),
-      caption("登録リンクの QR コードを読み取るか、同期先のサーバの URL を入力します。"),
+      caption("招待または登録リンクの QR コードを読み取るか、同期先のサーバの URL を入力します。"),
       scan,
       caption("カメラを使います。映像は端末内で処理し、送信しません。"),
       spacer(8),
@@ -219,34 +249,76 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       next
     )
 
-  /** Open registration: this device is either the user's first or joins one. */
+  /** Open registration: this device either registers a new user or joins one. */
   private def startChoice(u: String, next: LinearLayout): View =
     vbox(
       target(u),
-      action(button("新しく始める（この端末が最初）")(startRegistration(u, "account", ""))),
-      caption("このサーバに新しく登録し、暗号化の鍵を作成します。"),
-      outlined("別の端末から追加") {
+      action(button("新しく登録") {
+        newAccountFor = Some(u)
+        usernameError = None
         next.removeAllViews()
-        next.addView(pairingCodeInput(u))
+        next.addView(newAccountInput(u, None))
+      }),
+      caption("このサーバに新しく登録し、この端末で暗号化の鍵を作ります。"),
+      outlined("この端末を追加") {
+        next.removeAllViews()
+        next.addView(pairingCodeInput(u, None))
       },
       caption("登録済みの端末で発行したペアリングコードと、復旧コードを入力します。")
     )
 
-  /** `fromLink`: the code of a registration link for this server, filled in. */
-  private def pairingCodeInput(u: String, fromLink: Option[String] = linkCode): View =
+  /** 「新しく登録」: the username only, then the account (with `invite`, or
+    * without one where the server allows it), then the key.
+    */
+  private def newAccountInput(u: String, invite: Option[String]): View =
+    val name = EditText(act)
+    name.setHint("例: hanako_01")
+    name.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+    name.setFilters(Array(android.text.InputFilter.LengthFilter(20)))
+    name.setText(usernameDraft)
+    usernameError.foreach(name.setError(_))
+    name.addTextChangedListener(new TextWatcher:
+      def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()
+      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = usernameDraft = s.toString
+      def afterTextChanged(s: Editable): Unit = ()
+    )
+    val go = action(button("登録") {
+      val raw = name.getText.toString
+      Username.problem(raw) match
+        case Some(why) => name.setError(why)
+        case None =>
+          val username = Username.normalize(raw).get
+          usernameError = None
+          startRegistration(u, "account", invite.getOrElse(""), username)
+    })
+    vbox(
+      spacer(8),
+      text("新しく登録", 15f, bold = true),
+      caption(if invite.isDefined then "招待のリンクから、このサーバに新しく登録します。登録先を確認してください。"
+        else "このサーバに新しく登録します。"),
+      caption("ユーザ名"),
+      name,
+      caption("英小文字・数字・_ の 3〜20 文字。他の利用者に表示され、フォローの申請に使われます。"),
+      target(u),
+      go
+    )
+
+  /** 「この端末を追加」. `fromLink`: the code of a registration link for this server, filled in. */
+  private def pairingCodeInput(u: String, fromLink: Option[String]): View =
     val code = EditText(act)
     code.setHint("ペアリングコード（8文字）")
     code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
     fromLink.foreach(code.setText(_))
-    val go = action(button("この端末を登録") {
+    val go = action(button("この端末を追加") {
       val c = code.getText.toString.trim.toUpperCase
       if c.isEmpty then toast("ペアリングコードを入力してください")
       else startRegistration(u, "pair", c)
     })
     vbox(
       spacer(8),
-      caption(if fromLink.isDefined then "登録リンクからサーバとペアリングコードを入力しました。登録先を確認してから登録してください。"
-        else "サーバの管理ページ、または登録済みの別の端末でペアリングコードを発行して入力します。"),
+      text("この端末を追加", 15f, bold = true),
+      caption(if fromLink.isDefined then "登録リンクからサーバとペアリングコードを入力しました。登録先を確認してから追加してください。"
+        else "登録済みの別の端末、またはサーバの管理者が発行したペアリングコードを入力します。"),
       code,
       target(u),
       go
@@ -255,8 +327,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
   /** Stores the request with a new device token, then sends it. One at a
     * time, app-wide; the outcome arrives through [[onRegistration]].
     */
-  private def startRegistration(u: String, kind: String, code: String): Unit =
-    if !busy then Registration.start(u, kind, code, SyncScheduler.deviceName)
+  private def startRegistration(u: String, kind: String, code: String, username: String = ""): Unit =
+    if !busy then Registration.start(u, kind, code, SyncScheduler.deviceName, username)
 
   /** A registration being sent, or sent but not answered: wait, retry it
     * with the same token, or give it up. Giving up also drops the answer of
@@ -274,9 +346,15 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
         else "登録の応答を受け取れていません。同じ内容でもう一度送ると、サーバで登録済みならその登録を使います。")
     )
     val detail = s.pending.toSeq.flatMap { p =>
-      Seq(target(p.url), caption(if p.kind == "account" then "新しく始める（この端末が最初）" else s"ペアリングコード ${p.code}"))
+      val what =
+        if p.kind != "account" then s"この端末を追加（ペアリングコード ${p.code}）"
+        else
+          val how = if p.code.nonEmpty then "招待で新しく登録" else "新しく登録"
+          if p.username.nonEmpty then s"$how（ユーザ名 ${p.username}）" else how
+      Seq(target(p.url), caption(what))
     }
     card((head ++ detail ++ Seq(retry, cancel))*)
+
 
 
   // --- step 2: the encryption key ---
@@ -434,8 +512,23 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
   private def statusCard(): View =
     val last = SyncConfig.lastSync
     val err = SyncConfig.lastError
+    // The username as last seen, then as the server has it now (an admin may set or change it).
+    val who = caption("")
+    def showWho(name: String): Unit =
+      who.setText(if name.nonEmpty then s"ユーザ名 $name" else "ユーザ名 未設定（サーバの管理者が設定します）")
+    if SyncConfig.username.nonEmpty then showWho(SyncConfig.username) else who.setVisibility(View.GONE)
+    async(SyncClient(SyncConfig.serverUrl, SyncConfig.token).me()) {
+      case scala.util.Success((true, name)) =>
+        SyncConfig.username = name.getOrElse("")
+        showWho(name.getOrElse(""))
+        who.setVisibility(View.VISIBLE)
+      // A device registered before users existed has no user, so no username.
+      case scala.util.Success((false, _)) => who.setVisibility(View.GONE)
+      case scala.util.Failure(_) => ()
+    }
     card(
       text("● 同期中", 16f, bold = true, colorAttr = attr.primary),
+      who,
       caption(SyncConfig.serverUrl),
       caption(if last == 0 then "まだ同期していません" else s"最終同期 ${Instant.ofEpochMilli(last).atZone(AshidoriApp.zone).format(fmt)}"),
       (if err.nonEmpty then text(s"前回のエラー: $err", 13f, colorAttr = attr.error) else spacer(0)),

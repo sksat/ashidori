@@ -6,7 +6,7 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { issueAdminCode, newDevice, newToken, OPEN, register, selfRegister } from "./helpers";
+import { acceptInvite, adminCall, createInvite, issueAdminCode, newDevice, newToken, OPEN, register, selfRegister } from "./helpers";
 
 interface Gate {
   db: D1Database;
@@ -166,8 +166,8 @@ describe("concurrent self-registration", () => {
   it("Accounts_norecheck: the same token at MAX_USERS: one creates the account, the other gets it (200)", async () => {
     const env1 = { ...OPEN, MAX_USERS: "1" };
     const [a, b] = await race(
-      (db) => selfRegister({ deviceName: "pixel", token }, "192.0.2.1", { ...env1, DB: db }),
-      (db) => selfRegister({ deviceName: "pixel", token }, "192.0.2.2", { ...env1, DB: db }),
+      (db) => selfRegister({ deviceName: "pixel", token, username: "alice" }, "192.0.2.1", { ...env1, DB: db }),
+      (db) => selfRegister({ deviceName: "pixel", token, username: "alice" }, "192.0.2.2", { ...env1, DB: db }),
     );
     const first = await body(a);
     expect(first.status).toBe(201);
@@ -177,8 +177,8 @@ describe("concurrent self-registration", () => {
 
   it("the same token below MAX_USERS: 201 and 200, one user", async () => {
     const [a, b] = await race(
-      (db) => selfRegister({ deviceName: "pixel", token }, "192.0.2.1", { ...OPEN, DB: db }),
-      (db) => selfRegister({ deviceName: "pixel", token }, "192.0.2.2", { ...OPEN, DB: db }),
+      (db) => selfRegister({ deviceName: "pixel", token, username: "alice" }, "192.0.2.1", { ...OPEN, DB: db }),
+      (db) => selfRegister({ deviceName: "pixel", token, username: "alice" }, "192.0.2.2", { ...OPEN, DB: db }),
     );
     const first = await body(a);
     expect(first.status).toBe(201);
@@ -197,9 +197,9 @@ describe("concurrent self-registration", () => {
   it("Accounts_closedrace: a copy that passed the recovery before the account existed gets it after the close (200)", async () => {
     const t = newToken();
     const held = holdAfterFirstQuery();
-    const pb = selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin", DB: held.db });
+    const pb = selfRegister({ deviceName: "pixel", token: t, username: "alice" }, "192.0.2.2", { REGISTRATION: "admin", DB: held.db });
     await held.reached; // B's recovery found nothing
-    const a = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.1", OPEN));
+    const a = await body(await selfRegister({ deviceName: "pixel", token: t, username: "alice" }, "192.0.2.1", OPEN));
     expect(a.status).toBe(201);
     held.release();
     expect(await body(await pb)).toEqual({ status: 200, body: a.body });
@@ -211,11 +211,11 @@ describe("concurrent self-registration", () => {
   // before it takes a 403 as final, see docs/sync-protocol.md) gets it.
   it("a copy refused before the other copy committed: 403, and a later copy gets the account (200)", async () => {
     const t = newToken();
-    const b = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin" }));
+    const b = await body(await selfRegister({ deviceName: "pixel", token: t, username: "alice" }, "192.0.2.2", { REGISTRATION: "admin" }));
     expect(b).toEqual({ status: 403, body: { error: "registration closed" } });
-    const a = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.1", OPEN));
+    const a = await body(await selfRegister({ deviceName: "pixel", token: t, username: "alice" }, "192.0.2.1", OPEN));
     expect(a.status).toBe(201);
-    const again = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin" }));
+    const again = await body(await selfRegister({ deviceName: "pixel", token: t, username: "alice" }, "192.0.2.2", { REGISTRATION: "admin" }));
     expect(again).toEqual({ status: 200, body: a.body });
   });
 
@@ -227,5 +227,64 @@ describe("concurrent self-registration", () => {
     );
     expect(a.status).toBe(201);
     expect(await body(b)).toEqual({ status: 403, body: { error: "registration full" } });
+  });
+});
+
+describe("concurrent registration with an invite", () => {
+  const invites = async () =>
+    (await (await adminCall("/admin/invites")).json()) as Array<{ status: string; user: { username: string } | null }>;
+
+  // formal/tla/Invites.tla RetriesAgree: the second copy's batch consumes
+  // nothing (the first used the invite), and the recheck finds the account.
+  it("the same request twice: one creates the account, the other gets it (200)", async () => {
+    const { code } = await createInvite();
+    const token = newToken();
+    const [a, b] = await race(
+      (db) => acceptInvite(code, "alice", token, "192.0.2.1", { DB: db }),
+      (db) => acceptInvite(code, "alice", token, "192.0.2.2", { DB: db }),
+    );
+    const first = await body(a);
+    expect(first).toEqual({ status: 201, body: { deviceId: expect.any(String), username: "alice" } });
+    expect(await body(b)).toEqual({ status: 200, body: first.body });
+    expect(await count("SELECT COUNT(*) AS n FROM users")).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM devices")).toBe(1);
+  });
+
+  // Invites.tla OneUserPerInvite.
+  it("two tokens race for one invite: one user; the other gets 401", async () => {
+    const { code } = await createInvite();
+    const [a, b] = await race(
+      (db) => acceptInvite(code, "alice", newToken(), "192.0.2.1", { DB: db }),
+      (db) => acceptInvite(code, "bob", newToken(), "192.0.2.2", { DB: db }),
+    );
+    expect(a.status).toBe(201);
+    expect(await body(b)).toEqual({ status: 401, body: { error: "invalid or expired invite" } });
+    expect(await count("SELECT COUNT(*) AS n FROM users")).toBe(1);
+    expect((await invites())[0]).toMatchObject({ status: "used", user: { username: "alice" } });
+  });
+
+  // Invites.tla UsernameUnique and ConsumedHasUser: the loser's batch rolls
+  // back (UNIQUE), and its invite stays unused.
+  it("two invites race for one username: 201 and 409, the loser's invite unused", async () => {
+    const [x, y] = [await createInvite(), await createInvite()];
+    const [a, b] = await race(
+      (db) => acceptInvite(x.code, "alice", newToken(), "192.0.2.1", { DB: db }),
+      (db) => acceptInvite(y.code, "Alice", newToken(), "192.0.2.2", { DB: db }),
+    );
+    expect(a.status).toBe(201);
+    expect(await body(b)).toEqual({ status: 409, body: { error: "username taken" } });
+    expect(await count("SELECT COUNT(*) AS n FROM users")).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM devices")).toBe(1);
+    expect((await invites()).map((i) => i.status).sort()).toEqual(["pending", "used"]);
+  });
+
+  it("without invites, two tokens race for one username: 201 and 409", async () => {
+    const [a, b] = await race(
+      (db) => selfRegister({ token: newToken(), username: "alice" }, "192.0.2.1", { ...OPEN, DB: db }),
+      (db) => selfRegister({ token: newToken(), username: "alice" }, "192.0.2.2", { ...OPEN, DB: db }),
+    );
+    expect(a.status).toBe(201);
+    expect(await body(b)).toEqual({ status: 409, body: { error: "username taken" } });
+    expect(await count("SELECT user_count AS n FROM server_usage")).toBe(1);
   });
 });

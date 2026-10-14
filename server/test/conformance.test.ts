@@ -26,6 +26,7 @@ import {
   issueAdminCode,
   legacyDevice,
   newToken,
+  newUsername,
   OPEN,
   register,
   sha256Hex,
@@ -243,7 +244,7 @@ function randomOp(rng: Rng, w: World, concurrent: boolean): Op {
             {
               method: "POST",
               headers: { "Content-Type": "application/json", "CF-Connecting-IP": `198.51.100.${rng.int(250)}` },
-              body: JSON.stringify({ token, deviceName: "self" }),
+              body: JSON.stringify({ token, deviceName: "self", username: newUsername() }),
             },
             ENV,
           ));

@@ -1,6 +1,6 @@
 package ashidori.core
 
-import ashidori.core.sync.PairLink
+import ashidori.core.sync.{PairLink, Username}
 
 class PairLinkSuite extends munit.FunSuite:
   private val Code = "7K3M9QXZ"
@@ -68,3 +68,45 @@ class PairLinkSuite extends munit.FunSuite:
     assertEquals(PairLink.normalizeServer("https://sync.example.net/admin", allowHttp = false), None)
     assertEquals(PairLink.normalizeServer("http://localhost:8787", allowHttp = false), None)
     assertEquals(PairLink.normalizeServer("http://localhost:8787", allowHttp = true), Some("http://localhost:8787"))
+
+  private val Invite = "7K3M9QXZ0ABCDEFG"
+
+  test("parses invites: i= with 16 characters, in both forms"):
+    val inv = PairLink("https://sync.example.net", Invite, invite = true)
+    assertEquals(PairLink.parse(s"https://sync.example.net/pair#i=$Invite"), Some(inv))
+    val enc = java.net.URLEncoder.encode("https://sync.example.net", "UTF-8")
+    assertEquals(PairLink.parse(s"ashidori://pair?server=$enc&i=$Invite"), Some(inv))
+    assertEquals(PairLink.parse(s"ashidori://pair?i=$Invite&server=https://sync.example.net/"), Some(inv))
+    assertEquals(PairLink.parse(PairLink.inviteUrl("https://sync.example.net/", Invite)), Some(inv))
+    // A pairing code is not an invite.
+    assert(!PairLink.parse(s"https://sync.example.net/pair#c=$Code").get.invite)
+
+  test("refuses invite links of any other shape"):
+    val enc = java.net.URLEncoder.encode("https://sync.example.net", "UTF-8")
+    for bad <- Seq(
+        s"https://sync.example.net/pair#i=$Code", // an invite has 16 characters
+        s"https://sync.example.net/pair#c=$Invite", // a pairing code has 8
+        s"https://sync.example.net/pair#i=${Invite.toLowerCase}",
+        s"https://sync.example.net/pair#i=${Invite.take(4)}-${Invite.drop(4)}",
+        s"https://sync.example.net/pair#i=${Invite.dropRight(1)}I",
+        s"https://sync.example.net/pair#i=${Invite}0",
+        s"https://sync.example.net/pair#i=$Invite&c=$Code",
+        s"https://sync.example.net/pair#c=$Code&i=$Invite",
+        s"https://sync.example.net/pair#invite=$Invite",
+        s"https://sync.example.net/pair#=$Invite",
+        s"https://sync.example.net/pair?i=$Invite",
+        s"ashidori://pair?server=$enc&i=$Code",
+        s"ashidori://pair?server=$enc&c=$Invite",
+        s"ashidori://pair?server=$enc&i=$Invite&c=$Code",
+        s"ashidori://pair?server=$enc&i=$Invite&i=$Invite",
+        s"ashidori://pair?server=$enc&i=$Invite&x=1",
+        s"ashidori://pair?i=$Invite"
+      )
+    do assertEquals(PairLink.parse(bad), None, bad)
+
+  test("usernames: 3 to 20 of a-z, 0-9 and _, case-insensitive"):
+    assertEquals(Username.normalize(" Alice_1 "), Some("alice_1"))
+    for bad <- Seq("ab", "x" * 21, "a-b", "a b", "ユーザ", "", "alice!") do
+      assertEquals(Username.normalize(bad), None, bad)
+      assert(Username.problem(bad).isDefined, bad)
+    assertEquals(Username.problem("Alice_1"), None)

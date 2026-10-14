@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configErrors, parseCertFingerprints } from "../src/config";
-import { ANDROID_PACKAGE, RELEASES_URL } from "../src/pair";
-import { adminCall, call } from "./helpers";
+import { ANDROID_PACKAGE, INVITE_FRAGMENT_RE, PAIR_FRAGMENT_RE, RELEASES_URL } from "../src/pair";
+import { adminCall, call, createInvite, createUser } from "./helpers";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -29,9 +29,42 @@ describe("GET /pair", () => {
     // The code is read from the fragment, client-side, and checked strictly.
     expect(html).toContain("location.hash");
     expect(html).toContain("/^#c=([0-9ABCDEFGHJKMNPQRSTVWXYZ]{8})$/");
-    expect(html).toContain('"ashidori://pair?server=" + encodeURIComponent(location.origin)');
+    expect(html).toContain("/^#i=([0-9ABCDEFGHJKMNPQRSTVWXYZ]{16})$/");
+    expect(html).toContain('"ashidori://pair?server=" + encodeURIComponent(location.origin) + "&" + key + "=" + code');
     expect(html).toContain("アプリで開く");
+    expect(html).toContain("招待");
     expect(html).toContain(RELEASES_URL);
+  });
+
+  it("accepts exactly the two fragments: c= with a pairing code, i= with an invite", () => {
+    const re = (s: string) => new RegExp(s.slice(1, -1));
+    const pairRe = re(PAIR_FRAGMENT_RE);
+    const inviteRe = re(INVITE_FRAGMENT_RE);
+    const ok = (h: string) => pairRe.test(h) || inviteRe.test(h);
+    expect(pairRe.test("#c=7K3M9QXZ")).toBe(true);
+    expect(inviteRe.test("#i=7K3M9QXZ7K3M9QXZ")).toBe(true);
+    for (const bad of [
+      "#i=7K3M9QXZ", // an invite is 16 characters
+      "#c=7K3M9QXZ7K3M9QXZ", // a pairing code is 8
+      "#i=7k3m9qxz7k3m9qxz",
+      "#i=7K3M-9QXZ-7K3M-9QXZ",
+      "#i=7K3M9QXZ7K3M9QXI",
+      "#x=7K3M9QXZ",
+      "#c=7K3M9QXZ&i=7K3M9QXZ7K3M9QXZ",
+      "#i=7K3M9QXZ7K3M9QXZ&c=7K3M9QXZ",
+      "#invite=7K3M9QXZ7K3M9QXZ",
+      "",
+    ]) {
+      expect(ok(bad), bad).toBe(false);
+    }
+  });
+
+  it("matches the invites the server issues", async () => {
+    const invite = await createInvite();
+    expect(invite.link).toBe(`https://ashidori.example/pair#i=${invite.code}`);
+    expect(new URL(invite.link).hash).toMatch(new RegExp(INVITE_FRAGMENT_RE.slice(1, -1)));
+    const html = await (await adminCall("/admin/")).text();
+    expect(html).toContain('location.origin + "/pair#i=" + body.code');
   });
 
   it("uses a fresh nonce per response", async () => {
@@ -45,12 +78,7 @@ describe("GET /pair", () => {
   });
 
   it("matches the codes the server issues", async () => {
-    const res = await adminCall("/admin/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "alice" }),
-    });
-    const { id } = (await res.json()) as { id: string };
+    const id = await createUser("alice");
     const { code } = (await (await adminCall(`/admin/users/${id}/pairing`, { method: "POST" })).json()) as { code: string };
     expect(`#c=${code}`).toMatch(/^#c=([0-9ABCDEFGHJKMNPQRSTVWXYZ]{8})$/);
   });

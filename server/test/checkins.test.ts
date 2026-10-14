@@ -35,7 +35,7 @@ describe("PUT /v1/checkins/shared/:localId", () => {
       {
         id,
         cursor,
-        user: { id: alice.userId, handle: "alice", name: "alice" },
+        user: { id: alice.userId, username: "alice" },
         t: CHECKIN.t,
         lat: CHECKIN.lat,
         lon: CHECKIN.lon,
@@ -190,7 +190,7 @@ describe("GET /v1/checkins/feed", () => {
     await putCheckin(carol.token, "1", { ...CHECKIN, venue: "C1" });
     await putCheckin(alice.token, "2", { ...CHECKIN, venue: "A2" });
 
-    expect((await feed(bob.token)).items.map((i) => [i.venue, i.user.name])).toEqual([
+    expect((await feed(bob.token)).items.map((i) => [i.venue, i.user.username])).toEqual([
       ["A1", "alice"],
       ["B1", "bob"],
       ["A2", "alice"],
@@ -232,7 +232,7 @@ describe("GET /v1/checkins/feed", () => {
     const delta = await feed(bob.token, `?after=${last}`);
     // Disabling does not change whom bob follows; the entries come as deletions.
     expect(delta.followsVersion).toBe(synced.followsVersion);
-    expect(delta.items.map((i) => [i.user.name, i.deleted, i.venue, i.comment])).toEqual([
+    expect(delta.items.map((i) => [i.user.username, i.deleted, i.venue, i.comment])).toEqual([
       ["alice", true, null, null],
       ["alice", true, null, null],
     ]);
@@ -266,9 +266,9 @@ describe("admin: shared check-ins", () => {
 
     const res = await adminCall("/admin/checkins");
     expect(res.status).toBe(200);
-    const list = (await res.json()) as Array<{ id: string; venue: string; user: { name: string }; userStatus: string }>;
+    const list = (await res.json()) as Array<{ id: string; venue: string; user: { username: string }; userStatus: string }>;
     // Newest first, without unshared ones.
-    expect(list.map((i) => [i.venue, i.user.name, i.userStatus])).toEqual([
+    expect(list.map((i) => [i.venue, i.user.username, i.userStatus])).toEqual([
       ["New", "alice", "active"],
       ["Old", "alice", "active"],
     ]);

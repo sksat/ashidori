@@ -1,80 +1,81 @@
 import { Hono } from "hono";
-import { registrationMode, SELF_REGISTERED, serverUsage } from "./accounts";
+import { INVITED_PREFIX, registrationMode, SELF_REGISTERED, serverUsage } from "./accounts";
 import { adminAuth } from "./auth";
 import { listRecentCheckins, removeCheckin } from "./checkins";
 import { parseLimits } from "./config";
 import { createPairingCode, listAllDevices, revokeDevice } from "./devices";
 import type { AppEnv } from "./env";
+import { createInvite, INVITE_DEFAULT_DAYS, listInvites, parseInviteDays, revokeInvite } from "./invites";
 import { QR_SCRIPT } from "./qr";
 import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
-import {
-  createUser,
-  getUser,
-  HandleTaken,
-  listUsers,
-  parseNewUser,
-  parseUserPatch,
-  setUserStatus,
-  updateUser,
-} from "./users";
+import { getUser, listUsers, parseUsernamePatch, setUserStatus, setUsername, UsernameTaken } from "./users";
 import { base64UrlEncode, jsonError, randomBytes, readJson, TooLarge } from "./util";
 
 // Operator API. Every route requires an admin (see adminAuth), which also
 // rejects cross-origin requests. POST bodies, where present, must be JSON,
 // which a cross-site form cannot send without a CORS preflight.
+//
+// Admins do not create users: they create invites (invites.ts), and the
+// person creates their user on their first app device with a username of
+// their choice. Admins set the username of legacy users that have none.
 export const admin = new Hono<AppEnv>();
 
 admin.use("*", adminAuth);
+
+async function body(c: { req: { raw: Request } }): Promise<{ value: unknown } | { status: 400 | 413; error: string }> {
+  try {
+    return { value: await readJson(c.req.raw) };
+  } catch (e) {
+    if (e instanceof TooLarge) return { status: 413, error: "body too large" };
+    return { status: 400, error: "invalid JSON body" };
+  }
+}
+
+// ---- Invites ----
+
+admin.get("/invites", async (c) => c.json(await listInvites(c.env.DB)));
+
+// `{ttlDays?}` (1-30, default 7) → `{id, code, expiresAt, link}`. The code is
+// returned only here; the server keeps its hash.
+admin.post("/invites", async (c) => {
+  const b = await body(c);
+  if ("error" in b) return jsonError(c, b.status, b.error);
+  const days = parseInviteDays(b.value);
+  if (days === null) return jsonError(c, 400, "invalid ttlDays");
+  const invite = await createInvite(c.env.DB, `admin:${c.get("adminEmail")}`, days);
+  // The code goes in the fragment, which browsers never send to the server.
+  const link = `${new URL(c.req.url).origin}/pair#i=${invite.code}`;
+  return c.json({ ...invite, link }, 201);
+});
+
+admin.post("/invites/:id/revoke", async (c) => {
+  const r = await revokeInvite(c.env.DB, c.req.param("id"));
+  if (r === null) return jsonError(c, 404, "no such invite");
+  if (r === "used") return jsonError(c, 409, "invite already used");
+  return c.json({ revoked: true });
+});
 
 // ---- Users ----
 
 admin.get("/users", async (c) => c.json(await listUsers(c.env.DB)));
 
-admin.post("/users", async (c) => {
-  let body: unknown;
-  try {
-    body = await readJson(c.req.raw);
-  } catch (e) {
-    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
-    return jsonError(c, 400, "invalid JSON body");
-  }
-  const parsed = parseNewUser(body);
-  if (typeof parsed === "string") return jsonError(c, 400, parsed);
-  // Like every creation, refused while a limit variable is invalid (fail closed).
-  const limits = parseLimits(c.env);
-  if (!limits.ok) {
-    console.error("invalid limit variables; refusing new users:", limits.invalid.join(", "));
-    return jsonError(c, 503, "server misconfigured");
-  }
-  try {
-    return c.json(await createUser(c.env.DB, parsed, c.get("adminEmail")), 201);
-  } catch (e) {
-    if (e instanceof HandleTaken) return jsonError(c, 409, "handle already taken");
-    throw e;
-  }
-});
-
-// `{name?, handle?}`; `handle: null` removes the handle.
+// `{username}`: sets the username of a legacy user, or changes it.
 admin.patch("/users/:id", async (c) => {
-  let body: unknown;
-  try {
-    body = await readJson(c.req.raw);
-  } catch (e) {
-    if (e instanceof TooLarge) return jsonError(c, 413, "body too large");
-    return jsonError(c, 400, "invalid JSON body");
-  }
-  const parsed = parseUserPatch(body);
+  const b = await body(c);
+  if ("error" in b) return jsonError(c, b.status, b.error);
+  const parsed = parseUsernamePatch(b.value);
   if (typeof parsed === "string") return jsonError(c, 400, parsed);
   try {
-    const user = await updateUser(c.env.DB, c.req.param("id"), parsed);
+    const user = await setUsername(c.env.DB, c.req.param("id"), parsed.username);
     return user ? c.json(user) : jsonError(c, 404, "no such user");
   } catch (e) {
-    if (e instanceof HandleTaken) return jsonError(c, 409, "handle already taken");
+    if (e instanceof UsernameTaken) return jsonError(c, 409, "username taken");
     throw e;
   }
 });
 
-// A pairing code for the user's device; the user enters it in the app.
+// A pairing code for a device of an existing user (for example a legacy
+// user, or one who lost every device); the user enters it in the app.
 admin.post("/users/:id/pairing", async (c) => {
   if (!(await edgeAllowed(c.env.RL_PAIRING, "RL_PAIRING", `pairing:admin:${c.get("adminEmail")}`))) {
     return jsonError(c, 429, "too many requests");
@@ -120,25 +121,25 @@ admin.post("/checkins/:id/delete", async (c) => {
   return c.json({ deleted: true });
 });
 
-// Minimal admin page (behind Access) to manage users and devices and to
-// moderate shared check-ins.
+// Minimal admin page (behind Access): invites, users, devices and the
+// moderation of shared check-ins. Copy follows docs/web-ui.md (文言).
 admin.get("/", async (c) => {
   const nonce = base64UrlEncode(randomBytes(16));
   // All server-generated (fixed strings and numbers), safe to embed.
   const modeText =
     registrationMode(c.env) === "open"
-      ? "新規登録: 公開（誰でもアプリから利用者を作成できる）"
-      : "新規登録: 管理者のみ（この画面で利用者を作成する）";
+      ? "登録の方式: 招待または自由な登録（招待がなくてもアプリから登録できます）"
+      : "登録の方式: 招待のみ";
   const parsed = parseLimits(c.env);
   const limits = parsed.ok ? parsed.limits : null;
   const quota = limits ? limits.userQuotaBytes : null;
   const usage = await serverUsage(c.env.DB);
   const misconfig: string[] = [];
   if (!parsed.ok) {
-    misconfig.push(`設定が不正なため、新しい利用者・デバイス・データの作成を停止しています: ${parsed.invalid.join(", ")}`);
+    misconfig.push(`設定が不正なため、利用者・端末・データの新規作成を停止しています: ${parsed.invalid.join(", ")}`);
   }
   if (registrationMode(c.env) === "open" && !selfRegistrationEdgeReady(c.env)) {
-    misconfig.push("レート制限の binding RL_ACCOUNT がないため、アプリからの新規登録を停止しています。");
+    misconfig.push("レート制限の binding RL_ACCOUNT がないため、招待のない登録を停止しています。");
   }
   const limitsText = misconfig.map((m) => `<p class="misconfig">${m}</p>`).join("");
   c.header(
@@ -147,33 +148,36 @@ admin.get("/", async (c) => {
   );
   return c.html(`<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ashidori admin</title>
+<title>ashidori 管理</title>
 <style nonce="${nonce}">
-body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}
-#code{font:700 2rem ui-monospace,monospace;letter-spacing:.2em;margin:.2rem 0}
-#pairing[hidden]{display:none}#pairing{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}#link{word-break:break-all}
-#pairing .row{display:flex;flex-wrap:wrap;gap:1rem;align-items:center}#pairing .row>div{flex:1 1 16rem}
+body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem}
+#code{font:700 1.6rem ui-monospace,monospace;letter-spacing:.1em;margin:.2rem 0;word-break:break-all}
+#issued[hidden]{display:none}#issued{border:1px solid #ccc;padding:.5rem 1rem;margin:1rem 0}#link{word-break:break-all}
+#issued .row{display:flex;flex-wrap:wrap;gap:1rem;align-items:center}#issued .row>div{flex:1 1 16rem}
 #qr svg{display:block;width:12rem;height:12rem}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ccc;padding:.3rem;text-align:left}
-td button{margin-right:.3rem}#err,.misconfig{color:#b00}
+td button{margin-right:.3rem}#err,.misconfig,.todo{color:#b00}.note{color:#555;font-size:.9rem}
 </style></head><body>
-<h1>ashidori admin</h1>
+<h1>ashidori 管理</h1>
 <p id="err"></p>
-<section><h2>利用者</h2>
 ${limitsText}
-<p>${modeText}。容量の上限は利用者ごとに <span id="quota"></span> です。</p>
-<p>サーバ全体: 利用者 ${usage.userCount}${limits ? ` / ${limits.maxUsers}（自己登録の上限）` : ""}、保存量 <span id="total"></span></p>
-<p><input id="name" placeholder="名前" maxlength="64"> <input id="handle" placeholder="ハンドル (任意)" maxlength="20"> <input id="email" type="email" placeholder="メールアドレス (任意)"> <button id="create">作成</button></p>
-<p>ハンドルは英小文字・数字・_ の 3〜20 文字です。他の利用者はハンドルの完全一致で検索し、フォローを申請します。</p>
-<div id="pairing" hidden><div class="row"><div id="qr"></div><div><p id="for"></p><p id="code"></p><p id="exp"></p>
+<section><h2>招待</h2>
+<p>${modeText}</p>
+<p><label>有効期限 <select id="ttl"><option value="1">1 日</option><option value="${INVITE_DEFAULT_DAYS}" selected>${INVITE_DEFAULT_DAYS} 日</option><option value="30">30 日</option></select></label> <button id="invite">招待を作成</button></p>
+<p class="note">招待は 1 回限りの登録リンクです。招待された人がアプリで開き、ユーザ名を決めて登録します。</p>
+<div id="issued" hidden><div class="row"><div id="qr"></div><div><p id="for"></p><p id="code"></p><p id="exp"></p>
 <p>登録リンク: <code id="link"></code> <button id="copy">コピー</button></p></div></div>
-<p>利用者がアプリの「QR コードを読み取る」でこの QR コードを読み取るか、アプリのある端末でリンクを開くと、サーバとコードが入力されます。2 台目以降の端末では、登録後に復旧コードを入力します。復旧コードは QR コードとリンクに含まれません。</p></div>
-<table><thead><tr><th>名前</th><th>ハンドル</th><th>メールアドレス</th><th>作成</th><th>状態</th><th>デバイス</th><th>使用量</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
-<section><h2>デバイス</h2>
-<p>利用者が「なし」のデバイスは、利用者の導入前に登録されたものです。</p>
-<table><thead><tr><th>名前</th><th>利用者</th><th>作成</th><th>最終アクセス</th><th></th></tr></thead><tbody id="devices"></tbody></table></section>
+<p id="howto" class="note"></p></div>
+<table><thead><tr><th>作成</th><th>有効期限</th><th>状態</th><th></th></tr></thead><tbody id="invites"></tbody></table></section>
+<section><h2>利用者</h2>
+<p id="todo" class="todo"></p>
+<p>利用者 ${usage.userCount}${limits ? `（招待のない登録の上限 ${limits.maxUsers}）` : ""}、保存量 <span id="total"></span>、容量の上限は利用者ごとに <span id="quota"></span></p>
+<table><thead><tr><th>ユーザ名</th><th>登録</th><th>状態</th><th>端末</th><th>使用量</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
+<section><h2>端末</h2>
+<p class="note">利用者が「なし」の端末は、利用者の導入前に登録されたものです。</p>
+<table><thead><tr><th>名前</th><th>利用者</th><th>登録</th><th>最終アクセス</th><th></th></tr></thead><tbody id="devices"></tbody></table></section>
 <section><h2>共有チェックイン</h2>
-<p>利用者がフォロワーに共有したチェックインです (新しい順、最大 200 件)。</p>
+<p class="note">利用者がフォロワーに共有したチェックインです（新しい順、最大 200 件）。</p>
 <table><thead><tr><th>日時</th><th>利用者</th><th>場所</th><th>カテゴリ</th><th>コメント</th><th></th></tr></thead><tbody id="checkins"></tbody></table></section>
 <script nonce="${nonce}">${QR_SCRIPT}</script>
 <script nonce="${nonce}">
@@ -182,6 +186,8 @@ const $ = (id) => document.getElementById(id);
 const QUOTA = ${quota};
 const TOTAL = ${usage.totalBytes};
 const MAX_TOTAL = ${limits ? limits.maxTotalBytes : null};
+const SELF = ${JSON.stringify(SELF_REGISTERED)};
+const INVITED = ${JSON.stringify(INVITED_PREFIX)};
 function fmtBytes(n) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
@@ -207,53 +213,84 @@ function row(tbody, values, buttons) {
   }
   tr.appendChild(td); tbody.appendChild(tr);
 }
+// A user as the page names them: the username, or for a legacy user without one, what identifies them.
+function who(u) {
+  if (u.username) return u.username;
+  const hint = [u.legacyName, u.email].filter((x) => x).join("、");
+  return "未設定" + (hint ? "（" + hint + "）" : "");
+}
+async function setName(u) {
+  const v = prompt((u.username ?? who(u)) + " のユーザ名（英小文字・数字・_ の 3〜20 文字）", u.username ?? "");
+  if (v !== null && await api("/admin/users/" + encodeURIComponent(u.id), { username: v.trim() }, "PATCH")) load();
+}
+const INVITE_STATUS = { pending: "未使用", used: "使用済み", expired: "期限切れ", revoked: "取り消し済み" };
 async function load() {
-  const [users, devices, checkins] = await Promise.all([
+  const [invites, users, devices, checkins] = await Promise.all([
+    fetch("/admin/invites").then((r) => r.json()),
     fetch("/admin/users").then((r) => r.json()),
     fetch("/admin/devices").then((r) => r.json()),
     fetch("/admin/checkins").then((r) => r.json()),
   ]);
+  const it = $("invites"); it.textContent = "";
+  for (const i of invites) {
+    const status = INVITE_STATUS[i.status] + (i.user ? "（" + (i.user.username ?? "ユーザ名未設定") + "）" : "");
+    const buttons = i.status === "pending" ? [["取り消す", async () => {
+      if (confirm("この招待を取り消しますか。登録リンクは使えなくなります。") && await api("/admin/invites/" + encodeURIComponent(i.id) + "/revoke")) load();
+    }]] : [];
+    row(it, [fmt(i.createdAt), fmt(i.expiresAt), status], buttons);
+  }
+  const missing = users.filter((u) => !u.username).length;
+  $("todo").textContent = missing === 0 ? "" : "ユーザ名が未設定の利用者が " + missing + " 人います。「ユーザ名を設定」で設定してください。";
   const ut = $("users"); ut.textContent = "";
   for (const u of users) {
     const active = u.status === "active";
     const buttons = active
-      ? [["ペアリングコード発行", () => issue(u)],
-         ["ハンドル変更", async () => {
-           const h = prompt(u.name + " のハンドル (空欄で削除)", u.handle ?? "");
-           if (h !== null && await api("/admin/users/" + encodeURIComponent(u.id), { handle: h.trim() || null }, "PATCH")) load();
-         }],
-         ["停止", async () => { if (confirm(u.name + " を停止しますか。この利用者のデバイスは同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
+      ? [["ペアリングコード発行", () => issuePairing(u)],
+         [u.username ? "ユーザ名を変更" : "ユーザ名を設定", () => setName(u)],
+         ["停止", async () => { if (confirm(who(u) + " を停止しますか。この利用者の端末は同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
       : [["再開", async () => { if (await api("/admin/users/" + encodeURIComponent(u.id) + "/enable")) load(); }]];
-    const createdBy = u.createdBy === ${JSON.stringify(SELF_REGISTERED)} ? "自己登録" : "管理者";
+    const how = u.createdBy === SELF ? "自由な登録" : u.createdBy.startsWith(INVITED) ? "招待" : "管理者";
     const used = fmtBytes(u.storageBytes) + (QUOTA === null ? "" : " (" + Math.floor((u.storageBytes / QUOTA) * 100) + "%)");
-    row(ut, [u.name, u.handle ?? "-", u.email ?? "-", createdBy, active ? "有効" : "停止中", String(u.deviceCount), used, fmt(u.lastSeenAt)], buttons);
+    row(ut, [who(u), how, active ? "有効" : "停止中", String(u.deviceCount), used, fmt(u.lastSeenAt)], buttons);
   }
   const dt = $("devices"); dt.textContent = "";
   for (const d of devices) {
     const buttons = d.revoked ? [] : [["失効", async () => {
       if (confirm(d.name + " を失効させますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
     }]];
-    row(dt, [d.name + (d.revoked ? " (失効)" : ""), d.userName ?? "なし", fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
+    const owner = d.userId === null ? "なし" : (d.username ?? "ユーザ名未設定");
+    row(dt, [d.name + (d.revoked ? " (失効)" : ""), owner, fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
   }
   const ct = $("checkins"); ct.textContent = "";
   for (const p of checkins) {
     const where = p.venue + (p.place ? " (" + p.place + ")" : "");
-    row(ct, [fmt(p.t), p.user.name + (p.userStatus === "active" ? "" : " (停止中)"), where, p.category ?? "-", p.comment ?? "-"], [["削除", async () => {
+    row(ct, [fmt(p.t), (p.user.username ?? "ユーザ名未設定") + (p.userStatus === "active" ? "" : " (停止中)"), where, p.category ?? "-", p.comment ?? "-"], [["削除", async () => {
       if (confirm(where + " を削除しますか。フォロワーの一覧から消えます。") && await api("/admin/checkins/" + encodeURIComponent(p.id) + "/delete")) load();
     }]]);
   }
 }
-async function issue(u) {
+// The issued code, its link (code in the fragment, never sent to the server) and the link's QR code.
+function show(title, code, expiresAt, link, howto) {
+  $("issued").hidden = false;
+  $("for").textContent = title;
+  $("code").textContent = code.match(/.{4}/g).join("-");
+  $("exp").textContent = "有効期限: " + fmt(expiresAt) + "（1 回のみ使用可）";
+  $("link").textContent = link;
+  $("howto").textContent = howto;
+  showQr($("qr"), link);
+}
+$("invite").onclick = async () => {
+  const body = await api("/admin/invites", { ttlDays: Number($("ttl").value) });
+  if (!body) return;
+  show("招待", body.code, body.expiresAt, location.origin + "/pair#i=" + body.code,
+    "招待する人に登録リンクを渡します。アプリの「QR コードを読み取る」でこの QR コードを読み取るか、アプリのある端末でリンクを開くと、新しく登録する画面になります。");
+  load();
+};
+async function issuePairing(u) {
   const body = await api("/admin/users/" + encodeURIComponent(u.id) + "/pairing");
   if (!body) return;
-  $("pairing").hidden = false;
-  $("for").textContent = u.name + " のペアリングコード";
-  $("code").textContent = body.code.slice(0, 4) + "-" + body.code.slice(4);
-  $("exp").textContent = "有効期限: " + fmt(body.expiresAt) + " (1 回のみ使用可)";
-  // The code goes in the fragment, which browsers never send to the server.
-  const link = location.origin + "/pair#c=" + body.code;
-  $("link").textContent = link;
-  showQr($("qr"), link);
+  show(who(u) + " のペアリングコード", body.code, body.expiresAt, location.origin + "/pair#c=" + body.code,
+    "この利用者の端末を追加します。アプリで QR コードを読み取るか、リンクを開くと、サーバとコードが入力されます。登録後、その端末に復旧コードを入力します。復旧コードは QR コードとリンクに含まれません。");
 }
 $("copy").onclick = async () => {
   try {
@@ -263,14 +300,6 @@ $("copy").onclick = async () => {
     $("copy").textContent = "コピーできませんでした";
   }
   setTimeout(() => { $("copy").textContent = "コピー"; }, 2000);
-};
-$("create").onclick = async () => {
-  const email = $("email").value.trim();
-  const handle = $("handle").value.trim();
-  const body = { name: $("name").value.trim() };
-  if (email) body.email = email;
-  if (handle) body.handle = handle;
-  if (await api("/admin/users", body)) { $("name").value = ""; $("handle").value = ""; $("email").value = ""; load(); }
 };
 load();
 </script></body></html>`);

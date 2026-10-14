@@ -8,7 +8,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { deleteExpiredRateLimits, hitRateLimit, RULES } from "../src/ratelimit";
 import { generatePairingCode, sha256Hex } from "../src/util";
-import { defaultUserId, issueAdminCode, newDevice, postJson, register } from "./helpers";
+import { adminCall, authed, defaultUserId, issueAdminCode, newDevice, newToken, postJson, register, selfRegister } from "./helpers";
 
 const HOUR = 3_600_000;
 const TEN_MIN = 10 * 60 * 1000;
@@ -115,5 +115,45 @@ describe("pairing codes of the older Worker", () => {
     expect((await register(ghost)).status).toBe(401);
     // Codes of the current Worker are unaffected.
     expect((await register(await issueAdminCode())).status).toBe(201);
+  });
+});
+
+// Migration 0006 adds only the invites table, which the Worker of 0005 does
+// not use; its users have no username.
+describe("users of the Worker of migration 0005 (no usernames, no invites)", () => {
+  /** Its self-registration batch (users.name = the device name, no handle). */
+  async function oldSelfRegistration(token: string): Promise<string> {
+    const now = Date.now();
+    const [userId, deviceId] = [crypto.randomUUID(), crypto.randomUUID()];
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO users (id, name, handle, email, status, created_at, created_by)
+         SELECT ?1, ?2, NULL, NULL, 'active', ?3, ?4
+         WHERE (SELECT user_count FROM server_usage WHERE id = 1) < ?5`,
+      ).bind(userId, "Pixel 8a", now, "self", 100),
+      env.DB.prepare(
+        `INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, user_id)
+         SELECT ?1, ?2, ?3, ?4, ?5, id FROM users WHERE id = ?6`,
+      ).bind(deviceId, "Pixel 8a", await sha256Hex(token), now, now - (now % HOUR), userId),
+    ]);
+    return deviceId;
+  }
+
+  it("keep working: a retry is recovered without a username, and the admin can set one", async () => {
+    const token = newToken();
+    const deviceId = await oldSelfRegistration(token);
+    // A request the older app stored: no username.
+    const retry = await selfRegister({ token, deviceName: "Pixel 8a", username: undefined }, "192.0.2.1", { REGISTRATION: "admin" });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ deviceId, username: null });
+    const [user] = (await (await adminCall("/admin/users")).json()) as Array<{ id: string; username: string | null; legacyName: string }>;
+    expect(user).toMatchObject({ username: null, legacyName: "Pixel 8a" });
+    const set = await adminCall(`/admin/users/${user!.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "pixel_owner" }),
+    });
+    expect(set.status).toBe(200);
+    expect(await (await authed(token, "/v1/me")).json()).toEqual({ userId: user!.id, username: "pixel_owner" });
   });
 });

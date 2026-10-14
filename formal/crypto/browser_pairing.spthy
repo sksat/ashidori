@@ -1,0 +1,216 @@
+theory AshidoriBrowserPairing
+begin
+
+/*
+ * Browser pairing v1 (docs/design/browser-pairing-v1.md): the app hands the
+ * batch key kdf(K) to a browser's ephemeral X25519 key after a 4-word
+ * comparison, with commit-then-reveal and confirmation on both sides.
+ *
+ * Attacker: Dolev-Yao. It is the network, the Worker, D1 and R2 at once: it
+ * issues the pairing id and the code, may give each side a different id,
+ * relays or replaces the commit, the app's nonce, scope and ttl, the reveal
+ * and the grant, and can seal its own grants to any public key. It does not
+ * change the page (trust model: the page is honest).
+ *
+ * Trusted: the app, the browser page, fresh randomness, and the user, who
+ *   - types the code shown by browser tid into one app (UserCode(tid, code));
+ *     the user is assumed to pair the right browser with the right app;
+ *   - approves in the app and confirms in the browser only when that browser
+ *     and that app show the same words (restriction Equal).
+ * Not modelled: cancellation, expiry, restarts (server state, not secrecy).
+ *
+ * Transcript: th = h(<id, code, c, nA, scope, ttl, pkB, nB>). The words are
+ * sas(<id, code, pkB, nB>, <nA, scope, ttl>), an ideal hash of the same
+ * fields (c is a function of pkB and nB). Each side fixes its fields before
+ * it sends its next message: the browser id, code, pkB, nB before it learns
+ * nA, and nA, scope, ttl before it reveals; the app id, code, c, nA, scope,
+ * ttl before it sends nA. The same tuple is used for the words, the approval,
+ * the confirmation, the HPKE info and the open.
+ *
+ * Grinding: the 44-bit truncation is modelled by letting whoever picks its
+ * nonce last, after it knows the other fields and the target words t, hit t
+ * (grindA for the app's nonce, grindB for the browser's nonce). This is an
+ * abstraction of that capability, not the 2^-44 bound, which is argued on
+ * paper. -D=NOCOMMIT shows that grinding works without the commitment.
+ *
+ * HPKE base mode: hseal(pk, info, m), opened only with the secret key and
+ * the same info. Anyone can seal to any public key.
+ *
+ * The browser may leak everything it holds after accepting (B_Leak): its
+ * secret key and the batch key. master_key_secrecy and auth_key_secrecy hold
+ * even then, i.e. nothing the viewer holds yields K or the blob-auth key.
+ *
+ * Mutations (each must break the lemma named):
+ *   -D=NOCOMMIT     the browser sends pkB and nB in clear before nA:
+ *                   batch_key_secrecy is falsified (grinding).
+ *   -D=NOGRANTAUTH  the browser does not check that the grant carries the
+ *                   preimage sA of nA: grant_agreement is falsified.
+ *   -D=APPONLY      the user confirms only in the app: grant_agreement is
+ *                   falsified (the server plays the app towards the
+ *                   browser), batch_key_secrecy still holds.
+ */
+
+builtins: hashing
+functions: pk/1, hseal/3, hopen/3, kdf/1, kauth/1, sas/2, grindA/4, grindB/5
+equations:
+  hopen(hseal(pk(sk), info, m), sk, info) = m,
+  sas(b, <grindA(b, s, l, t), s, l>) = t,
+  sas(<i, c, p, grindB(i, c, p, a, t)>, a) = t
+
+restriction Equal:
+  "All x y #i. Eq(x, y) @ i ==> x = y"
+
+// A user's app holds K. The batch key is kdf(K); the blob-auth key kauth(K)
+// (HKDF label "ashidori batch auth v1") never leaves the app.
+rule Create_User:
+    [ Fr(~K) ]
+  --[ NewKey(~K) ]->
+    [ !App($A, ~K) ]
+
+// The browser makes its ephemeral key and nonce, commits to both, takes the
+// pairing id and code from the server, and shows the code.
+#ifdef NOCOMMIT
+rule B_Start:
+    [ Fr(~tid), Fr(~sk), Fr(~nB), In(<id, code>) ]
+  -->
+    [ BWait(~tid, id, code, ~sk, ~nB), UserCode(~tid, code), Out(<pk(~sk), ~nB>) ]
+#else
+rule B_Start:
+    [ Fr(~tid), Fr(~sk), Fr(~nB), In(<id, code>) ]
+  -->
+    [ BWait(~tid, id, code, ~sk, ~nB), UserCode(~tid, code), Out(h(<'commit', pk(~sk), ~nB>)) ]
+#endif
+
+// The user types the code into the app. The app takes the id and the commit
+// the server hands it, then fixes sA, scope and ttl and sends nA = h(sA).
+#ifdef NOCOMMIT
+rule A_Claim:
+    [ !App(A, K), UserCode(tid, code), In(<id, pkX, nX>), Fr(~sA) ]
+  -->
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, ~sA, $scope, $ttl),
+      !ADisplay(tid, sas(<id, code, pkX, nX>, <h(<'app', ~sA>), $scope, $ttl>)),
+      Out(<h(<'app', ~sA>), $scope, $ttl>) ]
+#else
+rule A_Claim:
+    [ !App(A, K), UserCode(tid, code), In(<id, c>), Fr(~sA) ]
+  -->
+    [ AWait(tid, K, id, code, c, ~sA, $scope, $ttl), Out(<h(<'app', ~sA>), $scope, $ttl>) ]
+#endif
+
+// The browser takes the first nA, scope and ttl, shows the words, and
+// reveals pkB and nB.
+#ifdef NOCOMMIT
+rule B_Reveal:
+    [ BWait(tid, id, code, sk, nB), In(<nA, scope, ttl>) ]
+  -->
+    [ BShown(tid, id, code, sk, nB, nA, scope, ttl),
+      !BDisplay(tid, sas(<id, code, pk(sk), nB>, <nA, scope, ttl>)) ]
+#else
+rule B_Reveal:
+    [ BWait(tid, id, code, sk, nB), In(<nA, scope, ttl>) ]
+  -->
+    [ BShown(tid, id, code, sk, nB, nA, scope, ttl),
+      !BDisplay(tid, sas(<id, code, pk(sk), nB>, <nA, scope, ttl>)),
+      Out(<pk(sk), nB>) ]
+
+// The app accepts the reveal only if it opens the commit, and shows the words.
+rule A_Reveal:
+    [ AWait(tid, K, id, code, h(<'commit', pkX, nX>), sA, scope, ttl), In(<pkX, nX>) ]
+  -->
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, sA, scope, ttl),
+      !ADisplay(tid, sas(<id, code, pkX, nX>, <h(<'app', sA>), scope, ttl>)) ]
+#endif
+
+// The user approves in the app only when the browser shows the same words.
+// The app seals sA and the batch key to the revealed key, with th as info.
+rule A_Approve:
+    let nA = h(<'app', sA>)
+        th = h(<id, code, c, nA, scope, ttl, pkX, nX>)
+    in
+    [ AShown(tid, K, id, code, c, pkX, nX, sA, scope, ttl), !BDisplay(tid, wB) ]
+  --[ Eq(sas(<id, code, pkX, nX>, <nA, scope, ttl>), wB),
+      Approve(tid, th, kdf(K)) ]->
+    [ Out(hseal(pkX, <'grant', th>, <sA, kdf(K)>)) ]
+
+// The user confirms in the browser only when the app shows the same words.
+#ifdef APPONLY
+rule B_Confirm:
+    [ BShown(tid, id, code, sk, nB, nA, scope, ttl) ]
+  --[ BConfirm(tid) ]->
+    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl) ]
+#else
+rule B_Confirm:
+    [ BShown(tid, id, code, sk, nB, nA, scope, ttl), !ADisplay(tid, wA) ]
+  --[ Eq(sas(<id, code, pk(sk), nB>, <nA, scope, ttl>), wA), BConfirm(tid) ]->
+    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl) ]
+#endif
+
+// After its own confirmation, the browser opens the grant with its th and
+// keeps the key only if the grant carries the preimage of nA.
+#ifdef NOGRANTAUTH
+rule B_Accept:
+    let th = h(<id, code, h(<'commit', pk(sk), nB>), nA, scope, ttl, pk(sk), nB>)
+    in
+    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl), In(hseal(pk(sk), <'grant', th>, <s, bk>)) ]
+  --[ BAccept(tid, th, bk) ]->
+    [ BHolds(tid, sk, bk) ]
+#else
+rule B_Accept:
+    let nA = h(<'app', sA>)
+        th = h(<id, code, h(<'commit', pk(sk), nB>), nA, scope, ttl, pk(sk), nB>)
+    in
+    [ BConfirmed(tid, id, code, sk, nB, nA, scope, ttl), In(hseal(pk(sk), <'grant', th>, <sA, bk>)) ]
+  --[ BAccept(tid, th, bk) ]->
+    [ BHolds(tid, sk, bk) ]
+#endif
+
+// The viewer is compromised after it accepted (a malicious page later, an
+// extension): everything it holds leaks.
+rule B_Leak:
+    [ BHolds(tid, sk, bk) ]
+  --[ BLeak(tid) ]->
+    [ Out(<sk, bk>) ]
+
+// ---- Sanity: the honest run is possible, in both confirmation orders and
+// ---- for two browsers of one user ----
+
+lemma executable_approve_first:
+  exists-trace
+  "Ex tid th bk #i #j #k. Approve(tid, th, bk) @ i & BConfirm(tid) @ j & BAccept(tid, th, bk) @ k
+     & #i < #j & #j < #k & not (Ex t #l. BLeak(t) @ l)"
+
+lemma executable_confirm_first:
+  exists-trace
+  "Ex tid th bk #i #j #k. BConfirm(tid) @ j & Approve(tid, th, bk) @ i & BAccept(tid, th, bk) @ k
+     & #j < #i & #i < #k & not (Ex t #l. BLeak(t) @ l)"
+
+lemma executable_two_browsers:
+  exists-trace
+  "Ex t1 t2 th1 th2 bk #i #j. BAccept(t1, th1, bk) @ i & BAccept(t2, th2, bk) @ j
+     & not (t1 = t2) & not (Ex t #l. BLeak(t) @ l)"
+
+// ---- Properties ----
+
+// The attacker never learns K, even from a viewer that leaks everything it
+// holds: no viewer holds K or anything K can be derived from.
+lemma master_key_secrecy:
+  "All K #i. NewKey(K) @ i ==> not (Ex #j. K(K) @ j)"
+
+// Likewise for the blob-auth key: a viewer key cannot forge blobs apps accept.
+lemma auth_key_secrecy:
+  "All K #i. NewKey(K) @ i ==> not (Ex #j. K(kauth(K)) @ j)"
+
+// The batch key stays secret unless a viewer that received it leaks it.
+lemma batch_key_secrecy:
+  "All K #i. NewKey(K) @ i ==>
+     not (Ex #j. K(kdf(K)) @ j) | (Ex tid #l. BLeak(tid) @ l)"
+
+// The key a browser accepts is the one the app approved for exactly that
+// transcript (id, code, commit, nA, scope, ttl, pkB, nB) and that browser,
+// and each approval is accepted at most once.
+lemma grant_agreement:
+  "All tid th bk #i. BAccept(tid, th, bk) @ i ==>
+     (Ex #j. Approve(tid, th, bk) @ j & #j < #i)
+     & not (Ex tid2 bk2 #i2. BAccept(tid2, th, bk2) @ i2 & not (#i2 = #i))"
+
+end

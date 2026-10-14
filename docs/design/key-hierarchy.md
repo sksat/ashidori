@@ -209,7 +209,7 @@ EK は書き手ごとには分けない。
 ### 最初の端末
 
 1. 端末はトークン、`DS`、`DE` を作る。`RK` を作り、`RS`、`RE`、`IK` を用意する。
-2. 自己登録（`POST /v2/accounts`）か管理者のコードで、ユーザ ID、世代 1 のアカウント記録、自分の証明書を送る。
+2. 招待か、サーバが許す場合は招待なしで（`POST /v2/accounts`）、ユーザ名、世代 1 のアカウント記録、自分の証明書を送る。
 3. 復旧コードを表示し、一部を入力させて控えを確かめる。
 4. `RK`、`RS`、`RE` の秘密鍵を消す。
 
@@ -372,8 +372,8 @@ v1 の復旧コードは `K` とチェックサムで 55 文字、v2 は版の 1
 | 経路 | 種類 | 内容 |
 | --- | --- | --- |
 | `GET /v1/info` | 変更 | `protocols: [1, 2]` を加える |
-| `POST /admin/users`、`PATCH /admin/users/:id` | 変更 | `handle`（ユーザ ID）を必須にする |
-| `POST /v2/accounts` | 新規 | `{token, handle, deviceName?, accountRecord, cert}`。ユーザ ID が使用中なら `409` |
+| `PATCH /admin/users/:id` | 変更なし | v1 で導入済み（旧形式の利用者のユーザ名の設定） |
+| `POST /v2/accounts` | 新規 | `{token, username, invite?, deviceName?, accountRecord, cert}`。ユーザ名が使用中なら `409` |
 | `POST /v2/devices/register` | 新規 | `{code, token, cert}`。全権限は `RS`、制限付きは発行した端末の署名を検証する |
 | `POST /v2/recover` | 新規 | challenge への `RS` の署名で登録する。保留あり |
 | `GET /v2/roster`、`POST /v2/roster` | 新規 | 名簿の取得と追記（先頭のハッシュで CAS） |
@@ -383,7 +383,7 @@ v1 の復旧コードは `K` とチェックサムで 55 文字、v2 は版の 1
 | `POST /v2/commit` | 新規 | `{attemptId, objects, heads: [{id, ifVersion, record}]}` を一つのトランザクションで確定する |
 | `GET /v2/heads?kid=…`、`GET /v2/changes?after=…` | 新規 | head の取得と変更の一覧 |
 | `POST /v2/pairing/…` | 新規 | 試行、commit、乱数、開示、付与、閲覧トークン |
-| `POST /v2/account/migrate` | 新規 | v1 の利用者にアカウント記録とユーザ ID を登録する（冪等） |
+| `POST /v2/account/migrate` | 新規 | v1 の利用者にアカウント記録を登録する（冪等）。ユーザ名のない旧形式の利用者はユーザ名も登録する |
 | `PUT /v1/batches/…` | 変更 | 移行を終えた利用者には `410`。`GET` は残す |
 | 共有チェックイン | 変更 | [上記](#共有チェックインの暗号化) |
 
@@ -394,7 +394,7 @@ v1 の復旧コードは `K` とチェックサムで 55 文字、v2 は版の 1
 
 | 段階 | 内容 | 完了の条件 |
 | --- | --- | --- |
-| 1 | 新しい `RK` を作り、Keystore で包んで仮に保存する。ユーザ ID がなければ選ぶ | 保存の確認 |
+| 1 | 新しい `RK` を作り、Keystore で包んで仮に保存する。ユーザ名がなければ選ぶ | 保存の確認 |
 | 2 | 新しい復旧コードを表示し、一部を入力させる | 入力の一致 |
 | 3 | アカウント記録と自分の証明書を登録する | サーバの応答（冪等） |
 | 4 | 旧バッチ鍵 HKDF(`K`, `ashidori batch v1`) を `legacy` の EK として自分の `DE` と `RE` に包んで送る | サーバから取得して開けること |

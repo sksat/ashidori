@@ -7,23 +7,37 @@ import scala.util.Try
 
 /** A registration request whose token is already stored. Retrying it with
   * the same token is idempotent on the server.
-  * `kind` is "account" (`POST /v1/accounts`) or "pair" (`POST /v1/devices/register`).
+  * `kind` is "account" (`POST /v1/accounts`: a new user, this device its
+  * first) or "pair" (`POST /v1/devices/register`: a device added to a user).
+  * `code` is the pairing code ("pair"), or the invite code ("account"; empty
+  * for open registration without an invite). `username` is the username the
+  * person chose ("account" only; empty in requests stored by older versions,
+  * which the server recovers by the token alone).
   */
-final case class PendingRegistration(url: String, kind: String, code: String, name: String, token: String):
+final case class PendingRegistration(url: String, kind: String, code: String, name: String, token: String,
+                                     username: String = ""):
   def host: String = Try(java.net.URI(url).getHost).toOption.flatMap(Option(_)).getOrElse(url)
 
   def toBytes: Array[Byte] =
-    ujson.write(ujson.Obj("url" -> url, "kind" -> kind, "code" -> code, "name" -> name, "token" -> token)).getBytes(UTF_8)
+    ujson.write(ujson.Obj("url" -> url, "kind" -> kind, "code" -> code, "name" -> name, "token" -> token,
+      "username" -> username)).getBytes(UTF_8)
 
 object PendingRegistration:
   def fromBytes(b: Array[Byte]): Option[PendingRegistration] =
     Try {
       val js = ujson.read(String(b, UTF_8))
-      PendingRegistration(js("url").str, js("kind").str, js("code").str, js("name").str, js("token").str)
+      PendingRegistration(js("url").str, js("kind").str, js("code").str, js("name").str, js("token").str,
+        js.obj.get("username").map(_.str).getOrElse(""))
     }.toOption
 
 /** The server refused a registration for good (a 4xx other than 408/429). */
-final class RegistrationRejected(msg: String) extends RuntimeException(msg)
+class RegistrationRejected(msg: String) extends RuntimeException(msg)
+
+/** The server refused a new account because another user has `username`
+  * (409). Final like any refusal: the person chooses another username, which
+  * is a new request with a new token.
+  */
+final class UsernameTakenError(val username: String) extends RegistrationRejected(s"ユーザ名「$username」はすでに使われています")
 
 /** What the registration screen shows: the stored request, and whether an
   * attempt to send it is in flight.
@@ -41,6 +55,8 @@ enum RegistrationEvent:
   case Paired(attempt: Long, newAccount: Boolean)
   /** Attempt `attempt` (or starting / cancelling one) failed. */
   case Failed(attempt: Long, message: String)
+  /** Attempt `attempt` was refused because `username` is taken; the request is dropped. */
+  case UsernameTaken(attempt: Long, username: String)
 
 /** What [[RegistrationMachine]] stores. Every method blocks and returns
   * once the change is on disk, or throws.
@@ -132,10 +148,10 @@ final class RegistrationMachine(
     if current.compareAndSet(id, 0) then emit(RegistrationEvent.Changed)
 
   /** Stores a new request with a fresh token, checked to be on disk. On `local`. */
-  private def begin(id: Long, url: String, kind: String, code: String, name: String): PendingRegistration =
+  private def begin(id: Long, url: String, kind: String, code: String, name: String, username: String): PendingRegistration =
     if current.get != id then throw IllegalStateException("登録をやめました")
     if storage.busy || pending.isDefined then throw IllegalStateException("登録の処理がすでに進んでいます")
-    val p = PendingRegistration(url.stripSuffix("/"), kind, code, name, randomToken())
+    val p = PendingRegistration(url.stripSuffix("/"), kind, code, name, randomToken(), username)
     store(Some(p))
     p
 
@@ -168,19 +184,20 @@ final class RegistrationMachine(
         Try(finish(id, p, answer)) match
           case scala.util.Success(Some(_)) => emit(RegistrationEvent.Paired(id, p.kind == "account"))
           case scala.util.Success(None)    => () // cancelled meanwhile: dropped
+          case scala.util.Failure(e: UsernameTakenError) => emit(RegistrationEvent.UsernameTaken(id, e.username))
           case scala.util.Failure(e)       => emit(RegistrationEvent.Failed(id, e.getMessage))
         emit(RegistrationEvent.Changed)
       }
     }
 
   /** Starts a registration: stores the request, then sends it. Non-blocking. */
-  def start(url: String, kind: String, code: String, name: String): Unit =
+  def start(url: String, kind: String, code: String, name: String, username: String = ""): Unit =
     claim() match
       case None => emit(RegistrationEvent.Failed(0, "登録の処理がすでに進んでいます"))
       case Some(id) =>
         emit(RegistrationEvent.Changed)
         local.execute { () =>
-          Try(begin(id, url, kind, code, name)) match
+          Try(begin(id, url, kind, code, name, username)) match
             case scala.util.Success(p) =>
               emit(RegistrationEvent.Changed)
               run(id, p)
@@ -238,10 +255,10 @@ final class RegistrationMachine(
     emit(RegistrationEvent.Changed)
 
   /** Registers on the calling thread and returns the device id. Blocking. */
-  def registerBlocking(url: String, kind: String, code: String, name: String): String =
+  def registerBlocking(url: String, kind: String, code: String, name: String, username: String = ""): String =
     val id = claim().getOrElse(throw IllegalStateException("登録の処理がすでに進んでいます"))
     try
-      val p = onLocal(begin(id, url, kind, code, name))
+      val p = onLocal(begin(id, url, kind, code, name, username))
       val answer = Try(send(p))
       onLocal(finish(id, p, answer)).getOrElse(throw IllegalStateException("登録をやめました"))
     finally release(id)

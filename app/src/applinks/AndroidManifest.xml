@@ -2,7 +2,8 @@
 <!-- Merged only when the Gradle property ashidori.defaultServer is set
      (app/build.gradle.kts): registration links of that server open the app
      (App Links, verified against https://<host>/.well-known/assetlinks.json).
-     The pairing code is in the fragment: https://<host>/pair#c=<CODE>. -->
+     The code is in the fragment: https://<host>/pair#c=<CODE> (pairing code)
+     or #i=<INVITE> (invite). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <activity android:name=".MainActivity">

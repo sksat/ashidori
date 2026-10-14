@@ -73,14 +73,44 @@ export function randomBytes(n: number): Uint8Array {
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/** 8 Crockford base32 characters = 40 random bits. */
-export function generatePairingCode(): string {
-  const bytes = randomBytes(5);
+/** `n` Crockford base32 characters, 5 random bits each. */
+function crockford(n: number): string {
+  const bytes = randomBytes(Math.ceil((n * 5) / 8));
   let bits = 0n;
   for (const b of bytes) bits = (bits << 8n) | BigInt(b);
   let out = "";
-  for (let i = 7; i >= 0; i--) out += CROCKFORD[Number((bits >> BigInt(i * 5)) & 31n)];
+  for (let i = n - 1; i >= 0; i--) out += CROCKFORD[Number((bits >> BigInt(i * 5)) & 31n)];
   return out;
+}
+
+/** 8 Crockford base32 characters = 40 random bits. */
+export function generatePairingCode(): string {
+  return crockford(8);
+}
+
+/**
+ * Invite codes: 16 Crockford base32 characters = 80 random bits. An invite
+ * lives for days, not minutes, so it is longer than a pairing code.
+ */
+export const INVITE_CODE_LENGTH = 16;
+
+export function generateInviteCode(): string {
+  return crockford(INVITE_CODE_LENGTH);
+}
+
+/** Crockford's rules: case-insensitive, I/L -> 1, O -> 0, hyphens and spaces ignored. */
+function normalizeCrockford(input: string, length: number): string | null {
+  const s = input
+    .toUpperCase()
+    .replace(/[\s-]/g, "")
+    .replace(/[IL]/g, "1")
+    .replace(/O/g, "0");
+  return new RegExp(`^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{${length}}$`).test(s) ? s : null;
+}
+
+/** An invite code as normalizePairingCode does it, of INVITE_CODE_LENGTH characters. */
+export function normalizeInviteCode(input: string): string | null {
+  return normalizeCrockford(input, INVITE_CODE_LENGTH);
 }
 
 /**
@@ -88,13 +118,7 @@ export function generatePairingCode(): string {
  * hyphens and spaces ignored. Returns null if the result is not 8 valid characters.
  */
 export function normalizePairingCode(input: string): string | null {
-  const s = input
-    .toUpperCase()
-    .replace(/[\s-]/g, "")
-    .replace(/[IL]/g, "1")
-    .replace(/O/g, "0");
-  if (!/^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$/.test(s)) return null;
-  return s;
+  return normalizeCrockford(input, 8);
 }
 
 export const DEVICE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;

@@ -13,13 +13,14 @@ import {
   upsertCheckin,
 } from "./checkins";
 import { type Limits, parseLimits } from "./config";
+import { getUser } from "./users";
 import {
   acceptFollow,
   deleteFollow,
   listFollowers,
   listFollowing,
-  lookupHandle,
-  normalizeHandle,
+  lookupUsername,
+  normalizeUsername,
   requestFollow,
 } from "./follows";
 import {
@@ -37,6 +38,7 @@ import {
   DEVICE_TOKEN_RE,
   floorHour,
   jsonError,
+  normalizeInviteCode,
   normalizePairingCode,
   readBody,
   readJson,
@@ -169,61 +171,88 @@ v1.get("/info", async (c) => {
   return c.json({ registration: registrationMode(c.env), basemap: versions });
 });
 
-// `{token, deviceName?}`: creates a user and registers the calling device,
-// authenticated by the client-generated token, as its first device. The user
-// has no handle (an admin may set one) and is marked as self-registered.
-// Further devices are paired from this one (POST /v1/pairing). A retry with
-// the same token returns the same device (200).
+// `{token, username, invite?, deviceName?}`: creates a user named `username`
+// and registers the calling device, authenticated by the client-generated
+// token, as its first device (accounts.ts). With `invite` (an invite code from
+// an admin, invites.ts) in any REGISTRATION mode, consuming the invite;
+// without one only when REGISTRATION = "open" (self-registration). Further
+// devices are paired from this one (POST /v1/pairing). A retry with the same
+// token and invite returns the same device (200).
 //
 // Result recovery comes before every gate (REGISTRATION, the edge binding,
-// the rate limits, MAX_USERS and the limit variables): a client whose
+// the rate limits, MAX_USERS and the limit variables) and before the username
+// is validated (a request stored by an older app has none): a client whose
 // response got lost gets its account back (200) even after the operator
 // closed registration. Only the creation of a new user is gated.
 //
 // A copy of the request may pass that recovery just before a concurrent copy
 // with the same token creates the account. So before a final refusal (403
-// "registration closed"; "registration full" is rechecked in createAccount)
-// the recovery is looked up again, and the account, if there is one now, is
-// the answer (formal/tla/Accounts_closedrace.cfg). 429 and 503 are not
-// final: the client sends the request again, and recovery comes first then.
-// A copy refused before the other copy commits still gets 403; the client
-// treats that as final only for a token it never sent before
-// (docs/sync-protocol.md, Registration requests).
+// "registration closed"; "registration full", 401 and 409 are rechecked in
+// createAccount) the recovery is looked up again, and the account, if there
+// is one now, is the answer (formal/tla/Accounts_closedrace.cfg). 429 and 503
+// are not final: the client sends the request again, and recovery comes
+// first then. A copy refused before the other copy commits still gets 403;
+// the client treats that as final only for a token it never sent before
+// (docs/sync-protocol.md, Registration requests). With an invite there is no
+// such 403: REGISTRATION is not read.
 v1.post("/accounts", async (c) => {
   const parsed = await jsonBody(c);
   if (parsed instanceof Response) return parsed;
-  const { deviceName: rawName, token } = parsed.body;
+  const { deviceName: rawName, token, username: rawUsername, invite: rawInvite } = parsed.body;
   if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 400, "invalid token");
   let name: string | null = DEFAULT_DEVICE_NAME;
   if (rawName !== undefined && rawName !== null && rawName !== "") {
     name = typeof rawName === "string" ? parseDeviceName(rawName) : null;
     if (name === null) return jsonError(c, 400, "invalid deviceName");
   }
-  const known = await recoverAccount(c.env.DB, token);
-  if (known !== null) return c.json({ deviceId: known }, 200);
-
-  if (registrationMode(c.env) !== "open") {
-    const now = await recoverAccount(c.env.DB, token);
-    if (now !== null) return c.json({ deviceId: now }, 200);
+  const withInvite = rawInvite !== undefined && rawInvite !== null;
+  if (withInvite && typeof rawInvite !== "string") return jsonError(c, 400, "invalid invite");
+  // A malformed code is answered like an unknown one, after the gates.
+  const invite = withInvite ? normalizeInviteCode(rawInvite as string) : null;
+  if (!withInvite || invite !== null) {
+    const known = await recoverAccount(c.env.DB, token, invite);
+    if (known !== null) return c.json(known, 200);
+  }
+  // Closed before the username is looked at: an older app (no username) on
+  // a closed server still learns that registration is closed.
+  if (!withInvite && registrationMode(c.env) !== "open") {
+    const now = await recoverAccount(c.env.DB, token, null);
+    if (now !== null) return c.json(now, 200);
     return jsonError(c, 403, "registration closed");
   }
-  // Fail closed without the edge limiter (see ratelimit.ts).
-  if (!selfRegistrationEdgeReady(c.env)) {
-    console.error("REGISTRATION is open but the RL_ACCOUNT binding is missing; refusing self-registration");
-    return jsonError(c, 503, "server misconfigured");
-  }
+  const username = typeof rawUsername === "string" ? normalizeUsername(rawUsername) : null;
+  if (username === null) return jsonError(c, 400, "invalid username");
   const ip = clientKey(c.req.raw);
-  if (!(await edgeAllowed(c.env.RL_ACCOUNT, "RL_ACCOUNT", `account:${ip}`))) {
-    return jsonError(c, 429, "too many requests");
+
+  if (withInvite) {
+    // Like registration with a pairing code: counted after validation, before
+    // the invite is looked at, so that wrong codes count.
+    if (!(await edgeAllowed(c.env.RL_REGISTER, "RL_REGISTER", `invite:${ip}`))) {
+      return jsonError(c, 429, "too many requests");
+    }
+    if (!(await hitRateLimit(c.env.DB, RULES.invite, ip))) return jsonError(c, 429, "too many requests");
+    if (invite === null) return jsonError(c, 401, "invalid or expired invite");
+  } else {
+    // Fail closed without the edge limiter (see ratelimit.ts).
+    if (!selfRegistrationEdgeReady(c.env)) {
+      console.error("REGISTRATION is open but the RL_ACCOUNT binding is missing; refusing self-registration");
+      return jsonError(c, 503, "server misconfigured");
+    }
+    if (!(await edgeAllowed(c.env.RL_ACCOUNT, "RL_ACCOUNT", `account:${ip}`))) {
+      return jsonError(c, 429, "too many requests");
+    }
+    if (!(await hitRateLimit(c.env.DB, RULES.account, ip))) return jsonError(c, 429, "too many requests");
   }
-  if (!(await hitRateLimit(c.env.DB, RULES.account, ip))) return jsonError(c, 429, "too many requests");
   const limits = limitsOr503(c);
   if (limits instanceof Response) return limits;
 
-  const r = await createAccount(c.env.DB, { token, name, maxUsers: limits.maxUsers });
+  const r = await createAccount(c.env.DB, { token, invite, username, name, maxUsers: limits.maxUsers });
   if (r === "full") return jsonError(c, 403, "registration full");
   if (r === "token in use") return jsonError(c, 409, "token already in use");
-  return c.json({ deviceId: r.deviceId }, r.created ? 201 : 200);
+  if (r === "username taken") return jsonError(c, 409, "username taken");
+  // Unknown, used (also by another token), expired or revoked: all alike.
+  if (r === "invalid invite") return jsonError(c, 401, "invalid or expired invite");
+  return c.json({ deviceId: r.deviceId, username: r.username }, r.created ? 201 : 200);
 });
 
 // ---- Everything below requires a device token ----
@@ -246,6 +275,7 @@ v1.use("/users/lookup", edgeByIp("RL_LOOKUP", "lookup"));
 
 v1.use("/pairing", deviceAuth);
 v1.use("/devices", deviceAuth);
+v1.use("/me", deviceAuth);
 v1.use("/devices/:id/revoke", deviceAuth);
 v1.use("/batches", deviceAuth);
 v1.use("/batches/*", deviceAuth);
@@ -281,6 +311,14 @@ v1.post("/pairing", async (c) => {
 });
 
 v1.get("/devices", async (c) => c.json(await listDevices(c.env.DB, c.get("device").user_id)));
+
+// The device's user: `{userId, username}`; both null for a legacy device,
+// `username` null for a legacy user an admin has not given one yet.
+v1.get("/me", async (c) => {
+  const userId = c.get("device").user_id;
+  const user = userId === null ? null : await getUser(c.env.DB, userId);
+  return c.json({ userId, username: user?.handle ?? null });
+});
 
 v1.post("/devices/:id/revoke", async (c) => {
   const scope = { userId: c.get("device").user_id };
@@ -468,7 +506,7 @@ v1.get("/checkins/feed", async (c) => {
 
 // ---- Follows (see follows.ts) ----
 
-// Exact match only, and rate limited, which limits bulk probing of handles.
+// Exact match only, and rate limited, which limits bulk probing of usernames.
 v1.get("/users/lookup", async (c) => {
   if (!(await edgeAllowed(c.env.RL_LOOKUP, "RL_LOOKUP", `lookup:user:${c.get("device").user_id}`))) {
     return jsonError(c, 429, "too many requests");
@@ -476,8 +514,8 @@ v1.get("/users/lookup", async (c) => {
   if (!(await hitRateLimit(c.env.DB, RULES.lookup, clientKey(c.req.raw)))) {
     return jsonError(c, 429, "too many requests");
   }
-  const handle = normalizeHandle(c.req.query("handle") ?? "");
-  const user = handle ? await lookupHandle(c.env.DB, handle) : null;
+  const username = normalizeUsername(c.req.query("username") ?? "");
+  const user = username ? await lookupUsername(c.env.DB, username) : null;
   return user ? c.json(user) : jsonError(c, 404, "no such user");
 });
 

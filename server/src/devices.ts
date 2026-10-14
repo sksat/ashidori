@@ -17,7 +17,8 @@ export interface DeviceView {
 /** Admin view: every device with the user it belongs to (null for legacy devices). */
 export interface AdminDeviceView extends DeviceView {
   userId: string | null;
-  userName: string | null;
+  /** The user's username (null for legacy devices, or a legacy user without one). */
+  username: string | null;
 }
 
 /**
@@ -222,12 +223,12 @@ export async function listDevices(db: D1Database, userId: string | null): Promis
 export async function listAllDevices(db: D1Database): Promise<AdminDeviceView[]> {
   const { results } = await db
     .prepare(
-      `SELECT d.id, d.name, d.created_at, d.last_seen_at, d.revoked_at, d.user_id, u.name AS user_name
+      `SELECT d.id, d.name, d.created_at, d.last_seen_at, d.revoked_at, d.user_id, u.handle AS username
        FROM devices d LEFT JOIN users u ON u.id = d.user_id
        ORDER BY d.created_at, d.id`,
     )
-    .all<Omit<DeviceRow, "token_hash"> & { user_name: string | null }>();
-  return results.map((r) => ({ ...toView(r), userId: r.user_id, userName: r.user_name }));
+    .all<Omit<DeviceRow, "token_hash"> & { username: string | null }>();
+  return results.map((r) => ({ ...toView(r), userId: r.user_id, username: r.username }));
 }
 
 /**

@@ -31,6 +31,7 @@
 // `visibility` is always 'followers' for now. Sharing with selected users
 // (encrypted per recipient) is expected to add other values.
 
+import type { UserRef } from "./follows";
 import { floorHour } from "./util";
 
 export const LOCAL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -55,8 +56,7 @@ export interface CheckinInput {
 interface CheckinRow {
   id: string;
   user_id: string;
-  user_name: string;
-  user_handle: string | null;
+  user_username: string | null;
   user_status: string;
   t: number | null;
   lat: number | null;
@@ -73,7 +73,7 @@ interface CheckinRow {
 export interface CheckinView {
   id: string;
   cursor: number;
-  user: { id: string; handle: string | null; name: string };
+  user: UserRef;
   t: number | null;
   lat: number | null;
   lon: number | null;
@@ -87,7 +87,7 @@ export interface CheckinView {
 }
 
 const NEXT_CURSOR = "(SELECT COALESCE(MAX(cursor), 0) + 1 FROM shared_checkins)";
-const VIEW_COLUMNS = `p.id, p.user_id, u.name AS user_name, u.handle AS user_handle, u.status AS user_status,
+const VIEW_COLUMNS = `p.id, p.user_id, u.handle AS user_username, u.status AS user_status,
   p.t, p.lat, p.lon, p.venue, p.category, p.place, p.comment, p.updated_at, p.deleted_at, p.cursor`;
 
 function optionalText(v: unknown, max: number, re: RegExp): string | null | undefined {
@@ -131,7 +131,7 @@ function toView(r: CheckinRow): CheckinView {
   return {
     id: r.id,
     cursor: r.cursor,
-    user: { id: r.user_id, handle: r.user_handle, name: r.user_name },
+    user: { id: r.user_id, username: r.user_username },
     t: deleted ? null : r.t,
     lat: deleted ? null : r.lat,
     lon: deleted ? null : r.lon,
@@ -211,7 +211,7 @@ export async function upsertCheckin(
        FROM shared_checkins WHERE device_id = ?1 AND local_id = ?2`,
     )
     .bind(deviceId, localId)
-    .first<Omit<CheckinRow, "user_id" | "user_name" | "user_handle" | "user_status" | "updated_at"> & {
+    .first<Omit<CheckinRow, "user_id" | "user_username" | "user_status" | "updated_at"> & {
       rev: number;
       removed_by_admin: number;
     }>();

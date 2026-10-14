@@ -15,9 +15,10 @@ check-ins that a user explicitly shares with their followers; see
 
 - One deployment serves several users. Every device belongs to exactly one
   user, and a user's devices share that user's data. Users do not sign in to
-  the web. Either an admin creates the user and hands them a pairing code, or,
-  when the server allows it, the user's first device creates the user itself
-  (see [Registration and limits](#registration-and-limits)).
+  the web. Every user is created by their first app device, under a username
+  chosen there: with an invite from an admin, or without one when the server
+  allows it (see [Registration and limits](#registration-and-limits)). There
+  is no browser-first signup, and admins do not create users.
 - Data is isolated per user: a device only sees the devices and batches of its
   own user. Devices registered before users existed have no user; they only
   see each other, and cannot use shared check-ins or follows.
@@ -61,19 +62,24 @@ check-ins that a user explicitly shares with their followers; see
 - **Pairing**:
   - A pairing code is 8 characters of Crockford base32, single use, with a TTL of 10 minutes. The code's creation, its expiry and the check whether it has expired all use D1's clock, and the check runs inside the statement that consumes the code: a request delayed between the Worker and D1 cannot consume a code that expired meanwhile.
   - Every code is bound to a user, and the device registered with it belongs to that user.
-  - Codes are created either by an existing device (`POST /v1/pairing`, for the device's own user) or by an admin for a given user (`POST /admin/users/:id/pairing`).
+  - Codes are created either by an existing device (`POST /v1/pairing`, for the device's own user) or by an admin for a given user (`POST /admin/users/:id/pairing`, for example a legacy user without a device).
   - A code created by a device works only while that device is not revoked. Revoking a device also deletes the unused codes it created, in the same transaction. A code that an older server version stored without its issuing device is checked against the device named in its creator field; it is never taken for an admin's code.
-  - A user's first device registers with a code from an admin, or, when registration is open, creates its user with `POST /v1/accounts`. Further devices always pair with a code.
+  - A user's first device creates its user with `POST /v1/accounts`: with an invite (below) on any server, without one only when registration is open. Further devices always pair with a code.
+- **Invites**: an admin's single-use permission to create one user.
+  - An invite code is 16 characters of Crockford base32 (80 random bits), created by `POST /admin/invites` with an expiry of 1 to 30 days (default 7). The server stores only its SHA-256. Like a pairing code, its creation, its expiry and the expiry check use D1's clock, and the check runs inside the statement that consumes it.
+  - It is consumed by the `POST /v1/accounts` that creates its user, in the same transaction that creates the user and the first device: all three or none. It is bound to no user before that, and to that user after it.
+  - An admin can revoke an unused invite. A revoked, expired, used or unknown invite gets `401 {"error": "invalid or expired invite"}`, all alike.
+- **Usernames**: every user has one username, chosen on the first device: `^[a-z0-9_]{3,20}$`, unique, case-insensitive (input is trimmed and lowercased; stored lowercase). It is what the app and the admin page show, and what other users look a user up by; there is no separate display name. Users created before usernames may have none (legacy) until an admin sets one. The API calls it `username`; the D1 column keeps its earlier name `users.handle`.
 - Tokens can be revoked per device. A revoked or unknown token gets `401`.
 - An admin can disable a user. The user's device tokens then get `401` and the
   user's unused pairing codes are rejected, until the user is enabled again.
 - **Rate limits**, in two layers:
   - A Workers Rate Limiting binding in front of D1, per Cloudflare location and 60-second window, eventually consistent. It only turns away floods cheaply, before any D1 access:
-    - Registration and self-registration: per client IP, after the body is validated and after the result recovery (see [Registration requests](#registration-requests)), before anything is written to D1. The result recovery reads D1 once per well-formed request, as the device authentication of every authenticated route does.
-    - Pairing and handle lookups: per client IP before the device token is checked (which reads D1), and once more per user after it.
+    - Registration, registration with an invite, and self-registration: per client IP, after the body is validated and after the result recovery (see [Registration requests](#registration-requests)), before anything is written to D1. The result recovery reads D1 once per well-formed request, as the device authentication of every authenticated route does.
+    - Pairing and username lookups: per client IP before the device token is checked (which reads D1), and once more per user after it.
     - A missing binding: self-registration with `REGISTRATION = open` is refused with `503 {"error": "server misconfigured"}` (fail closed; the admin page shows why). Elsewhere the check passes, and the server logs a warning once per isolate.
     - A binding that fails at runtime: the check passes, with a warning, and the D1 counters decide.
-  - Precise fixed-window counters in D1, per client IP (IPv4 address, or the /64 prefix of an IPv6 address; IPv4-mapped IPv6 counts as IPv4): registration 10 per 10 minutes (requests with a well-formed body, wrong codes included), pairing 20 per 10 minutes, handle lookups 20 per 10 minutes, self-registration 5 per hour. A rejected request does not write to D1.
+  - Precise fixed-window counters in D1, per client IP (IPv4 address, or the /64 prefix of an IPv6 address; IPv4-mapped IPv6 counts as IPv4): registration 10 per 10 minutes (requests with a well-formed body, wrong codes included), registration with an invite 10 per 10 minutes (likewise), pairing 20 per 10 minutes, username lookups 20 per 10 minutes, self-registration 5 per hour. A rejected request does not write to D1.
     - The window is taken from D1's clock in the statement that counts the request. A counter's window only moves forward: a request whose window is older than the stored one (from a server version that still uses its own clock, or after D1's clock stepped back) is counted in the stored window and never resets the counter.
   - Over the limit: `429 {"error": "too many requests"}`.
   - Counters are keyed by IP and are deleted by a scheduled job within about 10 minutes after their window has ended.
@@ -87,35 +93,38 @@ that a device whose response got lost can retry safely:
    - Taking in an answer and cancelling are one compare-and-set each on the attempt's state: the answer moves it from in flight to saving, the cancel from in flight to none. Exactly one of them wins. Once a cancel returned as successful, nothing of that attempt is saved, and only then is the stored request removed. A cancel that finds the answer being saved reports that it came too late and changes nothing: the request stays, and if saving the answer fails, that failure is reported as the attempt's own and the request can be sent again with the same token. Unpairing invalidates the attempt first, on the same executor that saves answers, then clears the registration. Results carry their attempt id, and the screen ignores results of an attempt that is no longer the latest.
    - `SharedPreferences.commit()` updates the in-memory copy before it writes the disk and keeps that update when the write fails, and any later write to the same file persists it. The registration (URL, device id, self-registration flag, unpairing mark) and the secrets (token, master key, pending request) are therefore not kept in SharedPreferences. Each group is one file owned by one store, which replaces it as a whole (temporary file, `fsync`, rename) and publishes an immutable snapshot of its records only after the file was written. A reader sees the records of the last write that reached the disk, never a value being written or whose write failed, and never waits for the disk. After a failure or a crash the file holds the old or the new records, so nothing has to be undone and a restart reads only values that were on disk. If a failed write cannot be read back to tell which, the keys it changed are unknown: they read as absent, except the unpairing mark, which reads as set (the file may still hold it, and the next start would then finish the unpairing over whatever was registered meanwhile). The next write reads the file again and starts from the records it holds, so it never writes back a value that the failed write may have replaced; if the file still cannot be read, a write that would have to guess an unknown key is refused. The device counts as paired or ready (for the settings screen and for the sync jobs) only on values that are on disk.
    - The master key is stored with the registration it was set for (a hash of the server URL and device id) and counts only for that registration: the device is ready only when the stored key's registration is the current one. A key left over from an earlier registration is never used for a later one, and saving a new registration never adopts it. A key stored by an earlier version without its registration is bound to the current registration once, at start.
-2. The server stores the hash of that token for the new device and returns `201 {"deviceId": "..."}`. It never generates or returns a token.
-3. A retry with the same token and the same request returns the same device: `200 {"deviceId": "..."}`.
+2. The server stores the hash of that token for the new device and returns `201 {"deviceId": "..."}` (`/v1/accounts`: `{"deviceId", "username"}`). It never generates or returns a token.
+3. A retry with the same token and the same request returns the same device: `200` with the same body.
    - Register: the same code, which that device consumed. The device must not be revoked.
-   - Accounts: the token is that of the first device of a self-registered user.
+   - Accounts: the token is that of the first device (not revoked) of a user created by the same kind of request: with the same invite, or self-registered without one. The username is not compared, and is not even required for the recovery (a request stored by an older app has none); the answer carries the user's username as it is now.
    - **Result recovery is separate from the permission to create.** The server answers a retry from what is stored, before any gate that decides whether something new may be created: `REGISTRATION`, the edge rate limiter (and whether its binding exists), the D1 rate-limit counters, `MAX_USERS`, the user's device limit and invalid limit variables. A device whose response got lost therefore gets its id back even after the operator closed registration, while the client is rate limited, or once the server is full. Only a request that would create a user or a device is gated. A request with an unknown token, or with a known token that does not match the request, goes through the gates like any other and is counted by the rate limits.
-4. This also holds for two identical requests in flight at once (a retry sent before the first response arrived): one creates the device (`201`), the other gets it (`200`), also when the first one took the code's last device slot or the server's last user slot (`MAX_USERS`), or when the operator closed registration after the first one created the account. Before answering `401`, `403` or `409`, the server checks again whether the request's token now has a device that matches the request (formal/tla `Accounts_closedrace`).
-   - Not covered: a copy refused before the other copy committed. For `/v1/accounts`, `REGISTRATION` is read by the Worker, not inside the transaction, so a copy that reaches it before the other copy created the account gets `403 registration closed` (or `registration full`), and the account is created afterwards. The client therefore takes a `403` from `/v1/accounts` as final only for the first request with a token it made in this process and never sent before. A token that may have been sent before (an earlier attempt whose answer was lost, a retry, a request stored before a crash) is sent again with growing intervals (2 s, 4 s, … up to 30 s) for 2 minutes after a `403`; if the other copy created the account meanwhile, recovery answers `200`. Only then is the request dropped as refused.
-5. A used code with another token gives `401`, like an unknown code. A known token with another code also gives `401`. For `/v1/accounts`, a token that belongs to any other device gives `409 {"error": "token already in use"}`.
+4. This also holds for two identical requests in flight at once (a retry sent before the first response arrived): one creates the device (`201`), the other gets it (`200`), also when the first one took the code's last device slot, the invite, the username or the server's last user slot (`MAX_USERS`), or when the operator closed registration after the first one created the account. Before answering `401`, `403` or `409`, the server checks again whether the request's token now has a device that matches the request (formal/tla `Accounts_closedrace`, `Invites`).
+   - Not covered: a copy refused before the other copy committed. For `/v1/accounts` without an invite, `REGISTRATION` is read by the Worker, not inside the transaction, so a copy that reaches it before the other copy created the account gets `403 registration closed` (or `registration full`), and the account is created afterwards. The client therefore takes a `403` from `/v1/accounts` as final only for the first request with a token it made in this process and never sent before. A token that may have been sent before (an earlier attempt whose answer was lost, a retry, a request stored before a crash) is sent again with growing intervals (2 s, 4 s, … up to 30 s) for 2 minutes after a `403`; if the other copy created the account meanwhile, recovery answers `200`. Only then is the request dropped as refused. With an invite, `REGISTRATION` is not read, and every refusal (`401`, `409`) is decided inside or after the transaction.
+5. A used code with another token gives `401`, like an unknown code. A known token with another code also gives `401`. An invite used by another token gives `401`, like an unknown invite. For `/v1/accounts`, a token that belongs to any other device (including the first device of a user created with another invite) gives `409 {"error": "token already in use"}`, and a username that another user has gives `409 {"error": "username taken"}`.
 
 Consuming the code and creating the device happen in one D1 transaction: both or
-neither. Used codes are kept for a day after they expire; a retry later than
-that gets `401`. A self-registered account that stored nothing is deleted after
-7 days (see below); a retry after that creates a new account.
+neither. Likewise consuming the invite, creating the user and creating its first
+device; a username conflict rolls all of it back, so the invite stays unused.
+Used codes are kept for a day after they expire; a retry later than that gets
+`401`. Used invites are kept. A self-registered account (without an invite) that
+stored nothing is deleted after 7 days (see below); a retry after that creates a
+new account.
 
 ### Registration links
 
-A pairing code can be handed over as a link that also names the server:
+A pairing code or an invite can be handed over as a link that also names the server:
 
-- `https://<server>/pair#c=<CODE>`: shown with every new code, on the admin page and in the app, as text and as a QR code.
+- `https://<server>/pair#c=<CODE>` (pairing code: add a device to a user) or `https://<server>/pair#i=<INVITE>` (invite: register a new user): shown with every new code, on the admin page and in the app, as text and as a QR code.
   - The code is in the **fragment**. Browsers never send the fragment, so opening the link does not put the code in the request line, in a `Referer` or in the server's logs. The server never puts the code in a path or query.
-  - `<CODE>` is exactly the 8 characters the server issued: uppercase Crockford base32 (`^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$`), no hyphen. The fragment is exactly `c=<CODE>`; the path is exactly `/pair`; there is no query.
-- `ashidori://pair?server=<url>&c=<CODE>`: the fallback the `/pair` page offers. `server` is percent-encoded `scheme://host[:port]` (no user info, path, query or fragment; `https` only, `http` also in debug builds); exactly these two parameters, each once.
-- **The recovery code is never part of a link or a QR code.** A link only admits a device to the code's user; the device still needs the recovery code, entered separately, to read anything.
+  - The fragment is exactly `c=<CODE>` or exactly `i=<INVITE>`, the value being exactly what the server issued, in uppercase Crockford base32 without hyphens: `<CODE>` 8 characters (`^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$`), `<INVITE>` 16 (`^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{16}$`). The key decides the kind: an invite under `c=`, a pairing code under `i=`, both keys, or anything appended is refused. The path is exactly `/pair`; there is no query.
+- `ashidori://pair?server=<url>&c=<CODE>` or `ashidori://pair?server=<url>&i=<INVITE>`: the fallback the `/pair` page offers. `server` is percent-encoded `scheme://host[:port]` (no user info, path, query or fragment; `https` only, `http` also in debug builds); exactly `server` and one of `c` or `i`, each once, in any order.
+- **The recovery code is never part of a link or a QR code.** A pairing link only admits a device to the code's user; the device still needs the recovery code, entered separately, to read anything. An invite link admits nothing until its user is created, and that user's key is created on that device.
 
-The app parses both forms strictly and refuses anything else, whether the link was opened or scanned from a QR code on the sync setup screen (CameraX and ZXing, on the device; the camera permission is asked for when a scan starts). A link only fills in the server and the code on the sync setup screen: the user checks the server shown there and confirms the registration. A link for a server other than the one already entered or configured needs a confirmation that names that server. An already registered device ignores links. The app has no built-in server: a build may set one with the Gradle property `ashidori.defaultServer`, which fills in the URL field and declares the App Link for that host.
+The app parses both forms strictly and refuses anything else, whether the link was opened or scanned from a QR code on the sync setup screen (CameraX and ZXing, on the device; the camera permission is asked for when a scan starts). A link only fills in the server and the code on the sync setup screen, which names what happens (「新しく登録」 for an invite, 「この端末を追加」 for a pairing code) and shows the server; the user checks it and confirms (for an invite, after choosing a username). A link for a server other than the one already entered or configured needs a confirmation that names that server. An already registered device ignores links. The app has no built-in server: a build may set one with the Gradle property `ashidori.defaultServer`, which fills in the URL field and declares the App Link for that host.
 
 Server side:
 
-- `GET /pair` is a static page (CSP with a per-response nonce, no `connect-src`, as the admin page). It reads the fragment in the browser, shows the server, the code and the QR code of `<origin>/pair#c=<CODE>` (so that a page opened on a PC can be scanned by the app), and links to the `ashidori://` form built from `location.origin`. The QR encoder (qrcode-generator 2.0.4, MIT) is inlined as a nonce script, as on the admin page. It also says where to get the app (GitHub releases) and that the URL and the code can be entered by hand.
+- `GET /pair` is a static page (CSP with a per-response nonce, no `connect-src`, as the admin page). It reads the fragment in the browser and accepts exactly the two forms above. It shows the server, the pairing code or 「招待」, the QR code of `<origin>/pair#c=<CODE>` or `#i=<INVITE>` (so that a page opened on a PC can be scanned by the app), and 「アプリで開く」, the `ashidori://` form built from `location.origin`. The QR encoder (qrcode-generator 2.0.4, MIT) is inlined as a nonce script, as on the admin page. It also says where to get the app (GitHub releases), and for a pairing code that the URL and the code can be entered by hand (an invite is used through its link or QR code).
 - `GET /.well-known/assetlinks.json` is the Digital Asset Links statement that lets the app handle `https://<server>/pair` (Android App Links, `autoVerify`): `delegate_permission/common.handle_all_urls` for the package `net.sksat.ashidori` with the SHA-256 fingerprints of the app's signing certificates from the variable `ANDROID_CERT_SHA256` (comma-separated). Empty gives `[]`; a malformed value also gives `[]` (logged), and the deploy workflow refuses it. The app declares the App Link only for the host set at build time (`ashidori.defaultServer`), and none without it; other links open the `/pair` page in the browser.
 
 ## HTTP API
@@ -124,21 +133,24 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/admin/users` | admin | list users with usage (`storageBytes`, `batchCount`, `sharedCheckinCount`) |
-| POST | `/admin/users` | admin | `{name, handle?, email?}` → the created user; `409` if the handle is taken; `503` while a limit variable is invalid |
-| PATCH | `/admin/users/:id` | admin | `{name?, handle?}` (`handle: null` removes it) → the user |
-| POST | `/admin/users/:id/pairing` | admin | → `{code, expiresAt}` for that user |
+| GET | `/admin/invites` | admin | the 200 newest invites: `[{id, status: "pending" \| "used" \| "expired" \| "revoked", createdBy, createdAt, expiresAt, usedAt, user: {id, username} \| null, revokedAt}]` (status by D1's clock) |
+| POST | `/admin/invites` | admin | `{ttlDays?}` (1–30, default 7) → `201 {id, code, expiresAt, link}`, `link` = `https://<server>/pair#i=<code>`; the code is returned only here |
+| POST | `/admin/invites/:id/revoke` | admin | revoke an unused invite (again: no-op) → `{revoked: true}`; `409 {"error": "invite already used"}` |
+| GET | `/admin/users` | admin | list users: `{id, username, legacyName, email, status, createdAt, createdBy, disabledAt}` (`legacyName`: the earlier name of a legacy user without a username, else null; `createdBy`: `"self"`, `"invite:<id>"`, or a legacy admin's e-mail address) with usage (`deviceCount`, `lastSeenAt`, `storageBytes`, `batchCount`, `sharedCheckinCount`) |
+| PATCH | `/admin/users/:id` | admin | `{username}` → the user: sets the username of a legacy user, or changes one; `409 {"error": "username taken"}` |
+| POST | `/admin/users/:id/pairing` | admin | → `{code, expiresAt}` for a device of that user (for example a legacy user without one) |
 | POST | `/admin/users/:id/disable`, `/admin/users/:id/enable` | admin | disable / enable a user |
-| GET | `/admin/devices` | admin | list all devices with their user |
+| GET | `/admin/devices` | admin | list all devices with their user (`userId`, `username`) |
 | POST | `/admin/devices/:id/revoke` | admin | revoke any device (and delete its unused codes) |
 | GET | `/admin/checkins` | admin | the 200 most recently changed shared check-ins (moderation) |
 | POST | `/admin/checkins/:id/delete` | admin | remove a shared check-in for good (leaves a tombstone) |
 | GET | `/v1/info` | – | `{registration: "admin" \| "open", basemap: ["<version>", ...]}` |
 | GET | `/basemap/:version/:file` | – | the app's offline basemap archive or its descriptor (see below) |
-| POST | `/v1/accounts` | – | `{token, deviceName?}` → `201 {deviceId}` (retry: `200`, also when registration is closed or full); creates a user with this device. `403 {"error": "registration closed"}` unless open; `403 {"error": "registration full"}` at `MAX_USERS`; `503` without the `RL_ACCOUNT` binding |
+| POST | `/v1/accounts` | – | `{token, username, invite?, deviceName?}` → `201 {deviceId, username}` (retry: `200`, also when registration is closed or full, or the invite expired); creates a user with this device (see [Registration and limits](#registration-and-limits)). `400 {"error": "invalid username"}`; `409 {"error": "username taken"}`; with `invite`: `401 {"error": "invalid or expired invite"}`; without: `403 {"error": "registration closed"}` unless open, `403 {"error": "registration full"}` at `MAX_USERS`, `503` without the `RL_ACCOUNT` binding |
 | POST | `/v1/devices/register` | – | `{code, name, token}` → `201 {deviceId}` (retry: `200`, also when rate limited or at the device limit); the code is consumed. `401` for an invalid code; `409 {"error": "too many devices"}` at the user's device limit (the code is then not consumed) |
 | POST | `/v1/pairing` | device | → `{code, expiresAt}` for the device's user |
 | GET | `/v1/devices` | device | the user's devices: `[{id, name, createdAt, lastSeenAt, revoked}]` |
+| GET | `/v1/me` | device | the device's user: `{userId, username}` (both null for a legacy device; `username` null for a legacy user without one) |
 | POST | `/v1/devices/:id/revoke` | device | revoke one of the user's devices (including self) |
 | PUT | `/v1/batches/:stream/:seq` | device | body: blob (`application/octet-stream`, 32 bytes to 8 MiB) |
 | GET | `/v1/batches?after=<cursor>&limit=<n>` | device | metadata of the batches of all the user's devices, ordered by a global cursor |
@@ -147,23 +159,23 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 | DELETE | `/v1/checkins/shared/:localId?rev=<rev>` | user device | unshare this device's check-in (also one not shared yet) → `{deleted: true}`; `409` stale; `400` without `rev` |
 | DELETE | `/v1/checkins/shared/by-id/:id?rev=<rev>` | user device | unshare any of the user's check-ins by its server id → `{deleted: true}`; `409` stale; `400` without `rev` |
 | GET | `/v1/checkins/feed?after=<cursor>&limit=<n>` | user device | own and followed users' shared check-ins |
-| GET | `/v1/users/lookup?handle=<handle>` | user device | → `{id, handle, name}` of the active user with exactly that handle, else `404` |
-| POST | `/v1/follows` | user device | `{userId}` → `{user: {id, handle, name}, status}`; sends a follow request |
-| GET | `/v1/follows` | user device | users I follow or asked to: `[{id, handle, name, status, since}]` |
+| GET | `/v1/users/lookup?username=<username>` | user device | → `{id, username}` of the active user with exactly that username, else `404` |
+| POST | `/v1/follows` | user device | `{userId}` → `{user: {id, username}, status}`; sends a follow request |
+| GET | `/v1/follows` | user device | users I follow or asked to: `[{id, username, status, since}]` |
 | DELETE | `/v1/follows/:userId` | user device | unfollow, or cancel a request |
-| GET | `/v1/follow-requests` | user device | incoming requests: `[{id, handle, name, since}]` |
+| GET | `/v1/follow-requests` | user device | incoming requests: `[{id, username, since}]` |
 | POST | `/v1/follow-requests/:userId/accept` | user device | accept a request |
 | POST | `/v1/follow-requests/:userId/decline` | user device | decline a request (deletes it) |
-| GET | `/v1/followers` | user device | accepted followers: `[{id, handle, name, since}]` |
+| GET | `/v1/followers` | user device | accepted followers: `[{id, username, since}]` |
 | DELETE | `/v1/followers/:userId` | user device | remove a follower |
 | GET | `/v1/health` | – | `{ok: true}` |
-| GET | `/pair` | – | HTML page for a registration link (see [Registration links](#registration-links)); the code stays in the fragment |
+| GET | `/pair` | – | HTML page for a registration link, `#c=` or `#i=` (see [Registration links](#registration-links)); the code stays in the fragment |
 | GET | `/.well-known/assetlinks.json` | – | App Links statement from `ANDROID_CERT_SHA256` (`[]` when empty) |
 
 - "user device" means a device that belongs to a user. Legacy devices without a user get `403 {"error": "no user"}`.
 - Listings, fetches and revocations only cover the caller's user. A device of another user is reported like a missing one (`404`).
 - The numbers that the server and the app must agree on (the digits of a cursor and of a seq, page limits, blob sizes, the token length, the pairing-code TTL, the commit deadline `D` and the orphan grace period `G`) are listed in [`protocol-constants.json`](protocol-constants.json). The server's tests check the server against it, and that `D ≤ G / 2` (see [Batches](#batches)); they also check the app's cursor and seq bounds.
-- While a limit variable of the server is invalid, requests that would create something (a user, also on the admin page, a device, a batch, a shared check-in or its tombstone) get `503 {"error": "server misconfigured"}`. Everything else keeps working, including unsharing an existing entry.
+- While a limit variable of the server is invalid, requests that would create something (a user, also with an invite, a device, a batch, a shared check-in or its tombstone) get `503 {"error": "server misconfigured"}`. Everything else keeps working, including unsharing an existing entry.
 
 ### Batches
 
@@ -189,23 +201,25 @@ All bodies are JSON unless noted. Errors are `{"error": "..."}` with a suitable 
 
 ## Registration and limits
 
-The server variable `REGISTRATION` decides who creates users:
+A user is always created by their first app device, with `POST /v1/accounts`. The server variable `REGISTRATION` decides whether that needs an invite:
 
-- `admin` (default): only admins, on the admin page. Any value other than exactly `open` (case and spaces matter), including an empty one, means `admin`.
-- `open`: anyone may create a user from the app. The server is then only an end-to-end encrypted backup and sync target; no admin is involved.
+- `admin` (default): only with an invite, which an admin creates on the admin page. Any value other than exactly `open` (case and spaces matter), including an empty one, means `admin`.
+- `open`: with an invite, or without one (self-registration). The server is then also an end-to-end encrypted backup and sync target for anyone; no admin is involved.
 
 `GET /v1/info` tells the app which mode the server is in, so that it can offer the right setup steps. A server without this endpoint is treated as `admin`.
 
 `basemap` lists the versions of the app's offline basemap that the server serves at `GET /basemap/<version>/ashidori-basemap-<version>.zip` (and `.json`, the descriptor). Older servers lack the field; the app then downloads from GitHub Releases. The route is public and unauthenticated (the archive is the same for everyone and covers whole countries), serves only those two names of a well-formed version (`404` otherwise and when the object is missing), supports a single `Range` (`206`, `416`), `If-Range`, `ETag`/`If-None-Match` and `Content-Length`, and sets no cookies. The app verifies the archive against the size and sha256 it pins, whichever source it came from.
 
-`POST /v1/accounts {token, deviceName?}`:
+`POST /v1/accounts {token, username, invite?, deviceName?}`:
 
-- Creates a user and registers the calling device, authenticated by `token`, as its first device, in one transaction. See [Registration requests](#registration-requests) for retries.
-- The user's name is the trimmed `deviceName` (1–64 characters, no control characters; else `400`). Without one, both names are `"device"`.
-- The user has no handle (an admin may set one later) and is marked as self-registered (`createdBy: "self"` in the admin user list). Admins can disable such users like any other.
-- Refused with `403 {"error": "registration full"}` once the server has `MAX_USERS` users (all users count; admins may still create users).
-- A self-registered user that has stored nothing (no batch and no shared check-in) 7 days after its creation is deleted by a scheduled job, with its devices, pairing codes and follows. Users that stored anything are never deleted automatically.
+- Creates a user named `username` and registers the calling device, authenticated by `token`, as its first device, in one transaction; with `invite`, consuming the invite in the same transaction. See [Registration requests](#registration-requests) for retries.
+- `username` is required (see Usernames under [Authentication](#authentication)); a username another user has gets `409 {"error": "username taken"}`, and nothing changes (the invite stays unused). The device's name is the trimmed `deviceName` (1–64 characters, no control characters; else `400`), `"device"` without one.
+- With `invite`: works in any `REGISTRATION` mode, is rate limited like registration with a pairing code, and is not limited by `MAX_USERS` (the admin decided to invite). The user is marked as invited (`createdBy: "invite:<invite id>"` in the admin user list).
+- Without: only when `REGISTRATION` is `open`. Refused with `403 {"error": "registration full"}` once the server has `MAX_USERS` users (all users count, invited ones too). The user is marked as self-registered (`createdBy: "self"`). A self-registered user that has stored nothing (no batch and no shared check-in) 7 days after its creation is deleted by a scheduled job, with its devices, pairing codes and follows. Invited users and users that stored anything are never deleted automatically.
+- Admins can disable any user.
 - The app then creates `K` and shows the recovery code, as for any first device. Further devices pair from this device (`POST /v1/pairing`) and enter the recovery code.
+
+Unused invites are deleted by a scheduled job 30 days after they expired or were revoked; used ones are kept.
 
 ### Limits
 
@@ -220,7 +234,7 @@ fixed, and the deploy workflow refuses to deploy it.
 | `USER_MAX_BATCHES` | 200 000 | batches per user |
 | `USER_MAX_DEVICES` | 50 | devices ever registered per user, revoked ones included |
 | `USER_MAX_SHARED_CHECKINS` | 5 000 | shared check-ins per user, unshared ones (tombstones) included |
-| `MAX_USERS` | 100 | users on the server, for self-registration |
+| `MAX_USERS` | 100 | users on the server, for self-registration (registration without an invite) |
 | `MAX_TOTAL_BYTES` | 50 GiB | blob bytes on the server |
 
 - Per-user limits count all the user's devices, revoked ones included (their data is kept). Legacy devices without a user share their data, so together they count as one user.
@@ -236,8 +250,8 @@ other people. Everything else stays end-to-end encrypted in batches.
 
 ### Follows
 
-- Each user may have a **handle** (`^[a-z0-9_]{3,20}$`, unique, case-insensitive, stored lowercase), set by an admin. A user without a handle cannot be looked up.
-- There is no user directory and no search. `GET /v1/users/lookup` matches the exact handle only and is rate limited, which limits bulk probing of handles. It does not prevent guessing: whoever tries a handle that exists learns that it exists and the user's name.
+- Users find each other by **username** (see Usernames under [Authentication](#authentication)). A legacy user without one cannot be looked up until an admin sets it.
+- There is no user directory and no search. `GET /v1/users/lookup` matches the exact username only and is rate limited, which limits bulk probing of usernames. It does not prevent guessing: whoever tries a username that exists learns that it exists.
 - `POST /v1/follows {userId}` sends a follow request (`pending`). It is idempotent and returns the current status. Following yourself is refused (`400`); an unknown or disabled user is `404`.
 - The followee accepts (`accepted`) or declines the request. Declining deletes it, so the request can be sent again.
 - Following is one-way. The follower can unfollow (or cancel a request); the followee can remove a follower.
@@ -271,7 +285,7 @@ entries and those of the users the caller follows (accepted), ordered by cursor:
 
 ```json
 {
-  "items": [{"id": "...", "cursor": 12, "user": {"id": "...", "handle": "...", "name": "..."},
+  "items": [{"id": "...", "cursor": 12, "user": {"id": "...", "username": "..."},
              "t": 0, "lat": 0, "lon": 0, "venue": "...", "category": null, "place": null,
              "comment": null, "updatedAt": 0, "deleted": false}],
   "next": null,
@@ -293,7 +307,8 @@ uses the service.
 
 - **Detailed logs**: ciphertext only. Without `K` the operator cannot read positions, times, places or check-ins in batches.
 - **Metadata the server keeps**:
-  - users: name, handle, optional e-mail address, status, creation time, who created the user (an admin, or self-registration), and usage counters;
+  - users: username (and, for users from before usernames, their earlier name and an optional e-mail address), status, creation time, how the user was created (an invite, which records the user it created, or self-registration), and usage counters;
+  - invites: hash of the code, creating admin, creation, expiry, use and revocation times;
   - devices: id, name, registration time, last-seen time (rounded down to the hour);
   - batches in D1: device, stream name, sequence number, blob size, SHA-256, upload time (rounded down to the hour);
   - blobs in R2: the object key (device, stream, sequence number, SHA-256) and the **exact** upload time that R2 records for every object. The hour rounding applies to D1 only.

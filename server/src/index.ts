@@ -5,6 +5,7 @@ import type { AppEnv, Env } from "./env";
 import { sweepUnusedAccounts } from "./accounts";
 import { sweepOrphanBlobs } from "./batches";
 import { deleteOldPairingCodes } from "./devices";
+import { deleteOldInvites } from "./invites";
 import { deleteExpiredRateLimits } from "./ratelimit";
 import { assetLinks, pair } from "./pair";
 import { jsonError } from "./util";
@@ -64,7 +65,7 @@ app.route("/admin", admin);
 // Public, unauthenticated, read-only (see basemap.ts).
 app.route("/basemap", basemap);
 // Registration links (see pair.ts): the page that https://<host>/pair#c=<CODE>
-// shows without the app, and the App Links statement for the app.
+// and #i=<INVITE> show without the app, and the App Links statement for the app.
 app.route("/pair", pair);
 app.get("/.well-known/assetlinks.json", (c) => c.json(assetLinks(c.env)));
 
@@ -84,6 +85,7 @@ export async function maintenance(env: Env, now: number): Promise<void> {
     // IP-keyed rate-limit counters whose window has ended.
     ["rate limits", () => deleteExpiredRateLimits(env.DB, now)],
     ["pairing codes", () => deleteOldPairingCodes(env.DB, now)],
+    ["invites", () => deleteOldInvites(env.DB, now)],
     ["unused accounts", () => sweepUnusedAccounts(env.DB, now)],
     ["orphan blobs", () => sweepOrphanBlobs(env.DB, env.BLOBS, now)],
   ];

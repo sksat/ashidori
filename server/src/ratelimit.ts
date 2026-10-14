@@ -22,7 +22,10 @@ export interface RateLimitRule {
 export const RULES = {
   register: { bucket: "register", limit: 10, windowMs: 10 * 60 * 1000 },
   pairing: { bucket: "pairing", limit: 20, windowMs: 10 * 60 * 1000 },
-  // Handle lookups (exact match), against bulk probing of handles.
+  // Registration with an invite (POST /v1/accounts with `invite`), against
+  // guessing invite codes; as strict as registration with a pairing code.
+  invite: { bucket: "invite", limit: 10, windowMs: 10 * 60 * 1000 },
+  // Username lookups (exact match), against bulk probing of usernames.
   lookup: { bucket: "lookup", limit: 20, windowMs: 10 * 60 * 1000 },
   // Self-registration (REGISTRATION = "open"): each success creates a user,
   // so it is much stricter than pairing-code registration.
@@ -117,8 +120,8 @@ export function clientKey(req: Request): string {
 // ---- Edge layer ----
 //
 // Where it runs: before anything that reads D1. Unauthenticated routes
-// (registration, self-registration) check it by client IP first. The
-// authenticated routes that are rate limited (pairing, handle lookup) check
+// (registration, invites, self-registration) check it by client IP first. The
+// authenticated routes that are rate limited (pairing, username lookup) check
 // it by client IP before the device authentication (a D1 read), and once
 // more by user after it.
 //

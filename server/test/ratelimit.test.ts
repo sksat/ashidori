@@ -158,7 +158,7 @@ describe("edge rate limiters", () => {
     const unknown = "x".repeat(43);
     for (const [path, binding, key] of [
       ["/v1/pairing", "RL_PAIRING", "pairing:ip:203.0.113.9"],
-      ["/v1/users/lookup?handle=alice", "RL_LOOKUP", "lookup:ip:203.0.113.9"],
+      ["/v1/users/lookup?username=alice", "RL_LOOKUP", "lookup:ip:203.0.113.9"],
     ] as const) {
       const limiter = fakeLimiter(() => false);
       const res = await authed(
@@ -183,7 +183,7 @@ describe("edge rate limiters", () => {
     expect(res.status).toBe(429);
     expect(pairing.keys).toEqual(["pairing:ip:203.0.113.9", `pairing:user:${alice.userId}`]);
     const lookup = fakeLimiter((k) => k.includes(":ip:"));
-    const l = await authed(alice.token, "/v1/users/lookup?handle=alice", ip, { RL_LOOKUP: lookup });
+    const l = await authed(alice.token, "/v1/users/lookup?username=alice", ip, { RL_LOOKUP: lookup });
     expect(l.status).toBe(429);
     expect(lookup.keys).toEqual(["lookup:ip:203.0.113.9", `lookup:user:${alice.userId}`]);
     // Refused before the D1 counters.
@@ -211,7 +211,7 @@ describe("edge rate limiters", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     for (let i = 0; i < 3; i++) {
       expect((await authed(a.token, "/v1/pairing", { method: "POST" }, { RL_PAIRING: undefined })).status).toBe(201);
-      expect((await authed(a.token, "/v1/users/lookup?handle=aaa", {}, { RL_LOOKUP: undefined })).status).toBe(200);
+      expect((await authed(a.token, "/v1/users/lookup?username=aaa", {}, { RL_LOOKUP: undefined })).status).toBe(200);
     }
     const msgs = warn.mock.calls.map((c) => String(c[0]));
     expect(msgs.filter((m) => m.includes("RL_PAIRING is missing"))).toHaveLength(1);
