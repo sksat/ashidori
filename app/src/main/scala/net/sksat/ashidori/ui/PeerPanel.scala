@@ -42,8 +42,8 @@ object PeerFormat:
       t.setTextColor(color(attr.onSurfaceVariant))
 
   /** "⚡ 82%" while charging, "🔋 82%" otherwise; low battery in red. */
-  def battery(s: DeviceStatus, t: TextView)(using Ctx): Unit =
-    if s.batteryPct < 0 then t.setText("")
+  def battery(s: DeviceStatus, t: TextView, missing: String = "")(using Ctx): Unit =
+    if s.batteryPct < 0 then t.setText(missing)
     else
       t.setText(s"${if s.charging then "⚡" else "🔋"} ${s.batteryPct}%")
       t.setTextColor(color(if !s.charging && s.batteryPct <= 15 then attr.error else attr.onSurface))
@@ -66,11 +66,16 @@ final class PeerPanel(act: MainActivity):
 
   private val rows = vbox()
   /** Runs the sync now: uploads, then fetches the other devices' status. */
-  private val refreshButton = button("更新", tonal = true) {
-    // Also retries statuses that failed to read before, without waiting for their backoff.
-    PeerStatus.requestRetry()
-    SyncScheduler.syncNow(act)
-  }
+  private val refreshButton =
+    val b = button("更新", tonal = true) {
+      // Also retries statuses that failed to read before, without waiting for their backoff.
+      PeerStatus.requestRetry()
+      SyncScheduler.syncNow(act)
+    }
+    // Wide enough for every label (更新 / 更新中 / 待機中), so it does not resize.
+    b.setMinWidth(math.max(b.getMinWidth,
+      b.getPaint.measureText("待機中").ceil.toInt + b.getPaddingLeft + b.getPaddingRight))
+    b
   private val header =
     val t = text("端末", 16f, bold = true)
     t.setLayoutParams(weighted())
@@ -123,26 +128,27 @@ final class PeerPanel(act: MainActivity):
     name.setSingleLine(true)
     name.setEllipsize(android.text.TextUtils.TruncateAt.END)
     name.setLayoutParams(weighted())
-    val age = caption("")
+    val age = tabular(caption(""))
     val top = hbox(name, age)
-    val body = vbox(top)
+    // The same three lines whether or not a status has arrived.
+    val rec = tabular(text("", 14f))
+    val bat = tabular(text("", 14f))
+    bat.setPadding(dp(12), 0, 0, 0)
+    val where = tabular(oneLine(caption("")))
+    val body = vbox(top, hbox(rec, bat), where)
     e match
       case None =>
         age.setText("未受信")
+        rec.setText("—")
+        rec.setTextColor(color(attr.onSurfaceVariant))
+        where.setText("📍 —")
       case Some(e) =>
         val s = e.status
         age.setText(PeerFormat.ago(s.t, now))
         if now - s.t > PeerFormat.StaleMs then age.setTextColor(color(attr.error))
-        val rec = text("", 14f)
         PeerFormat.recording(s, rec)
-        val bat = text("", 14f)
         PeerFormat.battery(s, bat)
-        bat.setPadding(dp(12), 0, 0, 0)
-        body.addView(hbox(rec, bat))
-        val where = caption(s"📍 ${PeerFormat.place(e)}" + s.lastFix.fold("")(f => s"・${PeerFormat.ago(f.t, now)}"))
-        where.setSingleLine(true)
-        where.setEllipsize(android.text.TextUtils.TruncateAt.END)
-        body.addView(where)
+        where.setText(s"📍 ${PeerFormat.place(e)}" + s.lastFix.fold("")(f => s"・${PeerFormat.ago(f.t, now)}"))
     // Shown, not skipped: the server may have served a damaged or foreign blob.
     problem.foreach(u => body.addView(PeerFormat.problem(u)))
     body.setLayoutParams(weighted())

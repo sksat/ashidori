@@ -269,14 +269,14 @@ final class FeedScreen(act: MainActivity) extends Screen:
 
   private def dayHeading(tl: DayTimeline, today: LocalDate): View =
     val d = tl.date
-    val title = text(
-      (if d == today then "今日　" else if d == today.minusDays(1) then "昨日　" else "") + d.format(dayFmt), 16f, bold = true)
+    val title = oneLine(text(
+      (if d == today then "今日　" else if d == today.minusDays(1) then "昨日　" else "") + d.format(dayFmt), 16f, bold = true))
     title.setLayoutParams(weighted())
     val s = tl.summary
-    val stats = caption(Seq(
+    val stats = tabular(caption(Seq(
       if s.steps > 0 then f"${s.steps}%,d歩" else "",
       if s.totalDistanceM > 0 then fmtDistance(s.totalDistanceM) else ""
-    ).filter(_.nonEmpty).mkString("・"))
+    ).filter(_.nonEmpty).mkString("・")))
     val row = hbox(title, stats)
     row.setPadding(dp(16), dp(18), dp(16), dp(6))
     row.setMinimumHeight(dp(48))
@@ -348,7 +348,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
       val byMode = tls.flatMap(_.summary.distanceByMode).groupMapReduce(_._1)(_._2)(_ + _)
       val steps = tls.map(_.summary.steps).sum
       val places = visits.flatMap(_.placeId).distinct.size
-      box.addView(text(f"${fmtDistance(byMode.values.sum)}・$steps%,d歩・${places}か所・記録 ${active}日", 14f))
+      box.addView(tabular(text(f"${fmtDistance(byMode.values.sum)}・$steps%,d歩・${places}か所・記録 ${active}日", 14f)))
       box.addView(modeBar(byMode))
       val m = modeLine(byMode)
       if m.nonEmpty then box.addView(caption(m))

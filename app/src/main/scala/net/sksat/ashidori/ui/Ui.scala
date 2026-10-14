@@ -71,6 +71,67 @@ object Ui:
 
   def caption(s: CharSequence)(using Ctx): TextView = text(s, 12f, colorAttr = attr.onSurfaceVariant)
 
+  // --- layout stability: values change, the layout does not ---
+
+  /** Digits of equal width, so a changing number does not jiggle. */
+  def tabular[T <: TextView](t: T): T =
+    t.setFontFeatureSettings("tnum")
+    t
+
+  /** One line, cut with "…" instead of wrapping to a second line. */
+  def oneLine[T <: TextView](t: T): T =
+    t.setSingleLine(true)
+    t.setEllipsize(android.text.TextUtils.TruncateAt.END)
+    t
+
+  /** Text that is always as tall as the tallest of `variants` would be at
+    * its width, so switching between them does not move what follows.
+    * The current text counts as a variant too.
+    */
+  final class StableText(c: Ctx, variants: () => Seq[CharSequence]) extends TextView(c):
+    /** Measures the variants the way this view would measure them: same
+      * text attributes, same TextView code path (fallback fonts such as
+      * emoji and CJK make some lines taller than others).
+      */
+    private lazy val twin =
+      val t = TextView(c)
+      // Never attached, but setText checks its layout params.
+      t.setLayoutParams(ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+      t
+    override def onMeasure(w: Int, h: Int): Unit =
+      super.onMeasure(w, h)
+      if View.MeasureSpec.getMode(h) != View.MeasureSpec.EXACTLY then
+        twin.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, getTextSize)
+        twin.setTypeface(getTypeface)
+        twin.setFontFeatureSettings(getFontFeatureSettings)
+        twin.setLetterSpacing(getLetterSpacing)
+        twin.setLineSpacing(getLineSpacingExtra, getLineSpacingMultiplier)
+        twin.setIncludeFontPadding(getIncludeFontPadding)
+        twin.setFallbackLineSpacing(isFallbackLineSpacing)
+        twin.setBreakStrategy(getBreakStrategy)
+        twin.setHyphenationFrequency(getHyphenationFrequency)
+        twin.setLineBreakStyle(getLineBreakStyle)
+        twin.setLineBreakWordStyle(getLineBreakWordStyle)
+        twin.setMaxLines(getMaxLines)
+        twin.setEllipsize(getEllipsize)
+        twin.setPadding(getPaddingLeft, getPaddingTop, getPaddingRight, getPaddingBottom)
+        val ws = View.MeasureSpec.makeMeasureSpec(getMeasuredWidth, View.MeasureSpec.EXACTLY)
+        val hs = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        val need = variants().map { s =>
+          twin.setText(s)
+          twin.measure(ws, hs)
+          twin.getMeasuredHeight
+        }.maxOption.getOrElse(0)
+        if need > getMeasuredHeight then
+          setMeasuredDimension(getMeasuredWidth, View.resolveSize(need, h))
+
+  /** A caption reserving the height of its tallest variant (see [[StableText]]). */
+  def stableCaption(variants: => Seq[CharSequence])(using c: Ctx): StableText =
+    val t = StableText(c, () => variants)
+    t.setTextSize(12f)
+    t.setTextColor(color(attr.onSurfaceVariant))
+    t
+
   def button(label: String, tonal: Boolean = false)(onClick: => Unit)(using c: Ctx): MaterialButton =
     val b =
       if tonal then MaterialButton(c, null, com.google.android.material.R.attr.materialButtonTonalStyle)

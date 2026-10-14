@@ -52,9 +52,14 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private def anchor: LocalDate = if spans.size > 1 then ownAnchor else act.selectedDate
   private def anchor_=(d: LocalDate): Unit = if spans.size > 1 then ownAnchor = d else act.selectedDate = d
 
-  private val dateLabel = text("", 18f, bold = true)
+  private val dateLabel = oneLine(text("", 18f, bold = true))
   private val summary = hbox()
   private val list = vbox()
+  // Until the day has loaded, the totals' room is already taken ("—").
+  summary.addView(stat("—", "歩数"))
+  summary.addView(stat("—", "移動"))
+  summary.addView(stat("—", "滞在"))
+  padded(summary, 8, 8)
 
   private def arrow(label: String)(f: => Unit) =
     val b = outlined(label)(f)
@@ -280,7 +285,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private def time(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
 
   private def stat(value: String, label: String): View =
-    val v = vbox(text(value, 20f, bold = true), caption(label))
+    val v = vbox(tabular(oneLine(text(value, 20f, bold = true))), caption(label))
     v.setGravity(Gravity.CENTER)
     v.setLayoutParams(weighted())
     v
@@ -314,25 +319,23 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     )
 
     // The day's stays and trips are read on the timeline; here the map leads.
+    // One row of one height for every day, with or without records, so the
+    // sheet (and the map's free area) keeps its size while paging days.
     list.removeAllViews()
-    if tl.segments.isEmpty then list.addView(emptyState(tl.date))
-    else
-      val b = outlined("この日のタイムライン")(act.openTimeline(tl.date))
-      val lp = matchWrap
-      lp.setMargins(dp(16), 0, dp(16), dp(4))
-      b.setLayoutParams(lp)
-      list.addView(b)
+    val slot =
+      if tl.segments.isEmpty then emptyState(tl.date)
+      else outlined("この日のタイムライン")(act.openTimeline(tl.date))
+    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
+    lp.setMargins(dp(16), 0, dp(16), dp(4))
+    slot.setLayoutParams(lp)
+    list.addView(slot)
 
   private def emptyState(date: LocalDate): View =
-    if LoggerState.running then
-      card(
-        text(if date == LocalDate.now(AshidoriApp.zone) then "記録待ち" else "記録なし", 16f, bold = true),
-        caption("")
-      )
-    else
-      card(
-        text("記録停止中", 16f, bold = true),
-        caption(""),
-        spacer(8),
-        button("▶  記録を開始")(act.startLogging())
-      )
+    val label = oneLine(text(
+      if !LoggerState.running then "記録停止中"
+      else if date == LocalDate.now(AshidoriApp.zone) then "記録待ち"
+      else "記録なし", 16f, bold = true))
+    label.setLayoutParams(weighted())
+    val row = hbox(label)
+    if !LoggerState.running then row.addView(button("▶  記録を開始")(act.startLogging()))
+    row

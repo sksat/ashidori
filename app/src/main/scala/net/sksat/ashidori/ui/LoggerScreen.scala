@@ -62,11 +62,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     a.setRepeatMode(android.animation.ValueAnimator.REVERSE)
     a.setRepeatCount(android.animation.ValueAnimator.INFINITE)
     a
-  private val status = text("", 20f, bold = true)
-  private val elapsed = caption("")
+  private val status = oneLine(text("", 20f, bold = true))
+  private val elapsed = tabular(oneLine(caption("")))
   private val recBadge =
     val t = vbox(status, elapsed)
     t.setPadding(dp(12), 0, 0, 0)
+    t.setLayoutParams(weighted())
     val h = hbox(recDot, t)
     h.setLayoutParams(weighted())
     h
@@ -75,7 +76,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private def row(label: String): (View, TextView) =
     val l = text(label, 14f, colorAttr = attr.onSurfaceVariant)
     l.setLayoutParams(LinearLayout.LayoutParams(dp(72), android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
-    val v = text("", 15f)
+    val v = tabular(oneLine(text("", 15f)))
     v.setLayoutParams(weighted())
     val h = hbox(l, v)
     h.setPadding(0, dp(3), 0, dp(3))
@@ -85,8 +86,21 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val (envRow, envValue) = row("場所")
   private val (batteryRow, batteryValue) = row("電池")
   private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow)
-  /** Why it is like this: supplementary, so quieter and marked with ⓘ. */
-  private val notes = vbox()
+  /** Why it is like this: supplementary, so quieter and marked with ⓘ.
+    * The mode note keeps its line even when empty: switching modes adds or
+    * removes it ("「高精度」で動作中: 充電中のため1段階上げ").
+    */
+  private val modeNote =
+    val t = stableCaption(Seq("ⓘ " + PositioningPanel.ModeNoteSample))
+    t.setPadding(0, dp(6), 0, 0)
+    t
+  /** Indoors, the indoor note's lines stay reserved in every mode (全力ログ
+    * has none).
+    */
+  private val indoorNote =
+    val t = stableCaption(PositioningPanel.indoorNoteVariants.map("ⓘ " + _))
+    t.setPadding(0, dp(6), 0, 0)
+    t
   /** Shown only while stopped. Recording is meant to stay on; the user
     * normally just changes the mode.
     */
@@ -118,11 +132,22 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     val r = hbox(stop)
     r.setPadding(0, dp(8), 0, 0)
     r
+  /** Start and stop share one slot, so the card keeps its height. */
+  private val controls =
+    val f = frame(start, stopRow)
+    f.setLayoutParams(matchWrap)
+    f
 
   // --- mode: a slider from battery-saving to log-everything ---
   private val modes = LoggingMode.values.toSeq
   /** The chosen mode, large, in its color. */
-  private val modeTitle = text("", 22f, bold = true)
+  private def modeName(m: LoggingMode) = s"${ModeInfo.symbol(m)} ${m.label}"
+  /** As tall as the tallest mode's name: the symbols' (emoji) heights differ. */
+  private val modeTitle =
+    val t = oneLine(StableText(act, () => modes.map(modeName)))
+    t.setTextSize(22f)
+    t.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+    t
   private val modeSlider =
     val sl = com.google.android.material.slider.Slider(act)
     sl.setValueFrom(0f)
@@ -133,17 +158,28 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     sl.addOnChangeListener((_, v, fromUser) => if fromUser then selectMode(modes(v.round)))
     sl.setLayoutParams(matchWrap)
     sl
-  /** Stop names under the slider's ticks; tapping one selects it. */
-  private val stopLabels = modes.map { m =>
-    val t = text(m.label, 12f)
+  /** Stop names under the slider's ticks; tapping one selects it. Each sits
+    * in a box of one fixed width (the chosen one turns bold, which is wider),
+    * the end ones aligned to the track's ends.
+    */
+  private val stopLabels = modes.zipWithIndex.map { (m, i) =>
+    val t = oneLine(text(m.label, 12f))
     t.setPadding(dp(4), dp(6), dp(4), dp(6))
+    t.setGravity(
+      if i == 0 then android.view.Gravity.START
+      else if i == modes.size - 1 then android.view.Gravity.END
+      else android.view.Gravity.CENTER_HORIZONTAL)
     t.setOnClickListener(_ => selectMode(m))
     t
   }
+  private val labelWidth =
+    val bold = android.graphics.Paint(stopLabels.head.getPaint)
+    bold.setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
+    modes.map(m => bold.measureText(m.label)).max.ceil.toInt + dp(8) + dp(4)
   private val labelFrame =
     val f = android.widget.FrameLayout(act)
     stopLabels.foreach(t => f.addView(t, android.widget.FrameLayout.LayoutParams(
-      android.view.ViewGroup.LayoutParams.WRAP_CONTENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT)))
+      labelWidth, android.view.ViewGroup.LayoutParams.WRAP_CONTENT)))
     f.setLayoutParams(matchWrap)
     f
   // Put each name under its tick once the slider knows its track width.
@@ -153,11 +189,13 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     for (t, i) <- stopLabels.zipWithIndex do
       t.post { () =>
         val cx = pad + track * i / (modes.size - 1).toFloat
-        t.setTranslationX(math.max(0f, math.min((r - l - t.getWidth).toFloat, cx - t.getWidth / 2f)))
+        t.setTranslationX(math.max(0f, math.min((r - l - labelWidth).toFloat, cx - labelWidth / 2f)))
       }
   )
   private val modeRow = vbox(modeTitle, modeSlider, labelFrame)
-  private val modeInfo = caption("")
+  private def modeText(m: LoggingMode) = s"${ModeInfo.summary(m)}・${ModeInfo.battery(m)}"
+  /** As tall as the longest mode's description, so the cards below stay put. */
+  private val modeInfo = stableCaption(modes.map(modeText))
   modeInfo.setPadding(0, dp(4), 0, 0)
 
   private def paintModes(): Unit =
@@ -170,12 +208,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     modeSlider.setHaloTintList(android.content.res.ColorStateList.valueOf((c & 0x00ffffff) | 0x33000000))
     modeSlider.setTickActiveTintList(android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE))
     modeSlider.setTrackInactiveTintList(android.content.res.ColorStateList.valueOf(color(attr.surfaceContainerHigh)))
-    modeTitle.setText(s"${ModeInfo.symbol(chosen)} ${chosen.label}")
+    modeTitle.setText(modeName(chosen))
     modeTitle.setTextColor(c)
     for (t, m) <- stopLabels.zip(modes) do
       t.setTextColor(if m == chosen then c else color(attr.onSurfaceVariant))
       t.setTypeface(null, if m == chosen then android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
-    modeInfo.setText(s"${ModeInfo.summary(chosen)}・${ModeInfo.battery(chosen)}")
+    modeInfo.setText(modeText(chosen))
 
   private def selectMode(m: LoggingMode): Unit =
     if Settings.mode != m then
@@ -184,9 +222,16 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     paintModes()
     refresh()
 
-  private val detailText = text("", 14f)
-  /** When the automatic detail logs run in the current mode. */
-  private val detailSchedule = caption("")
+  private val detailText = tabular(oneLine(text("", 14f)))
+  private def schedule(m: LoggingMode): String =
+    val p = SamplingPolicy.profiles(m)
+    def every(ms: Long) = if ms >= 3_600_000 then s"${ms / 3_600_000}時間" else s"${ms / 60_000}分"
+    if m == LoggingMode.Max then "自動: 常に"
+    else s"自動: 移動中は${every(p.detailEveryMovingMs)}ごと・静止中は${every(p.detailEveryStillMs)}ごとに${fmtDuration(p.detailDurationMs)}"
+  /** When the automatic detail logs run in the current mode; as tall as the
+    * longest mode's schedule.
+    */
+  private val detailSchedule = tabular(stableCaption(modes.map(schedule)))
   private val burst = button("5分間 記録", tonal = true) {
     act.ensurePermissions { () =>
       Settings.burstUntil = System.currentTimeMillis() + LoggerService.BurstMs
@@ -204,7 +249,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     scroll(
       vbox((Seq(
         peers.view,
-        card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, notes, spacer(4), start, stopRow),
+        card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, modeNote, indoorNote, spacer(4), controls),
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
         card(
@@ -287,28 +332,28 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     else
       blink.cancel()
       recDot.setAlpha(1f)
-    start.setVisibility(if running then View.GONE else View.VISIBLE)
-    stop.setVisibility(if running then View.VISIBLE else View.GONE)
-    notes.removeAllViews()
-    def note(n: String): Unit =
-      val t = caption(s"ⓘ $n")
-      t.setPadding(0, dp(6), 0, 0)
-      notes.addView(t)
-    LoggerState.plan match
-      case Some(p) if running =>
-        stateRows.setVisibility(View.VISIBLE)
-        sourceValue.setText(PositioningPanel.sourceState(p))
-        motionValue.setText(LoggerState.motion.label)
-        motionRow.setVisibility(if LoggerState.motion == MotionState.Unknown then View.GONE else View.VISIBLE)
-        envValue.setText(LoggerState.environment.label)
-        envRow.setVisibility(if LoggerState.environment == Environment.Unknown then View.GONE else View.VISIBLE)
+    // Both stay laid out (INVISIBLE, not GONE): the slot keeps its height.
+    start.setVisibility(if running then View.INVISIBLE else View.VISIBLE)
+    stopRow.setVisibility(if running then View.VISIBLE else View.INVISIBLE)
+    // The same rows in every state; "—" where there is nothing to show.
+    val plan = LoggerState.plan.filter(_ => running)
+    sourceValue.setText(plan.fold("—")(PositioningPanel.sourceState))
+    motionValue.setText(
+      if plan.isEmpty || LoggerState.motion == MotionState.Unknown then "—" else LoggerState.motion.label)
+    envValue.setText(
+      if plan.isEmpty || LoggerState.environment == Environment.Unknown then "—" else LoggerState.environment.label)
+    batteryValue.setText(
+      if plan.isEmpty || LoggerState.battery < 0 then "—"
+      else
         val d = LoggerState.drainPctPerHour
-        batteryValue.setText(s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
-        batteryRow.setVisibility(if LoggerState.battery >= 0 then View.VISIBLE else View.GONE)
-        PositioningPanel.notes(p, Settings.mode).foreach(note)
-      case _ =>
-        stateRows.setVisibility(View.GONE)
-        ()
+        s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
+    modeNote.setText(plan.flatMap(PositioningPanel.modeNote(_, Settings.mode)).fold("")("ⓘ " + _))
+    // Indoors the note keeps its room in every mode (全力ログ has none);
+    // elsewhere it does not appear.
+    indoorNote.setText(plan.flatMap(PositioningPanel.indoorNote).fold("")("ⓘ " + _))
+    indoorNote.setVisibility(
+      if plan.isDefined && LoggerState.environment == Environment.Indoor || indoorNote.getText.length > 0 then View.VISIBLE
+      else View.GONE)
 
     val now = System.currentTimeMillis()
     val manualLeft = Settings.burstUntil - now
@@ -321,13 +366,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         if last == 0 then "待機中" else s"待機中・前回 ${fmtDuration(now - last)}前"
     )
     burst.setEnabled(running && manualLeft <= 0)
-    detailSchedule.setText {
-      val m = LoggerState.plan.map(_.effectiveMode).getOrElse(Settings.mode)
-      val p = SamplingPolicy.profiles(m)
-      def every(ms: Long) = if ms >= 3_600_000 then s"${ms / 3_600_000}時間" else s"${ms / 60_000}分"
-      if m == LoggingMode.Max then "自動: 常に"
-      else s"自動: 移動中は${every(p.detailEveryMovingMs)}ごと・静止中は${every(p.detailEveryStillMs)}ごとに${fmtDuration(p.detailDurationMs)}"
-    }
+    detailSchedule.setText(schedule(LoggerState.plan.map(_.effectiveMode).getOrElse(Settings.mode)))
 
     panel.refresh()
     sensorPanel.refresh()

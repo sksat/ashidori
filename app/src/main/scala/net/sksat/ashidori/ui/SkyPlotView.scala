@@ -93,8 +93,13 @@ final class Cn0BarsView(c: Context) extends View(c):
     setMeasuredDimension(View.MeasureSpec.getSize(w), Ui.dp(96))
 
   override def onDraw(canvas: Canvas): Unit =
-    if sats.isEmpty then return
     val h = getHeight - Ui.dp(14)
+    // The baseline stays while nothing is received, so the empty chart
+    // reads as a chart (the view keeps its height either way).
+    bar.setColor(Ui.color(Ui.attr.outlineVariant))
+    bar.setAlpha(255)
+    canvas.drawRect(0, h.toFloat, getWidth.toFloat, h + Ui.dp(1).toFloat, bar)
+    if sats.isEmpty then return
     val bw = getWidth.toFloat / math.max(sats.size, 12)
     label.setColor(Ui.color(Ui.attr.onSurfaceVariant))
     for (s, i) <- sats.zipWithIndex do

@@ -15,6 +15,11 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
   private given Ctx = act
   private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
   private def time(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
+  /** The tallest each stay's chip line has been (by the stay's start), so an
+    * edit that removes its chips (naming the place, taking a suggestion)
+    * keeps the line's room instead of pulling the rows below up.
+    */
+  private val chipLineHeight = scala.collection.mutable.Map.empty[Long, Int]
 
   /** Rows for a day, newest first; the rail runs through all of them. */
   def rows(tl: DayTimeline): Seq[View] =
@@ -65,13 +70,17 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
       case None =>
         if place.forall(!_.named) || v.confidence < 0.6 then
           chips.addView(chip("場所を確認", color(attr.surfaceContainerHigh), color(attr.primary)))
+    chips.setMinimumHeight(chipLineHeight.getOrElse(v.start, 0))
+    chips.addOnLayoutChangeListener((_, _, t, _, b, _, _, _, _) =>
+      if b - t > 0 then chipLineHeight(v.start) = math.max(chipLineHeight.getOrElse(v.start, 0), b - t))
     val body = vbox(
-      text(name, 16f, bold = true),
-      caption(
+      // One line: a name that resolves later (or is long) does not add one.
+      oneLine(text(name, 16f, bold = true)),
+      oneLine(tabular(caption(
         s"${time(v.start)} – ${time(v.end)}・${fmtDuration(v.durationMs)}" +
           // Say so when the position is only roughly known.
           (if v.radius > 80 then s"・範囲 約${(v.radius / 10).round * 10}m" else "")
-      ),
+      ))),
       chips
     )
     padded(body, 8, 10)
@@ -88,13 +97,13 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
   def tripRow(t: Trip, tl: DayTimeline): View =
     val legs = t.legs.filter(_.mode != TransportMode.Still).reverse
     val rows = legs.map { l =>
-      val label = text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f)
+      val label = oneLine(text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f))
       label.setLayoutParams(weighted())
-      val detail = caption(
+      val detail = tabular(caption(
         // Rough legs (GNSS gaps, poor fixes): "約" on the distance; the map draws them faded.
         s"${if l.isUncertain then "約" else ""}${fmtDistance(l.distanceM)}・${fmtDuration(l.durationMs)}" +
           (if l.steps > 0 then f"・${l.steps}%,d歩" else "")
-      )
+      ))
       val row = hbox(label, detail)
       row.setMinimumHeight(dp(44))
       row.setBackgroundResource(android.R.drawable.list_selector_background)
@@ -102,7 +111,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
       row.setOnClickListener(_ => pickMode(l, tl))
       row
     }
-    val body = vbox((caption(s"${time(t.start)} – ${time(t.end)}・${fmtDuration(t.durationMs)}") +: rows)*)
+    val body = vbox((tabular(caption(s"${time(t.start)} – ${time(t.end)}・${fmtDuration(t.durationMs)}")) +: rows)*)
     padded(body, 8, 6)
     // The rail takes the color of the main transport mode, like the map line.
     withRail(RailView(act, false, android.graphics.Color.parseColor(t.mainMode.color), true, true), body)

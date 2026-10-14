@@ -128,7 +128,14 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val search = EditText(act)
   search.setHint("施設を検索、または名前を入力")
   search.setSingleLine(true)
-  private val status = caption("")
+  private val NoLocation = "現在地を取得できませんでした。名前を入力してチェックインできます。"
+  private val NoVenues = "施設を取得できませんでした。名前を入力してチェックインできます。"
+  private val LocalOnly = "過去の場所とチェックイン先のみを表示しています。"
+  /** As tall as its longest message, empty or not, so the candidates below
+    * stay where they are as the search goes on.
+    */
+  private val status = stableCaption(
+    VenueError.values.toSeq.map(_.message) ++ Seq(NoLocation, NoVenues, LocalOnly, "近くの施設を検索中…"))
   private val list = vbox()
   /** Shown while sending location information is blocked: one explicit search. */
   private val searchOnce =
@@ -219,7 +226,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
           if l != null then
             val p = LatLng(l.getLatitude, l.getLongitude)
             if known.forall(_.distanceTo(p) > 100) then fetch(p)
-          else if known.isEmpty then status.setText("現在地を取得できませんでした。名前を入力してチェックインできます。")
+          else if known.isEmpty then status.setText(NoLocation)
         )
       catch case _: SecurityException => status.setText("位置情報の権限がありません")
 
@@ -234,13 +241,24 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       .sortBy(_._2)
       .distinctBy(_._1.name)
 
+  /** Candidates already listed keep their places; new ones (by distance)
+    * go below them, so a row does not move under the finger as results arrive.
+    */
+  private def merged(more: Vector[(Venue, Double)]): Vector[(Venue, Double)] =
+    val shown = venues.map(_._1.name).toSet
+    venues ++ more.filterNot(v => shown(v._1.name)).distinctBy(_._1.name).sortBy(_._2)
+
+  /** Once shown, the button keeps its room when hidden (INVISIBLE). */
+  private def hideSearchOnce(): Unit =
+    if searchOnce.getVisibility == View.VISIBLE then searchOnce.setVisibility(View.INVISIBLE)
+
   private def fetch(p: LatLng): Unit =
     here = Some(p)
     // Local candidates first, so check-in works without a network.
     AshidoriApp.io.execute { () =>
       val local = localCandidates(p)
       act.runOnUiThread { () =>
-        venues = (local ++ venues).distinctBy(_._1.name)
+        venues = merged(local)
         render()
       }
     }
@@ -248,12 +266,12 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       // Results of an earlier explicit search stay usable; nothing is sent.
       VenueSearch.cached(p) match
         case Some(vs) =>
-          venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
+          venues = merged(vs)
           status.setText("")
-          searchOnce.setVisibility(View.GONE)
+          hideSearchOnce()
           render()
         case None =>
-          status.setText("過去の場所とチェックイン先のみを表示しています。")
+          status.setText(LocalOnly)
           searchOnce.setVisibility(View.VISIBLE)
       footnote.setText("検索すると、位置情報が OpenStreetMap のサーバに送られます。")
     else searchOnline(p, explicit = false)
@@ -263,7 +281,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     * searches by itself (setting off) and stops if the setting turns on.
     */
   private def searchOnline(p: LatLng, explicit: Boolean): Unit =
-    searchOnce.setVisibility(View.GONE)
+    hideSearchOnce()
     footnote.setText("近くの施設は OpenStreetMap から取得します（位置情報がそのサーバに送られます）。")
     status.setText("近くの施設を検索中…")
     VenueSearch.nearby(p, explicit = explicit) { r =>
@@ -271,7 +289,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
         e => {
           status.setText(e match
             case v: VenueError => v.message
-            case _             => "施設を取得できませんでした。名前を入力してチェックインできます。"
+            case _             => NoVenues
           )
           // Stopped by the setting: searching stays possible on request.
           if e == VenueError.Blocked then
@@ -279,7 +297,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
             footnote.setText("検索すると、位置情報が OpenStreetMap のサーバに送られます。")
         },
         vs => {
-          venues = (venues ++ vs).distinctBy(_._1.name).sortBy(_._2)
+          venues = merged(vs)
           status.setText("")
         }
       )
@@ -287,9 +305,9 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     }
 
   private def row(title: String, sub: String)(onClick: => Unit): View =
-    val t = text(title, 16f)
+    val t = oneLine(text(title, 16f))
     t.setLayoutParams(weighted())
-    val r = hbox(t, caption(sub))
+    val r = hbox(t, tabular(caption(sub)))
     r.setMinimumHeight(dp(52))
     r.setOnClickListener(_ => onClick)
     r.setBackgroundResource(android.R.drawable.list_selector_background)

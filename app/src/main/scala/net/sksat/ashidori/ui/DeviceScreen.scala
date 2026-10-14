@@ -67,6 +67,9 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     val l = text(label, 14f, colorAttr = attr.onSurfaceVariant)
     l.setLayoutParams(LinearLayout.LayoutParams(dp(72), ViewGroup.LayoutParams.WRAP_CONTENT))
     value.setLayoutParams(weighted())
+    value match
+      case t: android.widget.TextView => tabular(oneLine(t))
+      case _ => ()
     val h = hbox(l, value)
     h.setPadding(0, dp(3), 0, dp(3))
     h
@@ -82,7 +85,9 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
         val s = e.status
         val now = System.currentTimeMillis()
         val color = if s.recording then ModeInfo.color(PeerFormat.mode(s)) else 0xff757575.toInt
-        s.lastFix.foreach(f => body.addView(map(f, color)))
+        // The map's room stays without a position, so a status with one
+        // (or without) does not move the cards below.
+        body.addView(s.lastFix.fold(noMap())(f => map(f, color)))
 
         val updated = text(s"${PeerFormat.time(s.t)}（${PeerFormat.ago(s.t, now)}）", 15f)
         if now - s.t > PeerFormat.StaleMs then updated.setTextColor(Ui.color(attr.error))
@@ -90,38 +95,57 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
         PeerFormat.recording(s, rec)
         if s.recording && s.since > 0 then rec.append(s"・${PeerFormat.time(s.since)} から")
         val bat = text("", 15f)
-        PeerFormat.battery(s, bat)
+        PeerFormat.battery(s, bat, missing = "—")
         body.addView(card(
           row("更新", updated),
           row("記録", rec),
           row("電池", bat)
         ))
 
-        s.lastFix.foreach { f =>
-          val acc = if f.acc.isNaN then "" else f"・±${f.acc}%.0f m"
-          body.addView(card(
-            text("位置", 16f, bold = true),
-            spacer(4),
-            row("場所", if e.area.nonEmpty then e.area else "-"),
-            row("座標", PeerFormat.coords(f) + acc),
-            row("測位", s"${PeerFormat.time(f.t)}（${PeerFormat.ago(f.t, now)}）"),
-            spacer(4),
-            outlined("地図アプリで開く") {
-              val uri = Uri.parse(s"geo:${f.lat},${f.lon}?q=${f.lat},${f.lon}(${Uri.encode(title)})")
-              try act.startActivity(Intent(Intent.ACTION_VIEW, uri))
-              catch case _: android.content.ActivityNotFoundException => ()
-            }
-          ))
+        // The same rows with or without a position ("—").
+        val f = s.lastFix
+        val open = outlined("地図アプリで開く") {
+          f.foreach { f =>
+            val uri = Uri.parse(s"geo:${f.lat},${f.lon}?q=${f.lat},${f.lon}(${Uri.encode(title)})")
+            try act.startActivity(Intent(Intent.ACTION_VIEW, uri))
+            catch case _: android.content.ActivityNotFoundException => ()
+          }
         }
+        open.setEnabled(f.isDefined)
+        body.addView(card(
+          text("位置", 16f, bold = true),
+          spacer(4),
+          row("場所", if f.isDefined && e.area.nonEmpty then e.area else "—"),
+          row("座標", f.fold("—")(f => PeerFormat.coords(f) + (if f.acc.isNaN then "" else f"・±${f.acc}%.0f m"))),
+          row("測位", f.fold("—")(f => s"${PeerFormat.time(f.t)}（${PeerFormat.ago(f.t, now)}）")),
+          spacer(4),
+          open
+        ))
 
         body.addView(card(
           text("端末", 16f, bold = true),
           spacer(4),
-          row("機種", if s.model.nonEmpty then s.model else "-"),
-          row("アプリ", if s.versionName.nonEmpty then s"${s.versionName}（${s.versionCode}）" else "-"),
+          row("機種", if s.model.nonEmpty then s.model else "—"),
+          row("アプリ", if s.versionName.nonEmpty then s"${s.versionName}（${s.versionCode}）" else "—"),
           row("受信", PeerFormat.time(e.fetchedAt))
         ))
     body.addView(spacer(24))
+
+  /** The map's frame without a position: same size, marked 「位置なし」. */
+  private def noMap(): View =
+    stopMap()
+    val label = caption("位置なし")
+    val frame = FrameLayout(act)
+    frame.addView(label, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+      android.view.Gravity.CENTER))
+    val bg = GradientDrawable()
+    bg.setCornerRadius(dp(16).toFloat)
+    bg.setColor(color(attr.surfaceContainerHigh))
+    frame.setBackground(bg)
+    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(240))
+    lp.setMargins(dp(12), dp(6), dp(12), dp(6))
+    frame.setLayoutParams(lp)
+    frame
 
   /** A still map around the position: accuracy circle and a dot in the
     * recording mode's color. Without tiles (offline) it stays blank.

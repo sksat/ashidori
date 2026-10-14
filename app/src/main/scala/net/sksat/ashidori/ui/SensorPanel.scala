@@ -14,7 +14,8 @@ final class SensorPanel(act: MainActivity):
   private def row(label: String): (View, TextView) =
     val l = text(label, 14f, colorAttr = attr.onSurfaceVariant)
     l.setLayoutParams(LinearLayout.LayoutParams(dp(96), android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
-    val v = text("", 15f)
+    // One line each: a longer value is cut, not wrapped, so rows keep their height.
+    val v = tabular(oneLine(text("", 15f)))
     v.setLayoutParams(weighted())
     val h = hbox(l, v)
     h.setGravity(android.view.Gravity.TOP)
@@ -22,7 +23,7 @@ final class SensorPanel(act: MainActivity):
     (h, v)
 
   private val (_, accel) = row("加速度")
-  private val (shakeRow, shake) = row("直近の動き")
+  private val (_, shake) = row("直近の動き")
   private val (_, steps) = row("歩数計")
   private val (_, pdr) = row("歩行推定")
   private val (_, raw) = row("生データ")
@@ -75,9 +76,9 @@ final class SensorPanel(act: MainActivity):
     )
     LoggerState.lastWindow match
       case Some(w) if running && System.currentTimeMillis() - w.end < 10 * 60_000 =>
-        shakeRow.setVisibility(View.VISIBLE)
         shake.setText(f"揺れ ${w.accelStd}%.2f m/s²・${w.cadencePerMin}%.0f 歩/分")
-      case _ => shakeRow.setVisibility(View.GONE)
+      // The row stays; only its value says there is nothing recent.
+      case _ => shake.setText("—")
     steps.setText(if running then f"${LoggerState.stepsSession}%,d 歩" else "—")
     pdr.setText(
       if s.pdr then "● 動作中" else "待機（屋内歩行時のみ）"

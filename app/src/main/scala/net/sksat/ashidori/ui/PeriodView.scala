@@ -50,7 +50,7 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
   @volatile private var token = 0
 
   private def stat(value: String, label: String): View =
-    val v = vbox(text(value, 20f, bold = true), caption(label))
+    val v = vbox(tabular(oneLine(text(value, 20f, bold = true))), caption(label))
     v.setGravity(Gravity.CENTER)
     v.setLayoutParams(weighted())
     v
@@ -78,9 +78,14 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
     val (a, b0) = span.range(anchor)
     val b = if b0.isAfter(today) then today else b0
     val days = Iterator.iterate(a)(_.plusDays(1)).takeWhile(!_.isAfter(b)).toVector
+    // The totals keep their place ("—") while the period is summed up.
     summary.removeAllViews()
+    summary.addView(stat("—", "移動"))
+    summary.addView(stat("—", "歩数"))
+    summary.addView(stat("—", "場所"))
+    padded(summary, 8, 8)
     list.removeAllViews()
-    val progress = caption("集計中…")
+    val progress = tabular(caption("集計中…"))
     list.addView(padded(progress, 16, 8))
     AshidoriApp.io.execute { () =>
       val tls = days.zipWithIndex.map { (d, i) =>
