@@ -1,0 +1,35 @@
+# サーバ側からの漏洩経路（docs/design/key-hierarchy.md）
+# 太線は記録の内容が出る経路、破線は条件付きの経路を表す。
+direction: right
+
+classes: {
+  leak: {style.stroke-width: 3}
+  maybe: {style.stroke-dash: 4}
+}
+
+attacker: "侵入者、悪意ある管理者\nCloudflare アカウントの乗っ取り" {shape: person}
+
+server: 同期サーバ（Cloudflare） {
+  d1: "D1\n包んだ鍵、公開鍵\nメタデータ" {shape: cylinder}
+  r2: "R2\n暗号文\n正確な送信時刻" {shape: cylinder}
+  backup: "D1 の Time Travel\n30 日" {shape: cylinder}
+  logs: "ログ\nエラーだけ" {shape: page}
+  page: "Web 閲覧のページ" {class: maybe}
+  shared: "共有チェックイン\n平文（暗号化は予定）" {shape: cylinder}
+  reports: "通報\n通報者が添えた平文" {shape: page; class: maybe}
+}
+
+browser: "ブラウザ\n付与した範囲の EK" {class: maybe}
+tiles: "地図タイル、地名\n外部サービス" {class: maybe}
+
+attacker -> server.d1: "時刻、大きさ、件数"
+attacker -> server.r2: "暗号文だけ"
+attacker -> server.logs: "位置は出さない"
+attacker -> server.page: 書き換える
+server.page -> browser: 改ざんしたコード {class: maybe}
+browser -> attacker: "範囲の EK を送り出せる" {class: leak}
+browser -> server.d1: "見た月と時刻" {class: maybe}
+attacker -> server.shared: "導入まで読める" {class: leak}
+attacker -> server.backup: "平文の共有が 30 日残る" {class: leak}
+attacker -> server.reports: "通報の内容" {class: maybe}
+browser -> tiles: "一部の取得は見た地域を示す" {class: maybe}

@@ -1,0 +1,41 @@
+# 鍵の階層（docs/design/key-hierarchy.md）
+# 破線は予定または条件付きの鍵を表す。
+direction: right
+
+classes: {
+  maybe: {style.stroke-dash: 4}
+}
+
+rk: "復旧鍵 RK\n（復旧コード）\n利用者の控え"
+
+root: RK から導出（使う間だけ） {
+  rs: "アカウント署名鍵 RS"
+  re: "復旧用受信鍵 RE"
+}
+
+ar: "アカウント記録\n世代 G、RS、RE、IK\n証明書、チェックポイント" {shape: page}
+
+devices: 端末（DS で署名、DE で受け取る） {
+  full: "全権限の端末"
+  limited: "制限付きの端末"
+  full -> limited: 証明書を発行
+}
+
+data: "データ鍵 EK\n種別 × 月 × 世代"
+
+web: "ブラウザ\n一時鍵 VK" {class: maybe}
+
+obj: "暗号化した object\nmanifest、status" {shape: cylinder}
+
+share: "共有（予定）\nFK → フォロワーの IK" {class: maybe}
+
+rk -> root.rs: HKDF
+rk -> root.re: HKDF
+root.rs -> ar: 署名
+ar -> devices: 固定する
+data -> root.re: 全部を包む
+data -> devices.full: 全部を包む
+data -> devices.limited: 選んだ分
+data -> web: 範囲だけ {class: maybe}
+data -> obj: 暗号化
+devices -> obj: 署名

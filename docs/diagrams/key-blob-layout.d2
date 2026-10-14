@@ -1,0 +1,42 @@
+# record、object、manifest、鍵パッケージの形式（docs/design/key-hierarchy.md）
+direction: right
+
+record: "record v2" {
+  shape: sql_table
+  magic: "ASH2（4 B）"
+  kind: "種類（1 B）"
+  gen: "暗号世代（4 B）"
+  kid: "鍵 ID（16 B）"
+  writer: "書き手の端末 ID（32 B）"
+  name: "object ID または head ID（16 B）"
+  version: "head の版（8 B）"
+  refs: "参照する object ID（head だけ）"
+  body: "AEAD: nonce と暗号文 / HPKE: 鍵 ID、enc、暗号文"
+  sig: "Ed25519 署名（64 B）"
+}
+
+object: "object（寿命ごと）" {
+  shape: sql_table
+  count: "record の数"
+  records: "record × n"
+}
+
+manifest: "manifest（書き手 × kid）" {
+  shape: sql_table
+  version: 版
+  prev: 前の版のハッシュ
+  live: "生きている項目: ID、位置、sha256、期間、part"
+  superseded: "置き換えた項目: ID、置き換え先"
+}
+
+kp: "鍵パッケージ（HPKE の中身）" {
+  shape: sql_table
+  kid: 鍵 ID
+  meta: "種別、期間、世代"
+  key: "EK（32 B）"
+}
+
+object.records -> record: 各 record
+record.refs -> object: 参照数
+manifest.live -> object: 指す
+kp.kid -> record.kid: 同じ鍵 ID
