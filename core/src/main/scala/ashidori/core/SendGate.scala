@@ -12,27 +12,39 @@ import scala.collection.mutable
   * the setting off and its ticket of the current generation. So work asked
   * for before a change never sends after it.
   *
-  * An explicit request to show the online map is a grant to one owner (a
-  * map view) for the current generation. It lets that owner send, nobody
-  * else, and ends when the owner revokes it (it left the screen) or the
+  * An explicit request to show the online map is remembered per map
+  * surface (e.g. the map tab, the period view) as a consent
+  * ([[remember]]): which online map the user chose there. It lasts across
+  * leaving the screen and app restarts ([[consents]] is what the app
+  * stores), until the user switches back ([[forget]]) or the setting
+  * changes. A consent is never shared between surfaces, and automatic work
+  * does not look at it.
+  *
+  * While a map of a consenting surface is on screen, it holds a grant
+  * ([[grant]]): transient, to that one view (owner), for the current
+  * generation, and ended when the view leaves the screen ([[revoke]]) or the
   * setting changes. [[networkAllowed]] (the map library's process-wide
-  * switch) only follows the grants as a second line: what keeps other work
-  * from sending is that it does not use an online style or ask a server.
+  * switch) follows the grants as a second line: what keeps other work from
+  * sending is that it does not use an online style or ask a server.
   *
   * Thread-safe.
   */
-final class SendGate(initialBlock: Boolean):
+final class SendGate(initialBlock: Boolean, initialConsents: Map[String, String] = Map.empty,
+                     persist: (Boolean, Map[String, String]) => Unit = (_, _) => ()):
   private var blocked = initialBlock
   private var gen = 0L
   private val grants = mutable.Map.empty[AnyRef, Long]
+  /** Surface -> the online map consented to there. Only kept with the setting on. */
+  private var remembered: Map[String, String] = if initialBlock then initialConsents else Map.empty
   private val listeners = mutable.LinkedHashSet.empty[() => Unit]
 
   def block: Boolean = synchronized(blocked)
   def generation: Long = synchronized(gen)
 
   /** Sets the setting. A change starts a new generation, ends every grant
-    * and then tells the listeners (to drop queued work and abort running
-    * work). Returns whether it changed.
+    * and every remembered consent (stored together with the setting through
+    * `persist`, so neither outlives the other), and then tells the listeners
+    * (to drop queued work and abort running work). Returns whether it changed.
     */
   def setBlock(b: Boolean): Boolean =
     val changed = synchronized {
@@ -41,6 +53,8 @@ final class SendGate(initialBlock: Boolean):
         blocked = b
         gen += 1
         grants.clear()
+        remembered = Map.empty
+        persist(blocked, remembered)
         true
     }
     if changed then synchronized(listeners.toVector).foreach(_())
@@ -62,7 +76,27 @@ final class SendGate(initialBlock: Boolean):
     */
   def current(ticket: Long): Boolean = synchronized(ticket == gen)
 
-  /** `owner` explicitly asked to show the online map. */
+  /** The user explicitly chose the online map `map` on `surface` (setting on). */
+  def remember(surface: String, map: String): Unit = synchronized {
+    if blocked && !remembered.get(surface).contains(map) then
+      remembered += surface -> map
+      persist(blocked, remembered)
+  }
+
+  /** The user switched `surface` back to the on-device map. */
+  def forget(surface: String): Unit = synchronized {
+    if remembered.contains(surface) then
+      remembered -= surface
+      persist(blocked, remembered)
+  }
+
+  /** The online map consented to on `surface`, while the setting is on. */
+  def consent(surface: String): Option[String] = synchronized(if blocked then remembered.get(surface) else None)
+
+  /** Every remembered consent (what the app stores). */
+  def consents: Map[String, String] = synchronized(remembered)
+
+  /** `owner`, a map of a consenting surface, is on screen. */
   def grant(owner: AnyRef): Unit = synchronized(grants(owner) = gen)
 
   /** `owner` no longer shows the online map (switched back, or left the screen). */
@@ -137,6 +171,58 @@ final class SnapshotQueue[H](gate: SendGate):
           case _: Exception =>
             running = None
             busy = false
+
+/** The stored setting and map consents ([[SendGate]]'s `persist`). */
+object MapConsents:
+  /** A stored value as read back. */
+  enum Stored[+A]:
+    case Missing
+    /** Present but of the wrong type or unreadable. */
+    case Bad
+    case Ok(value: A)
+
+  private val Version = 1
+
+  /** One versioned JSON record; values are escaped, so no URL can forge another entry. */
+  def encode(consents: Map[String, String]): String =
+    ujson.write(ujson.Obj(
+      "v" -> Version,
+      "consents" -> ujson.Arr(consents.toSeq.sorted.map((s, m) => ujson.Obj("surface" -> s, "map" -> m))*)
+    ))
+
+  /** The record's (surface, map) pairs, or None if it is not a well-formed record. */
+  def decode(json: String): Option[Seq[(String, String)]] =
+    try
+      val o = ujson.read(json).obj
+      if o.get("v").flatMap(_.numOpt).contains(Version.toDouble) then
+        o.get("consents").map(_.arr.toSeq.map { e =>
+          val r = e.obj
+          (r("surface").str, r("map").str)
+        })
+      else None
+    catch case _: Exception => None
+
+  /** The setting and consents to start with. Fails safe: a setting that is
+    * missing or unreadable is on with no consents (whatever consents are
+    * stored), and a consent record that is unreadable or not in the exact
+    * form [[encode]] writes (e.g. a key or surface given twice) gives no
+    * consents. Entries for an unknown surface or a map that
+    * is no longer valid (e.g. a changed custom URL) are dropped.
+    */
+  def load(block: Stored[Boolean], consents: Stored[String],
+           surfaces: Set[String], validMap: String => Boolean): (Boolean, Map[String, String]) =
+    block match
+      case Stored.Ok(false) => (false, Map.empty)
+      case Stored.Ok(true) =>
+        val pairs = consents match
+          // Canonical only: what decodes must encode back to exactly the
+          // stored text (no repeated JSON keys, no repeated surfaces, no
+          // extra fields), so no reading picks one of two values.
+          case Stored.Ok(json) => decode(json).filter(ps => encode(ps.toMap) == json).getOrElse(Nil)
+          case _               => Nil
+        if pairs.map(_._1).distinct.size != pairs.size then (true, Map.empty)
+        else (true, pairs.filter((s, m) => surfaces(s) && validMap(m)).toMap)
+      case _ => (true, Map.empty)
 
 object SendGate:
   /** Tries `attempt` on each of `targets` in order until one succeeds.

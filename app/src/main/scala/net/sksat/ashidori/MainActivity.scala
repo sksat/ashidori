@@ -95,6 +95,10 @@ class MainActivity extends AppCompatActivity:
       locales.setApplicationLocales(android.os.LocaleList.forLanguageTags("ja-JP"))
     // Brand colors (themes.xml) rather than wallpaper-derived dynamic color.
     super.onCreate(savedInstanceState)
+    // Recreated (process killed in the background, configuration change):
+    // the day the map showed. The camera is restored by the map tab.
+    Option(savedInstanceState).flatMap(b => Option(b.getString(MainActivity.StateDate)))
+      .foreach(d => selectedDate = LocalDate.parse(d))
 
     toolbar = MaterialToolbar(this)
     toolbar.setNavigationOnClickListener(_ => pop())
@@ -127,10 +131,14 @@ class MainActivity extends AppCompatActivity:
 
     tabs = Map(
       MainActivity.TabTimeline -> TimelineScreen(this, savedInstanceState),
-      MainActivity.TabFeed -> FeedScreen(this),
+      MainActivity.TabFeed -> FeedScreen(this, savedInstanceState),
       MainActivity.TabLogger -> LoggerScreen(this),
       MainActivity.TabSettings -> SettingsScreen(this)
     )
+    // Recreated: where each tab was scrolled to (restored when it is shown).
+    for (id, screen) <- tabs; b <- Option(savedInstanceState) do
+      val y = b.getInt(MainActivity.StateScroll + id, 0)
+      if y > 0 then scrollY(screen) = y
     nav.setOnItemSelectedListener { item =>
       tabId = item.getItemId
       stack.clear()
@@ -225,7 +233,10 @@ class MainActivity extends AppCompatActivity:
       push(OnboardingScreen(this, permissionsOnly = false, onFinish = () => finishOnboarding()))
       if fresh then handleIntent(getIntent)
     else
-      nav.setSelectedItemId(MainActivity.TabTimeline)
+      // Recreated: the tab that was open.
+      val tab = Option(savedInstanceState).map(_.getInt(MainActivity.StateTab, MainActivity.TabTimeline))
+        .filter(tabs.contains).getOrElse(MainActivity.TabTimeline)
+      nav.setSelectedItemId(tab)
       // Resume logging after an app update or a force stop.
       if Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
         LoggerService.send(this, LoggerService.ActionStart)
@@ -311,7 +322,10 @@ class MainActivity extends AppCompatActivity:
     if tabId == MainActivity.TabTimeline then show(tabs(tabId)) else nav.setSelectedItemId(MainActivity.TabTimeline)
 
   private def show(s: Screen): Unit =
-    current.filterNot(_ eq s).foreach(_.onHide())
+    current.filterNot(_ eq s).foreach { old =>
+      MainActivity.scroller(old.view).foreach(v => scrollY(old) = v.getScrollY)
+      old.onHide()
+    }
     setFabLift(0)
     screenHost.removeAllViews()
     Option(s.view.getParent).foreach(_.asInstanceOf[ViewGroup].removeView(s.view))
@@ -332,8 +346,36 @@ class MainActivity extends AppCompatActivity:
       // Tab roots: the bottom bar already says where you are.
       toolbar.setTitle("")
     s.onShow()
+    // Screens stay alive across tab switches, but a re-attached scroll view
+    // may come back at the top: put it back where the user left it (unless
+    // the screen started over in onShow, see forgetScroll).
+    for y <- scrollY.remove(s) if y > 0; v <- MainActivity.scroller(s.view) do restoreScroll(v, y)
 
   def registerMap(m: TrackMap): Unit = maps += m
+
+  /** Scroll position of each hidden screen's main scroll view. */
+  private val scrollY = mutable.Map.empty[Screen, Int]
+
+  /** `s` shows new content from the top: do not restore its old position. */
+  def forgetScroll(s: Screen): Unit = scrollY -= s
+
+  /** Scrolls `v` to `y`, again on each layout until its content is tall
+    * enough (content loaded on showing, e.g. the feed's pages, may take a
+    * moment); gives up after three seconds.
+    */
+  private def restoreScroll(v: View, y: Int): Unit =
+    val until = System.currentTimeMillis() + 3000
+    val obs = v.getViewTreeObserver
+    // Only once the content reaches that far; never a clamped part-way position.
+    def reaches = v match
+      case g: ViewGroup if g.getChildCount > 0 => g.getChildAt(0).getHeight - v.getHeight >= y
+      case _                                   => false
+    lazy val listener: android.view.ViewTreeObserver.OnGlobalLayoutListener = () =>
+      val ok = reaches
+      if ok then v.scrollTo(0, y)
+      if ok || System.currentTimeMillis() > until then v.getViewTreeObserver.removeOnGlobalLayoutListener(listener)
+    obs.addOnGlobalLayoutListener(listener)
+    v.post(() => if reaches then v.scrollTo(0, y))
 
   /** Raise the check-in button by `px` (the map tab keeps it above its sheet). */
   def setFabLift(px: Int): Unit =
@@ -371,6 +413,17 @@ class MainActivity extends AppCompatActivity:
   override def onSaveInstanceState(out: Bundle): Unit =
     super.onSaveInstanceState(out)
     maps.foreach(_.onSaveInstanceState(out))
+    out.putInt(MainActivity.StateTab, tabId)
+    for (id, screen) <- tabs do
+      val y = if current.exists(_ eq screen) then MainActivity.scroller(screen.view).fold(0)(_.getScrollY)
+        else scrollY.getOrElse(screen, 0)
+      if y > 0 then out.putInt(MainActivity.StateScroll + id, y)
+    out.putString(MainActivity.StateDate, selectedDate.toString)
+    tabs.values.foreach {
+      case t: TimelineScreen => t.saveState(out)
+      case f: FeedScreen     => f.saveState(out)
+      case _                 => ()
+    }
   override def onDestroy(): Unit =
     current.foreach(_.onHide())
     tabs.values.foreach(_.onDestroy())
@@ -392,6 +445,16 @@ object MainActivity:
   val TabFeed = 2
   val TabLogger = 4
   val TabSettings = 5
+  private val StateTab = "tab"
+  private val StateDate = "selectedDate"
+  /** Prefix of a tab's scroll position, followed by its tab id. */
+  private val StateScroll = "scroll."
+
+  /** A screen's main vertical scroll view: the first one in its tree. */
+  private def scroller(v: View): Option[View] = v match
+    case _: android.widget.ScrollView | _: androidx.core.widget.NestedScrollView => Some(v)
+    case g: ViewGroup => (0 until g.getChildCount).iterator.map(g.getChildAt).flatMap(scroller).nextOption()
+    case _ => None
   val RequiredPermissions: Seq[String] = Seq(
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.POST_NOTIFICATIONS,

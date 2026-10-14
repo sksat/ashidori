@@ -30,6 +30,32 @@ enum MapStyle(val key: String, val label: String, val note: String):
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
 
+  /** What a remembered consent names ([[SendGate.remember]]): the map, and
+    * for [[Custom]] its URL, so a consent never carries over to another server.
+    */
+  def consentId: String = if this == Custom then s"$key:${MapStyle.custom._1}" else key
+
+  /** A sample of this map at a fixed area unrelated to the user (central
+    * Tokyo), bundled with the app (tools/map-previews): the picker shows it
+    * instead of a thumbnail at the current view, which would send the area.
+    */
+  def preview: Option[Int] =
+    import net.sksat.ashidori.R
+    this match
+      case Standard  => Some(R.drawable.map_preview_ofm_liberty)
+      case Light     => Some(R.drawable.map_preview_ofm_positron)
+      case GsiStd    => Some(R.drawable.map_preview_gsi_std)
+      case GsiPale   => Some(R.drawable.map_preview_gsi_pale)
+      case GsiPhoto  => Some(R.drawable.map_preview_gsi_photo)
+      case GsiRelief => Some(R.drawable.map_preview_gsi_relief)
+      case _         => None
+
+  /** Credit line shown with [[preview]]. */
+  def previewCredit: String = this match
+    case Standard | Light => "© OpenFreeMap © OpenMapTiles © OpenStreetMap contributors"
+    case GsiStd | GsiPale | GsiPhoto | GsiRelief => "地理院タイル"
+    case _ => ""
+
   /** Style document: a URL, or inline JSON. The policy picks [[Offline]]
     * only while its data is there ([[Basemap.available]]); should it be gone
     * meanwhile, the map shows no base map rather than an online one.
@@ -66,6 +92,11 @@ enum MapStyle(val key: String, val label: String, val note: String):
 object MapStyle:
   private def prefs = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
+  /** Interactive map surfaces, each with its own remembered consent: the map tab and the period view. */
+  val SurfaceMap = "map"
+  val SurfacePeriod = "period"
+  val Surfaces: Set[String] = Set(SurfaceMap, SurfacePeriod)
+
   private def byKey(k: String): Option[MapStyle] = values.find(_.key == k)
 
   /** The user's choice; may be [[Offline]]. */
@@ -75,17 +106,25 @@ object MapStyle:
     if s.online then e.putString("mapStyleOnline", s.key)
     e.apply()
 
-  /** The online map last chosen: what "詳しい地図" shows when [[current]] is offline. */
+  /** The online map last chosen: what "詳しい地図" asks for when [[current]] is offline. */
   def lastOnline: MapStyle =
     byKey(prefs.getString("mapStyleOnline", "")).filter(_.online)
       .orElse(Some(current).filter(_.online)).getOrElse(Standard)
 
-  /** Base map of an interactive map; `detailed` if the user asked for the
-    * online map in that view (see [[BaseMapPolicy]]). [[Outcome.NoBasemap]]
-    * when it would be the offline map and that is not downloaded.
+  /** The online map a consent names, if it is still that map ([[consentId]]). */
+  def fromConsent(id: String): Option[MapStyle] = values.find(s => s.online && s.consentId == id)
+
+  /** The online map an explicit request for detail shows (see [[BaseMapPolicy.detailMap]]). */
+  def detailMap: MapStyle = BaseMapPolicy.detailMap(current, lastOnline, Offline)
+
+  /** Base map of an interactive map on `surface`: with the setting on, the
+    * online map remembered there, else the offline one (see
+    * [[BaseMapPolicy]]). [[Outcome.NoBasemap]] when it would be the offline
+    * map and that is not downloaded.
     */
-  def forView(detailed: Boolean): Outcome[MapStyle] =
-    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, lastOnline, Offline, Basemap.available, detailed)
+  def forView(surface: String, onScreen: Boolean): Outcome[MapStyle] =
+    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, Offline, Basemap.available,
+      Settings.gate.consent(surface).flatMap(fromConsent), onScreen)
 
   /** Base map of a still image (feed, period, other devices), with the
     * setting as it is now (or `block`, as taken right before a job starts).
@@ -129,10 +168,21 @@ object MapStyle:
     snapshotters.foreach(_.cancel())
     snapshotters.clear()
 
-  /** User-supplied XYZ raster tiles: URL template ({z}/{x}/{y}) and credit line. */
-  def custom: (String, String) = (prefs.getString("customTileUrl", ""), prefs.getString("customTileCredit", ""))
-  def custom_=(v: (String, String)): Unit =
-    prefs.edit().putString("customTileUrl", v._1.trim).putString("customTileCredit", v._2.trim).apply()
+  /** User-supplied XYZ raster tiles: URL template ({z}/{x}/{y}) and credit
+    * line. A stored URL that is not valid ([[BaseMapPolicy.validTileUrl]]) reads as none.
+    */
+  def custom: (String, String) =
+    val url = Option(prefs.getString("customTileUrl", "")).getOrElse("")
+    (if BaseMapPolicy.validTileUrl(url) then url else "",
+      Option(prefs.getString("customTileCredit", "")).getOrElse("").filterNot(_.isControl))
+
+  /** Stores a valid URL ([[BaseMapPolicy.validTileUrl]]); stores nothing and returns false otherwise. */
+  def setCustom(url: String, credit: String): Boolean =
+    val u = url.trim
+    BaseMapPolicy.validTileUrl(u) && {
+      prefs.edit().putString("customTileUrl", u).putString("customTileCredit", credit.trim.filterNot(_.isControl)).apply()
+      true
+    }
 
   /** Writes `json` to the cache (once per content) and returns its file:// URI. */
   private def styleFile(key: String, json: String): String =

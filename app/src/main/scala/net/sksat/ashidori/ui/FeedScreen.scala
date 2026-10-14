@@ -68,7 +68,7 @@ final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Se
   * 日 is one continuous rail of stays and trips with date headings; 週 and 月
   * show one card per period. Tapping opens the day on the map or the period.
   */
-final class FeedScreen(act: MainActivity) extends Screen:
+final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) extends Screen:
   private given Ctx = act
   private val dayFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private val shortFmt = DateTimeFormatter.ofPattern("M/d", Locale.JAPANESE)
@@ -97,6 +97,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
         if sp != unit then
           unit = sp
           prefs.edit().putString("feedUnit", sp.toString).apply()
+          restoreTarget = None
           reload()
       }
   }
@@ -110,6 +111,8 @@ final class FeedScreen(act: MainActivity) extends Screen:
       if y + v.getHeight > items.getHeight - dp(1200) then loadMore()
     )
     s.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+    // The user scrolling first ends a pending restore.
+    s.setOnTouchListener((_, e) => { if e.getActionMasked == android.view.MotionEvent.ACTION_DOWN then restoreTarget = None; false })
     s
   /** Search the history ("when did I go to …"), at thumb reach. */
   private val searchFab =
@@ -132,6 +135,8 @@ final class FeedScreen(act: MainActivity) extends Screen:
 
   /** Open 日 at a given day (older days continue below it). */
   def showFrom(d: LocalDate): Unit =
+    act.forgetScroll(this)
+    restoreTarget = None
     startAt = Some(d).filter(_ != LocalDate.now(AshidoriApp.zone))
     if unit != Span.Day then
       unit = Span.Day
@@ -150,19 +155,68 @@ final class FeedScreen(act: MainActivity) extends Screen:
   private var emptyRun = Vector.empty[LocalDate]
   /** Each shown day's views, so an edit redraws only that day. */
   private val dayBoxes = scala.collection.mutable.Map.empty[LocalDate, LinearLayout]
+  /** Each shown period card (週 / 月) by its first day, so one can be redrawn in place. */
+  private val periodBoxes = scala.collection.mutable.Map.empty[LocalDate, View]
   private lazy val rows = DayRows(act, tl => refreshDay(tl.date))
   /** Show 日 starting from this day instead of today (from the map). */
   private var startAt: Option[LocalDate] = None
   private val backToToday =
-    val b = outlined("今日へ") { startAt = None; reload() }
+    val b = outlined("今日へ") { startAt = None; restoreTarget = None; reload() }
     b.setVisibility(View.GONE)
     b
 
+  /** The day the feed was loaded on: "今日" and "昨日" depend on it. */
+  private var loadedOn: Option[LocalDate] = None
+
+  // Recreated after the process was killed: the day 日 started from (opened
+  // from the map) and where it was scrolled to. The position is applied
+  // only once that content has loaded down to it ([[continueRestore]]).
+  private var restoreTarget: Option[Int] = None
+  for b <- Option(saved) do
+    startAt = Option(b.getString(FeedScreen.KeyStartAt)).map(LocalDate.parse).filter(_ => unit == Span.Day)
+    restoreTarget = Some(b.getInt(FeedScreen.KeyScroll, 0)).filter(_ > 0)
+
+  /** Start day and scroll position, for a recreated activity. */
+  def saveState(out: android.os.Bundle): Unit =
+    startAt.foreach(d => out.putString(FeedScreen.KeyStartAt, d.toString))
+    val y = restoreTarget.getOrElse(scroller.getScrollY)
+    if y > 0 then out.putInt(FeedScreen.KeyScroll, y)
+
+  /** After a batch: once the loaded content reaches the saved position,
+    * scroll there; until then load on. If the history ends first, stay at
+    * the top rather than put the position on other content.
+    */
+  private def continueRestore(): Unit =
+    for y <- restoreTarget do
+      scroller.post { () =>
+        if restoreTarget.contains(y) then
+          if items.getHeight >= y + scroller.getHeight then
+            restoreTarget = None
+            scroller.scrollTo(0, y)
+          else if done then restoreTarget = None
+          else loadMore()
+      }
+
   override def onShow(): Unit =
-    // Refresh when coming back after a while (today changes).
-    if cursor == LocalDate.MIN || System.currentTimeMillis() - loadedAt > 60_000 then reload()
+    val today = LocalDate.now(AshidoriApp.zone)
+    // Coming back keeps where the user was (scroll, 日 / 週 / 月, the day
+    // opened from the map). Only a new day, or a jump asked for, starts over.
+    // The first load keeps a position restored after the app was recreated.
+    if loadedOn.isEmpty then reload()
+    else if cursor == LocalDate.MIN || !loadedOn.contains(today) then
+      restoreTarget = None
+      reload()
+    // After a while, today's records grew: redraw just today, or the
+    // current week / month card, in place (the scroll position stays).
+    else if System.currentTimeMillis() - loadedAt > 60_000 then
+      loadedAt = System.currentTimeMillis()
+      if unit == Span.Day then { if dayBoxes.contains(today) then refreshDay(today) }
+      else refreshPeriod(unit.range(today)._1)
 
   def reload(): Unit =
+    // Content starts over: never the generic restore of an older position
+    // (a recreated feed restores its own, see continueRestore).
+    act.forgetScroll(this)
     generation += 1
     items.removeAllViews()
     footer.setText("読み込み中…")
@@ -170,11 +224,13 @@ final class FeedScreen(act: MainActivity) extends Screen:
     done = false
     loading = false
     dayBoxes.clear()
+    periodBoxes.clear()
     DayMap.cancelPending()
     if unit != Span.Day then startAt = None
     backToToday.setVisibility(if startAt.isDefined then View.VISIBLE else View.GONE)
     cursor = startAt.getOrElse(unit.range(LocalDate.now(AshidoriApp.zone))._1)
     loadedAt = System.currentTimeMillis()
+    loadedOn = Some(LocalDate.now(AshidoriApp.zone))
     scroller.scrollTo(0, 0)
     val gen = generation
     AshidoriApp.io.execute { () =>
@@ -208,7 +264,11 @@ final class FeedScreen(act: MainActivity) extends Screen:
         if gen == generation then
           loading = false
           if sp == Span.Day then periods.foreach((_, tls) => appendDays(tls, today))
-          else periods.foreach((a, tls) => items.addView(periodCard(sp, a, tls, today)))
+          else periods.foreach { (a, tls) =>
+            val card = periodCard(sp, a, tls, today)
+            periodBoxes(a) = card
+            items.addView(card)
+          }
           val reachedEnd = oldest.forall(o => cursor.isBefore(unit.range(o)._1))
           if reachedEnd then
             flushEmpty()
@@ -216,6 +276,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
             footer.setText(if oldest.isEmpty then "まだ記録がありません" else "これより前の記録はありません")
           // Fill the screen even when the first batch is short.
           else scroller.post(() => if items.getHeight < scroller.getHeight + dp(1200) then loadMore())
+          continueRestore()
       }
     }
 
@@ -245,6 +306,26 @@ final class FeedScreen(act: MainActivity) extends Screen:
     rs.foreach(box.addView)
     if rs.isEmpty then
       box.addView(padded(caption(if LoggerState.running then "記録待ち" else "記録停止中"), 52, 8))
+
+  /** Redraws the shown card of the period starting `a` (週 / 月) in place. */
+  private def refreshPeriod(a: LocalDate): Unit =
+    if periodBoxes.contains(a) then
+      val gen = generation
+      val sp = unit
+      AshidoriApp.io.execute { () =>
+        val today = LocalDate.now(AshidoriApp.zone)
+        val (from, to0) = sp.range(a)
+        val to = if to0.isAfter(today) then today else to0
+        val tls = Iterator.iterate(to)(_.minusDays(1)).takeWhile(!_.isBefore(from)).map(TimelineRepo.day).toVector
+        act.runOnUiThread { () =>
+          if gen == generation then
+            for old <- periodBoxes.get(a); i = items.indexOfChild(old) if i >= 0 do
+              val card = periodCard(sp, a, tls, today)
+              items.removeViewAt(i)
+              items.addView(card, i)
+              periodBoxes(a) = card
+        }
+      }
 
   /** After an edit (place name, mode), rebuild just that day. */
   private def refreshDay(d: LocalDate): Unit =
@@ -370,3 +451,7 @@ final class FeedScreen(act: MainActivity) extends Screen:
     lp.setMargins(dp(12), dp(6), dp(12), dp(6))
     box.setLayoutParams(lp)
     box
+
+object FeedScreen:
+  private val KeyStartAt = "feed.startAt"
+  private val KeyScroll = "feed.scroll"

@@ -1,0 +1,13 @@
+{
+  "name": "ashidori-map-previews",
+  "private": true,
+  "type": "module",
+  "description": "Renders the base-map picker's bundled samples (see render.mjs).",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "devDependencies": {
+    "maplibre-gl": "6.11.2",
+    "playwright-core": "1.62.1"
+  }
+}

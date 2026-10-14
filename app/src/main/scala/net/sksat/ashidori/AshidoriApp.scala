@@ -73,8 +73,9 @@ object Settings:
     * app's own initiative: no platform geocoder, no automatic venue search
     * (OpenStreetMap), and maps and their snapshots drawn from the on-device
     * basemap only. An explicit user action may still send: a venue search,
-    * the online map in one map view ("この範囲を詳しい地図で表示") while it
-    * is on screen, opening a position in another app (`geo:`), sharing an
+    * the online map on the one map where the user chose it ("この範囲を詳しい
+    * 地図で表示" or an online map in its picker; remembered for that map until
+    * switched back or this setting changes), opening a position in another app (`geo:`), sharing an
     * export. Off: venues are searched automatically, the platform geocoder
     * fills names the offline index lacks, and the chosen base map is used.
     *
@@ -88,11 +89,26 @@ object Settings:
     */
   def blockExternalLocation: Boolean = gate.block
   def blockExternalLocation_=(b: Boolean): Unit =
-    prefs.edit().putBoolean("blockExternalLocation", b).apply()
-    gate.setBlock(b)
+    // A change is stored with the (cleared) map consents in one write.
+    if !gate.setBlock(b) then prefs.edit().putBoolean("blockExternalLocation", b).apply()
 
-  /** The setting's generation, grants and listeners (see [[SendGate]]). */
-  lazy val gate: SendGate = SendGate(prefs.getBoolean("blockExternalLocation", true))
+  /** The setting's generation, grants, the maps' remembered consents and
+    * listeners (see [[SendGate]]). The setting and the consents are stored
+    * together ([[MapConsents]]), and read back fail-safe.
+    */
+  lazy val gate: SendGate =
+    import MapConsents.Stored
+    def read[A](key: String)(get: => A): Stored[A] =
+      if !prefs.contains(key) then Stored.Missing
+      else try Stored.Ok(get) catch case _: ClassCastException => Stored.Bad
+    val (block, consents) = MapConsents.load(
+      read("blockExternalLocation")(prefs.getBoolean("blockExternalLocation", true)),
+      read("mapConsents")(prefs.getString("mapConsents", "")),
+      ui.MapStyle.Surfaces,
+      id => ui.MapStyle.fromConsent(id).isDefined
+    )
+    SendGate(block, consents, (b, c) =>
+      prefs.edit().putBoolean("blockExternalLocation", b).putString("mapConsents", MapConsents.encode(c)).apply())
 
   /** Upgrades stored settings; call once at start. */
   def migrate(): Unit =

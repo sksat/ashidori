@@ -41,7 +41,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
 
-  private val map = TrackMap(act, saved, controlsOnTop = true)
+  /** The map tab (day) and the period view are separate map surfaces: an
+    * online map chosen on one is not shown on the other.
+    */
+  private val map = TrackMap(act, saved, if spans == Seq(Span.Day) then MapStyle.SurfaceMap else MapStyle.SurfacePeriod, controlsOnTop = true)
   /** Day (the detailed timeline) or a longer period summary. */
   private var span = if spans.contains(Span.Month) then Span.Month else spans.head
   private val dayOnly = spans == Seq(Span.Day)
@@ -175,6 +178,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     if dayOnly && view.getHeight > 0 then act.setFabLift(math.max(0, view.getHeight - sheet.getTop))
 
   override def onShow(): Unit =
+    map.onScreen()
     view.post(() => liftFab())
     // First open: show where we last were right away, before the day loads.
     if fittedDate.isEmpty then
@@ -198,8 +202,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   override def onHide(): Unit =
     unobserve()
-    // Leaving the screen ends the detailed (online) map of this view.
-    map.endDetail()
+    // Leaving the screen ends the view's grant to use the network; the map
+    // chosen here stays for when it is shown again.
+    map.offScreen()
 
   /** Time of the last point drawn by the latest full render. */
   private var drawnUntil = Long.MaxValue
@@ -248,8 +253,6 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   /** Open a period (from a summary card in the feed). */
   def showPeriod(sp: Span, d: LocalDate): Unit =
-    // A reused period screen opens another period with the offline map.
-    map.endDetail()
     span = sp
     ownAnchor = d
     syncChips()
@@ -339,3 +342,24 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     val row = hbox(label)
     if !LoggerState.running then row.addView(button("▶  記録を開始")(act.startLogging()))
     row
+
+  /** Camera and shown day, for a recreated activity (the day tab only). */
+  def saveState(out: Bundle): Unit =
+    if dayOnly then
+      for d <- fittedDate; (p, zoom) <- map.camera do
+        out.putString(TimelineScreen.KeyDate, d.toString)
+        out.putDouble(TimelineScreen.KeyLat, p.lat)
+        out.putDouble(TimelineScreen.KeyLon, p.lon)
+        out.putDouble(TimelineScreen.KeyZoom, zoom)
+
+  // Recreated after the process was killed (or a configuration change): the
+  // camera where it was, and that day not fitted again.
+  if dayOnly && saved != null && saved.containsKey(TimelineScreen.KeyZoom) then
+    fittedDate = Option(saved.getString(TimelineScreen.KeyDate)).map(LocalDate.parse)
+    map.moveTo(LatLng(saved.getDouble(TimelineScreen.KeyLat), saved.getDouble(TimelineScreen.KeyLon)), saved.getDouble(TimelineScreen.KeyZoom))
+
+object TimelineScreen:
+  private val KeyDate = "map.date"
+  private val KeyLat = "map.lat"
+  private val KeyLon = "map.lon"
+  private val KeyZoom = "map.zoom"
