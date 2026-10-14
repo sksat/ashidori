@@ -4,7 +4,8 @@ import { basemap } from "./basemap";
 import type { AppEnv, Env } from "./env";
 import { sweepUnusedAccounts } from "./accounts";
 import { sweepOrphanBlobs } from "./batches";
-import { deleteOldPairingCodes } from "./devices";
+import { deleteOldPairingCodes, deleteOldViewers } from "./devices";
+import { deleteOldViewerPairings } from "./viewer-pairings";
 import { deleteOldInvites } from "./invites";
 import { deleteExpiredRateLimits } from "./ratelimit";
 import { assetLinks, pair } from "./pair";
@@ -89,6 +90,10 @@ export async function maintenance(env: Env, now: number): Promise<void> {
     ["rate limits", () => deleteExpiredRateLimits(env.DB, now)],
     ["pairing codes", () => deleteOldPairingCodes(env.DB, now)],
     ["invites", () => deleteOldInvites(env.DB, now)],
+    // Browser pairing attempts a day after they expired, viewers 30 days
+    // after they expired or were revoked.
+    ["viewer pairings", () => deleteOldViewerPairings(env.DB, now)],
+    ["viewers", () => deleteOldViewers(env.DB, now)],
     ["unused accounts", () => sweepUnusedAccounts(env.DB, now)],
     ["orphan blobs", () => sweepOrphanBlobs(env.DB, env.BLOBS, now)],
   ];

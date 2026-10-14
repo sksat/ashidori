@@ -87,6 +87,7 @@ BATCH_EXPECT="
 executable verified
 key_secrecy verified
 batch_key_secrecy verified
+auth_key_secrecy verified
 payload_secrecy verified
 slot_binding verified
 no_slot_move verified
@@ -168,19 +169,24 @@ run_tamarin() {
     fi
   done <<<"$BATCH_EXPECT"
 
-  # Mutation: the slot is not bound as AAD; slot binding must break.
-  log="$LOGS/batch-NOAAD.log"
-  t0=$(date +%s)
-  "$TAMARIN" --with-maude="$MAUDE" -D=NOAAD --prove=slot_binding --prove=no_slot_move "$HERE/crypto/batch.spthy" >"$log" 2>&1 || true
-  t1=$(date +%s)
-  summary=$(sed -n '/summary of summaries/,$p' "$log")
-  for lemma in slot_binding no_slot_move; do
-    got=$(echo "$summary" | grep -E "^ *$lemma \(" | sed -E 's/.*\): ([a-z]+).*/\1/')
-    if [ "$got" = falsified ]; then
-      report "tamarin batch -D=NOAAD/$lemma" ok $((t1 - t0)) "falsified (expected)"
-    else
-      report "tamarin batch -D=NOAAD/$lemma" FAIL $((t1 - t0)) "got '${got:-none}', expected falsified; see $log"
-    fi
+  # Mutations: the slot is not bound (NOAAD), or the app also accepts ASH1
+  # without the cut-over, so a leaked batch key forges blobs (ASH1); slot
+  # binding must break.
+  local mut
+  for mut in NOAAD ASH1; do
+    log="$LOGS/batch-$mut.log"
+    t0=$(date +%s)
+    "$TAMARIN" --with-maude="$MAUDE" -D=$mut --prove=slot_binding --prove=no_slot_move "$HERE/crypto/batch.spthy" >"$log" 2>&1 || true
+    t1=$(date +%s)
+    summary=$(sed -n '/summary of summaries/,$p' "$log")
+    for lemma in slot_binding no_slot_move; do
+      got=$(echo "$summary" | grep -E "^ *$lemma \(" | sed -E 's/.*\): ([a-z]+).*/\1/')
+      if [ "$got" = falsified ]; then
+        report "tamarin batch -D=$mut/$lemma" ok $((t1 - t0)) "falsified (expected)"
+      else
+        report "tamarin batch -D=$mut/$lemma" FAIL $((t1 - t0)) "got '${got:-none}', expected falsified; see $log"
+      fi
+    done
   done
 
   local flag want name

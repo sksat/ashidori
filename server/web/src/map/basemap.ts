@@ -1,27 +1,48 @@
-// The app's offline basemap, read in place from the archive the server
-// serves at /basemap/<version>/ashidori-basemap-<version>.zip (see
-// server/src/basemap.ts and tools/basemap/package.py).
+// The app's offline basemap in the viewer: the same archive the app uses,
+// /basemap/<version>/ashidori-basemap-<version>.zip (see server/src/basemap.ts
+// and tools/basemap/package.py), pinned by the size and sha256 of
+// app/src/main/assets/basemap-pin.json (vite.config.ts injects it).
 //
-// The archive is a zip whose .pmtiles entries are stored (not deflated),
-// so each is one contiguous byte range of the zip: the map reads tiles
-// with HTTP Range requests at an offset into the archive, and the style,
-// glyphs and sprites (deflated) are inflated with DecompressionStream.
-// Nothing is fetched from another origin.
-//
-// Unlike the app, which downloads the whole archive, the browser reads only
-// the ranges of the tiles it shows; the server (and Cloudflare's edge) can
-// therefore tell which area is being viewed. The viewer already trusts the
-// server with the key; this is noted in the report, not hidden.
+// Where someone is looking on the map is location data. The viewer
+// therefore never reads the archive in pieces: HTTP Range requests for the
+// tiles in view would tell the server (and Cloudflare's edge) which area is
+// shown. Instead the map starts as a plain canvas, and only the explicit
+// action 「簡易地図を読み込む（約 64 MB）」 downloads the whole archive in one
+// request, the same for every user. It is verified against the pin, kept in
+// Cache Storage, and read locally from then on: tiles, style, glyphs and
+// sprites are slices of a Blob in this browser. A copy already in Cache
+// Storage is verified again and used without asking, since that sends
+// nothing. Online tiles exist only behind 「詳しい地図」 (gl.ts).
 
 import type { AddProtocolAction, StyleSpecification } from "maplibre-gl";
 import { PMTiles, Protocol, type RangeResponse, type Source } from "pmtiles";
 import { Api } from "../data/api";
-import { buf, readCapped } from "../data/bytes";
+import { buf, hex, readCapped } from "../data/bytes";
+
+export interface BasemapPin {
+  version: string;
+  file: string;
+  bytes: number;
+  sha256: string;
+}
+
+/** The archive the app pins (one source of truth: the app's asset). */
+export const PIN: BasemapPin = __BASEMAP_PIN__;
 
 const PLACEHOLDER = "@BASEMAP_DIR@";
 const ZIP_SCHEME = "ashzip";
 const MAX_STYLE = 4 * 1024 * 1024;
 const MAX_ENTRY = 16 * 1024 * 1024;
+export const CACHE_NAME = "ashidori-basemap";
+
+export function archiveUrl(pin: BasemapPin = PIN): string {
+  return `/basemap/${encodeURIComponent(pin.version)}/${encodeURIComponent(pin.file)}`;
+}
+
+/** The size the load button names: 「約 64 MB」. */
+export function approxMB(pin: BasemapPin = PIN): number {
+  return Math.round(pin.bytes / 1_000_000);
+}
 
 interface ZipEntry {
   name: string;
@@ -31,52 +52,37 @@ interface ZipEntry {
   headerOffset: number;
 }
 
-class RangeError_ extends Error {}
-
-async function range(url: string, start: number, length: number, signal?: AbortSignal): Promise<{ data: Uint8Array; total: number }> {
-  const res = await fetch(url, {
-    headers: { Range: `bytes=${start}-${start + length - 1}` },
-    credentials: "omit",
-    ...(signal ? { signal } : {}),
-  });
-  if (res.status !== 206) throw new RangeError_(`range request answered ${res.status}`);
-  const cr = /\/(\d+)$/.exec(res.headers.get("Content-Range") ?? "");
-  const data = await readCapped(res.body ?? new Blob().stream(), length, "range");
-  return { data, total: cr ? Number(cr[1]) : NaN };
+async function slice(blob: Blob, start: number, length: number): Promise<Uint8Array> {
+  if (start < 0 || length < 0 || start + length > blob.size) throw new Error("read past the end of the archive");
+  return new Uint8Array(await blob.slice(start, start + length).arrayBuffer());
 }
 
-async function suffix(url: string, length: number): Promise<{ data: Uint8Array; total: number }> {
-  const res = await fetch(url, { headers: { Range: `bytes=-${length}` }, credentials: "omit" });
-  if (res.status !== 206) throw new RangeError_(`range request answered ${res.status}`);
-  const cr = /\/(\d+)$/.exec(res.headers.get("Content-Range") ?? "");
-  const data = await readCapped(res.body ?? new Blob().stream(), length, "range");
-  return { data, total: cr ? Number(cr[1]) : NaN };
-}
-
-/** Reads a zip over HTTP ranges: its central directory, then entries on demand. */
-export class ZipOverHttp {
+/** A zip held in this browser: its central directory, then entries on demand. */
+export class LocalZip {
   private readonly dataOffsets = new Map<string, Promise<number>>();
   private constructor(
-    readonly url: string,
+    readonly blob: Blob,
     readonly entries: Map<string, ZipEntry>,
   ) {}
 
-  static async open(url: string): Promise<ZipOverHttp> {
+  static async open(blob: Blob): Promise<LocalZip> {
     // End of central directory: 22 bytes plus a comment of up to 64 KiB.
-    const tail = await suffix(url, 22 + 0xffff);
-    const v = new DataView(tail.data.buffer, tail.data.byteOffset, tail.data.byteLength);
+    const tailLen = Math.min(blob.size, 22 + 0xffff);
+    const tail = await slice(blob, blob.size - tailLen, tailLen);
+    const v = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
     let eocd = -1;
-    for (let i = tail.data.byteLength - 22; i >= 0; i--) if (v.getUint32(i, true) === 0x06054b50) {
-      eocd = i;
-      break;
-    }
+    for (let i = tail.byteLength - 22; i >= 0; i--)
+      if (v.getUint32(i, true) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
     if (eocd < 0) throw new Error("not a zip archive");
     const count = v.getUint16(eocd + 10, true);
     const cdSize = v.getUint32(eocd + 12, true);
     const cdOffset = v.getUint32(eocd + 16, true);
     if (cdOffset === 0xffffffff || count === 0xffff) throw new Error("zip64 archives are not supported");
-    const cd = await range(url, cdOffset, cdSize);
-    const d = new DataView(cd.data.buffer, cd.data.byteOffset, cd.data.byteLength);
+    const cd = await slice(blob, cdOffset, cdSize);
+    const d = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
     const entries = new Map<string, ZipEntry>();
     const dec = new TextDecoder();
     let p = 0;
@@ -89,18 +95,18 @@ export class ZipOverHttp {
       const m = d.getUint16(p + 30, true);
       const k = d.getUint16(p + 32, true);
       const headerOffset = d.getUint32(p + 42, true);
-      const name = dec.decode(cd.data.subarray(p + 46, p + 46 + n));
+      const name = dec.decode(cd.subarray(p + 46, p + 46 + n));
       entries.set(name, { name, method, compressed, size, headerOffset });
       p += 46 + n + m + k;
     }
-    return new ZipOverHttp(url, entries);
+    return new LocalZip(blob, entries);
   }
 
   /** Offset of an entry's data: after its local header, whose extra field may differ from the central one. */
   dataOffset(e: ZipEntry): Promise<number> {
     let o = this.dataOffsets.get(e.name);
     if (!o) {
-      o = range(this.url, e.headerOffset, 30).then(({ data }) => {
+      o = slice(this.blob, e.headerOffset, 30).then((data) => {
         const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
         if (v.getUint32(0, true) !== 0x04034b50) throw new Error("bad local header");
         return e.headerOffset + 30 + v.getUint16(26, true) + v.getUint16(28, true);
@@ -110,13 +116,12 @@ export class ZipOverHttp {
     return o;
   }
 
-  async read(name: string, max = MAX_ENTRY, signal?: AbortSignal): Promise<Uint8Array> {
+  async read(name: string, max = MAX_ENTRY): Promise<Uint8Array> {
     const e = this.entries.get(name);
     if (!e) throw new Error(`no ${name} in the basemap`);
     if (e.size > max || e.compressed > max) throw new Error(`${name} is too large`);
     if (e.size === 0) return new Uint8Array(0);
-    const off = await this.dataOffset(e);
-    const { data } = await range(this.url, off, e.compressed, signal);
+    const data = await slice(this.blob, await this.dataOffset(e), e.compressed);
     if (e.method === 0) return data;
     if (e.method !== 8) throw new Error(`unsupported zip method ${e.method}`);
     const out = new Blob([buf(data)]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
@@ -124,21 +129,21 @@ export class ZipOverHttp {
   }
 }
 
-/** A .pmtiles entry stored in the zip, as a pmtiles Source. */
+/** A .pmtiles entry stored in the zip, as a pmtiles Source over the local Blob. */
 class ZipEntrySource implements Source {
   constructor(
-    private readonly zip: ZipOverHttp,
+    private readonly zip: LocalZip,
     private readonly entry: ZipEntry,
     private readonly key: string,
   ) {}
   getKey() {
     return this.key;
   }
-  async getBytes(offset: number, length: number, signal?: AbortSignal): Promise<RangeResponse> {
+  async getBytes(offset: number, length: number): Promise<RangeResponse> {
     const base = await this.zip.dataOffset(this.entry);
     const len = Math.max(0, Math.min(length, this.entry.size - offset));
     if (len === 0) return { data: new ArrayBuffer(0) };
-    const { data } = await range(this.zip.url, base + offset, len, signal);
+    const data = await slice(this.zip.blob, base + offset, len);
     return { data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer };
   }
 }
@@ -165,23 +170,16 @@ export function remoteUrls(style: StyleSpecification): string[] {
   return urls.filter((u) => !u.startsWith(`${ZIP_SCHEME}://`) && !u.startsWith(`pmtiles://${ZIP_SCHEME}/`));
 }
 
-let cached: Promise<Basemap | null> | null = null;
-
-/** The newest basemap the server serves, or null (no basemap, no Range support, a bad archive). */
-export function offlineBasemap(): Promise<Basemap | null> {
-  cached ??= load().catch((e: unknown) => {
-    console.warn("offline basemap unavailable", e);
-    return null;
-  });
-  return cached;
+/** Whether `blob` is exactly the pinned archive. */
+export async function matchesPin(blob: Blob, pin: BasemapPin = PIN): Promise<boolean> {
+  if (blob.size !== pin.bytes) return false;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", await blob.arrayBuffer()));
+  return hex(digest) === pin.sha256.toLowerCase();
 }
 
-async function load(): Promise<Basemap | null> {
-  const { basemap } = await Api.info();
-  const version = basemap[0];
-  if (!version) return null;
-  const url = `/basemap/${encodeURIComponent(version)}/ashidori-basemap-${encodeURIComponent(version)}.zip`;
-  const zip = await ZipOverHttp.open(url);
+/** A basemap read from a verified archive in this browser. Null if its style would fetch from elsewhere. */
+export async function basemapFromBlob(blob: Blob, version: string): Promise<Basemap | null> {
+  const zip = await LocalZip.open(blob);
   const raw = new TextDecoder().decode(await zip.read("style.json", MAX_STYLE));
   if (!raw.includes(PLACEHOLDER)) return null;
   // Archive paths: "pmtiles://file://@BASEMAP_DIR@/japan.pmtiles" → "pmtiles://ashzip/japan.pmtiles",
@@ -209,12 +207,160 @@ async function load(): Promise<Basemap | null> {
       const protocol = new Protocol();
       for (const p of pmtiles.values()) protocol.add(p);
       addProtocol("pmtiles", protocol.tile as AddProtocolAction);
-      addProtocol(ZIP_SCHEME, async (params, abort) => {
+      addProtocol(ZIP_SCHEME, async (params) => {
         const path = decodeURIComponent(params.url.slice(`${ZIP_SCHEME}://archive/`.length));
-        const data = await zip.read(path, MAX_ENTRY, abort.signal);
+        const data = await zip.read(path, MAX_ENTRY);
         if (params.type === "json") return { data: JSON.parse(new TextDecoder().decode(data)) as object };
         return { data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) };
       });
     },
   };
 }
+
+// ---- loading: from Cache Storage (no request), or the explicit download ----
+
+export interface BasemapDeps {
+  fetch: typeof fetch;
+  /** Cache Storage, or null where it is unavailable (an insecure context, storage blocked). */
+  caches: CacheStorage | null;
+  pin: BasemapPin;
+}
+
+function browserDeps(): BasemapDeps {
+  let c: CacheStorage | null = null;
+  try {
+    c = typeof caches === "undefined" ? null : caches;
+  } catch {
+    c = null;
+  }
+  return { fetch: fetch.bind(globalThis), caches: c, pin: PIN };
+}
+
+let current: Basemap | null = null;
+const listeners = new Set<() => void>();
+
+/** The basemap loaded in this page, if any. */
+export function loadedBasemap(): Basemap | null {
+  return current;
+}
+
+/** Called when a basemap becomes available (every map switches to it). */
+export function onBasemap(f: () => void): () => void {
+  listeners.add(f);
+  return () => listeners.delete(f);
+}
+
+function publish(b: Basemap): Basemap {
+  current = b;
+  for (const f of [...listeners]) f();
+  return b;
+}
+
+/** For tests. */
+export function resetBasemap(): void {
+  current = null;
+  cachedOnce = null;
+  downloading = null;
+}
+
+let cachedOnce: Promise<Basemap | null> | null = null;
+
+/**
+ * The archive kept in Cache Storage by an earlier 「簡易地図を読み込む」,
+ * verified again against the pin. Sends no request. A copy that does not
+ * match is deleted.
+ */
+export function cachedBasemap(deps: BasemapDeps = browserDeps()): Promise<Basemap | null> {
+  if (current) return Promise.resolve(current);
+  cachedOnce ??= (async () => {
+    if (!deps.caches) return null;
+    try {
+      const cache = await deps.caches.open(CACHE_NAME);
+      const url = archiveUrl(deps.pin);
+      const res = await cache.match(url);
+      if (!res) return null;
+      const blob = await res.blob();
+      if (!(await matchesPin(blob, deps.pin))) {
+        await cache.delete(url);
+        return null;
+      }
+      const b = await basemapFromBlob(blob, deps.pin.version);
+      return b ? publish(b) : null;
+    } catch (e) {
+      console.warn("cached basemap unavailable", e);
+      return null;
+    }
+  })();
+  return cachedOnce;
+}
+
+/** Whether the server serves the pinned version (GET /v1/info, the same for everyone). */
+export async function basemapOffered(deps: BasemapDeps = browserDeps()): Promise<boolean> {
+  try {
+    return (await Api.info("", deps.fetch)).basemap.includes(deps.pin.version);
+  } catch {
+    return false;
+  }
+}
+
+export class BasemapError extends Error {
+  constructor(readonly kind: "http" | "size" | "hash" | "archive") {
+    super(`basemap ${kind}`);
+    this.name = "BasemapError";
+  }
+}
+
+let downloading: Promise<Basemap> | null = null;
+
+/**
+ * 「簡易地図を読み込む」: the whole pinned archive in one request, without
+ * a Range header, verified, then kept in Cache Storage. `progress` gets
+ * the bytes received so far.
+ */
+export function downloadBasemap(progress?: (received: number, total: number) => void, deps: BasemapDeps = browserDeps()): Promise<Basemap> {
+  if (current) return Promise.resolve(current);
+  downloading ??= (async () => {
+    const pin = deps.pin;
+    const url = archiveUrl(pin);
+    const res = await deps.fetch(url, { credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer" });
+    if (res.status !== 200 || !res.body) throw new BasemapError("http");
+    const declared = res.headers.get("Content-Length");
+    if (declared !== null && Number(declared) !== pin.bytes) throw new BasemapError("size");
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let n = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        n += value.byteLength;
+        if (n > pin.bytes) {
+          await reader.cancel().catch(() => {});
+          throw new BasemapError("size");
+        }
+        chunks.push(value);
+        progress?.(n, pin.bytes);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const blob = new Blob(chunks.map((c) => buf(c)), { type: "application/zip" });
+    chunks.length = 0;
+    if (!(await matchesPin(blob, pin))) throw new BasemapError(blob.size === pin.bytes ? "hash" : "size");
+    const b = await basemapFromBlob(blob, pin.version).catch(() => null);
+    if (!b) throw new BasemapError("archive");
+    // Kept for later visits; a page without Cache Storage still uses it now.
+    try {
+      if (deps.caches) {
+        const cache = await deps.caches.open(CACHE_NAME);
+        await cache.put(url, new Response(blob, { headers: { "Content-Type": "application/zip", "Content-Length": String(blob.size) } }));
+      }
+    } catch (e) {
+      console.warn("basemap not kept in Cache Storage", e);
+    }
+    return publish(b);
+  })();
+  downloading.catch(() => (downloading = null));
+  return downloading;
+}
+

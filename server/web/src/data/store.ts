@@ -137,9 +137,12 @@ export class ViewerStore extends EventTarget {
     this.emit("change");
   }
 
-  /** Devices with any batch, plus the listed ones; the listed order first. */
+  /**
+   * Devices with any batch, plus the listed app devices; the listed order
+   * first. Browsers (viewers) record nothing and are left out.
+   */
   deviceIds(): string[] {
-    const ids = new Set(this.devices.map((d) => d.id));
+    const ids = new Set(this.devices.filter((d) => d.kind !== "viewer").map((d) => d.id));
     for (const b of this.batches) ids.add(b.deviceId);
     return [...ids];
   }

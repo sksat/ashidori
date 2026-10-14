@@ -50,7 +50,7 @@ CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.m
 
 | モデル | 防ぐ障害 | 主な性質 |
 |---|---|---|
-| `crypto/batch.spthy`, `batch_privacy.spthy` | サーバ管理者による位置ログの閲覧、別の端末やスロットへの暗号文の付け替え | `payload_secrecy`、`slot_binding`、識別不能性 |
+| `crypto/batch.spthy`, `batch_privacy.spthy` | サーバ管理者による位置ログの閲覧、別の端末やスロットへの暗号文の付け替え、閲覧端末から漏れたバッチ鍵による偽の blob | `payload_secrecy`、`slot_binding`、識別不能性 |
 | `crypto/browser_pairing.spthy` | ブラウザのペアリング（予定、[設計](../docs/design/browser-pairing-v1.md)）でサーバが鍵を差し替え、バッチ鍵を得る、偽の鍵をブラウザに渡す | `batch_key_secrecy`、`grant_agreement` |
 | `Registration` | 応答を失った端末が再送で別の結果を受け、トークンも端末も失う。期限切れのコードの消費 | `RetriesAgree`、`RecoverUngated`、`CodeIffDevice` |
 | `RegistrationClient` | 保存に失敗した鍵や登録で同期する。取消の失敗で再試行の手段を失う。解除の途中で落ちた後、別の登録が古い鍵を使う | `ReadReturnsPersisted`、`TokenRecoverable`、`NoForeignKey`、`CancelledNoEffect`、`Converges` |
@@ -77,20 +77,24 @@ CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.m
 信頼するのは、正規のアプリ、乱数生成、復旧コードによる端末間での `K` の受け渡しである。
 AES-256-GCM は理想的な AEAD とし、鍵、nonce、AAD が揃ったときだけ復号できるとする。
 バッチ鍵は `K` から一方向関数で導出する（HKDF のモデル）。
+`batch.spthy` の blob は v1.1 の `ASHM` であり、GCM の部分に、`K` から導く `Ka` による MAC（理想的な MAC）を続ける。
+閲覧端末（ブラウザ）が受け取ったバッチ鍵を漏らす規則 `Leak_BatchKey` を置く。閲覧端末は `K` も `Ka` も持たない。
 
 ### 性質と結果
 
-`batch.spthy`（`Reveal(K)` が起きない限り、という条件付き）：
+`batch.spthy`（`Reveal(K)` が起きない限り、という条件付き。バッチ鍵の漏洩 `LeakBK` は秘匿の補題だけで条件に加える）：
 
 | 補題 | 内容 | 結果 |
 |---|---|---|
 | `executable` | 正常な暗号化と受理が起こりうる | 成立（到達の確認） |
-| `key_secrecy`, `batch_key_secrecy` | 攻撃者は `K` もバッチ鍵も得られない | 成立 |
-| `payload_secrecy` | 暗号化した位置データを得られない | 成立 |
-| `slot_binding` | `Accept(K, device, stream, seq, m)` の前に、同じ `K` と AAD による `Seal` がある | 成立 |
+| `key_secrecy`, `batch_key_secrecy` | 攻撃者は `K` を得られない。バッチ鍵は閲覧端末が漏らさない限り得られない | 成立 |
+| `auth_key_secrecy` | バッチ鍵が漏れても、攻撃者は `Ka` を得られない | 成立 |
+| `payload_secrecy` | 閲覧端末がバッチ鍵を漏らさない限り、暗号化した位置データを得られない | 成立 |
+| `slot_binding` | `Accept(K, device, stream, seq, m)` の前に、同じ `K` と AAD による `Seal` がある。バッチ鍵が漏れても成り立つ | 成立 |
 | `no_slot_move` | あるスロット用の暗号文は、別のスロットでは受理されない | 成立 |
 | `*_if_key_revealed` | 上の三つから条件を外したもの | 期待どおり反例あり |
-| `-D=NOAAD` の `slot_binding`, `no_slot_move` | AAD にスロットを入れない変異 | 期待どおり反例あり |
+| `-D=NOAAD` の `slot_binding`, `no_slot_move` | AAD にも MAC にもスロットを入れない変異 | 期待どおり反例あり |
+| `-D=ASH1` の `slot_binding`, `no_slot_move` | アプリが MAC のない `ASH1` も受理する変異（切り替えの記録がない状態） | 期待どおり反例あり（漏れたバッチ鍵で任意のスロットの blob を作る） |
 | `no_forward_secrecy` | 後から `K` が漏れると、過去の暗号文も読める | そのような実行が存在する |
 | `same_device_id_for_two_devices` | 悪意あるサーバは同じ端末 ID を二台に与えられる | そのような実行が存在する |
 
@@ -103,6 +107,10 @@ AES-256-GCM は理想的な AEAD とし、鍵、nonce、AAD が揃ったとき�
 位置ログの秘匿は `K` の秘匿だけに依存し、トークンやペアリングコードの漏洩には依存しない。
 端末の失効は `K` の失効ではなく、`K` が一度漏れると過去と将来のすべてのバッチが読める。
 AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が保証するのは「その ID を割り当てられた、利用者のいずれかの端末が暗号化した」ことまでである。
+
+`ASH1` から `ASHM` への切り替え（[設計](../docs/design/browser-pairing-v1.md#blob-の認証v11)の切り替えの記録 `C`、`below` と `digest`、必須の状態に入る条件と保存、必須の前に `ASHM` を受理した位置より上の `ASH1` の拒否）はモデルにない。
+モデルは `ASHM` だけを受理する場合（成立）と、`ASH1` を無条件に受理する場合（`-D=ASH1`、反例あり）の両端だけを表す。
+切り替えの規則は core の試験 `BlobAuthSuite` で確かめる（`C` より上、`ASHM` を受理した位置より上、digest の不一致の `ASH1` の拒否、再起動と書き込みの失敗の後の状態）。
 
 `browser_pairing.spthy` は、予定のブラウザのペアリング（[`docs/design/browser-pairing-v1.md`](../docs/design/browser-pairing-v1.md)）のモデルである。
 攻撃者はサーバと通信路で、ページは信頼する。

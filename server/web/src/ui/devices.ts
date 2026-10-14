@@ -6,7 +6,7 @@ import { RECORDING_MODES } from "../data/records";
 import type { KeyStorage } from "../data/session";
 import type { Ctx } from "./context";
 import { confirmDialog, emoji, h, icon, replace, srOnly, toast } from "./dom";
-import { relTime, shortTime, STALE_MS, timeEl } from "./format";
+import { absTime, relTime, shortTime, STALE_MS, timeEl } from "./format";
 import { MapPanel } from "./mappanel";
 
 let panel: MapPanel | null = null;
@@ -142,9 +142,14 @@ export function renderDevices(ctx: Ctx, main: HTMLElement): void {
         h("dd", { class: "anywhere" }, location.host),
         h("dt", null, "登録"),
         h("dd", null, timeEl(sess?.registeredAt ?? null)),
+        sess?.expiresAt ? [h("dt", null, "期限"), h("dd", null, `${absTime(sess.expiresAt)} まで`)] : null,
+        sess?.source === "pairing" ? [h("dt", null, "鍵の保存"), h("dd", null, "このタブを閉じるまで")] : null,
       ),
     ),
-    h("div", { class: "zone" }, h("fieldset", null, h("legend", null, "鍵の保存"), storageRadio("tab", "このタブを閉じるまで"), storageRadio("browser", "このブラウザに保存"), h("p", { class: "hint" }, "共用の PC では保存しないでください。"))),
+    // Only the dev stub can keep its key in IndexedDB; a paired browser keeps it in memory only.
+    sess?.source === "dev"
+      ? h("div", { class: "zone" }, h("fieldset", null, h("legend", null, "鍵の保存"), storageRadio("tab", "このタブを閉じるまで"), storageRadio("browser", "このブラウザに保存"), h("p", { class: "hint" }, "共用の PC では保存しないでください。")))
+      : null,
     h(
       "div",
       { class: "zone danger" },

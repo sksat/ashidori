@@ -40,7 +40,15 @@ export interface DeviceRow {
   revoked_at: number | null;
   /** NULL for devices registered before accounts existed. */
   user_id: string | null;
+  /** "device": an app device. "viewer": a read-only browser (migration 0007). */
+  kind: DeviceKind;
+  /** Viewers only: when the token stops working (D1's clock). */
+  expires_at: number | null;
+  /** Viewers only: the app device that approved it. */
+  granted_by: string | null;
 }
+
+export type DeviceKind = "device" | "viewer";
 
 export type UserStatus = "active" | "disabled";
 

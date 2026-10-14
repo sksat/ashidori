@@ -22,9 +22,18 @@ begin
  * AES-256-GCM is an ideal AEAD: aead(k, n, ad, m) can be built only with k,
  * opened only with k and the same nonce and AAD. The batch key is
  * kdf(K) = HKDF-SHA256(K, "ashidori batch v1").
+ *
+ * Blob authentication v1.1 (docs/design/browser-pairing-v1.md): apps write
+ * ASHM, the GCM part followed by mac(kauth(K), <label, AAD, nonce, ciphertext>)
+ * (HMAC-SHA256 under Ka = HKDF(K, "ashidori batch auth v1"); hmac is an ideal
+ * MAC: built only with the key). A viewer (browser) receives the batch key and
+ * may leak it (Leak_BatchKey); it never receives K or Ka.
+ * Apps accept only ASHM here. Accepting ASH1 at all (-D=ASH1) is what the
+ * cut-over C prevents in the required state; C itself (below, digest,
+ * the states before it) is not modelled but tested (core BlobAuthSuite).
  */
 
-functions: aead/4, adec/4, kdf/1
+functions: aead/4, adec/4, kdf/1, kauth/1, hmac/2
 equations: adec(aead(k, n, ad, m), k, n, ad) = m
 
 // The first device creates K. Further devices receive it by the recovery code.
@@ -46,30 +55,54 @@ rule Register_Device:
 // no_slot_move must then be falsified.
 #ifdef NOAAD
 rule Seal:
+    let c = aead(kdf(K), ~n, 'noaad', ~m) in
     [ !Device(U, dev, K), In(<stream, seq>), Fr(~n), Fr(~m) ]
   --[ Seal(K, dev, stream, seq, ~m) ]->
-    [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, 'noaad', ~m)>) ]
+    [ Out(<dev, stream, seq, ~n, c, hmac(kauth(K), <'blobauth', 'noaad', ~n, c>)>) ]
 #else
 rule Seal:
+    let ad = <dev, stream, seq>
+        c = aead(kdf(K), ~n, ad, ~m) in
     [ !Device(U, dev, K), In(<stream, seq>), Fr(~n), Fr(~m) ]
   --[ Seal(K, dev, stream, seq, ~m) ]->
-    [ Out(<dev, stream, seq, ~n, aead(kdf(K), ~n, <dev, stream, seq>, ~m)>) ]
+    [ Out(<dev, stream, seq, ~n, c, hmac(kauth(K), <'blobauth', ad, ~n, c>)>) ]
 #endif
 
 // A device of the same user downloads the blob the server serves for the
-// slot (dev, stream, seq) it asked for, and opens it with that slot's AAD.
-// Decryption succeeds only for a ciphertext of this shape (AEAD integrity).
+// slot (dev, stream, seq) it asked for, checks the mac under Ka with that
+// slot's AAD, and opens it with that AAD. Decryption succeeds only for a
+// ciphertext of this shape (AEAD integrity).
 #ifdef NOAAD
 rule Accept:
-    [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, 'noaad', m)>) ]
+    let c = aead(kdf(K), n, 'noaad', m) in
+    [ !Device(U, me, K), In(<dev, stream, seq, n, c, hmac(kauth(K), <'blobauth', 'noaad', n, c>)>) ]
   --[ Accept(K, dev, stream, seq, m) ]->
     [ ]
 #else
 rule Accept:
+    let ad = <dev, stream, seq>
+        c = aead(kdf(K), n, ad, m) in
+    [ !Device(U, me, K), In(<dev, stream, seq, n, c, hmac(kauth(K), <'blobauth', ad, n, c>)>) ]
+  --[ Accept(K, dev, stream, seq, m) ]->
+    [ ]
+#endif
+
+// Mutation (-D=ASH1): the app also accepts ASH1 (GCM only), as without the
+// cut-over. A leaked batch key then forges blobs for any slot: slot_binding
+// and no_slot_move must be falsified.
+#ifdef ASH1
+rule Accept_Ash1:
     [ !Device(U, me, K), In(<dev, stream, seq, n, aead(kdf(K), n, <dev, stream, seq>, m)>) ]
   --[ Accept(K, dev, stream, seq, m) ]->
     [ ]
 #endif
+
+// A viewer that received the batch key leaks it (a hostile browser, or the
+// page changed by the operator). The viewer never holds K or Ka.
+rule Leak_BatchKey:
+    [ !UserKey(U, K) ]
+  --[ LeakBK(K) ]->
+    [ Out(kdf(K)) ]
 
 // Sanity: the key leaks (a compromised device, a typed-in recovery code on a
 // hostile web page, ...).
@@ -91,20 +124,28 @@ lemma key_secrecy:
   "All U K #i. NewKey(U, K) @ i ==>
      not (Ex #j. K(K) @ j) | (Ex #r. RevealK(K) @ r)"
 
+// A viewer that leaks the batch key exposes it, and with it the payloads.
 lemma batch_key_secrecy:
   "All U K #i. NewKey(U, K) @ i ==>
-     not (Ex #j. K(kdf(K)) @ j) | (Ex #r. RevealK(K) @ r)"
+     not (Ex #j. K(kdf(K)) @ j) | (Ex #r. RevealK(K) @ r) | (Ex #r. LeakBK(K) @ r)"
+
+// Ka never leaks with the batch key (v1.1).
+lemma auth_key_secrecy:
+  "All U K #i. NewKey(U, K) @ i ==>
+     not (Ex #j. K(kauth(K)) @ j) | (Ex #r. RevealK(K) @ r)"
 
 lemma payload_secrecy:
   "All K d s q m #i. Seal(K, d, s, q, m) @ i ==>
-     not (Ex #j. K(m) @ j) | (Ex #r. RevealK(K) @ r)"
+     not (Ex #j. K(m) @ j) | (Ex #r. RevealK(K) @ r) | (Ex #r. LeakBK(K) @ r)"
 
-// Accept(device, stream, seq, m) implies an earlier Seal with the same K and AAD.
+// Accept(device, stream, seq, m) implies an earlier Seal with the same K and
+// AAD, also when a viewer leaked the batch key (only K itself is excluded).
 lemma slot_binding:
   "All K d s q m #i. Accept(K, d, s, q, m) @ i ==>
      (Ex #j. Seal(K, d, s, q, m) @ j & #j < #i) | (Ex #r. RevealK(K) @ r)"
 
-// A ciphertext sealed for one slot is never accepted in another slot.
+// A ciphertext sealed for one slot is never accepted in another slot, also
+// when the batch key leaked.
 lemma no_slot_move:
   "All K d s q d2 s2 q2 m #i #j. Accept(K, d, s, q, m) @ i & Seal(K, d2, s2, q2, m) @ j ==>
      (d = d2 & s = s2 & q = q2) | (Ex #r. RevealK(K) @ r)"

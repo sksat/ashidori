@@ -1,6 +1,6 @@
 # ブラウザのペアリング v1（設計案）
 
-> 状態：**予定**。未実装の設計案である。「推奨」と記した項目は利用者の判断を待つ（[未決事項](#未決事項)）。
+> 状態：**実装中**。「推奨」と記した項目は採用した（[未決事項](#未決事項)）。サーバ、アプリ、ブラウザのペアリングは実装した。blob の認証（v1.1）は別に実装しており、アプリはそれが入るまで、リリースのビルドではペアリングを始めない。実ブラウザ（Playwright）の試験は未実施である。
 > 現行の同期は [`sync-protocol.md`](../sync-protocol.md)（v1）、鍵の階層の将来案は [`key-hierarchy.md`](key-hierarchy.md)（v2）である。
 > 形式モデルは [`formal/crypto/browser_pairing.spthy`](../../formal/crypto/browser_pairing.spthy) にある。
 

@@ -1,10 +1,12 @@
-import type { DeviceRow } from "./env";
+import type { DeviceKind, DeviceRow } from "./env";
 import { D1_NOW_MS, floorHour, generatePairingCode, sha256Hex } from "./util";
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000;
 /** Used and expired codes are kept this long after expiry (registration retries, auditing). */
 export const PAIRING_KEEP_MS = 24 * 60 * 60 * 1000;
 export const MAX_DEVICE_NAME = 64;
+/** Viewers are deleted this long after they expired or were revoked (they hold no batches). */
+export const VIEWER_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface DeviceView {
   id: string;
@@ -12,6 +14,10 @@ export interface DeviceView {
   createdAt: number;
   lastSeenAt: number | null;
   revoked: boolean;
+  /** "device" (an app) or "viewer" (a read-only browser). */
+  kind: DeviceKind;
+  /** Viewers: when the token stops working; null for app devices. */
+  expiresAt: number | null;
 }
 
 /** Admin view: every device with the user it belongs to (null for legacy devices). */
@@ -94,7 +100,8 @@ const CODE_USABLE = `used_at IS NULL AND expires_at > ${D1_NOW_MS}
   AND (CASE WHEN ${ISSUER} IS NULL THEN ${ADMIN_ISSUED}
        ELSE ${ISSUER} IN (SELECT id FROM devices WHERE revoked_at IS NULL) END)`;
 // Devices ever registered for the code's user (revoked ones included); `IS` so that NULL counts the legacy devices.
-const USER_DEVICES = "(SELECT COUNT(*) FROM devices WHERE user_id IS pairing_codes.user_id)";
+// Viewers (read-only browsers, migration 0007) do not count.
+const USER_DEVICES = "(SELECT COUNT(*) FROM devices WHERE user_id IS pairing_codes.user_id AND kind = 'device')";
 
 /**
  * What an earlier request with this token got: null if no device has the
@@ -199,13 +206,17 @@ export function parseDeviceName(raw: string): string | null {
   return name;
 }
 
-function toView(r: Omit<DeviceRow, "token_hash" | "user_id">): DeviceView {
+type ViewRow = Pick<DeviceRow, "id" | "name" | "created_at" | "last_seen_at" | "revoked_at" | "kind" | "expires_at">;
+
+function toView(r: ViewRow): DeviceView {
   return {
     id: r.id,
     name: r.name,
     createdAt: r.created_at,
     lastSeenAt: r.last_seen_at,
     revoked: r.revoked_at !== null,
+    kind: r.kind,
+    expiresAt: r.expires_at,
   };
 }
 
@@ -213,48 +224,84 @@ function toView(r: Omit<DeviceRow, "token_hash" | "user_id">): DeviceView {
 export async function listDevices(db: D1Database, userId: string | null): Promise<DeviceView[]> {
   const { results } = await db
     .prepare(
-      "SELECT id, name, created_at, last_seen_at, revoked_at FROM devices WHERE user_id IS ?1 ORDER BY created_at, id",
+      `SELECT id, name, created_at, last_seen_at, revoked_at, kind, expires_at
+       FROM devices WHERE user_id IS ?1 ORDER BY created_at, id`,
     )
     .bind(userId)
-    .all<Omit<DeviceRow, "token_hash" | "user_id">>();
+    .all<ViewRow>();
   return results.map(toView);
 }
 
 export async function listAllDevices(db: D1Database): Promise<AdminDeviceView[]> {
   const { results } = await db
     .prepare(
-      `SELECT d.id, d.name, d.created_at, d.last_seen_at, d.revoked_at, d.user_id, u.handle AS username
+      `SELECT d.id, d.name, d.created_at, d.last_seen_at, d.revoked_at, d.kind, d.expires_at, d.user_id,
+         u.handle AS username
        FROM devices d LEFT JOIN users u ON u.id = d.user_id
        ORDER BY d.created_at, d.id`,
     )
-    .all<Omit<DeviceRow, "token_hash"> & { username: string | null }>();
+    .all<ViewRow & { user_id: string | null; username: string | null }>();
   return results.map((r) => ({ ...toView(r), userId: r.user_id, username: r.username }));
 }
 
 /**
  * Revokes a device and, in the same batch (one transaction), deletes the
- * unused pairing codes it issued. Returns false if the device does not exist
- * in `scope`. Revoking twice is a no-op.
+ * unused pairing codes it issued, aborts the browser pairings it claimed and
+ * has not finished, and revokes the viewers it approved
+ * (docs/design/browser-pairing-v1.md, 承認端末の失効). The activation of a
+ * pairing checks in its own statement that the approving device is not
+ * revoked, so whichever commits first, no viewer approved by a revoked
+ * device remains. Returns false if the device does not exist in `scope`.
+ * Revoking twice is a no-op.
  */
 export async function revokeDevice(db: D1Database, id: string, scope: DeviceScope): Promise<boolean> {
   const now = Date.now();
-  const stmts =
-    scope === "all"
-      ? [
-          db.prepare(`DELETE FROM pairing_codes WHERE ${ISSUER} = ?1 AND used_at IS NULL`).bind(id),
-          db.prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1").bind(id, now),
-        ]
-      : [
-          db
-            .prepare(
-              `DELETE FROM pairing_codes WHERE ${ISSUER} = ?1 AND used_at IS NULL
-                 AND EXISTS (SELECT 1 FROM devices WHERE id = ?1 AND user_id IS ?2)`,
-            )
-            .bind(id, scope.userId),
-          db
-            .prepare("UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1 AND user_id IS ?3")
-            .bind(id, now, scope.userId),
-        ];
+  // In the user scope, every statement acts only if the device is the user's
+  // (?3; "all" binds ?3 to 1 and skips the check).
+  const all = scope === "all";
+  const inScope = all ? "?3 = 1" : "EXISTS (SELECT 1 FROM devices WHERE id = ?1 AND user_id IS ?3)";
+  const scopeArg = all ? 1 : scope.userId;
+  const stmts = [
+    db
+      .prepare(`DELETE FROM pairing_codes WHERE ${ISSUER} = ?1 AND used_at IS NULL AND ?2 = ?2 AND ${inScope}`)
+      .bind(id, now, scopeArg),
+    db
+      .prepare(
+        `UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2)
+         WHERE id = ?1 AND ${all ? "?3 = 1" : "user_id IS ?3"}`,
+      )
+      .bind(id, now, scopeArg),
+    db
+      .prepare(
+        `UPDATE viewer_pairings SET state = 'aborted', aborted_at = ?2
+         WHERE claimed_by = ?1 AND state NOT IN ('active', 'aborted') AND ${inScope}`,
+      )
+      .bind(id, now, scopeArg),
+    db
+      .prepare(
+        `UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2)
+         WHERE granted_by = ?1 AND kind = 'viewer' AND ${inScope}`,
+      )
+      .bind(id, now, scopeArg),
+  ];
   const [, revoked] = await db.batch(stmts);
   return revoked!.meta.changes > 0;
+}
+
+/**
+ * Scheduled: deletes viewers that expired or were revoked more than
+ * VIEWER_KEEP_MS ago, at most `limit`. Viewers hold no batches, codes or
+ * check-ins, so nothing refers to them.
+ */
+export async function deleteOldViewers(db: D1Database, now: number, limit = 1000): Promise<number> {
+  const res = await db
+    .prepare(
+      `DELETE FROM devices WHERE id IN (
+         SELECT id FROM devices WHERE kind = 'viewer'
+           AND (expires_at < ?1 OR revoked_at < ?1 OR expires_at IS NULL)
+         LIMIT ?2)`,
+    )
+    .bind(now - VIEWER_KEEP_MS, limit)
+    .run();
+  return res.meta.changes;
 }

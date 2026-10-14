@@ -1,17 +1,18 @@
-// The browser's registration as a read-only device: its device token and
-// the batch key. The pairing protocol that hands these over (the browser
-// makes a temporary key pair, the app seals the key to it after the user
-// compared the confirmation words; docs/web-viewer.md) is designed
-// separately (docs/design/browser-pairing-v1.md). Until it exists, the only
-// way in is the dev panel, compiled into dev builds only, which takes a
-// device token and the batch key pasted by the developer.
+// The browser's registration as a read-only device (a viewer): its token
+// and the batch key, nothing else. Pairing v1 (data/pairing.ts,
+// docs/design/browser-pairing-v1.md) hands them over: the browser shows a
+// code, the app seals the batch key to the browser's temporary key after
+// the user compared the four words on both. Dev builds also have a panel
+// that takes a device token and the batch key pasted by the developer.
 //
 // The key is kept as a non-extractable CryptoKey (docs/web-ui.md,
 // "セキュリティに関わる UX"): scripts of the same origin (the admin page)
-// can use it while the page is open, but cannot read its value.
+// can use it while the page is open, but cannot read its value. A paired
+// session lives in memory only; a reload or a closed tab pairs again.
 
 import { fromBase64, fromHex } from "./bytes";
 import { importBatchKey } from "./crypto";
+import { PairingAttempt, browserDeps, type PairingDeps, type PairingEvent } from "./pairing";
 
 export type KeyStorage = "tab" | "browser";
 
@@ -24,6 +25,8 @@ export interface ViewerSession {
   /** The name the browser registered under. */
   name: string;
   registeredAt: number;
+  /** When the server stops serving this browser (ms), null if unknown. */
+  expiresAt: number | null;
   storage: KeyStorage;
   source: "dev" | "pairing";
 }
@@ -35,29 +38,34 @@ export interface SessionStore {
   clear(): Promise<void>;
 }
 
-/**
- * The pairing protocol, to be implemented from browser-pairing-v1. The UI
- * (3 steps: code, confirmation words, done) only depends on this.
- */
-export interface Pairing {
-  /** Step 1: a code issued by the app. Resolves with the words to compare. */
-  start(code: string, signal?: AbortSignal): Promise<{ words: string[]; expiresAt: number }>;
-  /** Step 2: waits until the app allowed it, then returns the session. */
-  wait(signal?: AbortSignal): Promise<ViewerSession>;
-  /** 「一致しない」, expiry or failure: drops the temporary key. */
+/** One running attempt, as the UI controls it. */
+export interface PairingControl {
+  /** 「一致する」. */
+  confirm(): void;
+  /** 「一致しない」: aborts and drops the temporary key. */
+  mismatch(): Promise<void>;
+  /** Leaves the attempt without a result (the page starts another). */
   cancel(): Promise<void>;
+  /** Milliseconds left of the attempt. */
+  remainingMs(): number;
 }
 
-/** No protocol yet: every attempt says so. */
-export const PAIRING_UNAVAILABLE: Pairing = {
-  async start() {
-    throw new Error("pairing not implemented");
-  },
-  async wait() {
-    throw new Error("pairing not implemented");
-  },
-  async cancel() {},
-};
+/** The pairing protocol. The UI (3 steps: code, words, done) only depends on this. */
+export interface Pairing {
+  /** Starts a new attempt; its progress and outcome arrive as events. */
+  start(onEvent: (e: PairingEvent) => void): PairingControl;
+}
+
+/** Pairing v1 against the server that serves this page. */
+export function pairingV1(deps: PairingDeps = browserDeps()): Pairing {
+  return {
+    start(onEvent) {
+      const a = new PairingAttempt(deps, onEvent);
+      void a.run();
+      return a;
+    },
+  };
+}
 
 /** The dev panel exists only in `vite` dev builds (import.meta.env.DEV is false in production bundles). */
 export const DEV_PANEL: boolean = import.meta.env.DEV;
@@ -81,7 +89,7 @@ export async function devSession(token: string, keyText: string, storage: KeySto
   const raw = parseKeyText(keyText);
   const batchKey = await importBatchKey(raw);
   raw.fill(0);
-  return { token: tok, batchKey, deviceId: null, name: "開発用", registeredAt: Date.now(), storage, source: "dev" };
+  return { token: tok, batchKey, deviceId: null, name: "開発用", registeredAt: Date.now(), expiresAt: null, storage, source: "dev" };
 }
 
 /** 「このタブを閉じるまで」: memory only; a reload asks again. */
@@ -130,7 +138,7 @@ export class IdbStore implements SessionStore {
   async load(): Promise<ViewerSession | null> {
     try {
       const v = (await tx("readonly", (s) => s.get("current"))) as ViewerSession | undefined;
-      return v && v.batchKey instanceof CryptoKey && TOKEN_RE.test(v.token) ? v : null;
+      return v && v.source === "dev" && v.batchKey instanceof CryptoKey && TOKEN_RE.test(v.token) ? { ...v, expiresAt: v.expiresAt ?? null } : null;
     } catch {
       return null;
     }
@@ -158,9 +166,10 @@ export class Sessions {
     return (await this.memory.load()) ?? (await this.persistent.load());
   }
 
+  /** A paired session is never persisted (memory only, browser-pairing-v1). */
   async save(s: ViewerSession): Promise<void> {
     await this.memory.save(s);
-    if (s.storage === "browser") await this.persistent.save(s);
+    if (s.storage === "browser" && s.source === "dev") await this.persistent.save(s);
     else await this.persistent.clear();
   }
 

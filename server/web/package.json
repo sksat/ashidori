@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hpke/core": "1.9.0",
     "fflate": "0.8.2",
     "hyparquet": "1.31.2",
     "maplibre-gl": "6.11.2",

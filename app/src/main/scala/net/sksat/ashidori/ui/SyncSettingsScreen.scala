@@ -42,6 +42,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
   private given Ctx = act
   override val title = "同期"
   private val net = Executors.newSingleThreadExecutor()
+  /** 「ブラウザでも見る」: the opt-in, the browsers that can read, and the approval. */
+  private lazy val browsers = BrowserPairingUi(act, () => ())
   private val fmt = DateTimeFormatter.ofPattern("M/d HH:mm")
   private val body = vbox()
   val view: View = scroll(body)
@@ -87,6 +89,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
   override def onDestroy(): Unit =
     unobserve()
     net.shutdown()
+    browsers.shutdown()
 
   /** Outcomes of registration attempts, whichever screen instance started
     * them. A result of an attempt that is no longer the latest (cancelled,
@@ -179,6 +182,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       body.addView(statusCard())
       body.addView(optionsCard())
       body.addView(devicesCard())
+      body.addView(browsers.view())
     body.addView(spacer(24))
 
   // --- step 1: server and registration ---
@@ -566,7 +570,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
           js =>
             // Same list as the 端末 section of the ステータス tab.
             PeerStatus.saveDevices(js, reg)
-            for d <- js.arr do
+            // Browsers are listed in their own card (BrowserPairingUi).
+            for d <- js.arr if !d.obj.get("kind").flatMap(_.strOpt).contains("viewer") do
               val id = d("id").str
               val revoked = d.obj.get("revoked").exists(_.bool)
               val me = id == SyncConfig.deviceId

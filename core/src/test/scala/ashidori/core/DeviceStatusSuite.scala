@@ -11,7 +11,7 @@ class DeviceStatusSuite extends munit.FunSuite:
   )
 
   test("record survives seal, gzip and decode under the source device's AAD") {
-    val key = Crypto.batchKey(Crypto.newMasterKey())
+    val key = BlobKeys.of(Crypto.newMasterKey())
     val aad = Crypto.aad("devA", DeviceStatus.Stream, 3)
     val blob = Crypto.seal(key, aad, Crypto.gzip(DeviceStatus.encode(status)))
     val back = DeviceStatus.decode(Crypto.gunzip(Crypto.open(key, aad, blob))).get
@@ -74,7 +74,7 @@ class DeviceStatusSuite extends munit.FunSuite:
   }
 
   test("a fetched blob must match the listed size and SHA-256 before it is opened") {
-    val key = Crypto.batchKey(Crypto.newMasterKey())
+    val key = BlobKeys.of(Crypto.newMasterKey())
     val aad = Crypto.aad("a", DeviceStatus.Stream, 5)
     val plain = Crypto.gzip(DeviceStatus.encode(status))
     val listedBlob = Crypto.seal(key, aad, plain)

@@ -32,6 +32,7 @@ import {
   revokeDevice,
 } from "./devices";
 import { basemapVersions } from "./basemap";
+import { viewerPairings } from "./viewer-pairings";
 import type { AppEnv } from "./env";
 import { clientKey, edgeAllowed, hitRateLimit, RULES, selfRegistrationEdgeReady } from "./ratelimit";
 import {
@@ -309,6 +310,9 @@ v1.post("/pairing", async (c) => {
   }
   return c.json(await createPairingCode(c.env.DB, device.id, device.user_id, device.id), 201);
 });
+
+// Browser pairing (see viewer-pairings.ts): its own authentication per route.
+v1.route("/viewer-pairings", viewerPairings);
 
 v1.get("/devices", async (c) => c.json(await listDevices(c.env.DB, c.get("device").user_id)));
 

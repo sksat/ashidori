@@ -12,6 +12,8 @@ dependencies {
     api(libs.ujson)
     // QR codes of registration links (PairQr). Apache License 2.0.
     implementation(libs.zxing.core)
+    // HPKE seal of the browser grant (ViewerPairing). Apache License 2.0.
+    implementation(libs.tink.android)
     testImplementation(libs.munit)
 }
 
@@ -31,5 +33,16 @@ tasks.register<JavaExec>("webFixtures") {
     description = "Writes the web viewer's test fixtures with the app's own code."
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("ashidori.core.WebFixtures")
+    args(rootProject.file("server/web/test/fixtures").absolutePath)
+    finalizedBy("viewerPairingFixtures")
+}
+
+// Interop vectors of browser pairing v1 (server/web/test/fixtures/viewer-pairing.json),
+// with grants sealed by Tink (ViewerPairingFixtures.scala).
+tasks.register<JavaExec>("viewerPairingFixtures") {
+    group = "verification"
+    description = "Writes the web viewer's browser-pairing vectors with the app's own code."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("ashidori.core.ViewerPairingFixtures")
     args(rootProject.file("server/web/test/fixtures").absolutePath)
 }

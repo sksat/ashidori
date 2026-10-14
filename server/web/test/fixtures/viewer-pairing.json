@@ -1,0 +1,164 @@
+{
+  "about": "Written by ./gradlew :core:webFixtures (core ViewerPairingFixtures, Tink 1.23.0); do not edit.",
+  "wordlistSha256": "2eed0aef492291e061633d7ad8117f1a2b03eb80a29d0e4e3117ac2528d05ffd",
+  "sas": {
+    "id": "000102030405060708090a0b0c0d0e0f",
+    "code": "ABCD2345",
+    "pkB": "3333333333333333333333333333333333333333333333333333333333333333",
+    "nB": "1111111111111111111111111111111111111111111111111111111111111111",
+    "sA": "4444444444444444444444444444444444444444444444444444444444444444",
+    "scope": "batch-v1",
+    "ttl": 3600,
+    "c": "bd511eec808fd863c98d184c6c3365b4795dd5faa744c4eb4739745b643c90a6",
+    "nA": "12f1f75587df148a55d473a566e6af39dfb694346eb15f318296e00ec72c0428",
+    "th": "7d6395cd068e7461034748a495ad8260d04489d466cb7a0b33f14b157cd9d3a8",
+    "d": "44999b5930258f874d3b41f7db18409b1024d7992aae8c45b5c98ef873c9e071",
+    "indices": [
+      548,
+      1638,
+      1714,
+      770
+    ],
+    "words": [
+      "けっせき",
+      "ぴっちり",
+      "ふみん",
+      "ざんしょ"
+    ]
+  },
+  "tamper": [
+    {
+      "field": "id",
+      "value": "000102030405060708090a0b0c0d0e0e",
+      "th": "c1f9fef96252d67bf5b3da71b236fb625a573dc2e93386c53dd9b47e4bfa8d97",
+      "words": [
+        "ちかい",
+        "さのう",
+        "そえん",
+        "こんかい"
+      ]
+    },
+    {
+      "field": "code",
+      "value": "ABCD2346",
+      "th": "e2eaade87c79d1ea11ce09a71aefbda74ac4c0112d3e8fa150bb05f01876fd41",
+      "words": [
+        "ざつおん",
+        "ねったいぎょ",
+        "ざいちゅう",
+        "なみだ"
+      ]
+    },
+    {
+      "field": "c",
+      "value": "bd511eec808fd863c98d184c6c3365b4795dd5faa744c4eb4739745b643c90a7",
+      "th": "6528f1a53c06dafe49c18e6f0587acbd12cfcdfa1c56b0cb08a74433b86bf0ce",
+      "words": [
+        "つわり",
+        "おたく",
+        "いない",
+        "はいれつ"
+      ]
+    },
+    {
+      "field": "nA",
+      "value": "12f1f75587df148a55d473a566e6af39dfb694346eb15f318296e00ec72c0429",
+      "th": "5cc30852eaeffadd95223cb0517ab180b4fc1e3e8a24b7b4f0e9f9934b355ea6",
+      "words": [
+        "こんぽん",
+        "くちこみ",
+        "きんかくじ",
+        "ちらみ"
+      ]
+    },
+    {
+      "field": "scope",
+      "value": "batch-v2",
+      "th": "cbfd9a6c4834ec9ffd9f83e71fda8767d9b33ac2d1ce8c6d2d222708648b654d",
+      "words": [
+        "はいけん",
+        "うけもつ",
+        "はいそう",
+        "ざつおん"
+      ]
+    },
+    {
+      "field": "ttl",
+      "value": 86400,
+      "th": "83096ca2d874d547606ae5133add1f480242a3b7f20c45bde3dd9f99a79a0f81",
+      "words": [
+        "せいじ",
+        "そつぎょう",
+        "むすめ",
+        "はってん"
+      ]
+    },
+    {
+      "field": "pkB",
+      "value": "3333333333333333333333333333333333333333333333333333333333333332",
+      "th": "750eb47142a9a66f582c58b5440a760de176228524b0c30ea603cda0ade3c6c5",
+      "words": [
+        "そいね",
+        "こんまけ",
+        "ほいく",
+        "きれい"
+      ]
+    },
+    {
+      "field": "nB",
+      "value": "1111111111111111111111111111111111111111111111111111111111111110",
+      "th": "45c7cbb538fdbf009bc12d528c9d2c0a206b33ca0768b45b844a94ba77df551e",
+      "words": [
+        "だいたい",
+        "せあぶら",
+        "しゅくはく",
+        "あさひ"
+      ]
+    }
+  ],
+  "grant": {
+    "skB": "077e446991be0fd1ada41ba9a8b67d8a3e081ca3c589e5664dd6eccbd3f02d95",
+    "pkB": "7d305c3fc791910dabacffc795787c3fda2092ef970e6dad5dab3207ca958247",
+    "nB": "2c4644bf7c8cac91ea5f3d3c41300fb82ce1e6e7fdca324f386bc7239373c26d",
+    "id": "54e98cf61468098b986705850e945dc4",
+    "code": "7K3M9QX2",
+    "sA": "36cd51d7713c395fd2ef19730adbd432190b4d781779e58b61ef2b1344898810",
+    "nA": "bf02129c8aa5af4163dd0cd4113f912a86166dfe833126a007280deaf1b6e73c",
+    "c": "590b57196f7736a8d1199e42c8a9afb72fd3eb1b6b71e4b4badb3d1d572a8f79",
+    "scope": "batch-v1",
+    "ttl": 86400,
+    "th": "3a5480bc06802acb5c291ccf0e66a851d352acb3bc2deb523ef8999a87938022",
+    "info": "61736869646f726920766965776572206772616e742076313a5480bc06802acb5c291ccf0e66a851d352acb3bc2deb523ef8999a87938022",
+    "batchKey": "270636ec8ea7ac498321b5bf8b12bb636fe260279b452c4a6b8afaed7a6bb0b9",
+    "grant": "dca3b029423c37918f463ff72be18861f8d1c3ec4fe23473fab92e2bf260c3563266fac97b42e576f0fcec83ccbb6254da2b7e388ca7a68268c989496082ad3384678af50e431db7ba2a255ee410873c7a8abf862972ed616198ea3605f3e981eff5cb5e60fc9aeb99001d7845c2eae014"
+  },
+  "wrongSa": {
+    "sA": "15a66489f02de96ddd4f71fb8db25162dc7771e1366ea103c214ddd61cb2a666",
+    "grant": "a19ef7f872732db060edb2c60cd4387aa49de2a9b73e19c09c297b3fc304d303bd44dabd61c6673ea1b569498243177b8cef1313f61cb2ba7c99cd2e784376856fb749c21c8332fc752d21ca9ee56a30596916cefdf55670924ee8999f8a18fd3ca010c679e36951c262b654511331e3e5"
+  },
+  "badVersion": {
+    "grant": "f6d3e88deecff8e567fcdcfa26bc596d0e983fc5c0576f2d0b42aae7d1732f1c5415398bbaebde9578881f39a0a407e3c7dea6d48e7f1fb0668f6a8474e4d07950921cbeb83c3f4d5faff940214e1604890f213f398425feb31602cfa3e7d7a117926914dddcef6e58d162608788ac3c5b"
+  },
+  "longPlain": {
+    "grant": "9e1fcb88692f92dad6828ddd04c0fa57656b1c61b9f7bf07f6ad587313c32f51e23c4a651ca055847b3568ade8a2c7c2000cff9d3e7b11f1c4bdfb01f3928498a268488e920b4cd333935ef033ba837d08fa926488578b37f3d26add58dc11045ab20e6640f5b6f0ea91a6374196c4fc758e"
+  },
+  "shortPlain": {
+    "grant": "25f8062949bc87512ad417352a160ed085388328243700663986a7d7895dfa7b6bb40dce2ee8d6761eac6a01d2007c1b8f22d0a81145283e51f3bf06b08761c0c6edd12b493b5c9c71ccf97aa7a7a27ce5dfb1b8efd206f5c7918900512a94c3440f7884b23a444ad3ba8130e8c2254a"
+  },
+  "lowOrder": [
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "0100000000000000000000000000000000000000000000000000000000000080",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880",
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "0000000000000000000000000000000000000000000000000000000000000080"
+  ]
+}

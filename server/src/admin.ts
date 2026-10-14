@@ -259,7 +259,8 @@ async function load() {
       if (confirm(d.name + " を失効させますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
     }]];
     const owner = d.userId === null ? "なし" : (d.username ?? "ユーザ名未設定");
-    row(dt, [d.name + (d.revoked ? " (失効)" : ""), owner, fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
+    const label = d.kind === "viewer" ? "ブラウザ (期限 " + fmt(d.expiresAt) + ")" : d.name;
+    row(dt, [label + (d.revoked ? " (失効)" : ""), owner, fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
   }
   const ct = $("checkins"); ct.textContent = "";
   for (const p of checkins) {

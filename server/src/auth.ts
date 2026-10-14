@@ -2,36 +2,98 @@ import type { MiddlewareHandler } from "hono";
 import { verifyAccessJwt } from "./access";
 import type { AppEnv, DeviceRow, UserStatus } from "./env";
 import { parseAdminEmails } from "./users";
-import { DEVICE_TOKEN_RE, floorHour, jsonError, sha256Hex, timingSafeEqualStr } from "./util";
+import { D1_NOW_MS, DEVICE_TOKEN_RE, floorHour, jsonError, sha256Hex, timingSafeEqualStr } from "./util";
 
-function bearer(req: Request): string | null {
+export function bearer(req: Request): string | null {
   const h = req.headers.get("Authorization");
   if (!h) return null;
   const m = /^Bearer\s+(\S+)\s*$/i.exec(h);
   return m ? m[1]! : null;
 }
 
-/** Device bearer-token authentication for /v1/*. */
+/**
+ * The stored token_hash of a viewer (a read-only browser, migration 0007):
+ * 'v:' || SHA-256(token). A Worker of migration 0006 looks devices up by the
+ * plain hash only, so it never authenticates a viewer token.
+ */
+export const VIEWER_HASH_PREFIX = "v:";
+
+/**
+ * What a viewer token may do (docs/design/browser-pairing-v1.md, 閲覧端末と
+ * トークンの範囲). Everything else is refused with 403 "read-only token": a
+ * route is open to viewers only if it is listed here (default deny).
+ * Revoking is allowed for the viewer itself only (the browser's 登録の解除).
+ */
+const VIEWER_ROUTES: Array<{ method: string; path: RegExp; self?: true }> = [
+  { method: "GET", path: /^\/v1\/devices$/ },
+  { method: "GET", path: /^\/v1\/batches$/ },
+  { method: "GET", path: /^\/v1\/batches\/[^/]+\/[^/]+\/[^/]+$/ },
+  { method: "POST", path: /^\/v1\/devices\/([^/]+)\/revoke$/, self: true },
+];
+
+/** Whether a viewer device may make this request. */
+export function viewerAllowed(method: string, path: string, viewerId: string): boolean {
+  const m = method === "HEAD" ? "GET" : method;
+  for (const r of VIEWER_ROUTES) {
+    if (r.method !== m) continue;
+    const match = r.path.exec(path);
+    if (!match) continue;
+    if (!r.self) return true;
+    try {
+      return decodeURIComponent(match[1]!) === viewerId;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+type AuthRow = DeviceRow & { user_status: UserStatus | null; expired: number };
+
+/**
+ * Looks a device up by its token: an app device by SHA-256(token), a viewer
+ * by 'v:' || SHA-256(token). Null if none, if both match (never issued: the
+ * pairing refuses a token that a device has), if revoked, expired (judged by
+ * D1's clock in the same statement) or of a disabled user.
+ */
+export async function authenticateToken(db: D1Database, token: string): Promise<DeviceRow | null> {
+  if (!DEVICE_TOKEN_RE.test(token)) return null;
+  const hash = await sha256Hex(token);
+  const { results } = await db
+    .prepare(
+      `SELECT d.id, d.name, d.token_hash, d.created_at, d.last_seen_at, d.revoked_at, d.user_id,
+         d.kind, d.expires_at, d.granted_by, u.status AS user_status,
+         CASE WHEN d.expires_at IS NOT NULL AND d.expires_at <= ${D1_NOW_MS} THEN 1 ELSE 0 END AS expired
+       FROM devices d LEFT JOIN users u ON u.id = d.user_id
+       WHERE d.token_hash IN (?1, '${VIEWER_HASH_PREFIX}' || ?1)`,
+    )
+    .bind(hash)
+    .all<AuthRow>();
+  if (results.length !== 1) return null;
+  const row = results[0]!;
+  const expected = row.kind === "viewer" ? VIEWER_HASH_PREFIX + hash : hash;
+  // The lookup is by hash; the explicit constant-time comparison is defense in depth.
+  if (!timingSafeEqualStr(row.token_hash, expected) || row.revoked_at !== null || row.expired !== 0) return null;
+  // A viewer always has an expiry; one without is never valid.
+  if (row.kind === "viewer" && row.expires_at === null) return null;
+  // Devices of a disabled user stop working (legacy devices have no user).
+  if (row.user_id !== null && row.user_status !== "active") return null;
+  const { user_status: _s, expired: _e, ...device } = row;
+  return device;
+}
+
+/**
+ * Device bearer-token authentication for /v1/*. A viewer token gets 403
+ * "read-only token" on every route that VIEWER_ROUTES does not list.
+ */
 export const deviceAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const token = bearer(c.req.raw);
   if (!token || !DEVICE_TOKEN_RE.test(token)) return jsonError(c, 401, "unauthorized");
-
-  const hash = await sha256Hex(token);
-  const row = await c.env.DB.prepare(
-    `SELECT d.id, d.name, d.token_hash, d.created_at, d.last_seen_at, d.revoked_at, d.user_id,
-       u.status AS user_status
-     FROM devices d LEFT JOIN users u ON u.id = d.user_id
-     WHERE d.token_hash = ?1`,
-  )
-    .bind(hash)
-    .first<DeviceRow & { user_status: UserStatus | null }>();
-  // The lookup is by hash; the explicit constant-time comparison below is defense in depth.
-  if (!row || !timingSafeEqualStr(row.token_hash, hash) || row.revoked_at !== null) {
-    return jsonError(c, 401, "unauthorized");
+  const device = await authenticateToken(c.env.DB, token);
+  if (!device) return jsonError(c, 401, "unauthorized");
+  if (device.kind === "viewer" && !viewerAllowed(c.req.method, c.req.path, device.id)) {
+    return jsonError(c, 403, "read-only token");
   }
-  // Devices of a disabled user stop working (legacy devices have no user).
-  if (row.user_id !== null && row.user_status !== "active") return jsonError(c, 401, "unauthorized");
-  const { user_status: _, ...device } = row;
 
   // Hour granularity: enough to spot unused devices, without a timeline of
   // when the user is active. At most one write per device per hour.

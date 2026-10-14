@@ -83,3 +83,30 @@ export function concat(parts: readonly Uint8Array[]): Uint8Array {
   }
   return out;
 }
+
+/** URL-safe base64 without padding (the API's byte fields, device tokens). */
+export function toBase64Url(b: Uint8Array): string {
+  let bin = "";
+  for (const x of b) bin += String.fromCharCode(x);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Strict URL-safe base64 without padding of exactly `len` bytes, else null. */
+export function fromBase64UrlExact(s: unknown, len: number): Uint8Array | null {
+  if (typeof s !== "string" || !/^[A-Za-z0-9_-]*$/.test(s) || s.length !== Math.ceil((len * 4) / 3)) return null;
+  try {
+    const b = fromBase64(s);
+    // Non-canonical encodings (stray bits in the last character) are refused.
+    return b.byteLength === len && toBase64Url(b) === s ? b : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Comparison of two byte strings without an early exit (their length is public). */
+export function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  let d = 0;
+  for (let i = 0; i < a.byteLength; i++) d |= a[i]! ^ b[i]!;
+  return d === 0;
+}

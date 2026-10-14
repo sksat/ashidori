@@ -105,6 +105,7 @@ object SyncConfig:
     AshidoriApp.db.clearSync()
     Uploader.deleteLegacyPending()
     PeerStatus.clear()
+    AuthCutover.clear()
     if !prefs.edit().clear().commit() then throw java.io.IOException("同期の設定を消去できませんでした")
 
 /** Serializes all sync work (periodic small, sync now, raw logs, unpairing):
@@ -125,8 +126,11 @@ object SyncLock:
       try Some(f)
       finally lock.unlock()
 
-/** A sync run's fixed view of the registration, taken under [[SyncLock]]. */
-final case class SyncRun(reg: String, deviceId: String, batchKey: Array[Byte], client: SyncClient, stopped: () => Boolean):
+/** A sync run's fixed view of the registration, taken under [[SyncLock]].
+  * `keys`: the batch key and the blob authentication key `Ka` (v1.1).
+  */
+final case class SyncRun(reg: String, deviceId: String, keys: BlobKeys, client: SyncClient, stopped: () => Boolean):
+  def batchKey: Array[Byte] = keys.batch
   def checkStopped(): Unit = if stopped() then throw SyncRun.Stopped()
 
 object SyncRun:
@@ -140,7 +144,7 @@ object SyncRun:
     */
   def current(stopped: () => Boolean = () => false): Option[SyncRun] =
     SyncConfig.session.map(s =>
-      SyncRun(s.reg, s.deviceId, Crypto.batchKey(s.key), SyncClient(s.url, Some(s.token)), stopped))
+      SyncRun(s.reg, s.deviceId, BlobKeys.of(s.key), SyncClient(s.url, Some(s.token)), stopped))
 
 /** Device registration ([[RegistrationMachine]]): the request and token in
   * [[SecureStore]], the result in [[SyncConfig]], events on the main thread.
@@ -453,15 +457,37 @@ object Uploader:
   private def jsonl(records: Seq[ujson.Value]): Array[Byte] =
     Crypto.gzip(records.map(ujson.write(_)).mkString("", "\n", "\n").getBytes(UTF_8))
 
-  /** Seals `plain` for the stream's next seq of `run`'s registration (outside
-    * any transaction), then stores it with `progress` in one small transaction.
+  /** Seals `plain` as ASHM (v1.1: with the MAC under `Ka`) for the stream's
+    * next seq of `run`'s registration (outside any transaction), then stores
+    * it with `progress` in one small transaction. Returns the seq and blob.
     */
   private def enqueue(run: SyncRun, cls: String, stream: String, plain: Array[Byte], progress: Seq[(String, Long)],
-                      remove: Seq[String] = Nil): Unit =
+                      remove: Seq[String] = Nil): (Long, Array[Byte]) =
     val db = AshidoriApp.db
     val seq = db.nextSeq(run.reg, stream)
-    val blob = Crypto.seal(run.batchKey, Crypto.aad(run.deviceId, stream, seq), plain)
+    val blob = Crypto.seal(run.keys, Crypto.aad(run.deviceId, stream, seq), plain)
     db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove)
+    (seq, blob)
+
+  /** Stores the cut-over record C (gzipped plaintext) for upload, as the next
+    * `authcut` batch of this device. On disk when it returns; sent by
+    * [[flushCutover]] (or any later small-stream run).
+    */
+  def enqueueCutover(run: SyncRun, plain: Array[Byte]): CutRef =
+    val (seq, blob) = enqueue(run, Small, CutoverRecord.Stream, plain, Nil)
+    CutRef(run.deviceId, seq, Crypto.sha256Hex(blob))
+
+  /** Sends the unsent `authcut` batches of the outbox, and nothing else (the
+    * user may be on a network the other batches wait out). Throws on
+    * failure; true when none is left.
+    */
+  def flushCutover(run: SyncRun): Boolean =
+    val db = AshidoriApp.db
+    for e <- db.outbox(run.reg, Set(Small)) if e.stream == CutoverRecord.Stream && e.deviceId == run.deviceId do
+      run.checkStopped()
+      run.client.putBatch(e.stream, e.seq, db.outboxBlob(e.id))
+      db.deleteOutbox(e.id)
+    !db.outbox(run.reg, Set(Small)).exists(e => e.stream == CutoverRecord.Stream && e.deviceId == run.deviceId)
 
   /** Upload the small streams. Returns the number of batches sent.
     * Editable data (places, check-ins, corrections) plus the archived

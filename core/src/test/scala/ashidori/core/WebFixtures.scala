@@ -6,7 +6,7 @@ import java.nio.file.Files
 import java.time.{LocalDate, ZoneId}
 import ashidori.core.parquet.*
 import ashidori.core.sim.*
-import ashidori.core.sync.{Crypto, DeviceStatus, StatusFix}
+import ashidori.core.sync.{BatchMeta, BlobKeys, CutRef, CutoverRecord, Crypto, DeviceStatus, StatusFix}
 
 /** Writes the fixtures of the web viewer's tests (server/web/test/fixtures)
   * with the app's own code: Parquet files from [[ParquetWriter]], batches
@@ -16,6 +16,10 @@ import ashidori.core.sync.{Crypto, DeviceStatus, StatusFix}
   *
   * Run with `./gradlew :core:webFixtures`. Sealed blobs use random nonces,
   * so every run changes them; everything else is deterministic.
+  *
+  * The batches of `sync/` mix the two formats as a real history does: the
+  * oldest are ASH1 (written before v1.1), the rest ASHM, and devA's
+  * cut-over record (`authcut`) sits between them, named by its last status.
   */
 object WebFixtures:
   private val Zone: ZoneId = Scenarios.Tokyo
@@ -37,7 +41,8 @@ object WebFixtures:
     val blobs = File(dir, "blobs")
     blobs.mkdirs()
     blobs.listFiles().foreach(_.delete())
-    val key = Crypto.batchKey(MasterKey)
+    val keys = BlobKeys.of(MasterKey)
+    val key = keys.batch
     val devA = "0f5c2a8e-7d1b-4c3e-9a61-2b7d5e8f4a10"
     val devB = "6a3e9b0c-1f2d-4e5a-8b7c-9d0e1f2a3b4c"
     val now = System.currentTimeMillis()
@@ -49,7 +54,7 @@ object WebFixtures:
       val s = seq((dev, stream))
       seq((dev, stream)) = s + 1
       val plain = records.map(r => ujson.write(r) + "\n").mkString.getBytes(UTF_8)
-      val blob = Crypto.seal(key, Crypto.aad(dev, stream, s), Crypto.gzip(plain))
+      val blob = Crypto.seal(keys, Crypto.aad(dev, stream, s), Crypto.gzip(plain))
       Files.write(File(blobs, s"$dev.$stream.$s").toPath, blob)
       cursor += 3
       items += ujson.Obj("cursor" -> num(cursor), "deviceId" -> dev, "stream" -> stream, "seq" -> num(s),
@@ -162,7 +167,8 @@ object WebFixtures:
     val blobs = File(dir, "blobs")
     blobs.mkdirs()
     blobs.listFiles().foreach(_.delete())
-    val key = Crypto.batchKey(MasterKey)
+    val keys = BlobKeys.of(MasterKey)
+    val key = keys.batch
     val devA = "0f5c2a8e-7d1b-4c3e-9a61-2b7d5e8f4a10"
     val devB = "6a3e9b0c-1f2d-4e5a-8b7c-9d0e1f2a3b4c"
     val hour = 3_600_000L
@@ -170,17 +176,25 @@ object WebFixtures:
     var cursor = 100L
     val seqs = scala.collection.mutable.Map.empty[(String, String), Long].withDefaultValue(0L)
     val items = Vector.newBuilder[ujson.Value]
+    val metas = Vector.newBuilder[BatchMeta]
+    // Before v1.1 every app wrote ASH1.
+    var legacy = true
 
-    def put(dev: String, stream: String, records: Seq[ujson.Value], seq: Option[Long] = None): Unit =
-      val s = seq.getOrElse(seqs((dev, stream)))
+    def putPlain(dev: String, stream: String, plain: Array[Byte]): (Long, Array[Byte]) =
+      val s = seqs((dev, stream))
       seqs((dev, stream)) = s + 1
-      val plain = records.map(r => ujson.write(r) + "\n").mkString.getBytes(UTF_8)
-      val blob = Crypto.seal(key, Crypto.aad(dev, stream, s), Crypto.gzip(plain))
+      val aad = Crypto.aad(dev, stream, s)
+      val blob = if legacy then Crypto.sealAsh1(key, aad, Crypto.gzip(plain)) else Crypto.seal(keys, aad, Crypto.gzip(plain))
       Files.write(File(blobs, s"$dev.$stream.$s").toPath, blob)
       // The server's global cursor skips values (other users' batches).
       cursor += 3
       items += ujson.Obj("cursor" -> num(cursor), "deviceId" -> dev, "stream" -> stream, "seq" -> num(s),
         "size" -> blob.length, "sha256" -> Crypto.sha256Hex(blob), "createdAt" -> num((t0 / hour) * hour))
+      metas += BatchMeta(cursor, dev, stream, s, blob.length, Crypto.sha256Hex(blob))
+      (s, blob)
+
+    def put(dev: String, stream: String, records: Seq[ujson.Value]): Unit =
+      putPlain(dev, stream, records.map(r => ujson.write(r) + "\n").mkString.getBytes(UTF_8))
 
     def archiveParts(file: String, gen: String, bytes: Array[Byte], partSize: Int, only: Option[Int] = None): Unit =
       val parts = ((bytes.length + partSize - 1) / partSize).max(1)
@@ -192,15 +206,20 @@ object WebFixtures:
     // An abandoned generation (the file changed during its upload), then the
     // complete one, sent in several parts.
     archiveParts(s"fixes/$Date.parquet", "1f00d", fixesPq.dropRight(17), 4 * 1024, only = Some(2))
+    // The apps were updated to v1.1 here: ASHM from now on.
+    legacy = false
     archiveParts(s"fixes/$Date.parquet", "2b7e1", fixesPq, 4 * 1024)
     archiveParts(s"motion/$Date.parquet", "3c9a4", motionPq, 3 * 1024 * 1024)
 
     val sc = Scenarios
+    // An ASH1 batch of an editable stream (sealed before the update, sent late).
+    legacy = true
     put(devA, "places", Seq(
       ujson.Obj("id" -> 1, "lat" -> sc.Home.lat, "lon" -> sc.Home.lon, "r" -> 60.0, "name" -> "", "kind" -> "HOME",
         "ext" -> "", "updatedAt" -> num(t0 - 5 * hour)),
       ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "", "kind" -> "UNKNOWN",
         "ext" -> "", "updatedAt" -> num(t0 - 5 * hour))))
+    legacy = false
     // A later snapshot of place 2 wins.
     put(devA, "places", Seq(
       ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "大手町オフィス",
@@ -216,9 +235,15 @@ object WebFixtures:
     def status(t: Long, pct: Int, on: Boolean, fixAt: LatLng, model: String) =
       DeviceStatus(t, pct, charging = !on, recording = on, mode = if on then "balanced" else "", since = if on then t - 48 * hour else 0L,
         lastFix = Some(StatusFix(t - 60_000, fixAt.lat, fixAt.lon, 12.0)), versionName = "0.1.0", versionCode = 12, model = model).toJson
+    legacy = true
     put(devA, "status", Seq(status(t0 - hour, 81, on = true, sc.Office, "Google Pixel 8a")))
-    put(devA, "status", Seq(status(t0, 78, on = true, sc.Home, "Google Pixel 8a")))
+    legacy = false
     put(devB, "status", Seq(status(t0 - 5 * hour, 100, on = false, sc.Home, "Google Pixel Tablet")))
+    // devA approves the first viewer: the cut-over record C over everything
+    // listed so far, then a status that names it.
+    val (cutSeq, cutBlob) = putPlain(devA, CutoverRecord.Stream, CutoverRecord.encode(CutoverRecord.fromListing(metas.result())))
+    val cut = CutRef(devA, cutSeq, Crypto.sha256Hex(cutBlob))
+    put(devA, "status", Seq(status(t0, 78, on = true, sc.Home, "Google Pixel 8a").tap(_("authcut") = cut.toJson)))
 
     write(dir, "listing.json", ujson.write(ujson.Obj("items" -> ujson.Arr.from(items.result()), "next" -> ujson.Null), indent = 1))
     write(dir, "meta.json", ujson.write(ujson.Obj(
@@ -228,6 +253,10 @@ object WebFixtures:
         ujson.Obj("id" -> devB, "name" -> "Pixel Tablet", "createdAt" -> num(t0 - 20 * 24 * hour), "lastSeenAt" -> num(t0 - 5 * hour), "revoked" -> false)
       )
     ), indent = 1))
+
+  extension (o: ujson.Obj) private def tap(f: ujson.Obj => Unit): ujson.Obj =
+    f(o)
+    o
 
   /** As the app applies a correction (TimelineRepo): overlap of more than half. */
   private def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =

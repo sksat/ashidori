@@ -1,11 +1,16 @@
-// ペアリング (docs/web-ui.md): the 3-step stepper. The protocol behind it
-// (data/session.ts `Pairing`) is not implemented yet, so step 1 reports
-// that. Dev builds add a panel that registers with a pasted device token
-// and batch key; production builds do not contain it.
+// ペアリング (docs/web-ui.md, docs/design/browser-pairing-v1.md): a 3-step
+// stepper. 1 コードの表示: this browser shows a code that the user enters in
+// the app's 「ブラウザでも見る」. 2 確認コードの照合: both show the same four
+// words; the user approves in the app and presses 「一致する」 here. 3 完了.
+// Mismatch, expiry and failure discard the temporary key and offer one
+// 「最初からやり直す」. Dev builds add a panel that registers with a pasted
+// device token and batch key; production builds do not contain it.
 
-import { DEV_PANEL, PAIRING_UNAVAILABLE, devSession, type KeyStorage, type Pairing } from "../data/session";
+import type { EndReason, PairingEvent } from "../data/pairing";
+import { DEV_PANEL, devSession, pairingV1, type KeyStorage, type Pairing, type PairingControl, type ViewerSession } from "../data/session";
 import type { Ctx } from "./context";
-import { h, icon, replace } from "./dom";
+import { $, h, icon, replace, toast } from "./dom";
+import { absTime } from "./format";
 
 const CODE_RE = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$/;
 
@@ -14,11 +19,109 @@ export function normalizeCode(s: string): string {
   return s.toUpperCase().replace(/[\s-]/g, "").replace(/[IL]/g, "1").replace(/O/g, "0");
 }
 
-let pairing: Pairing = PAIRING_UNAVAILABLE;
+/** "ABCD2345" → "ABCD-2345". */
+export function displayCode(code: string): string {
+  return CODE_RE.test(code) ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+}
 
-/** For the pairing implementation to plug in. */
+/** Remaining time as the page shows it: "9:58". */
+export function fmtLeft(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+let pairing: Pairing = pairingV1();
+
+/** For tests and alternative implementations. */
 export function setPairing(p: Pairing): void {
   pairing = p;
+}
+
+type View =
+  | { k: "intro" }
+  | { k: "code"; code: string | null; claimed: boolean }
+  | { k: "words"; words: string[]; scope: string; ttl: number; waiting: boolean }
+  | { k: "done"; session: ViewerSession }
+  | { k: "ended"; reason: EndReason };
+
+let view: View = { k: "intro" };
+let control: PairingControl | null = null;
+let ticker: ReturnType<typeof setInterval> | null = null;
+let announced = new Set<number>();
+let lastCtx: Ctx | null = null;
+
+function stopTicker(): void {
+  if (ticker !== null) clearInterval(ticker);
+  ticker = null;
+}
+
+/** Updates the countdown each second; announces only at 1 minute and 30 seconds. */
+function startTicker(): void {
+  stopTicker();
+  announced = new Set();
+  ticker = setInterval(() => {
+    if (!control) return stopTicker();
+    const left = control.remainingMs();
+    const el = $("#pair-left");
+    if (el) el.textContent = fmtLeft(left);
+    const sr = $("#pair-left-sr");
+    for (const mark of [60_000, 30_000]) {
+      if (left <= mark && left > mark - 1000 && !announced.has(mark) && sr) {
+        announced.add(mark);
+        sr.textContent = mark === 60_000 ? "残り 1 分です。" : "残り 30 秒です。";
+      }
+    }
+  }, 1000);
+}
+
+function show(next: View, focus = true): void {
+  view = next;
+  if (next.k === "ended" || next.k === "done" || next.k === "intro") {
+    stopTicker();
+    control = null;
+  }
+  lastCtx?.render();
+  if (focus) $<HTMLElement>("#pair-h")?.focus();
+}
+
+function onEvent(attempt: PairingControl, e: PairingEvent): void {
+  // Events of an attempt that the page has left are discarded.
+  if (attempt !== control) return;
+  switch (e.kind) {
+    case "code":
+      show({ k: "code", code: e.code, claimed: false });
+      break;
+    case "claimed":
+      if (view.k === "code") show({ ...view, claimed: true }, false);
+      break;
+    case "words":
+      show({ k: "words", words: e.words, scope: e.scope, ttl: e.ttl, waiting: false });
+      break;
+    case "waiting":
+      if (view.k === "words") show({ ...view, waiting: true }, false);
+      $<HTMLElement>("#pair-wait")?.focus();
+      break;
+    case "done":
+      show({ k: "done", session: e.session });
+      break;
+    case "ended":
+      show({ k: "ended", reason: e.reason });
+      break;
+  }
+}
+
+/** Starts a new attempt, leaving any earlier one. */
+function begin(): void {
+  const prev = control;
+  if (prev) void prev.cancel();
+  view = { k: "code", code: null, claimed: false };
+  let self: PairingControl | null = null;
+  const queued: PairingEvent[] = [];
+  self = pairing.start((e) => (self ? onEvent(self, e) : queued.push(e)));
+  control = self;
+  for (const e of queued) onEvent(self, e);
+  startTicker();
+  if (view.k === "code" && view.code === null) show(view);
 }
 
 function optIn(): HTMLElement {
@@ -26,6 +129,8 @@ function optIn(): HTMLElement {
     "ul",
     { hidden: true, id: "optin-more" },
     h("li", null, `配信元: ${location.host}`),
+    h("li", null, "このブラウザは、これまでの記録と、これから送る記録を読めます。"),
+    h("li", null, "期限はサーバが記録を渡すのをやめるだけです。鍵が持ち出されると、期限の後も読めます。"),
     h("li", null, "サーバの管理者が画面を書き換えると、記録を見られる可能性があります。"),
     h("li", null, "登録はいつでも解除できます。"),
   );
@@ -38,7 +143,7 @@ function optIn(): HTMLElement {
 }
 
 function stepper(step: number): HTMLElement {
-  const steps = ["コードの入力", "確認コードの照合", "完了"];
+  const steps = ["コードの表示", "確認コードの照合", "完了"];
   return h(
     "ol",
     { class: "stepper", "aria-label": "手順" },
@@ -46,71 +151,157 @@ function stepper(step: number): HTMLElement {
   );
 }
 
-function codeStep(): HTMLElement {
-  const err = h("p", { class: "ferr", id: "pair-err", hidden: true });
-  const input = h("input", {
-    id: "pair-code",
-    class: "codein",
-    autocomplete: "one-time-code",
-    autocapitalize: "characters",
-    spellcheck: "false",
-    maxlength: 11,
-    "aria-describedby": "pair-hint",
-  });
-  const showErr = (msg: string | null) => {
-    err.hidden = !msg;
-    replace(err, ...(msg ? [icon("xcirc"), msg] : []));
-    if (msg) {
-      input.setAttribute("aria-invalid", "true");
-      input.setAttribute("aria-describedby", "pair-hint pair-err");
-    } else {
-      input.removeAttribute("aria-invalid");
-      input.setAttribute("aria-describedby", "pair-hint");
-    }
-  };
-  const submit = h("button", { class: "btn primary", type: "submit" }, "次へ");
-  const form = h(
-    "form",
-    { novalidate: true },
-    h("label", { for: "pair-code", class: "flabel" }, "コード"),
-    input,
-    h("p", { class: "hint", id: "pair-hint" }, "8 文字。ハイフンは省略できます。"),
-    err,
-    h("div", { class: "formact" }, submit),
+function heading(text: string): HTMLElement {
+  return h("h2", { id: "pair-h", tabindex: -1 }, text);
+}
+
+function countdown(): HTMLElement {
+  return h(
+    "p",
+    { class: "pleft" },
+    "残り ",
+    h("span", { id: "pair-left", class: "num", "aria-hidden": "true" }, fmtLeft(control?.remainingMs() ?? 0)),
+    h("span", { id: "pair-left-sr", class: "sr-only", role: "status" }),
   );
-  input.addEventListener("blur", () => {
-    const c = normalizeCode(input.value);
-    if (c && !CODE_RE.test(c)) showErr("8 文字の英数字を入力してください。");
-  });
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const c = normalizeCode(input.value);
-    if (!CODE_RE.test(c)) {
-      showErr("8 文字の英数字を入力してください。");
-      input.focus();
-      return;
-    }
-    showErr(null);
-    submit.setAttribute("aria-busy", "true");
-    submit.textContent = "確認中";
-    try {
-      await pairing.start(c);
-    } catch {
-      await pairing.cancel();
-      showErr("このサーバは、ブラウザの登録にまだ対応していません。");
-      input.focus();
-    } finally {
-      submit.removeAttribute("aria-busy");
-      submit.textContent = "次へ";
-    }
-  });
+}
+
+const ttlLabel = (ttl: number) => (ttl === 86400 ? "24時間" : ttl === 3600 ? "1時間" : `${Math.round(ttl / 60)}分`);
+
+function introStep(): HTMLElement {
   return h(
     "section",
     { class: "card ppanel" },
-    h("h2", null, "コードの入力"),
-    h("p", null, "アプリの「ブラウザでも見る」で発行したコードを入力してください。"),
-    form,
+    heading("コードの表示"),
+    h("p", null, "このブラウザで記録を見るには、表示するコードをアプリに入力し、アプリで承認します。"),
+    h("div", { class: "formact" }, h("button", { class: "btn primary", type: "button", onclick: () => begin() }, "コードを表示")),
   );
+}
+
+function codeStep(v: Extract<View, { k: "code" }>): HTMLElement {
+  const code = v.code;
+  const copy = h(
+    "button",
+    {
+      class: "btn tonal sm",
+      type: "button",
+      disabled: !code,
+      onclick: async () => {
+        if (!code) return;
+        try {
+          await navigator.clipboard.writeText(code);
+          toast("コードをコピーしました");
+        } catch {
+          toast("コピーできませんでした。コードを入力してください。");
+        }
+      },
+    },
+    "コピー",
+  );
+  return h(
+    "section",
+    { class: "card ppanel", "aria-busy": code ? null : "true" },
+    heading("コードの表示"),
+    h("p", null, "アプリの同期設定で「ブラウザでも見る」を選び、このコードを入力してください。"),
+    h("div", { class: "codeshow" }, h("span", { class: "codebig", "aria-label": code ? `コード ${code.split("").join(" ")}` : "コードを準備しています" }, code ? displayCode(code) : "····-····"), copy),
+    v.claimed ? h("p", { class: "pstate", role: "status" }, icon("okcirc"), "アプリで入力されました。確認コードを準備しています。") : null,
+    code ? countdown() : null,
+    h("div", { class: "formact" }, h("button", { class: "btn ghost", type: "button", onclick: () => void abandon() }, "中止する")),
+  );
+}
+
+function wordsStep(v: Extract<View, { k: "words" }>): HTMLElement {
+  const acts = v.waiting
+    ? [
+        h("p", { class: "pstate", id: "pair-wait", tabindex: -1, role: "status" }, icon("info"), "アプリでの承認を待っています。"),
+        h("div", { class: "formact" }, h("button", { class: "btn danger", type: "button", onclick: () => void control?.mismatch() }, "中止する")),
+      ]
+    : [
+        h(
+          "div",
+          { class: "formact" },
+          h("button", { class: "btn primary", type: "button", onclick: () => control?.confirm() }, "一致する"),
+          h("button", { class: "btn danger", type: "button", onclick: () => void control?.mismatch() }, "一致しない"),
+        ),
+      ];
+  return h(
+    "section",
+    { class: "card ppanel" },
+    heading("確認コードの照合"),
+    h("p", null, "アプリに表示された 4 語と同じであることを確かめてください。"),
+    h("ol", { class: "sas", lang: "ja" }, v.words.map((w) => h("li", null, w))),
+    h(
+      "div",
+      { class: "kv" },
+      h("dl", null, h("dt", null, "範囲"), h("dd", null, v.scope === "batch-v1" ? "すべての記録の閲覧" : v.scope), h("dt", null, "期限"), h("dd", null, `${ttlLabel(v.ttl)}（アプリで選択）`)),
+    ),
+    countdown(),
+    ...acts,
+  );
+}
+
+function doneStep(ctx: Ctx, v: Extract<View, { k: "done" }>): HTMLElement {
+  return h(
+    "section",
+    { class: "card ppanel" },
+    heading("完了"),
+    h("p", { class: "pstate" }, icon("okcirc"), "このブラウザを登録しました。"),
+    h(
+      "div",
+      { class: "kv" },
+      h(
+        "dl",
+        null,
+        h("dt", null, "鍵の保存"),
+        h("dd", null, "このタブを閉じるまで"),
+        h("dt", null, "期限"),
+        h("dd", null, v.session.expiresAt ? `${absTime(v.session.expiresAt)} まで` : "—"),
+      ),
+    ),
+    h(
+      "div",
+      { class: "formact" },
+      h(
+        "button",
+        {
+          class: "btn primary",
+          type: "button",
+          onclick: async () => {
+            const s = v.session;
+            view = { k: "intro" };
+            await ctx.signIn(s);
+            ctx.go("timeline");
+          },
+        },
+        "タイムラインを開く",
+      ),
+    ),
+  );
+}
+
+const ENDED: Record<EndReason, [string, string]> = {
+  mismatch: ["中止しました", "確認コードが一致しなかったため、中止しました。一時的な鍵は破棄しました。"],
+  aborted: ["中止されました", "アプリまたはサーバで中止されました。一時的な鍵は破棄しました。"],
+  expired: ["時間切れです", "10 分以内に完了しなかったため、中止しました。一時的な鍵は破棄しました。"],
+  failed: ["登録できませんでした", "受け取った内容を確認できなかったため、中止しました。一時的な鍵は破棄しました。"],
+  cancelled: ["中止しました", "一時的な鍵は破棄しました。"],
+};
+
+function endedStep(v: Extract<View, { k: "ended" }>): HTMLElement {
+  const [title, text] = ENDED[v.reason];
+  return h(
+    "section",
+    { class: "card ppanel" },
+    h("div", { class: "errpanel" }, icon(v.reason === "expired" ? "alert" : "xcirc"), h("div", { class: "grow" }, heading(title), h("p", null, text))),
+    h("div", { class: "formact" }, h("button", { class: "btn primary", type: "button", onclick: () => begin() }, "最初からやり直す")),
+  );
+}
+
+async function abandon(): Promise<void> {
+  const c = control;
+  control = null;
+  stopTicker();
+  if (c) await c.cancel();
+  show({ k: "intro" });
 }
 
 /** Dev builds only (import.meta.env.DEV): register with a pasted token and batch key. */
@@ -141,6 +332,7 @@ function devPanel(ctx: Ctx): HTMLElement | null {
       const s = await devSession(token.value, key.value, storage);
       key.value = "";
       token.value = "";
+      await abandon();
       await ctx.signIn(s);
     } catch (x) {
       err.hidden = false;
@@ -157,21 +349,28 @@ function devPanel(ctx: Ctx): HTMLElement | null {
 }
 
 export function renderPairing(ctx: Ctx, main: HTMLElement): void {
+  lastCtx = ctx;
+  const v = view;
+  const step = v.k === "words" ? 2 : v.k === "done" ? 3 : 1;
+  const body =
+    v.k === "intro" ? introStep() : v.k === "code" ? codeStep(v) : v.k === "words" ? wordsStep(v) : v.k === "done" ? doneStep(ctx, v) : endedStep(v);
   replace(
     main,
     h(
       "div",
       { class: "pair" },
       h("h1", { id: "h1", tabindex: -1 }, "このブラウザを登録"),
-      optIn(),
-      stepper(1),
-      codeStep(),
-      devPanel(ctx),
+      v.k === "intro" || v.k === "code" ? optIn() : null,
+      v.k === "ended" ? null : stepper(step),
+      body,
+      v.k === "intro" ? devPanel(ctx) : null,
     ),
   );
 }
 
-export function renderUnregistered(ctx: Ctx, main: HTMLElement): void {
+export type UnregisteredReason = "revoked" | "expired";
+
+export function renderUnregistered(ctx: Ctx, main: HTMLElement, reason: UnregisteredReason = "revoked"): void {
   replace(
     main,
     h(
@@ -184,7 +383,12 @@ export function renderUnregistered(ctx: Ctx, main: HTMLElement): void {
           "div",
           { class: "errpanel" },
           icon("lock"),
-          h("div", { class: "grow" }, h("h1", { id: "h1", tabindex: -1 }, "このブラウザの登録は解除されました"), h("p", null, "鍵はこのブラウザから消去しました。")),
+          h(
+            "div",
+            { class: "grow" },
+            h("h1", { id: "h1", tabindex: -1 }, reason === "expired" ? "このブラウザの登録の期限が切れました" : "このブラウザの登録は解除されました"),
+            h("p", null, "鍵はこのブラウザから消去しました。"),
+          ),
           h("button", { class: "btn primary", type: "button", onclick: () => ctx.go("timeline") }, "もう一度登録する"),
         ),
       ),

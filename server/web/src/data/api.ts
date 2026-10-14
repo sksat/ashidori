@@ -25,6 +25,10 @@ export interface DeviceInfo {
   createdAt: number;
   lastSeenAt: number | null;
   revoked: boolean;
+  /** "viewer" for a browser (read-only, no batches); "device" for an app, and from older servers. */
+  kind: "device" | "viewer";
+  /** A viewer's expiry (ms); null for app devices. */
+  expiresAt: number | null;
 }
 
 export interface BatchMeta extends BlobRef {
@@ -152,6 +156,8 @@ export class Api {
           createdAt: typeof d.createdAt === "number" ? d.createdAt : 0,
           lastSeenAt: typeof d.lastSeenAt === "number" ? d.lastSeenAt : null,
           revoked: d.revoked === true || (typeof d.revoked === "number" && d.revoked > 0),
+          kind: d.kind === "viewer" ? "viewer" : "device",
+          expiresAt: typeof d.expiresAt === "number" && Number.isFinite(d.expiresAt) ? d.expiresAt : null,
         },
       ];
     });

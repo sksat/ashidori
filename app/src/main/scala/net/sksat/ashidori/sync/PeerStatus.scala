@@ -26,7 +26,9 @@ object StatusReport:
       lastFix = fix.map(f => StatusFix(f.time, f.lat, f.lon, f.accuracy.toDouble)),
       versionName = BuildInfo.versionName,
       versionCode = BuildInfo.versionCode,
-      model = Build.MODEL
+      model = Build.MODEL,
+      // The cut-over record this device knows, so the others learn it.
+      authCut = AuthCutover.knownCut
     )
 
 /** One of the user's devices, as the server lists it. */
@@ -69,7 +71,9 @@ object PeerStatus:
 
   def devices: Vector[Peer] =
     if !current then Vector.empty
-    else Try(ujson.read(prefs.getString("devices", "[]")).arr.toVector.map { d =>
+    // Browsers (kind "viewer") read only; they send no status, so they are not peers.
+    else Try(ujson.read(prefs.getString("devices", "[]")).arr.toVector
+      .filterNot(_.obj.get("kind").flatMap(_.strOpt).contains("viewer")).map { d =>
       Peer(d("id").str, d("name").str, d.obj.get("revoked").exists(_.boolOpt.contains(true)),
         d.obj.get("lastSeenAt").flatMap(_.numOpt).map(_.toLong).getOrElse(0L))
     }).getOrElse(Vector.empty)
@@ -199,6 +203,7 @@ object PeerStatus:
         val (items, next) = run.client.listBatches(st.cursor, PageSize)
         st = st.listed(items, run.deviceId, PageSize)
         save(st)
+        AuthCutover.noteListed(reg, items)
         more = next.isDefined && items.nonEmpty && st.cursor > before
     } {
       st = st.listFailed
@@ -212,9 +217,48 @@ object PeerStatus:
         val (items, next) = run.client.listBatches(st.rescan.get, PageSize)
         st = st.rescanned(items, run.deviceId, PageSize, next.isDefined && items.nonEmpty)
         save(st)
+        AuthCutover.noteListed(reg, items)
     }(())
 
     var known = entries
+    // Listed rows of a pair, for the digest of the cut-over (read at most
+    // once per run). None: the listing failed (next run); Some(None): it is
+    // longer than the budget, so the digest cannot be checked (refused).
+    var listedFor = Map.empty[StreamKey, Option[Option[Vector[BatchMeta]]]]
+    def listedRows(k: StreamKey): Option[Option[Vector[BatchMeta]]] =
+      listedFor.getOrElse(k, {
+        val rows =
+          try Some(AuthCutover.listAll(run, AuthCutover.MaxDigestPages, b => b.deviceId == k.deviceId && b.stream == k.stream))
+          catch
+            case e: SyncRun.Stopped => throw e
+            case e: Exception =>
+              Log.w(s"listing for the cut-over digest of ${k.deviceId}/${k.stream} failed", e)
+              None
+        listedFor += k -> rows
+        rows
+      })
+    /** Opens a status blob as an app (ASHM with its MAC, ASH1 under the
+      * cut-over rules) and stores its acceptance. None: not decided this run
+      * (the listing for the digest, or storing the state, failed).
+      */
+    def openStatus(dev: String, seq: Long, b: Array[Byte]): Option[BlobAuth.Opened] =
+      val k = StreamKey(dev, DeviceStatus.Stream)
+      val opened = BlobAuth.open(AuthCutover.state(reg), run.keys, k, seq, b) match
+        case o: BlobAuth.Opened => Some(o)
+        case BlobAuth.NeedListing(_) =>
+          listedRows(k).map(_.getOrElse(throw BlobRejected("the listing is too long to check the cut-over digest")))
+            .map(rows => BlobAuth.open(AuthCutover.state(reg), run.keys, k, seq, b, Some(rows))).collect {
+              case o: BlobAuth.Opened => o
+            }
+      opened.filter { o =>
+        try
+          AuthCutover.update(reg)(o.accept)
+          true
+        catch
+          case e: java.io.IOException =>
+            Log.w(s"status $dev/$seq: storing its acceptance failed", e)
+            false
+      }
     def fetch(dev: String, cand: StatusCandidate): Unit =
       run.checkStopped()
       val seq = cand.seq
@@ -238,11 +282,27 @@ object PeerStatus:
           st = st.failed(dev, cand, e.getMessage, at)
         case Right(Some(b)) =>
           try
-            val plain = Crypto.gunzip(Crypto.open(run.batchKey, Crypto.aad(dev, DeviceStatus.Stream, seq), b), DeviceStatus.MaxPlain)
-            val s = DeviceStatus.decode(plain).getOrElse(throw IllegalArgumentException("empty status batch"))
-            known += dev -> PeerEntry(seq, at, s, areaFor(s.lastFix, known.get(dev)))
-            st = st.succeeded(dev, seq)
+            openStatus(dev, seq, b).foreach { o =>
+              val plain = Crypto.gunzip(o.plain, DeviceStatus.MaxPlain)
+              val s = DeviceStatus.decode(plain).getOrElse(throw IllegalArgumentException("empty status batch"))
+              // An authenticated status that names C: C exists, so this
+              // device enters the required state, on disk before the status
+              // counts as read.
+              val stored = s.authCut.filter(_ => o.format == BlobFormat.Ashm).forall { ref =>
+                try
+                  AuthCutover.update(reg)(_.named(ref))
+                  true
+                catch
+                  case e: java.io.IOException =>
+                    Log.w(s"status $dev/$seq: storing the named cut-over failed", e)
+                    false
+              }
+              if stored then
+                known += dev -> PeerEntry(seq, at, s, areaFor(s.lastFix, known.get(dev)))
+                st = st.succeeded(dev, seq)
+            }
           catch
+            case e: SyncRun.Stopped => throw e
             case e: Exception =>
               Log.w(s"status $dev/$seq unreadable", e)
               st = st.failed(dev, cand, e.getMessage, at)
@@ -250,6 +310,8 @@ object PeerStatus:
     // The normal targets, then exhausted ones that are due, from their own budget.
     for (dev, cand) <- st.targets do fetch(dev, cand)
     for (dev, cand) <- st.retries(now) do fetch(dev, cand)
+    // The cut-over record named by a status or listed, if not fetched yet.
+    AuthCutover.learn(run)
     changed()
 
   /** Area name of the position, reusing the previous one when it barely moved. */

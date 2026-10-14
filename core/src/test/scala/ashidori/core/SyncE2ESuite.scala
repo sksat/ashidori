@@ -26,7 +26,11 @@ class SyncE2ESuite extends munit.FunSuite:
   test("server batches decrypt with the recovery code and hold valid records") {
     assume(env.isDefined, "ASHIDORI_E2E_* not set")
     val (base, token, rec) = env.get
-    val key = Crypto.batchKey(RecoveryCode.decode(rec).fold(e => fail(e), identity))
+    val key = BlobKeys.of(RecoveryCode.decode(rec).fold(e => fail(e), identity))
+    // ASHM with its MAC; ASH1 (written before v1.1) by GCM alone.
+    def open(k: BlobKeys, aad: Array[Byte], blob: Array[Byte]) = Crypto.format(blob) match
+      case Some(BlobFormat.Ashm) => Crypto.open(k, aad, blob)
+      case _                     => Crypto.openAsh1(k.batch, aad, blob)
     val list = ujson.read(String(get(s"$base/v1/batches?limit=1000", token), UTF_8))("items").arr
     assert(list.nonEmpty)
     val counts = list.map { it =>
@@ -35,16 +39,16 @@ class SyncE2ESuite extends munit.FunSuite:
       assertEquals(Crypto.sha256Hex(blob), it("sha256").str)
       // Ciphertext must not contain recognisable plaintext.
       assert(!String(blob, UTF_8).contains("\"lat\""))
-      val lines = String(Crypto.gunzip(Crypto.open(key, Crypto.aad(dev, stream, seq), blob)), UTF_8).linesIterator.toVector
+      val lines = String(Crypto.gunzip(open(key, Crypto.aad(dev, stream, seq), blob)), UTF_8).linesIterator.toVector
       lines.foreach(l => assert(ujson.read(l).obj.nonEmpty))
       stream -> lines.size
     }.groupMapReduce(_._1)(_._2)(_ + _)
     println(s"[sync e2e] decrypted records per stream: $counts")
     // A wrong key must not open anything.
-    val wrong = Crypto.batchKey(Crypto.newMasterKey())
+    val wrong = BlobKeys.of(Crypto.newMasterKey())
     val it = list.head
     intercept[Exception] {
-      Crypto.open(wrong, Crypto.aad(it("deviceId").str, it("stream").str, it("seq").num.toLong),
+      open(wrong, Crypto.aad(it("deviceId").str, it("stream").str, it("seq").num.toLong),
         get(s"$base/v1/batches/${it("deviceId").str}/${it("stream").str}/${it("seq").num.toLong}", token))
     }
   }

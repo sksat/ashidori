@@ -40,7 +40,7 @@ export interface UserView {
 }
 
 export interface UserListItem extends UserView {
-  /** Non-revoked devices. */
+  /** Non-revoked app devices (viewers not counted). */
   deviceCount: number;
   /** Latest lastSeenAt over the user's devices. */
   lastSeenAt: number | null;
@@ -101,7 +101,7 @@ export async function listUsers(db: D1Database): Promise<UserListItem[]> {
   const { results } = await db
     .prepare(
       `SELECT u.id, u.name, u.handle, u.email, u.status, u.created_at, u.created_by, u.disabled_at,
-         COUNT(d.id) - COUNT(d.revoked_at) AS device_count,
+         COALESCE(SUM(d.id IS NOT NULL AND d.revoked_at IS NULL AND d.kind = 'device'), 0) AS device_count,
          MAX(d.last_seen_at) AS last_seen_at, u.storage_bytes, u.batch_count, u.checkin_count
        FROM users u LEFT JOIN devices d ON d.user_id = u.id
        GROUP BY u.id ORDER BY u.created_at, u.id`,

@@ -42,13 +42,33 @@ function maplibreVendor(): Plugin {
   };
 }
 
+// The offline basemap archive the viewer may download (src/map/basemap.ts):
+// the app's own pin, so that both verify the same size and sha256.
+function basemapPin(): { version: string; file: string; bytes: number; sha256: string } {
+  const p = JSON.parse(readFileSync(join(import.meta.dirname, "../../app/src/main/assets/basemap-pin.json"), "utf8")) as Record<string, unknown>;
+  const { version, file, bytes, sha256 } = p;
+  if (
+    p.format !== "ashidori basemap archive v1" ||
+    typeof version !== "string" ||
+    !/^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(version) ||
+    file !== `ashidori-basemap-${version}.zip` ||
+    typeof bytes !== "number" ||
+    !Number.isSafeInteger(bytes) ||
+    bytes <= 0 ||
+    typeof sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(sha256)
+  )
+    throw new Error("app/src/main/assets/basemap-pin.json is malformed");
+  return { version, file, bytes, sha256 };
+}
+
 // Dev: `pnpm dev` here, with `wrangler dev` (port 8787) for the API.
 const API = process.env.ASHIDORI_API ?? "http://localhost:8787";
 
 export default defineConfig({
   root: import.meta.dirname,
   base: "/",
-  define: { __MAPLIBRE_PATH__: JSON.stringify(MAPLIBRE_PATH) },
+  define: { __MAPLIBRE_PATH__: JSON.stringify(MAPLIBRE_PATH), __BASEMAP_PIN__: JSON.stringify(basemapPin()) },
   plugins: [maplibreVendor()],
   build: {
     outDir: "dist",

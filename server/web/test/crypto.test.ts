@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { fromHex } from "../src/data/bytes";
-import { BlobError, STATUS_CAPS, aad, gunzip, importBatchKey, openBlob, parseJsonLines } from "../src/data/crypto";
+import { fromHex, sha256Hex } from "../src/data/bytes";
+import { BlobError, MAC, MIN_BLOB_AUTH, STATUS_CAPS, aad, blobFormat, gunzip, importBatchKey, openBlob, parseJsonLines } from "../src/data/crypto";
 import { blobOf, listing, syncMeta } from "./helpers";
 
 const key = () => importBatchKey(fromHex(syncMeta().batchKeyHex));
@@ -9,12 +9,74 @@ const row = (stream: string, seq = 0) => {
   return r;
 };
 
+/** The listing row of a changed blob: its own size and SHA-256 (as a server would list it). */
+const relisted = async (ref: ReturnType<typeof row>, blob: Uint8Array) => ({ ...ref, size: blob.byteLength, sha256: await sha256Hex(blob) });
+
+describe("ASHM blobs sealed by the app (v1.1)", () => {
+  it("the fixtures mix both formats as a real history: ASH1 before the update, ASHM after it", () => {
+    const formats = listing().items.map((r) => `${r.stream}/${r.seq}:${blobFormat(blobOf(r.deviceId, r.stream, r.seq))}`);
+    expect(formats).toContain("places/0:ASH1");
+    expect(formats).toContain("places/1:ASHM");
+    expect(formats).toContain("status/0:ASH1");
+    expect(formats).toContain("status/1:ASHM");
+    expect(formats).toContain("authcut/0:ASHM");
+    expect(formats.every((f) => f.endsWith(":ASH1") || f.endsWith(":ASHM"))).toBe(true);
+  });
+
+  it("opens every listed batch of either format", async () => {
+    const k = await key();
+    for (const ref of listing().items) {
+      const recs = await openBlob(k, ref, blobOf(ref.deviceId, ref.stream, ref.seq));
+      expect(recs.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("opens the status that names the cut-over record, and the record itself", async () => {
+    const ref = row("status", 1);
+    const [st] = (await openBlob(await key(), ref, blobOf(ref.deviceId, "status", 1), STATUS_CAPS)) as { authcut: { deviceId: string; seq: number; sha256: string } }[];
+    const cut = row("authcut", 0);
+    expect(st!.authcut).toEqual({ deviceId: cut.deviceId, seq: 0, sha256: cut.sha256 });
+    const entries = (await openBlob(await key(), cut, blobOf(cut.deviceId, "authcut", 0))) as { deviceId: string; stream: string; below: number; digest: string }[];
+    expect(entries.find((e) => e.stream === "places")).toMatchObject({ deviceId: cut.deviceId, below: 2 });
+    expect(entries.every((e) => /^[0-9a-f]{64}$/.test(e.digest))).toBe(true);
+  });
+
+  it("cannot check the mac: a changed mac still opens (viewers do not authenticate the writer until v2)", async () => {
+    const ref = row("places", 1);
+    const blob = blobOf(ref.deviceId, "places", 1);
+    expect(blobFormat(blob)).toBe("ASHM");
+    const badMac = blob.slice();
+    badMac[badMac.length - 1]! ^= 1;
+    await expect(openBlob(await key(), await relisted(ref, badMac), badMac)).resolves.toHaveLength(1);
+    // The GCM part is that of ASH1: with the mac stripped and the magic ASH1, it opens the same.
+    const stripped = blob.slice(0, blob.length - MAC);
+    stripped[3] = 0x31;
+    await expect(openBlob(await key(), await relisted(ref, stripped), stripped)).resolves.toHaveLength(1);
+  });
+
+  it("still fails on a changed GCM byte, a moved blob, or a truncated mac", async () => {
+    const ref = row("places", 1);
+    const blob = blobOf(ref.deviceId, "places", 1);
+    const badGcm = blob.slice();
+    badGcm[20]! ^= 1;
+    await expect(openBlob(await key(), await relisted(ref, badGcm), badGcm)).rejects.toMatchObject({ kind: "decrypt" });
+    await expect(openBlob(await key(), { ...ref, seq: 0 }, blob)).rejects.toMatchObject({ kind: "decrypt" });
+    // Cut into the mac: the GCM tag then sits where the mac is assumed to start.
+    const cut = blob.slice(0, blob.length - 1);
+    await expect(openBlob(await key(), await relisted(ref, cut), cut)).rejects.toMatchObject({ kind: "decrypt" });
+    const tooShort = blob.slice(0, MIN_BLOB_AUTH - 1);
+    await expect(openBlob(await key(), await relisted(ref, tooShort), tooShort)).rejects.toMatchObject({ kind: "format" });
+  });
+});
+
 describe("ASH1 blobs sealed by the app", () => {
   it("opens a status batch: listing checks, AES-GCM with the slot's AAD, gunzip, JSON Lines", async () => {
-    const ref = row("status", 1);
-    const recs = await openBlob(await key(), ref, blobOf(ref.deviceId, "status", 1), STATUS_CAPS);
+    const ref = row("status", 0);
+    const blob = blobOf(ref.deviceId, "status", 0);
+    expect(blobFormat(blob)).toBe("ASH1");
+    const recs = await openBlob(await key(), ref, blob, STATUS_CAPS);
     expect(recs).toHaveLength(1);
-    expect(recs[0]).toMatchObject({ battery: { pct: 78 }, recording: { on: true, mode: "balanced" }, device: { model: "Google Pixel 8a" } });
+    expect(recs[0]).toMatchObject({ battery: { pct: 81 }, recording: { on: true, mode: "balanced" }, device: { model: "Google Pixel 8a" } });
   });
 
   it("keeps the key non-extractable", async () => {

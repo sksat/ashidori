@@ -194,7 +194,15 @@ describe("device auth", () => {
     expect(res.status).toBe(200);
     const list = (await res.json()) as Array<Record<string, unknown>>;
     expect(list).toEqual([
-      { id: a.deviceId, name: "a", createdAt: expect.any(Number), lastSeenAt: expect.any(Number), revoked: false },
+      {
+        id: a.deviceId,
+        name: "a",
+        createdAt: expect.any(Number),
+        lastSeenAt: expect.any(Number),
+        revoked: false,
+        kind: "device",
+        expiresAt: null,
+      },
     ]);
     const seen = await lastSeen();
     expect(seen % HOUR).toBe(0);

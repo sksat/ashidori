@@ -30,7 +30,8 @@ const state: State = {
   load: { kind: "loading" },
   online: navigator.onLine,
 };
-let expired = false;
+/** Why the registration ended (the token got 401), until the user pairs again. */
+let expired: false | "revoked" | "expired" = false;
 
 function sectionFromHash(): Section {
   const s = location.hash.replace(/^#\/?/, "");
@@ -136,8 +137,8 @@ function render(): void {
   const main = $("#main")!;
   if (state.section !== "timeline") disposeTimeline();
   if (!ctx.session) {
-    document.title = expired ? "登録の解除" : "このブラウザを登録";
-    if (expired) renderUnregistered({ ...ctx, go: () => ((expired = false), render()) }, main);
+    document.title = expired === "expired" ? "登録の期限切れ" : expired ? "登録の解除" : "このブラウザを登録";
+    if (expired) renderUnregistered({ ...ctx, go: () => ((expired = false), render()) }, main, expired);
     else renderPairing(ctx, main);
     return;
   }
@@ -163,9 +164,10 @@ async function start(): Promise<void> {
   store.addEventListener("progress", () => state.section === "timeline" && refreshTimeline(ctx));
   store.addEventListener("change", onStoreChange);
   store.addEventListener("unauthorized", () => {
-    // The browser's registration was revoked: erase the key, then guide to pairing.
+    // The browser's registration was revoked or expired: erase the key, then guide to pairing.
+    const reason = s.expiresAt !== null && Date.now() >= s.expiresAt ? "expired" : "revoked";
     void forget().then(() => {
-      expired = true;
+      expired = reason;
       render();
     });
   });

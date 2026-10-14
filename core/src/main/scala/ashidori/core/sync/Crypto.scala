@@ -9,15 +9,43 @@ import javax.crypto.Mac
 import javax.crypto.spec.{GCMParameterSpec, SecretKeySpec}
 import scala.util.Using
 
+/** The keys an app holds for blobs, both derived from the master key `K`:
+  * the batch key (AES-256-GCM) and the blob authentication key `Ka` (the
+  * MAC of [[Crypto.seal]]). A viewer (browser) receives at most the batch
+  * key, never `Ka` (docs/design/browser-pairing-v1.md, v1.1).
+  */
+final class BlobKeys(val batch: Array[Byte], val auth: Array[Byte]):
+  require(batch.length == 32 && auth.length == 32, "blob keys are 32 bytes each")
+
+object BlobKeys:
+  def of(master: Array[Byte]): BlobKeys = BlobKeys(Crypto.batchKey(master), Crypto.authKey(master))
+
+/** The two blob formats. `Ash1`: GCM only (v1, still read under the rules of
+  * [[BlobAuth]]). `Ashm`: the same GCM part followed by an HMAC-SHA256
+  * under `Ka` (v1.1; every app writes it).
+  */
+enum BlobFormat:
+  case Ash1, Ashm
+
 /** End-to-end encryption of sync batches (see docs/sync-protocol.md).
   *
   * Only the user's devices know the master key; the server stores the output
   * of [[seal]] and cannot read it.
+  *
+  * ASHM = "ASHM" ‖ nonce (12) ‖ AES-256-GCM ciphertext and tag ‖ mac (32), with
+  * mac = HMAC-SHA256(Ka, "ashidori blob auth v1" ‖ len(AAD) (2, big-endian)
+  * ‖ AAD ‖ every byte before the mac). ASH1 is the same without the mac and
+  * with the magic "ASH1". The GCM key and the AAD are the same for both.
   */
 object Crypto:
+  /** Magic of the v1 format (GCM only). */
   val Magic: Array[Byte] = "ASH1".getBytes(UTF_8)
+  /** Magic of the v1.1 format (GCM and a MAC under `Ka`). */
+  val MagicAuth: Array[Byte] = "ASHM".getBytes(UTF_8)
   private val NonceLen = 12
   private val TagBits = 128
+  val MacLen = 32
+  private val MacLabel = "ashidori blob auth v1".getBytes(UTF_8)
   private val rnd = SecureRandom()
 
   def newMasterKey(): Array[Byte] =
@@ -45,25 +73,75 @@ object Crypto:
 
   def batchKey(master: Array[Byte]): Array[Byte] = hkdf(master, "ashidori batch v1")
 
+  /** `Ka`, the blob authentication key. Only apps hold it. */
+  def authKey(master: Array[Byte]): Array[Byte] = hkdf(master, "ashidori batch auth v1")
+
   def aad(deviceId: String, stream: String, seq: Long): Array[Byte] = s"$deviceId/$stream/$seq".getBytes(UTF_8)
 
-  /** Encrypts a plaintext for one batch slot. */
-  def seal(batchKey: Array[Byte], aad: Array[Byte], plaintext: Array[Byte]): Array[Byte] =
+  /** The format of `blob` by its magic and minimum length; None if neither. */
+  def format(blob: Array[Byte]): Option[BlobFormat] =
+    def magic(m: Array[Byte]) = blob.length >= 4 && java.util.Arrays.equals(blob, 0, 4, m, 0, 4)
+    if magic(Magic) && blob.length >= 4 + NonceLen + TagBits / 8 then Some(BlobFormat.Ash1)
+    else if magic(MagicAuth) && blob.length >= 4 + NonceLen + TagBits / 8 + MacLen then Some(BlobFormat.Ashm)
+    else None
+
+  /** Encrypts a plaintext for one batch slot as ASHM (what every app writes). */
+  def seal(keys: BlobKeys, aad: Array[Byte], plaintext: Array[Byte]): Array[Byte] =
+    val body = gcm(MagicAuth, keys.batch, aad, plaintext)
+    body ++ mac(keys.auth, aad, body, body.length)
+
+  /** Encrypts as ASH1 (v1, no MAC). Apps no longer write it; for tests and
+    * fixtures of the legacy format only.
+    */
+  def sealAsh1(batchKey: Array[Byte], aad: Array[Byte], plaintext: Array[Byte]): Array[Byte] =
+    gcm(Magic, batchKey, aad, plaintext)
+
+  private def gcm(magic: Array[Byte], batchKey: Array[Byte], aad: Array[Byte], plaintext: Array[Byte]): Array[Byte] =
     val nonce = new Array[Byte](NonceLen)
     rnd.nextBytes(nonce)
     val c = Cipher.getInstance("AES/GCM/NoPadding")
     c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(batchKey, "AES"), GCMParameterSpec(TagBits, nonce))
     c.updateAAD(aad)
-    Magic ++ nonce ++ c.doFinal(plaintext)
+    magic ++ nonce ++ c.doFinal(plaintext)
 
-  /** Decrypts a blob; throws if it was tampered with or moved to another slot. */
-  def open(batchKey: Array[Byte], aad: Array[Byte], blob: Array[Byte]): Array[Byte] =
-    require(blob.length > Magic.length + NonceLen && blob.take(4).sameElements(Magic), "not a ashidori blob")
+  /** HMAC-SHA256(Ka, label ‖ len(AAD) (2, big-endian) ‖ AAD ‖ blob[0, len)). */
+  def mac(authKey: Array[Byte], aad: Array[Byte], blob: Array[Byte], len: Int): Array[Byte] =
+    require(aad.length <= 0xffff, "AAD longer than 65535 bytes")
+    val m = Mac.getInstance("HmacSHA256")
+    m.init(SecretKeySpec(authKey, "HmacSHA256"))
+    m.update(MacLabel)
+    m.update(((aad.length >> 8) & 0xff).toByte)
+    m.update((aad.length & 0xff).toByte)
+    m.update(aad)
+    m.update(blob, 0, len)
+    m.doFinal()
+
+  /** Opens an ASHM blob: checks the MAC under `Ka` (in constant time), then
+    * decrypts. Throws if it is not ASHM, was tampered with (any byte, or the
+    * AAD), or was moved to another slot.
+    */
+  def open(keys: BlobKeys, aad: Array[Byte], blob: Array[Byte]): Array[Byte] =
+    require(format(blob).contains(BlobFormat.Ashm), "not an ASHM blob")
+    val n = blob.length - MacLen
+    val expect = mac(keys.auth, aad, blob, n)
+    if !MessageDigest.isEqual(expect, java.util.Arrays.copyOfRange(blob, n, blob.length)) then
+      throw java.security.GeneralSecurityException("blob MAC mismatch (tampered, moved, or not sealed by an app of this user)")
+    gcmOpen(keys.batch, aad, blob, n)
+
+  /** Decrypts an ASH1 blob (GCM only). Whether an ASH1 blob may be accepted
+    * at all is for [[BlobAuth]] to decide; this only decrypts.
+    */
+  def openAsh1(batchKey: Array[Byte], aad: Array[Byte], blob: Array[Byte]): Array[Byte] =
+    require(format(blob).contains(BlobFormat.Ash1), "not an ASH1 blob")
+    gcmOpen(batchKey, aad, blob, blob.length)
+
+  /** GCM part of a blob, `blob[0, end)`; throws on a wrong key, AAD or byte. */
+  private def gcmOpen(batchKey: Array[Byte], aad: Array[Byte], blob: Array[Byte], end: Int): Array[Byte] =
     val nonce = blob.slice(4, 4 + NonceLen)
     val c = Cipher.getInstance("AES/GCM/NoPadding")
     c.init(Cipher.DECRYPT_MODE, SecretKeySpec(batchKey, "AES"), GCMParameterSpec(TagBits, nonce))
     c.updateAAD(aad)
-    c.doFinal(blob, 4 + NonceLen, blob.length - 4 - NonceLen)
+    c.doFinal(blob, 4 + NonceLen, end - 4 - NonceLen)
 
   def gzip(b: Array[Byte]): Array[Byte] =
     val bo = ByteArrayOutputStream()
@@ -74,8 +152,9 @@ object Crypto:
   def gunzip(b: Array[Byte], max: Int = Int.MaxValue): Array[Byte] =
     Using.resource(GZIPInputStream(ByteArrayInputStream(b)))(in => Limits.readAtMost(in, max, "decompressed batch"))
 
-  def sha256Hex(b: Array[Byte]): String =
-    MessageDigest.getInstance("SHA-256").digest(b).map(x => f"${x & 0xff}%02x").mkString
+  def sha256Hex(b: Array[Byte]): String = hex(MessageDigest.getInstance("SHA-256").digest(b))
+
+  def hex(b: Array[Byte]): String = b.map(x => f"${x & 0xff}%02x").mkString
 
   def randomToken(): String =
     val b = new Array[Byte](32)

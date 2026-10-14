@@ -12,6 +12,8 @@ work = "2.12.0"
 appcompat = "1.8.0"
 zxing = "3.5.4"
 camerax = "1.6.2"
+# HPKE (RFC 9180) for browser pairing (core sync/ViewerPairing). Apache-2.0.
+tink = "1.23.0"
 
 [libraries]
 scala3-library = { group = "org.scala-lang", name = "scala3-library_3", version.ref = "scala" }
@@ -27,6 +29,7 @@ zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" 
 camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "camerax" }
 camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
 camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
+tink-android = { group = "com.google.crypto.tink", name = "tink-android", version.ref = "tink" }
 
 [plugins]
 androidApplication = { id = "com.android.application", version.ref = "agp" }

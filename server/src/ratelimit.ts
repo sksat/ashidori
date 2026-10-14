@@ -30,6 +30,11 @@ export const RULES = {
   // Self-registration (REGISTRATION = "open"): each success creates a user,
   // so it is much stricter than pairing-code registration.
   account: { bucket: "account", limit: 5, windowMs: 60 * 60 * 1000 },
+  // Browser pairing (viewer-pairings.ts): creating an attempt, per IP, and
+  // claiming one by its code, per IP and per user (wrong codes count).
+  viewerCreate: { bucket: "viewer-create", limit: 10, windowMs: 10 * 60 * 1000 },
+  viewerClaim: { bucket: "viewer-claim", limit: 20, windowMs: 10 * 60 * 1000 },
+  viewerClaimUser: { bucket: "viewer-claim-user", limit: 20, windowMs: 10 * 60 * 1000 },
 } satisfies Record<string, RateLimitRule>;
 
 /**

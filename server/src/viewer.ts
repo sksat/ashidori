@@ -21,7 +21,8 @@ export const VIEWER_CSP = [
   "style-src 'self'",
   // MapLibre's worker is a same-origin module (web/vite.config.ts).
   "worker-src 'self'",
-  // The API, the basemap archive (Range requests), and the online tiles of 「詳しい地図」.
+  // The API, the basemap archive (one full download on 「簡易地図を読み込む」,
+  // never Range requests), and the online tiles of 「詳しい地図」.
   "connect-src 'self' https://cyberjapandata.gsi.go.jp",
   "img-src 'self' data: blob: https://cyberjapandata.gsi.go.jp",
   "frame-ancestors 'none'",

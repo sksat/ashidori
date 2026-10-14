@@ -7,7 +7,9 @@ final case class StatusFix(t: Long, lat: Double, lon: Double, acc: Double)
 
 /** How one device is doing: one record of the append-only `status` stream,
   * uploaded on every small-stream sync so the user's other devices can show it.
-  * `mode` is a [[ashidori.core.LoggingMode]] key.
+  * `mode` is a [[ashidori.core.LoggingMode]] key. `authCut` names the
+  * cut-over record C this device knows (see [[BlobAuthState]]), so that the
+  * other apps learn the cut-over; omitted while it knows none.
   */
 final case class DeviceStatus(
     t: Long,
@@ -19,10 +21,11 @@ final case class DeviceStatus(
     lastFix: Option[StatusFix],
     versionName: String,
     versionCode: Long,
-    model: String
+    model: String,
+    authCut: Option[CutRef] = None
 ):
   def toJson: ujson.Obj =
-    ujson.Obj(
+    val o = ujson.Obj(
       "t" -> ujson.Num(t.toDouble),
       "battery" -> ujson.Obj("pct" -> batteryPct, "charging" -> charging),
       "recording" -> ujson.Obj("on" -> recording, "mode" -> mode, "since" -> ujson.Num(since.toDouble)),
@@ -34,6 +37,8 @@ final case class DeviceStatus(
       "app" -> ujson.Obj("versionName" -> versionName, "versionCode" -> ujson.Num(versionCode.toDouble)),
       "device" -> ujson.Obj("model" -> model)
     )
+    authCut.foreach(c => o("authcut") = c.toJson)
+    o
 
   private def round(x: Double, k: Double): Double = math.round(x * k) / k
 
@@ -63,7 +68,8 @@ object DeviceStatus:
       fix,
       str(app, "versionName"),
       num(app, "versionCode").map(_.toLong).getOrElse(0L),
-      str(obj("device"), "model")
+      str(obj("device"), "model"),
+      v.obj.get("authcut").flatMap(CutRef.fromJson)
     )
 
   /** Caps for a received `status` batch: the blob as downloaded, its
