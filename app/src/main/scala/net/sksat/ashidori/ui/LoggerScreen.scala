@@ -284,14 +284,19 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     val dir = File(act.getExternalFilesDir(null), "gnss")
     val fs = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(-_.lastModified()).take(8)
     files.removeAllViews()
-    for f <- fs do
-      val t = text(Instant.ofEpochMilli(f.lastModified()).atZone(AshidoriApp.zone).format(timeFmt), 14f)
-      t.setLayoutParams(weighted())
-      val row = hbox(t, caption(f"${f.length / 1024.0 / 1024.0}%.1f MB "), outlined("共有")(act.shareFile(f)))
-      row.setMinimumHeight(dp(48))
-      row.setBackgroundResource(android.R.drawable.list_selector_background)
-      row.setOnClickListener(_ => showStats(f))
-      files.addView(row)
+    for (f, i) <- fs.zipWithIndex do
+      // A list row: tap for the summary, the share button shares the file.
+      val row = navRow(Instant.ofEpochMilli(f.lastModified()).atZone(AshidoriApp.zone).format(timeFmt), trailingIcon = 0)(showStats(f))
+      row.setValue(f"${f.length / 1024.0 / 1024.0}%.1f MB")
+      tabular(row.value).setTextColor(color(attr.onSurfaceVariant))
+      row.trailing(iconButton(net.sksat.ashidori.R.drawable.ic_share, "共有")(act.shareFile(f)))
+      row.setPaddingRelative(dp(16), 0, dp(4), 0)
+      // Full card width, so the ripple reaches the card's edges.
+      val lp = matchWrap
+      lp.setMarginStart(-dp(16))
+      lp.setMarginEnd(-dp(16))
+      if i > 0 then files.addView(divider(0))
+      files.addView(row, lp)
 
   /** What a raw log contains, summarized from the file itself. */
   private def showStats(f: File): Unit =

@@ -207,6 +207,211 @@ object Ui:
       }
     }
 
+  // --- Material 3 lists: what you tap or change, set apart from what you read ---
+  //
+  // Tappable rows are whole-row touch targets (56dp, 72dp with a subtitle)
+  // with a ripple and a trailing mark: a chevron (opens something), a value
+  // (a choice), a switch, or nothing but the error colour (destructive).
+  // Section headers and supporting text have none of these.
+  // Rows go in a `listGroup`, a rounded card with dividers between rows.
+
+  /** Text inset of rows inside a [[listGroup]], from the screen edge; headers
+    * and supporting text line up with it.
+    */
+  private val TextInset = 28f
+
+  /** Ripple of a pressed row (or, borderless, of an icon button). */
+  def ripple(v: View, borderless: Boolean = false)(using c: Ctx): Unit =
+    val tv = android.util.TypedValue()
+    c.getTheme.resolveAttribute(
+      if borderless then android.R.attr.selectableItemBackgroundBorderless
+      else android.R.attr.selectableItemBackground, tv, true)
+    v.setBackgroundResource(tv.resourceId)
+
+  /** What TalkBack calls the view ("button", "switch"), and for a switch,
+    * whether it is on.
+    */
+  def a11yRole(v: View, cls: Class[?], checked: Option[() => Boolean] = None): Unit =
+    androidx.core.view.ViewCompat.setAccessibilityDelegate(v, new androidx.core.view.AccessibilityDelegateCompat:
+      override def onInitializeAccessibilityNodeInfo(host: View, info: androidx.core.view.accessibility.AccessibilityNodeInfoCompat): Unit =
+        super.onInitializeAccessibilityNodeInfo(host, info)
+        info.setClassName(cls.getName)
+        checked.foreach { f => info.setCheckable(true); info.setChecked(f()) }
+      override def onInitializeAccessibilityEvent(host: View, e: android.view.accessibility.AccessibilityEvent): Unit =
+        super.onInitializeAccessibilityEvent(host, e)
+        e.setClassName(cls.getName)
+        checked.foreach(f => e.setChecked(f()))
+    )
+
+  /** A list row: title (body large), optional subtitle (secondary colour)
+    * and trailing views. Without a click listener it is plain text.
+    */
+  class ListRow(c: Ctx) extends LinearLayout(c):
+    private given Ctx = c
+    val title: TextView = text("", 16f)
+    val subtitle: TextView = text("", 14f, colorAttr = attr.onSurfaceVariant)
+    /** The current value of a choice row, at the trailing edge. */
+    val value: TextView = oneLine(text("", 14f, colorAttr = attr.primary))
+    private val texts = vbox(title, subtitle)
+    // Wrap Japanese at phrase boundaries ("…サービスに / 送らない").
+    Seq(title, subtitle).foreach(_.setLineBreakWordStyle(android.graphics.text.LineBreakConfig.LINE_BREAK_WORD_STYLE_PHRASE))
+    setOrientation(LinearLayout.HORIZONTAL)
+    setGravity(Gravity.CENTER_VERTICAL)
+    setPadding(dp(16), dp(8), dp(16), dp(8))
+    texts.setLayoutParams(weighted())
+    addView(texts)
+    value.setMaxWidth(dp(160))
+    value.setPadding(dp(16), 0, 0, 0)
+    value.setVisibility(View.GONE)
+    addView(value)
+    setSubtitle("")
+
+    def setSubtitle(s: CharSequence): Unit =
+      subtitle.setText(s)
+      subtitle.setVisibility(if s.length == 0 then View.GONE else View.VISIBLE)
+      setMinimumHeight(dp(if s.length == 0 then 56 else 72))
+
+    def setValue(s: CharSequence): Unit =
+      value.setText(s)
+      value.setVisibility(if s.length == 0 then View.GONE else View.VISIBLE)
+
+    /** Adds a view at the trailing edge, after the value. */
+    def trailing(v: View): Unit =
+      val lp = wrap
+      lp.setMarginStart(dp(12))
+      v.setLayoutParams(lp)
+      addView(v)
+
+    def onTap(f: => Unit): Unit =
+      ripple(this)
+      setOnClickListener(_ => f)
+
+  private def listRow(title: String, subtitle: CharSequence)(using c: Ctx): ListRow =
+    val r = ListRow(c)
+    r.title.setText(title)
+    r.setSubtitle(subtitle)
+    r
+
+  /** A decorative icon (the role is on the row). */
+  def icon(res: Int, colorAttr: Int = attr.onSurfaceVariant)(using c: Ctx): android.widget.ImageView =
+    val v = android.widget.ImageView(c)
+    v.setImageResource(res)
+    v.setImageTintList(ColorStateList.valueOf(color(colorAttr)))
+    v.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    v.setLayoutParams(LinearLayout.LayoutParams(dp(24), dp(24)))
+    v
+
+  /** A 48dp icon button with its own ripple, e.g. "詳しく" or "共有" inside a row. */
+  def iconButton(res: Int, description: String)(onClick: => Unit)(using c: Ctx): android.widget.ImageButton =
+    val b = android.widget.ImageButton(c)
+    b.setImageResource(res)
+    b.setImageTintList(ColorStateList.valueOf(color(attr.onSurfaceVariant)))
+    b.setContentDescription(description)
+    b.setMinimumWidth(dp(48))
+    b.setMinimumHeight(dp(48))
+    b.setPadding(dp(12), dp(12), dp(12), dp(12))
+    ripple(b, borderless = true)
+    b.setOnClickListener(_ => onClick)
+    b
+
+  /** Opens a screen or a detail dialog: trailing chevron (or `trailingIcon`,
+    * e.g. share; 0 for none).
+    */
+  def navRow(title: String, subtitle: CharSequence = "", trailingIcon: Int = net.sksat.ashidori.R.drawable.ic_chevron_right)(onClick: => Unit)(using c: Ctx): ListRow =
+    val r = listRow(title, subtitle)
+    if trailingIcon != 0 then r.trailing(icon(trailingIcon))
+    r.onTap(onClick)
+    a11yRole(r, classOf[android.widget.Button])
+    r
+
+  /** A choice: the current value at the trailing edge; tapping opens the
+    * choices (a dialog).
+    */
+  def choiceRow(title: String, value: CharSequence, subtitle: CharSequence = "")(onClick: => Unit)(using c: Ctx): ListRow =
+    val r = listRow(title, subtitle)
+    r.setValue(value)
+    r.onTap(onClick)
+    a11yRole(r, classOf[android.widget.Button])
+    r
+
+  final class SwitchRow(c: Ctx) extends ListRow(c):
+    val switch: com.google.android.material.materialswitch.MaterialSwitch =
+      com.google.android.material.materialswitch.MaterialSwitch(c)
+
+  /** On/off: a switch at the trailing edge; tapping anywhere on the row
+    * toggles it. `onInfo` adds an info button ("詳しく") before the switch.
+    */
+  def switchRow(title: String, checked: Boolean, subtitle: CharSequence = "", onInfo: Option[() => Unit] = None)(onChange: Boolean => Unit)(using c: Ctx): SwitchRow =
+    val r = SwitchRow(c)
+    r.title.setText(title)
+    r.setSubtitle(subtitle)
+    onInfo.foreach(f => r.trailing(iconButton(net.sksat.ashidori.R.drawable.ic_info, "詳しく")(f())))
+    val s = r.switch
+    s.setChecked(checked)
+    // The row takes the touches and speaks for the switch.
+    s.setClickable(false)
+    s.setFocusable(false)
+    s.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    s.setOnCheckedChangeListener((_, b) => onChange(b))
+    r.trailing(s)
+    r.onTap(s.toggle())
+    a11yRole(r, classOf[android.widget.Switch], Some(() => s.isChecked))
+    r
+
+  /** A destructive action in the error colour, no chevron. Put it last in
+    * its group.
+    */
+  def dangerRow(title: String, subtitle: CharSequence = "")(onClick: => Unit)(using c: Ctx): ListRow =
+    val r = listRow(title, subtitle)
+    r.title.setTextColor(color(attr.error))
+    r.onTap(onClick)
+    a11yRole(r, classOf[android.widget.Button])
+    r
+
+  /** Small label in the primary colour above a group; not tappable. */
+  def sectionHeader(name: String)(using c: Ctx): TextView =
+    val t = text(name, 14f, colorAttr = attr.primary)
+    t.setTypeface(Typeface.create(Typeface.DEFAULT, 500, false))
+    t.setAccessibilityHeading(true)
+    t.setPadding(dp(TextInset), dp(24), dp(TextInset), dp(8))
+    t
+
+  /** Explanation under the group (or row) it belongs to: smaller, secondary,
+    * aligned with the rows' text.
+    */
+  def supportingText(s: CharSequence)(using c: Ctx): TextView =
+    val t = caption(s)
+    t.setPadding(dp(TextInset), dp(6), dp(TextInset), 0)
+    t
+
+  /** Rows in one rounded card, divided by inset lines. */
+  def listGroup(rows: View*)(using c: Ctx): MaterialCardView =
+    val g = MaterialCardView(c)
+    g.setRadius(dp(16).toFloat)
+    g.setCardElevation(0)
+    g.setCardBackgroundColor(color(attr.surfaceContainer))
+    g.setStrokeWidth(0)
+    g.setClipToOutline(true)
+    val inner = vbox()
+    rows.zipWithIndex.foreach { (r, i) =>
+      if i > 0 then inner.addView(divider(16))
+      inner.addView(r, matchWrap)
+    }
+    g.addView(inner)
+    val lp = matchWrap
+    lp.setMargins(dp(12), 0, dp(12), 0)
+    g.setLayoutParams(lp)
+    g
+
+  /** A hairline in the outline-variant colour, inset from the start. */
+  def divider(insetStart: Float = 0)(using c: Ctx): View =
+    val v = View(c)
+    v.setBackgroundColor(color(attr.outlineVariant))
+    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, math.max(1, dp(0.5f)))
+    lp.setMarginStart(dp(insetStart))
+    v.setLayoutParams(lp)
+    v
+
   def fmtDuration(ms: Long): String =
     val m = ms / 60000
     if ms < 60_000 then s"${math.max(0, ms / 1000)}秒"

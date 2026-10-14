@@ -75,34 +75,39 @@ final class DataScreen(act: MainActivity) extends Screen:
     }
     picker.show(act.getSupportFragmentManager, "export-range")
 
-  private def formatButton(label: String, note: String)(f: => Unit): View =
-    val b = button(label, tonal = true)(f)
-    b.setLayoutParams(matchWrap)
-    vbox(b, padded(caption(note), 4, 0))
+  private def format(label: String, note: String)(f: => Unit): View =
+    navRow(label, note, trailingIcon = net.sksat.ashidori.R.drawable.ic_share)(f)
+
+  /** Result of the last export or import; hidden until there is one. */
+  private val statusCard =
+    val c = card(status)
+    c.setVisibility(View.GONE)
+    c
 
   val view: View =
     scroll(
       vbox(
+        sectionHeader("エクスポート"),
         card(
-          text("エクスポート", 16f, bold = true),
-          caption("選んだ期間の記録をファイルにして共有します。非公開のチェックインは含めません。"),
-          spacer(8),
           rangeLabel,
           spacer(4),
           outlined("カレンダーで選ぶ")(pickRange()),
-          presetChips,
-          spacer(8),
-          formatButton("Timeline.json", "Google マップのタイムライン互換。滞在と移動")(exportAs("json")),
-          formatButton("GPX", "経路と滞在地。地図アプリや GIS で開けます")(exportAs("gpx")),
-          formatButton("記録データ（Parquet・zip）", "位置・動き・電池・衛星の状態・詳細ログ（GNSS 生データ・IMU）を表ごとに")(exportAs("parquet")),
-          formatButton("GNSS ログ（GnssLogger 形式・zip）", "詳細ログを GnssLogger のテキスト形式で。解析ツール向け")(exportAs("gnsslog"))
+          presetChips
         ),
-        card(
-          text("インポート", 16f, bold = true),
-          caption("Google マップのタイムラインから書き出した Timeline.json、または旧 Takeout の Records.json を読み込みます。"),
-          button("ファイルを選んで読み込む")(act.pickFile(importFile))
+        spacer(6),
+        listGroup(
+          format("Timeline.json", "Google マップのタイムライン互換。滞在と移動")(exportAs("json")),
+          format("GPX", "経路と滞在地。地図アプリや GIS で開けます")(exportAs("gpx")),
+          format("記録データ（Parquet・zip）", "位置・動き・電池・衛星の状態・詳細ログ（GNSS 生データ・IMU）を表ごとに")(exportAs("parquet")),
+          format("GNSS ログ（GnssLogger 形式・zip）", "詳細ログを GnssLogger のテキスト形式で。解析ツール向け")(exportAs("gnsslog"))
         ),
-        card(status),
+        supportingText("非公開のチェックインは含めません。"),
+        sectionHeader("インポート"),
+        listGroup(
+          navRow("ファイルを選んで読み込む", "Google マップの Timeline.json、旧 Takeout の Records.json")(act.pickFile(importFile))
+        ),
+        spacer(12),
+        statusCard,
         spacer(24)
       )
     )
@@ -110,9 +115,13 @@ final class DataScreen(act: MainActivity) extends Screen:
   setRange(from, to)
   AshidoriApp.io.execute(() => AshidoriApp.db.firstDataDateCached)
 
+  private def showStatus(s: String): Unit =
+    status.setText(s)
+    statusCard.setVisibility(View.VISIBLE)
+
   private def exportAs(kind: String): Unit =
     val (a, b) = (from, to)
-    status.setText("書き出し中…")
+    showStatus("書き出し中…")
     def progress(msg: String): Unit = act.runOnUiThread(() => status.setText(msg))
     AshidoriApp.io.execute { () =>
       val r = Try {
@@ -160,7 +169,7 @@ final class DataScreen(act: MainActivity) extends Screen:
     }
 
   private def importFile(uri: Uri): Unit =
-    status.setText("読み込み中…（大きなファイルは時間がかかります）")
+    showStatus("読み込み中…（大きなファイルは時間がかかります）")
     AshidoriApp.io.execute { () =>
       val r = Try {
         val json = Using.resource(act.getContentResolver.openInputStream(uri))(in => String(in.readAllBytes(), StandardCharsets.UTF_8))
