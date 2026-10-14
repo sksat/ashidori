@@ -1,6 +1,8 @@
 // The browser's side of pairing v1 (docs/design/browser-pairing-v1.md):
-// the browser shows a code, the user enters it in the app's 「ブラウザでも見る」,
-// both show the same four words, the user approves in the app and presses
+// the browser shows a QR code (data/viewerqr.ts) that the app's 「ブラウザでも見る」
+// scans, or its code, which the user types there instead; the QR code
+// carries the commit c to the app without the server. Both show the same
+// four words, the user approves in the app and presses
 // 「一致する」 here, and the browser receives the batch key sealed to its
 // temporary key. It receives nothing else: never K, the recovery code or
 // the blob authentication key.
@@ -52,7 +54,8 @@ export type EndReason =
   | "cancelled";
 
 export type PairingEvent =
-  | { kind: "code"; code: string }
+  /** The attempt was created: its code, and its id and commit c for the QR code. */
+  | { kind: "code"; code: string; id: string; commit: Uint8Array }
   /** The app entered the code; the words follow once it sent its nonce. */
   | { kind: "claimed" }
   | { kind: "words"; words: string[]; scope: string; ttl: number }
@@ -274,7 +277,7 @@ export class PairingAttempt {
       this.idBytes = idBytes;
       this.code = code;
       this.deadline = this.deps.now() + ATTEMPT_MS;
-      this.emit({ kind: "code", code });
+      this.emit({ kind: "code", code, id: this.id, commit: this.c.slice() });
       return;
     }
   }

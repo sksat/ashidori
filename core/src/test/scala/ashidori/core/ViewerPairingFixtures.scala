@@ -1,6 +1,6 @@
 package ashidori.core
 
-import ashidori.core.sync.{Bip39Japanese, ViewerPairing as VP}
+import ashidori.core.sync.{Bip39Japanese, ViewerQr, ViewerPairing as VP}
 import com.google.crypto.tink.{HybridDecrypt, InsecureSecretKeyAccess, KeysetHandle, RegistryConfiguration}
 import com.google.crypto.tink.hybrid.{HpkePrivateKey, HpkePublicKey, HybridConfig}
 import com.google.crypto.tink.subtle.X25519
@@ -52,6 +52,9 @@ object ViewerPairingFixtures:
       ("nB", ujson.Str(hex(flip(t.nB))), t.copy(nB = flip(t.nB))),
     )
 
+  /** Origins of the QR code vectors (example names only). */
+  val QrServers: Vector[String] = Vector("https://ashidori.example", "http://localhost:8787")
+
   /** Low-order X25519 public keys (and other encodings of them) that the app refuses. */
   val LowOrder: Vector[String] = Vector(
     "0000000000000000000000000000000000000000000000000000000000000000",
@@ -88,6 +91,9 @@ object ViewerPairingFixtures:
       "d" -> hex(VP.sha256("ashidori pair sas v1".getBytes(UTF_8), vth)),
       "indices" -> VP.sasIndices(vth), "words" -> VP.sasWords(vth))
     val tamper = tampered.map((f, v, t) => ujson.Obj("field" -> f, "value" -> v, "th" -> hex(t.hash), "words" -> VP.sasWords(t.hash)))
+    // The QR code's text for the vector's attempt, as the browser must write it.
+    val qr = QrServers.map(srv => ujson.Obj("server" -> srv, "id" -> VP.b64(VecId), "code" -> VecCode, "c" -> hex(vt.c),
+      "uri" -> ViewerQr.uri(srv, VP.b64(VecId), VecCode, hex(vt.c))))
 
     // A real key pair, as the browser would make it.
     val sk = X25519.generatePrivateKey()
@@ -107,6 +113,7 @@ object ViewerPairingFixtures:
       "wordlistSha256" -> Bip39Japanese.Sha256,
       "sas" -> sas,
       "tamper" -> tamper,
+      "qr" -> qr,
       "grant" -> ujson.Obj(
         "skB" -> hex(sk), "pkB" -> hex(pk), "nB" -> hex(nB), "id" -> hex(id), "code" -> t.code, "sA" -> hex(sA),
         "nA" -> hex(t.nA), "c" -> hex(t.c), "scope" -> t.scope, "ttl" -> t.ttl, "th" -> hex(th), "info" -> hex(info),

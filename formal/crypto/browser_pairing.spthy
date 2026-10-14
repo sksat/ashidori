@@ -13,8 +13,9 @@ begin
  * change the page (trust model: the page is honest).
  *
  * Trusted: the app, the browser page, fresh randomness, and the user, who
- *   - types the code shown by browser tid into one app (UserCode(tid, code));
- *     the user is assumed to pair the right browser with the right app;
+ *   - takes what browser tid shows (UserSees(tid, <id, code, c>)) into one
+ *     app: types the code, or (-D=QR) scans the QR code; the user is
+ *     assumed to pair the right browser with the right app;
  *   - approves in the app and confirms in the browser only when that browser
  *     and that app show the same words (restriction Equal).
  * Not modelled: cancellation, expiry, restarts (server state, not secrecy).
@@ -31,7 +32,11 @@ begin
  * nonce last, after it knows the other fields and the target words t, hit t
  * (grindA for the app's nonce, grindB for the browser's nonce). This is an
  * abstraction of that capability, not the 2^-44 bound, which is argued on
- * paper. -D=NOCOMMIT shows that grinding works without the commitment.
+ * paper. grindA gives the secret sA, not nA: a search over sA whose nA =
+ * appNonce(sA) hits t for the given scope and ttl, so the one who grinds
+ * also has the preimage that the browser's check of the grant asks for.
+ * -D=NOCOMMIT and -D=EARLYNB show that grinding works when nB is known
+ * before nA is fixed.
  *
  * HPKE base mode: hseal(pk, info, m), opened only with the secret key and
  * the same info. Anyone can seal to any public key.
@@ -39,6 +44,29 @@ begin
  * The browser may leak everything it holds after accepting (B_Leak): its
  * secret key and the batch key. master_key_secrecy and auth_key_secrecy hold
  * even then, i.e. nothing the viewer holds yields K or the blob-auth key.
+ *
+ * QR variant (-D=QR): the browser also shows a QR code of <id, code, c>.
+ * The camera is an authentic channel from the browser to the app that the
+ * attacker reads (it knows id, code and c anyway) but cannot change: the
+ * linear fact UserSees. The app claims with the code of the QR and goes on
+ * only if the server's answer has the QR's id and c. The code entry stays as
+ * a fallback in the same model (A_Claim). The user is weaker on the QR path:
+ * the app's approval does not need the comparison (A_Approve_qr has no Eq),
+ * since c from the QR already fixes the browser's key; the browser's
+ * confirmation keeps it. The QR mutations:
+ *   -D=QR -D=NOQRCHECK  the app takes c from the server, not from the QR:
+ *                       batch_key_secrecy is falsified (the app seals to
+ *                       the server's key); grant_agreement still holds.
+ *   -D=QR -D=APPONLY    no comparison in the browser either:
+ *                       grant_agreement is falsified, secrecy still holds.
+ *   -D=QR -D=EARLYNB    the QR keeps the commit, but the browser publishes
+ *                       pkB and nB before nA arrives (e.g. in the QR code):
+ *                       grant_agreement is falsified (the server grinds sA
+ *                       towards the browser), and batch_key_secrecy too,
+ *                       through the code entry of the same browser (the
+ *                       server's key to the app, the browser's words ground
+ *                       to match). This is why commit-then-reveal stays with
+ *                       the QR.
  *
  * Mutations (each must break the lemma named):
  *   -D=NOCOMMIT     the browser sends pkB and nB in clear before nA:
@@ -51,10 +79,12 @@ begin
  */
 
 builtins: hashing
-functions: pk/1, hseal/3, hopen/3, kdf/1, kauth/1, sas/3, grindA/3, grindB/3
+// appNonce(sA) is nA = H("ashidori pair app v1" ‖ sA): a one-way function
+// of its own, since the grinding equation below has to name it.
+functions: pk/1, appNonce/1, hseal/3, hopen/3, kdf/1, kauth/1, sas/3, grindA/5, grindB/3
 equations:
   hopen(hseal(pk(sk), info, m), sk, info) = m,
-  sas(b, n, grindA(b, n, t)) = t,
+  sas(b, n, <appNonce(grindA(b, n, s, l, t)), s, l>) = t,
   sas(b, grindB(b, a, t), a) = t
 
 restriction Equal:
@@ -73,12 +103,14 @@ rule Create_User:
 rule B_Start:
     [ Fr(~tid), Fr(~sk), Fr(~nB), In(<id, code>) ]
   -->
-    [ BWait(~tid, id, code, ~sk, ~nB), UserCode(~tid, code), Out(<pk(~sk), ~nB>) ]
+    [ BWait(~tid, id, code, ~sk, ~nB), UserSees(~tid, <id, code, 'none'>), Out(<pk(~sk), ~nB>) ]
 #else
 rule B_Start:
+    let c = h(<'commit', pk(~sk), ~nB>)
+    in
     [ Fr(~tid), Fr(~sk), Fr(~nB), In(<id, code>) ]
   -->
-    [ BWait(~tid, id, code, ~sk, ~nB), UserCode(~tid, code), Out(h(<'commit', pk(~sk), ~nB>)) ]
+    [ BWait(~tid, id, code, ~sk, ~nB), UserSees(~tid, <id, code, c>), Out(c) ]
 #endif
 
 // The user types the code into the app. The app takes the id and the commit
@@ -86,20 +118,42 @@ rule B_Start:
 // ap = <nA, scope, ttl> with nA = h(sA).
 #ifdef NOCOMMIT
 rule A_Claim:
-    let ap = <h(<'app', ~sA>), $scope, $ttl>
+    let ap = <appNonce(~sA), $scope, $ttl>
     in
-    [ !App(A, K), UserCode(tid, code), In(<id, pkX, nX>), Fr(~sA) ]
+    [ !App(A, K), UserSees(tid, <qid, code, qc>), In(<id, pkX, nX>), Fr(~sA) ]
   -->
-    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, ~sA, ap),
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, ~sA, ap, 'code'),
       !ADisplay(tid, sas(<id, code, pkX>, nX, ap)),
       Out(ap) ]
 #else
 rule A_Claim:
-    let ap = <h(<'app', ~sA>), $scope, $ttl>
+    let ap = <appNonce(~sA), $scope, $ttl>
     in
-    [ !App(A, K), UserCode(tid, code), In(<id, c>), Fr(~sA) ]
+    [ !App(A, K), UserSees(tid, <qid, code, qc>), In(<id, c>), Fr(~sA) ]
   -->
-    [ AWait(tid, K, id, code, c, ~sA, ap), Out(ap) ]
+    [ AWait(tid, K, id, code, c, ~sA, ap, 'code'), Out(ap) ]
+#endif
+
+#ifdef QR
+// The user scans the QR code into the app. The app claims with its code and
+// goes on only with the QR's id and c in the server's answer.
+rule A_Claim_qr:
+    let ap = <appNonce(~sA), $scope, $ttl>
+    in
+    [ !App(A, K), UserSees(tid, <id, code, c>), In(<id, c>), Fr(~sA) ]
+  --[ AScanned(tid) ]->
+    [ AWait(tid, K, id, code, c, ~sA, ap, 'qr'), Out(ap) ]
+#endif
+
+#ifdef NOQRCHECK
+// Mutation (with QR): the app takes c from the server's answer whatever the
+// QR says. This rule accepts every answer A_Claim_qr accepts, and more.
+rule A_Claim_qr_nocheck:
+    let ap = <appNonce(~sA), $scope, $ttl>
+    in
+    [ !App(A, K), UserSees(tid, <id, code, qc>), In(<id, c>), Fr(~sA) ]
+  --[ AScanned(tid) ]->
+    [ AWait(tid, K, id, code, c, ~sA, ap, 'qr'), Out(ap) ]
 #endif
 
 // The browser takes the first ap, shows the words, and reveals pkB and nB.
@@ -117,9 +171,9 @@ rule B_Reveal:
 
 // The app accepts the reveal only if it opens the commit, and shows the words.
 rule A_Reveal:
-    [ AWait(tid, K, id, code, h(<'commit', pkX, nX>), sA, ap), In(<pkX, nX>) ]
+    [ AWait(tid, K, id, code, h(<'commit', pkX, nX>), sA, ap, how), In(<pkX, nX>) ]
   -->
-    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, sA, ap),
+    [ AShown(tid, K, id, code, h(<'commit', pkX, nX>), pkX, nX, sA, ap, how),
       !ADisplay(tid, sas(<id, code, pkX>, nX, ap)) ]
 #endif
 
@@ -128,9 +182,35 @@ rule A_Reveal:
 rule A_Approve:
     let th = h(<id, code, c, ap, pkX, nX>)
     in
-    [ AShown(tid, K, id, code, c, pkX, nX, sA, ap), !BDisplay(tid, wB) ]
-  --[ Eq(sas(<id, code, pkX>, nX, ap), wB), Approve(tid, th, kdf(K)) ]->
+    [ AShown(tid, K, id, code, c, pkX, nX, sA, ap, 'code'), !BDisplay(tid, wB) ]
+  --[ Eq(sas(<id, code, pkX>, nX, ap), wB), Approve(tid, th, kdf(K)), SealedTo(pkX, kdf(K)) ]->
     [ Out(hseal(pkX, <'grant', th>, <sA, kdf(K)>)) ]
+
+#ifdef QR
+// After a scan, the approval does not rely on the comparison: the user may
+// approve without looking at the browser.
+rule A_Approve_qr:
+    let th = h(<id, code, c, ap, pkX, nX>)
+    in
+    [ AShown(tid, K, id, code, c, pkX, nX, sA, ap, 'qr') ]
+  --[ Approve(tid, th, kdf(K)), SealedTo(pkX, kdf(K)) ]->
+    [ Out(hseal(pkX, <'grant', th>, <sA, kdf(K)>)) ]
+#endif
+
+#ifdef EARLYNB
+// Mutation (with QR): the commit stays (in the QR code and at the server),
+// but the browser publishes pkB and nB before it fixed nA.
+rule B_EarlyReveal:
+    [ BWait(tid, id, code, sk, nB) ]
+  -->
+    [ BWaitEarly(tid, id, code, sk, nB), Out(<pk(sk), nB>) ]
+
+// Then as B_Reveal, without anything left to reveal.
+rule B_RevealEarly:
+    [ BWaitEarly(tid, id, code, sk, nB), In(ap) ]
+  -->
+    [ BShown(tid, id, code, sk, nB, ap), !BDisplay(tid, sas(<id, code, pk(sk)>, nB, ap)) ]
+#endif
 
 // The user confirms in the browser only when the app shows the same words.
 #ifdef APPONLY
@@ -156,7 +236,7 @@ rule B_Accept:
     [ BHolds(tid, sk, bk) ]
 #else
 rule B_Accept:
-    let ap = <h(<'app', sA>), scope, ttl>
+    let ap = <appNonce(sA), scope, ttl>
         th = h(<id, code, h(<'commit', pk(sk), nB>), ap, pk(sk), nB>)
     in
     [ BConfirmed(tid, id, code, sk, nB, ap), In(hseal(pk(sk), <'grant', th>, <sA, bk>)) ]
@@ -165,10 +245,11 @@ rule B_Accept:
 #endif
 
 // The viewer is compromised after it accepted (a malicious page later, an
-// extension): everything it holds leaks.
+// extension): everything it holds leaks, i.e. the key it accepted and its
+// secret key, which opens every grant sealed to it.
 rule B_Leak:
     [ BHolds(tid, sk, bk) ]
-  --[ BLeak(tid) ]->
+  --[ BLeak(tid, pk(sk), bk) ]->
     [ Out(<sk, bk>) ]
 
 // Helper for the leak rule: a key a browser holds came from an approval or
@@ -183,17 +264,24 @@ lemma accepted_key_source [sources]:
 lemma executable_approve_first:
   exists-trace
   "Ex tid th bk #i #j #k. Approve(tid, th, bk) @ i & BConfirm(tid) @ j & BAccept(tid, th, bk) @ k
-     & #i < #j & #j < #k & not (Ex t #l. BLeak(t) @ l)"
+     & #i < #j & #j < #k & not (Ex t p b #l. BLeak(t, p, b) @ l)"
 
 lemma executable_confirm_first:
   exists-trace
   "Ex tid th bk #i #j #k. BConfirm(tid) @ j & Approve(tid, th, bk) @ i & BAccept(tid, th, bk) @ k
-     & #j < #i & #i < #k & not (Ex t #l. BLeak(t) @ l)"
+     & #j < #i & #i < #k & not (Ex t p b #l. BLeak(t, p, b) @ l)"
 
 lemma executable_two_browsers:
   exists-trace
   "Ex t1 t2 th1 th2 bk #i #j. BAccept(t1, th1, bk) @ i & BAccept(t2, th2, bk) @ j
-     & not (t1 = t2) & not (Ex t #l. BLeak(t) @ l)"
+     & not (t1 = t2) & not (Ex t p b #l. BLeak(t, p, b) @ l)"
+
+#ifdef QR
+// The QR path is used: a browser receives the key from an app that scanned it.
+lemma executable_qr:
+  exists-trace
+  "Ex tid th bk #s #k. AScanned(tid) @ s & BAccept(tid, th, bk) @ k & not (Ex t p b #l. BLeak(t, p, b) @ l)"
+#endif
 
 // ---- Properties ----
 
@@ -206,10 +294,15 @@ lemma master_key_secrecy:
 lemma auth_key_secrecy:
   "All K #i. NewKey(K) @ i ==> not (Ex #j. K(kauth(K)) @ j)"
 
-// The batch key stays secret unless a viewer that received it leaks it.
+// A user's batch key stays secret unless a viewer leaks that key: one that
+// accepted it, or one whose key the app sealed it to (its secret key opens
+// the grant). A leak of another key (another user's, or a key from the
+// server) is no exception.
 lemma batch_key_secrecy:
   "All K #i. NewKey(K) @ i ==>
-     not (Ex #j. K(kdf(K)) @ j) | (Ex tid #l. BLeak(tid) @ l)"
+     not (Ex #j. K(kdf(K)) @ j)
+     | (Ex tid p #l. BLeak(tid, p, kdf(K)) @ l)
+     | (Ex tid p b #a #l. SealedTo(p, kdf(K)) @ a & BLeak(tid, p, b) @ l)"
 
 // The key a browser accepts is the one the app approved for exactly that
 // transcript (id, code, commit, nA, scope, ttl, pkB, nB) and that browser,

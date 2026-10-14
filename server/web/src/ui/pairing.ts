@@ -1,16 +1,19 @@
 // ペアリング (docs/web-ui.md, docs/design/browser-pairing-v1.md): a 3-step
-// stepper. 1 コードの表示: this browser shows a code that the user enters in
-// the app's 「ブラウザでも見る」. 2 確認コードの照合: both show the same four
-// words; the user approves in the app and presses 「一致する」 here. 3 完了.
+// stepper. 1 QR コードの読み取り: this browser shows a QR code that the app's
+// 「ブラウザでも見る」 scans, and the code for a phone that cannot scan (typed
+// there). 2 確認コードの照合: both show the same four words; the user approves
+// in the app and presses 「一致する」 here. 3 完了.
 // Mismatch, expiry and failure discard the temporary key and offer one
 // 「最初からやり直す」. Dev builds add a panel that registers with a pasted
 // device token and batch key; production builds do not contain it.
 
 import type { EndReason, PairingEvent } from "../data/pairing";
 import { DEV_PANEL, devSession, pairingV1, type KeyStorage, type Pairing, type PairingControl, type ViewerSession } from "../data/session";
+import { viewerQrUri } from "../data/viewerqr";
 import type { Ctx } from "./context";
 import { $, h, icon, replace, toast } from "./dom";
 import { absTime } from "./format";
+import { qrSvg } from "./qr";
 
 const CODE_RE = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{8}$/;
 
@@ -37,9 +40,29 @@ export function setPairing(p: Pairing): void {
   pairing = p;
 }
 
-type View =
+/** The stepper's steps. */
+export const STEPS = ["QR コードの読み取り", "確認コードの照合", "完了"] as const;
+
+/** The step (1 to 3) a view is at; ended views show no stepper. */
+export function stepOf(k: View["k"]): number {
+  return k === "words" ? 2 : k === "done" ? 3 : 1;
+}
+
+/**
+ * The QR code's text for this page's origin, or null if the origin cannot
+ * be put in it (the code still works).
+ */
+export function qrText(origin: string, e: { id: string; code: string; commit: Uint8Array }): string | null {
+  try {
+    return viewerQrUri(origin, e.id, e.code, e.commit);
+  } catch {
+    return null;
+  }
+}
+
+export type View =
   | { k: "intro" }
-  | { k: "code"; code: string | null; claimed: boolean }
+  | { k: "code"; code: string | null; qr: string | null; claimed: boolean }
   | { k: "words"; words: string[]; scope: string; ttl: number; waiting: boolean; limit: boolean }
   | { k: "done"; session: ViewerSession }
   | { k: "ended"; reason: EndReason };
@@ -89,7 +112,7 @@ function onEvent(attempt: PairingControl, e: PairingEvent): void {
   if (attempt !== control) return;
   switch (e.kind) {
     case "code":
-      show({ k: "code", code: e.code, claimed: false });
+      show({ k: "code", code: e.code, qr: qrText(location.origin, e), claimed: false });
       break;
     case "claimed":
       if (view.k === "code") show({ ...view, claimed: true }, false);
@@ -118,7 +141,7 @@ function onEvent(attempt: PairingControl, e: PairingEvent): void {
 function begin(): void {
   const prev = control;
   if (prev) void prev.cancel();
-  view = { k: "code", code: null, claimed: false };
+  view = { k: "code", code: null, qr: null, claimed: false };
   let self: PairingControl | null = null;
   const queued: PairingEvent[] = [];
   self = pairing.start((e) => (self ? onEvent(self, e) : queued.push(e)));
@@ -147,11 +170,10 @@ function optIn(): HTMLElement {
 }
 
 function stepper(step: number): HTMLElement {
-  const steps = ["コードの表示", "確認コードの照合", "完了"];
   return h(
     "ol",
     { class: "stepper", "aria-label": "手順" },
-    steps.map((t, i) => h("li", { "aria-current": step === i + 1 ? "step" : null, class: step > i + 1 ? "done" : "" }, h("span", { class: "n" }, step > i + 1 ? icon("check") : String(i + 1)), t)),
+    STEPS.map((t, i) => h("li", { "aria-current": step === i + 1 ? "step" : null, class: step > i + 1 ? "done" : "" }, h("span", { class: "n" }, step > i + 1 ? icon("check") : String(i + 1)), t)),
   );
 }
 
@@ -175,9 +197,9 @@ function introStep(): HTMLElement {
   return h(
     "section",
     { class: "card ppanel" },
-    heading("コードの表示"),
-    h("p", null, "このブラウザで記録を見るには、表示するコードをアプリに入力し、アプリで承認します。"),
-    h("div", { class: "formact" }, h("button", { class: "btn primary", type: "button", onclick: () => begin() }, "コードを表示")),
+    heading(STEPS[0]),
+    h("p", null, "このブラウザで記録を見るには、表示する QR コードをアプリで読み取り、アプリで承認します。"),
+    h("div", { class: "formact" }, h("button", { class: "btn primary", type: "button", onclick: () => begin() }, "QR コードを表示")),
   );
 }
 
@@ -204,10 +226,12 @@ function codeStep(v: Extract<View, { k: "code" }>): HTMLElement {
   return h(
     "section",
     { class: "card ppanel", "aria-busy": code ? null : "true" },
-    heading("コードの表示"),
-    h("p", null, "アプリの同期設定で「ブラウザでも見る」を選び、このコードを入力してください。"),
+    heading(STEPS[0]),
+    h("p", null, "アプリの「ブラウザでも見る」で QR コードを読み取ってください。"),
+    h("div", { class: "qrshow" }, v.qr ? qrSvg(v.qr, "アプリで読み取る QR コード") : h("span", { class: "qrwait" }, code ? "QR コードを表示できません。下のコードを入力してください。" : "QR コードを準備しています")),
+    h("p", { class: "hint" }, "読み取れない場合は、アプリで「コードを入力」を選び、このコードを入力してください。"),
     h("div", { class: "codeshow" }, h("span", { class: "codebig", "aria-label": code ? `コード ${code.split("").join(" ")}` : "コードを準備しています" }, code ? displayCode(code) : "····-····"), copy),
-    v.claimed ? h("p", { class: "pstate", role: "status" }, icon("okcirc"), "アプリで入力されました。確認コードを準備しています。") : null,
+    v.claimed ? h("p", { class: "pstate", role: "status" }, icon("okcirc"), "アプリで受け付けました。確認コードを準備しています。") : null,
     code ? countdown() : null,
     h("div", { class: "formact" }, h("button", { class: "btn ghost", type: "button", onclick: () => void abandon() }, "中止する")),
   );
@@ -370,7 +394,7 @@ function devPanel(ctx: Ctx): HTMLElement | null {
 export function renderPairing(ctx: Ctx, main: HTMLElement): void {
   lastCtx = ctx;
   const v = view;
-  const step = v.k === "words" ? 2 : v.k === "done" ? 3 : 1;
+  const step = stepOf(v.k);
   const body =
     v.k === "intro" ? introStep() : v.k === "code" ? codeStep(v) : v.k === "words" ? wordsStep(v) : v.k === "done" ? doneStep(ctx, v) : endedStep(v);
   replace(

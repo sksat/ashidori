@@ -1,7 +1,7 @@
 package ashidori.core
 
 import ashidori.core.ViewerPairingFixtures.*
-import ashidori.core.sync.{Bip39Japanese, ViewerApproval, ViewerFailure, ViewerPairingApi, ViewerPairing as VP}
+import ashidori.core.sync.{Bip39Japanese, ViewerApproval, ViewerFailure, ViewerPairingApi, ViewerQr, ViewerPairing as VP}
 import ashidori.core.sync.ViewerApproval.Phase
 import ashidori.core.sync.ViewerPairingApi.*
 import com.google.crypto.tink.subtle.X25519
@@ -97,6 +97,7 @@ class ViewerPairingSuite extends munit.FunSuite:
     // Deterministic parts equal what this code computes now.
     assertEquals(js("sas"), fresh("sas"))
     assertEquals(js("tamper"), fresh("tamper"))
+    assertEquals(js("qr"), fresh("qr"))
     assertEquals(js("lowOrder"), fresh("lowOrder"))
     assertEquals(js("wordlistSha256").str, Bip39Japanese.Sha256)
     val g = js("grant")
@@ -332,4 +333,151 @@ class ViewerPairingSuite extends munit.FunSuite:
     a.start("ABCD2345", 3600)
     s.state = "aborted"
     assertEquals(a.poll(), Phase.Failed(ViewerFailure.Aborted))
+  }
+
+  // ---- The QR code (scan instead of typing the code) ----
+
+  private val qrServer = "https://ashidori.example"
+  private def qrOf(s: FakeServer): ViewerQr = ViewerQr(qrServer, s.id, "ABCD2345", hex(s.c))
+
+  test("the QR code's text: the exact form round-trips; anything else is refused") {
+    val c = hex(VP.commit(VecPkB, VecNB))
+    val id = VP.b64(VecId)
+    val uri = ViewerQr.uri(qrServer, id, VecCode, c)
+    assertEquals(uri, s"ashidori://viewer?server=https%3A%2F%2Fashidori.example&id=$id&code=ABCD2345&c=$c")
+    assertEquals(ViewerQr.parse(uri), Some(ViewerQr(qrServer, id, VecCode, c)))
+    assertEquals(ViewerQr.parse(uri).map(q => hex(q.commit)), Some(c))
+    val local = ViewerQr.uri("http://localhost:8787", id, VecCode, c)
+    assertEquals(ViewerQr.parse(local), None) // http only in debug builds
+    assertEquals(ViewerQr.parse(local, allowHttp = true).map(_.server), Some("http://localhost:8787"))
+    val bad = Seq(
+      "",
+      uri + "&x=1",
+      uri + "#f",
+      uri.replace("ashidori://viewer?", "ashidori://pair?"),
+      uri.replace("ashidori://", "ASHIDORI://"),
+      uri.replace("ashidori://viewer?", "https://viewer?"),
+      // Order, duplicates, missing values.
+      s"ashidori://viewer?id=$id&server=https%3A%2F%2Fashidori.example&code=ABCD2345&c=$c",
+      uri.replace(s"&c=$c", s"&c=$c&c=$c"),
+      uri.replace(s"&c=$c", ""),
+      uri.replace("code=ABCD2345", "code="),
+      // Values: other encodings, case, lengths, alphabets.
+      uri.replace("https%3A%2F%2F", "https://"),
+      uri.replace("%3A", "%3a"),
+      uri.replace("ashidori.example", "Ashidori.example"),
+      uri.replace("ashidori.example", "ashidori.example%2F"),
+      uri.replace("ashidori.example", "ashidori.example%2Fpath"),
+      uri.replace("ashidori.example", "user%40ashidori.example"),
+      uri.replace("code=ABCD2345", "code=abcd2345"),
+      uri.replace("code=ABCD2345", "code=ABCD-2345"),
+      uri.replace("code=ABCD2345", "code=ABCU2345"),
+      uri.replace(s"c=$c", s"c=${c.toUpperCase}"),
+      uri.replace(s"c=$c", s"c=${c.drop(2)}"),
+      uri.replace(s"c=$c", s"c=${VP.b64(VP.commit(VecPkB, VecNB))}"),
+      uri.replace(s"id=$id", s"id=${id}AA"),
+      uri.replace(s"id=$id", s"id=${id.dropRight(1)}"),
+      uri + "x" * 600,
+    )
+    for b <- bad do assertEquals(ViewerQr.parse(b, allowHttp = true), None, b)
+  }
+
+  test("the QR code must be of the server the app syncs with") {
+    val q = ViewerQr(qrServer, VP.b64(VecId), VecCode, hex(VP.commit(VecPkB, VecNB)))
+    assert(ViewerQr.sameServer(q, "https://ashidori.example", allowHttp = false))
+    assert(ViewerQr.sameServer(q, "https://ASHIDORI.example/", allowHttp = false))
+    assert(!ViewerQr.sameServer(q, "https://other.example", allowHttp = false))
+    assert(!ViewerQr.sameServer(q, "https://ashidori.example:8443", allowHttp = false))
+    assert(!ViewerQr.sameServer(q, "http://ashidori.example", allowHttp = true))
+    assert(!ViewerQr.sameServer(q, "", allowHttp = false))
+  }
+
+  test("the same server is the same scheme, host and effective port") {
+    val c = hex(VP.commit(VecPkB, VecNB))
+    def qr(server: String) = ViewerQr(server, VP.b64(VecId), VecCode, c)
+    // A setting with the default port and a page origin without it (location.origin drops it), and back.
+    assert(ViewerQr.sameServer(qr("https://ashidori.example"), "https://ashidori.example:443", allowHttp = false))
+    assert(ViewerQr.sameServer(qr("https://ashidori.example:443"), "https://ashidori.example", allowHttp = false))
+    assert(ViewerQr.sameServer(qr("http://localhost"), "http://localhost:80", allowHttp = true))
+    assert(ViewerQr.sameServer(qr("http://localhost:8787"), "http://localhost:8787/", allowHttp = true))
+    // Other ports, schemes and hosts differ; 443 is not the default for http, nor 80 for https.
+    assert(!ViewerQr.sameServer(qr("https://ashidori.example"), "https://ashidori.example:8443", allowHttp = false))
+    assert(!ViewerQr.sameServer(qr("https://ashidori.example:80"), "https://ashidori.example", allowHttp = false))
+    assert(!ViewerQr.sameServer(qr("http://ashidori.example:443"), "https://ashidori.example", allowHttp = true))
+    assert(!ViewerQr.sameServer(qr("http://localhost:8787"), "http://localhost:8788", allowHttp = true))
+    // http only in debug builds, on both sides.
+    assert(!ViewerQr.sameServer(qr("http://localhost"), "http://localhost", allowHttp = false))
+    // A scanned code with the default port parses (the browser does not write one, but it is the same origin).
+    val uri = ViewerQr.uri("https://ashidori.example:443", VP.b64(VecId), VecCode, c)
+    assertEquals(ViewerQr.parse(uri).map(_.server), Some("https://ashidori.example:443"))
+  }
+
+  test("after a scan: the QR code's id and commit, the same words, approve, done") {
+    val s = FakeServer()
+    val a = ViewerApproval(s, () => batchKey.clone(), () => 0L)
+    val qr = ViewerQr.parse(qrOf(s).uri).get
+    assertEquals(a.startQr(qr, 3600), Phase.WaitingReveal)
+    assertEquals(s.calls.toList, List("claim ABCD2345", "nonce batch-v1 3600"))
+    s.reveal()
+    val words = VP.sasWords(s.browserTh)
+    assertEquals(a.poll(), Phase.Showing(words, "batch-v1", 3600, false))
+    s.confirm()
+    assertEquals(a.approve(), Phase.Done("viewer-1", 3600))
+    val plain = decrypter(s.sk).decrypt(s.grant.get, VP.info(s.browserTh))
+    assertEquals(hex(plain.drop(33)), hex(batchKey))
+  }
+
+  test("after a scan: a server that answers another commit (its own key) is refused before nA is sent") {
+    // The QR code has the browser's commit; the server puts a key of its own in its place.
+    val s = FakeServer()
+    val qr = qrOf(s)
+    s.revealPk = X25519.publicFromPrivate(X25519.generatePrivateKey())
+    s.c = VP.commit(s.revealPk, s.revealNb)
+    val a = ViewerApproval(s, () => batchKey.clone(), () => 0L)
+    assertEquals(a.startQr(qr, 3600), Phase.Failed(ViewerFailure.QrMismatch))
+    assertEquals(s.calls.toList, List("claim ABCD2345", "abort"))
+    assertEquals(s.state, "aborted")
+    s.reveal()
+    assertEquals(a.poll(), Phase.Failed(ViewerFailure.QrMismatch))
+    assertEquals(a.approve(), Phase.Failed(ViewerFailure.QrMismatch))
+    assert(s.grants.isEmpty)
+  }
+
+  test("after a scan: an attempt of another id is refused") {
+    val s = FakeServer()
+    val qr = qrOf(s).copy(id = VP.b64(VP.random(16)))
+    val a = ViewerApproval(s, () => batchKey.clone(), () => 0L)
+    assertEquals(a.startQr(qr, 3600), Phase.Failed(ViewerFailure.QrMismatch))
+    assertEquals(s.calls.toList, List("claim ABCD2345", "abort"))
+  }
+
+  test("with the code typed, the app takes the substituted commit: only the comparison of the words stops it") {
+    // What the scan adds: the same substitution passes the code entry up to the words.
+    val s = FakeServer()
+    s.revealPk = X25519.publicFromPrivate(X25519.generatePrivateKey())
+    s.c = VP.commit(s.revealPk, s.revealNb)
+    val a = ViewerApproval(s, () => batchKey.clone(), () => 0L)
+    assertEquals(a.start("ABCD2345", 3600), Phase.WaitingReveal)
+    s.reveal()
+    assert(a.poll().isInstanceOf[Phase.Showing])
+  }
+
+  test("after a scan: the browser's reveal must still open the QR code's commit") {
+    val s = FakeServer()
+    val a = ViewerApproval(s, () => batchKey, () => 0L)
+    a.startQr(qrOf(s), 3600)
+    s.revealNb = VP.random()
+    s.reveal()
+    assertEquals(a.poll(), Phase.Failed(ViewerFailure.BadReveal))
+  }
+
+  test("the web fixture's QR codes: what the browser writes, the app reads") {
+    val f = File("../server/web/test/fixtures/viewer-pairing.json")
+    assume(f.exists, s"$f not written yet (./gradlew :core:webFixtures)")
+    val js = ujson.read(java.nio.file.Files.readString(f.toPath))
+    assertEquals(js("qr").arr.size, QrServers.size)
+    for v <- js("qr").arr do
+      val q = ViewerQr.parse(v("uri").str, allowHttp = true).get
+      assertEquals((q.server, q.id, q.code, q.commitHex), (v("server").str, v("id").str, v("code").str, v("c").str))
+      assertEquals(q.commitHex, js("sas")("c").str)
   }

@@ -13,6 +13,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { Plugin } from "vite";
 import { defineConfig } from "vitest/config";
+import { QRCODE_GENERATOR_JS } from "../src/vendor/qrcode-generator.ts";
 
 const require = createRequire(import.meta.url);
 const maplibreDir = dirname(require.resolve("maplibre-gl/package.json"));
@@ -39,6 +40,26 @@ function maplibreVendor(): Plugin {
         this.emitFile({ type: "asset", fileName: `${MAPLIBRE_PATH.slice(1)}${f}`, source: readFileSync(join(maplibreDir, "dist", f)) });
       this.emitFile({ type: "asset", fileName: `${MAPLIBRE_PATH.slice(1)}LICENSE.txt`, source: readFileSync(join(maplibreDir, "LICENSE.txt")) });
     },
+  };
+}
+
+// The pairing QR code (src/ui/qr.ts) is drawn with the QR code generator
+// the server's pages inline (server/src/vendor/qrcode-generator.ts, verbatim
+// and hash-checked there), bundled as an ES module into /assets/ like the
+// rest of the viewer: no inline script, no eval, no change to the CSP.
+const QRCODE_ID = "virtual:qrcode-generator";
+
+function qrcodeVendor(): Plugin {
+  return {
+    name: "ashidori-qrcode-generator",
+    resolveId: (id) => (id === QRCODE_ID ? `\0${QRCODE_ID}` : null),
+    // In a function whose `define`, `exports` and `module` are undefined: the
+    // file's UMD footer then exports nothing of its own (a module runner may
+    // have an `exports` object).
+    load: (id) =>
+      id === `\0${QRCODE_ID}`
+        ? `const qrcode = (function (define, exports, module) {\n${QRCODE_GENERATOR_JS}\nreturn qrcode;\n})(undefined, undefined, undefined);\nexport default qrcode;\n`
+        : null,
   };
 }
 
@@ -69,7 +90,7 @@ export default defineConfig({
   root: import.meta.dirname,
   base: "/",
   define: { __MAPLIBRE_PATH__: JSON.stringify(MAPLIBRE_PATH), __BASEMAP_PIN__: JSON.stringify(basemapPin()) },
-  plugins: [maplibreVendor()],
+  plugins: [maplibreVendor(), qrcodeVendor()],
   build: {
     outDir: "dist",
     emptyOutDir: true,

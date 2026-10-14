@@ -12,14 +12,15 @@ import java.util.concurrent.Executors
 import scala.util.Try
 import net.sksat.ashidori.*
 import net.sksat.ashidori.sync.*
-import ashidori.core.sync.{ViewerApproval, ViewerFailure, ViewerPairing as VP}
+import ashidori.core.sync.{ViewerApproval, ViewerFailure, ViewerQr, ViewerPairing as VP}
 import ashidori.core.sync.ViewerApproval.Phase
 import Ui.*
 
 /** 「ブラウザでも見る」 in the sync settings (docs/design/browser-pairing-v1.md):
   * the opt-in with its consequence, the browsers that can read now (with
-  * 「終了」), and the approval: the code the browser shows → the four words,
-  * what the browser can read and until when → 「承認」 or 「一致しない」.
+  * 「終了」), and the approval: the QR code the browser shows, scanned (or
+  * its code, typed) → the four words, what the browser can read and until
+  * when → 「承認」 or 「一致しない」.
   *
   * The browser receives the batch key only. `sA` and the sealed grant live
   * in memory, in the [[ViewerApproval]] of the open dialog; closing the
@@ -105,7 +106,10 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
 
   // ---- the approval ----
 
-  /** Step 1: the code the browser shows, and the expiry. */
+  private def debuggable: Boolean =
+    (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+  /** Step 1: the expiry, then the QR code the browser shows (or its code, typed). */
   private def begin(done: () => Unit): Unit =
     // Blob authentication must be in force before any browser gets the batch key.
     val wait = MaterialAlertDialogBuilder(act).setTitle("ブラウザでも見る").setMessage("ほかの端末の状態を確認しています…").setCancelable(false).show()
@@ -114,28 +118,70 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
       r.fold(e => Left(String.valueOf(e.getMessage)), identity) match
         case Left(msg) =>
           MaterialAlertDialogBuilder(act).setTitle("ブラウザでも見る").setMessage(msg).setPositiveButton("閉じる", null).show()
-        case Right(()) => askCode(done)
+        case Right(()) => chooseWay(done)
     }
 
-  private def askCode(done: () => Unit): Unit =
+  /** The expiry, and how to take the browser's attempt: 「QR コードを読み取る」
+    * (primary) or 「コードを入力」 (for a phone that cannot scan).
+    */
+  private def chooseWay(done: () => Unit): Unit =
+    val ttl = RadioGroup(act)
+    val r1 = RadioButton(act); r1.setText("1時間"); r1.setId(View.generateViewId())
+    val r24 = RadioButton(act); r24.setText("24時間"); r24.setId(View.generateViewId())
+    ttl.addView(r1); ttl.addView(r24)
+    ttl.check(r1.getId)
+    def ttlSeconds = if ttl.getCheckedRadioButtonId == r24.getId then 86400 else 3600
+    var d: Option[AlertDialog] = None
+    val scan = button("QR コードを読み取る") {
+      d.foreach(_.dismiss())
+      val t = ttlSeconds
+      PairQrUi.scanFor(act, "ブラウザに表示された QR コードを写してください。", "ブラウザの登録の QR コードではありません。")(
+        ViewerQr.parse(_, allowHttp = debuggable))(qr => scanned(qr, t, done))
+    }
+    val typed = outlined("コードを入力") {
+      d.foreach(_.dismiss())
+      askCode(ttlSeconds, done)
+    }
+    for b <- Seq(scan, typed) do
+      b.setLayoutParams(LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
+    val content = vbox(
+      caption("ブラウザで閲覧ページを開き、表示された QR コードを読み取ってください。"),
+      spacer(8),
+      text("期限", 14f, bold = true),
+      ttl,
+      spacer(8),
+      scan,
+      typed,
+    )
+    d = Some(MaterialAlertDialogBuilder(act)
+      .setTitle("ブラウザでも見る")
+      .setView(scroll(padded(content, 24, 8)))
+      .setNegativeButton("キャンセル", null)
+      .show())
+
+  /** A scanned QR code: only of the server this app syncs with. */
+  private def scanned(qr: ViewerQr, ttl: Int, done: () => Unit): Unit =
+    if ViewerQr.sameServer(qr, SyncConfig.serverUrl, allowHttp = debuggable) then run(Right(qr), ttl, done)
+    else
+      val host = Try(java.net.URI(qr.server).getHost).toOption.flatMap(Option(_)).getOrElse(qr.server)
+      MaterialAlertDialogBuilder(act)
+        .setTitle("ブラウザでも見る")
+        .setMessage(s"この QR コードは $host のページのもので、同期しているサーバのものではありません。同期しているサーバのページで表示した QR コードを読み取ってください。")
+        .setPositiveButton("閉じる", null)
+        .show()
+
+  /** The fallback: the code the browser shows, typed. */
+  private def askCode(ttl: Int, done: () => Unit): Unit =
         val code = EditText(act)
         code.setHint("XXXX-XXXX")
         code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
         code.setTypeface(android.graphics.Typeface.MONOSPACE)
-        val ttl = RadioGroup(act)
-        val r1 = RadioButton(act); r1.setText("1時間"); r1.setId(View.generateViewId())
-        val r24 = RadioButton(act); r24.setText("24時間"); r24.setId(View.generateViewId())
-        ttl.addView(r1); ttl.addView(r24)
-        ttl.check(r1.getId)
         val err = text("", 13f, colorAttr = attr.error)
         err.setVisibility(View.GONE)
         val content = vbox(
           caption("ブラウザで表示されたコードを入力してください。"),
           code,
           err,
-          spacer(8),
-          text("期限", 14f, bold = true),
-          ttl,
         )
         val d = MaterialAlertDialogBuilder(act)
           .setTitle("ブラウザでも見る")
@@ -151,13 +197,17 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
                 err.setVisibility(View.VISIBLE)
               case Some(c) =>
                 d.dismiss()
-                run(c, if ttl.getCheckedRadioButtonId == r24.getId then 86400 else 3600, done)
+                run(Left(c), ttl, done)
           }
         }
         d.show()
 
-  /** Steps 2 and 3: waits for the browser, shows the words, approves. */
-  private def run(code: String, ttl: Int, done: () => Unit): Unit =
+  /** Steps 2 and 3: waits for the browser, shows the words, approves. `from`
+    * is the code typed (Left) or the QR code scanned (Right), whose id and
+    * commit the attempt checks against the server's answer.
+    */
+  private def run(from: Either[String, ViewerQr], ttl: Int, done: () => Unit): Unit =
+    val code = from.fold(identity, _.code)
     val attempt = ViewerApproval(ViewerPairingClient(client), () => ViewerGate.batchKey(), () => SystemClock.elapsedRealtime())
     val body = vbox()
     val timer = caption("")
@@ -270,7 +320,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
 
     d.setOnShowListener { _ =>
       show(Phase.Idle, None)
-      step(attempt.start(code, ttl))
+      step(from.fold(attempt.start(_, ttl), attempt.startQr(_, ttl)))
       tick()
       main.postDelayed(() => poll(), VP.PollMs)
     }
@@ -284,6 +334,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
     case ViewerFailure.UnknownCode => "コードが見つかりません。ブラウザに表示されたコードを確かめ、期限切れの場合はブラウザでやり直してください。"
     case ViewerFailure.Mismatch => "中止しました。ブラウザでも「一致しない」を押し、最初からやり直してください。"
     case ViewerFailure.BadReveal => "ブラウザの応答が正しくないため中止しました。ブラウザで最初からやり直してください。"
+    case ViewerFailure.QrMismatch => "サーバの応答が QR コードと一致しないため中止しました。ブラウザで最初からやり直してください。"
     case ViewerFailure.Changed => "途中で値が変わったため中止しました。ブラウザで最初からやり直してください。"
     case ViewerFailure.Expired => "期限（10分）が過ぎました。ブラウザで最初からやり直してください。"
     case ViewerFailure.Aborted => "この登録は中止されました。ブラウザで最初からやり直してください。"

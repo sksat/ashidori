@@ -98,8 +98,10 @@ same_device_id_for_two_devices verified
 no_forward_secrecy verified
 "
 
-# Expected result per lemma of crypto/browser_pairing.spthy, per mutation
-# flag ("-" = no flag): <flag> <lemma> <expected>.
+# Expected result per lemma of crypto/browser_pairing.spthy, per set of
+# flags ("-" = no flag, "A+B" = -D=A -D=B): <flags> <lemma> <expected>.
+# QR is the variant in which the app scans the browser's QR code (with the
+# code entry as a fallback in the same run).
 PAIRING_EXPECT="
 - accepted_key_source verified
 - executable_approve_first verified
@@ -116,18 +118,40 @@ NOGRANTAUTH grant_agreement falsified
 NOGRANTAUTH batch_key_secrecy verified
 APPONLY grant_agreement falsified
 APPONLY batch_key_secrecy verified
+QR accepted_key_source verified
+QR executable_approve_first verified
+QR executable_confirm_first verified
+QR executable_two_browsers verified
+QR executable_qr verified
+QR master_key_secrecy verified
+QR auth_key_secrecy verified
+QR batch_key_secrecy verified
+QR grant_agreement verified
+QR+NOQRCHECK batch_key_secrecy falsified
+QR+NOQRCHECK grant_agreement verified
+QR+APPONLY grant_agreement falsified
+QR+APPONLY batch_key_secrecy verified
+QR+EARLYNB grant_agreement falsified
+QR+EARLYNB batch_key_secrecy falsified
 "
 
 # Runs crypto/browser_pairing.spthy once per flag of $PAIRING_EXPECT and
 # checks each listed lemma.
 run_tamarin_pairing() {
-  local flag flags f log t0 t1 summary lemma want line got name
+  local flag flags f log t0 t1 summary lemma want line got name defs
   flags=$(echo "$PAIRING_EXPECT" | awk 'NF {print $1}' | awk '!seen[$0]++')
   for flag in $flags; do
-    if [ "$flag" = - ]; then log="$LOGS/browser_pairing.log"; name="tamarin pairing"; else log="$LOGS/browser_pairing-$flag.log"; name="tamarin pairing -D=$flag"; fi
+    if [ "$flag" = - ]; then
+      log="$LOGS/browser_pairing.log"; name="tamarin pairing"; defs=()
+    else
+      log="$LOGS/browser_pairing-$flag.log"; name="tamarin pairing -D=${flag//+/ -D=}"
+      IFS=+ read -ra defs <<<"$flag"
+      defs=("${defs[@]/#/-D=}")
+    fi
     t0=$(date +%s)
-    # shellcheck disable=SC2046 # no option, or one -D option
-    "$TAMARIN" --with-maude="$MAUDE" $([ "$flag" = - ] || echo "-D=$flag") --prove "$HERE/crypto/browser_pairing.spthy" >"$log" 2>&1 || true
+    # The derivation checks of the larger variants take longer than the 5 s
+    # default on a busy machine; a timeout there is reported as ill-formed.
+    "$TAMARIN" --with-maude="$MAUDE" --derivcheck-timeout=120 "${defs[@]}" --prove "$HERE/crypto/browser_pairing.spthy" >"$log" 2>&1 || true
     t1=$(date +%s)
     summary=$(sed -n '/summary of summaries/,$p' "$log")
     if ! grep -q "All wellformedness checks were successful" "$log"; then

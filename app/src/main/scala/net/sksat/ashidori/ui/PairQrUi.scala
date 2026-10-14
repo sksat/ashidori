@@ -17,7 +17,8 @@ import Ui.*
 /** QR codes of registration links: shown with ZXing (core), and scanned
   * with CameraX and ZXing. Frames are decoded on the device and never leave
   * it; no Google Play services. Only links are encoded, never the recovery
-  * code.
+  * code. The scanner also reads the web viewer's pairing QR code
+  * (BrowserPairingUi, [[scanFor]]).
   */
 object PairQrUi:
   /** `link` as a QR code with its quiet zone, about `sizeDp` wide, dark on
@@ -47,21 +48,28 @@ object PairQrUi:
     * scan goes on; nothing is registered here.
     */
   def scan(act: MainActivity, allowHttp: Boolean)(onLink: PairLink => Unit): Unit =
+    scanFor(act, "登録リンクの QR コードを写してください。", "登録リンクの QR コードではありません。")(PairLink.parse(_, allowHttp))(onLink)
+
+  /** Scans QR codes until `parse` accepts one, and hands its result to
+    * `onFound` (on the main thread). `prompt` is shown under the preview,
+    * `other` when a code was read that `parse` refuses (the scan goes on).
+    */
+  def scanFor[A](act: MainActivity, prompt: String, other: String)(parse: String => Option[A])(onFound: A => Unit): Unit =
     def toast(s: String) = Toast.makeText(act, s, Toast.LENGTH_LONG).show()
-    if act.granted(Manifest.permission.CAMERA) then scanner(act, allowHttp, onLink)
+    if act.granted(Manifest.permission.CAMERA) then scanner(act, prompt, other, parse, onFound)
     else
       act.requestPermissions(Seq(Manifest.permission.CAMERA)) { () =>
-        if act.granted(Manifest.permission.CAMERA) then scanner(act, allowHttp, onLink)
+        if act.granted(Manifest.permission.CAMERA) then scanner(act, prompt, other, parse, onFound)
         else toast("カメラの使用が許可されていません。Android の設定で許可できます")
       }
 
-  private def scanner(act: MainActivity, allowHttp: Boolean, onLink: PairLink => Unit): Unit =
+  private def scanner[A](act: MainActivity, prompt: String, other: String, parse: String => Option[A], onFound: A => Unit): Unit =
     given Ctx = act
     val preview = PreviewView(act)
     // A TextureView: a SurfaceView would sit outside the dialog's window.
     preview.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE)
     preview.setLayoutParams(LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp(280)))
-    val status = caption("登録リンクの QR コードを写してください。")
+    val status = caption(prompt)
     status.setPadding(0, dp(8), 0, 0)
     val worker = Executors.newSingleThreadExecutor()
     // Main thread only.
@@ -76,11 +84,11 @@ object PairQrUi:
 
     def found(text: String): Unit =
       if !closed then
-        PairLink.parse(text, allowHttp) match
-          case Some(link) =>
+        parse(text) match
+          case Some(a) =>
             d.dismiss()
-            onLink(link)
-          case None => status.setText("登録リンクの QR コードではありません。")
+            onFound(a)
+          case None => status.setText(other)
 
     // Reused between frames; the analyzer runs on `worker` only.
     var buf = Array.emptyByteArray

@@ -34,6 +34,8 @@ enum ViewerFailure:
   case Mismatch
   /** The browser's reveal does not match its commit, or its key is of low order. */
   case BadReveal
+  /** The server's id or commit differs from the scanned QR code's. */
+  case QrMismatch
   /** A pinned value came back different. */
   case Changed
   case Expired
@@ -43,10 +45,13 @@ enum ViewerFailure:
   case NotReady(message: String)
   case Refused(message: String)
 
-/** The app's side of one attempt: claim with the code the user typed, send
-  * `nA`, wait for the browser's reveal, show the words, approve with a grant
-  * sealed once. Every value is pinned when first received
-  * (「固定する時点」); a different value later aborts the attempt.
+/** The app's side of one attempt: claim with the code the user typed (or
+  * the one of the scanned QR code), send `nA`, wait for the browser's
+  * reveal, show the words, approve with a grant sealed once. Every value is
+  * pinned when first received (「固定する時点」); a different value later
+  * aborts the attempt. After a scan ([[startQr]]), the id and the commit the
+  * server answers must be the QR code's: the camera, not the server, tells
+  * the app which key the browser holds.
   *
   * `now` is a monotonic clock in ms. The attempt's local deadline is
   * [[ViewerPairing.AttemptMs]] after the claim was answered; past it the
@@ -94,15 +99,20 @@ final class ViewerApproval(api: ViewerPairingApi, batchKey: () => Array[Byte], n
     case _ => false
 
   /** Claims the attempt for `codeInput` and sends `nA`, `scope` and `ttl` (pinned here). */
-  def start(codeInput: String, ttlSeconds: Int): Phase = synchronized(startImpl(codeInput, ttlSeconds))
+  def start(codeInput: String, ttlSeconds: Int): Phase = synchronized(startImpl(codeInput, ttlSeconds, None))
 
-  private def startImpl(codeInput: String, ttlSeconds: Int): Phase =
+  /** Claims the attempt of a scanned QR code (whose server the caller checked);
+    * goes on only if the server answers the QR code's id and commit.
+    */
+  def startQr(qr: ViewerQr, ttlSeconds: Int): Phase = synchronized(startImpl(qr.code, ttlSeconds, Some(qr)))
+
+  private def startImpl(codeInput: String, ttlSeconds: Int, qr: Option[ViewerQr]): Phase =
     require(phase == Phase.Idle, "an attempt starts once")
     require(VP.Ttls.contains(ttlSeconds), "ttl is 1 h or 24 h")
     VP.normalizeCode(codeInput) match
       case None => fail(ViewerFailure.InvalidCode)
       case Some(norm) =>
-        // The code the user typed, normalized: never the server's echo.
+        // The code the user typed (or the QR code's), normalized: never the server's echo.
         code = norm
         ttl = ttlSeconds
         try
@@ -110,6 +120,8 @@ final class ViewerApproval(api: ViewerPairingApi, batchKey: () => Array[Byte], n
           deadline = now() + VP.AttemptMs
           if VP.unb64(cl.id, VP.IdLen).isEmpty || cl.commit.length != VP.KeyLen then return fail(ViewerFailure.Refused("サーバの応答が不正です。"))
           id = cl.id
+          // The camera's commit, not the server's: a different one ends the attempt before nA is sent.
+          if qr.exists(q => q.id != cl.id || !Arrays.equals(q.commit, cl.commit)) then return abortAndFail(ViewerFailure.QrMismatch)
           c = cl.commit
           // sA only after c arrived.
           sA = VP.random()

@@ -115,20 +115,27 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 `browser_pairing.spthy` は、予定のブラウザのペアリング（[`docs/design/browser-pairing-v1.md`](../docs/design/browser-pairing-v1.md)）のモデルである。
 攻撃者はサーバと通信路で、ページは信頼する。
 利用者は、ブラウザとアプリの 4 語が等しいときだけ、アプリで承認し、ブラウザで確認する。
-4 語は理想化したハッシュであり、後から自分の値を選ぶ者は `grindA`、`grindB` で一致させられるとして、44 bit の切り詰めを表す（確率そのものではない）。
+4 語は理想化したハッシュであり、後から自分の値を選ぶ者は `grindA`、`grindB` で一致させられるとして、44 bit の切り詰めを表す（確率そのものではない）。`grindA` は `nA` の原像 `sA` を返す。
 4 語と HPKE の `info` は、試行 ID、コード、範囲、期限を含む同じ transcript から作る。
 受け取った後のブラウザは、持つものをすべて漏らしうる（`B_Leak`）。
 取消、期限、再起動はモデルにない。
+`-D=QR` は、アプリがブラウザの QR コード（試行 ID、コード、commit）を読み取る経路を加える（コードの入力も同じ実行に残る）。
+カメラは、攻撃者が読めるが書き換えられない経路（線形の事実 `UserSees`）とし、QR コードの経路ではアプリの承認に 4 語の見比べを求めない。
+`run.sh` の期待の欄は、`QR+NOQRCHECK` のように `+` でつないだ複数の `-D` を表す。
 
 | 補題 | 内容 | 結果 |
 |---|---|---|
 | `executable_*` | 承認と確認のどちらが先でも、また 2 つのブラウザで、正常に受け取れる | 成立（到達の確認） |
 | `master_key_secrecy`, `auth_key_secrecy` | ブラウザが持つものをすべて漏らしても、攻撃者は `K` も blob の認証鍵も得られない | 成立 |
-| `batch_key_secrecy` | 受け取ったブラウザが漏らさない限り、バッチ鍵は攻撃者に渡らない | 成立 |
+| `batch_key_secrecy` | その鍵を受け取ったブラウザか、アプリがその鍵を封じた宛先のブラウザが漏らさない限り、バッチ鍵は攻撃者に渡らない | 成立 |
 | `grant_agreement` | ブラウザが受け取った鍵は、アプリが同じ transcript に承認したもの（単射的一致） | 成立 |
 | `-D=NOCOMMIT` の `batch_key_secrecy` | commit なし。サーバはアプリの nonce を見てから自分の値を選ぶ | 期待どおり反例あり |
 | `-D=NOGRANTAUTH` の `grant_agreement` | ブラウザが付与の中の `sA` を確かめない | 期待どおり反例あり |
 | `-D=APPONLY` の `grant_agreement` | ブラウザでの確認を省く（秘匿は成立のまま） | 期待どおり反例あり |
+| `-D=QR` の各補題、`executable_qr` | QR コードの経路（アプリは承認で見比べない） | 成立 |
+| `-D=QR -D=NOQRCHECK` の `batch_key_secrecy` | アプリが commit を QR コードと照合しない（`grant_agreement` は成立のまま） | 期待どおり反例あり |
+| `-D=QR -D=APPONLY` の `grant_agreement` | QR コードの経路でブラウザの確認も省く（秘匿は成立のまま） | 期待どおり反例あり |
+| `-D=QR -D=EARLYNB` の `grant_agreement`、`batch_key_secrecy` | commit を残したまま `nB` を早く公開する。commit-then-reveal を残す根拠 | 期待どおり反例あり |
 
 ## 状態モデル（`tla/`）
 

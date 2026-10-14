@@ -187,6 +187,10 @@ describe("pairing v1, browser side", () => {
     f.onGet = honestApp;
     const { events } = await runAttempt(f, confirmOnWords);
     expect(events.map((e) => e.kind)).toEqual(["code", "claimed", "words", "waiting", "done"]);
+    // The QR code's fields: the attempt's id and the commit the server received.
+    const code = events[0] as Extract<PairingEvent, { kind: "code" }>;
+    expect(code).toMatchObject({ code: "ABCD2345", id: f.id });
+    expect(hex(code.commit)).toBe(hex(f.commit));
     const words = events.find((e) => e.kind === "words") as Extract<PairingEvent, { kind: "words" }>;
     expect(words.words).toEqual(await sasWords(await f.th()));
     expect(words).toMatchObject({ scope: "batch-v1", ttl: 3600 });
