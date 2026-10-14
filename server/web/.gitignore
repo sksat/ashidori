@@ -1,0 +1,2 @@
+# Built by `pnpm --dir web build`; served by the Worker (wrangler.jsonc "assets").
+dist/

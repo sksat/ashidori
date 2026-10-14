@@ -20,6 +20,8 @@ export default defineConfig(async () => {
       }),
     ],
     test: {
+      // The viewer (web/) has its own tests, run with its own config.
+      include: ["test/**/*.test.ts"],
       setupFiles: ["./test/setup.ts"],
     },
   };

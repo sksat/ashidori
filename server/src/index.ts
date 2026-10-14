@@ -10,6 +10,7 @@ import { deleteExpiredRateLimits } from "./ratelimit";
 import { assetLinks, pair } from "./pair";
 import { jsonError } from "./util";
 import { v1 } from "./v1";
+import { viewer } from "./viewer";
 
 // strict: false so that both /admin and /admin/ serve the admin page.
 const app = new Hono<AppEnv>({ strict: false });
@@ -68,6 +69,8 @@ app.route("/basemap", basemap);
 // and #i=<INVITE> show without the app, and the App Links statement for the app.
 app.route("/pair", pair);
 app.get("/.well-known/assetlinks.json", (c) => c.json(assetLinks(c.env)));
+// The web viewer at `/` (see viewer.ts).
+app.route("/", viewer);
 
 app.notFound((c) => jsonError(c, 404, "not found"));
 app.onError((err, c) => {

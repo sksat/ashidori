@@ -23,3 +23,13 @@ tasks.withType<ScalaCompile>().configureEach {
 tasks.test {
     useJUnit()
 }
+
+// Fixtures of the web viewer's tests (server/web/test/fixtures), written by
+// the app's own Parquet writer, crypto and timeline code (WebFixtures.scala).
+tasks.register<JavaExec>("webFixtures") {
+    group = "verification"
+    description = "Writes the web viewer's test fixtures with the app's own code."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("ashidori.core.WebFixtures")
+    args(rootProject.file("server/web/test/fixtures").absolutePath)
+}

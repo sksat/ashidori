@@ -143,9 +143,15 @@ Node 24 と pnpm を使います。
 
 ```sh
 pnpm install
+pnpm --dir web build    # Web の閲覧画面 (web/) を web/dist にビルド。サーバのテストより先に行う
+pnpm --dir web test     # 閲覧画面のテスト (復号、Parquet、タイムライン)
 pnpm test               # vitest + @cloudflare/vitest-plugin (Workers runtime 上で実行)
 pnpm exec tsc --noEmit  # 型チェック
 ```
+
+閲覧画面は Workers Static Assets として `/` に配信します（`src/viewer.ts`、`wrangler.jsonc` の `assets`）。
+画面の開発は `pnpm dev` と並べて `pnpm --dir web dev` を使います。開発用のビルドにだけ、端末トークンとバッチ鍵を貼り付けて登録する欄があります。
+テストのデータ（`web/test/fixtures`）はアプリのコードで作ります（`./gradlew :core:webFixtures`）。
 
 ローカルで動かす場合は `.dev.vars.example` を `.dev.vars` にコピーし、`ADMIN_DEV_TOKEN` を長いランダム文字列にします。
 

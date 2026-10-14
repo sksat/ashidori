@@ -1,0 +1,19 @@
+{
+ "batchKeyHex": "197e115287c0d5ba7eb1b0f992ffd706bd2de9cc81f9e6435199e3990a088d8a",
+ "devices": [
+  {
+   "id": "0f5c2a8e-7d1b-4c3e-9a61-2b7d5e8f4a10",
+   "name": "Pixel 8a",
+   "createdAt": 1788622200000,
+   "lastSeenAt": 1791214200000,
+   "revoked": false
+  },
+  {
+   "id": "6a3e9b0c-1f2d-4e5a-8b7c-9d0e1f2a3b4c",
+   "name": "Pixel Tablet",
+   "createdAt": 1789486200000,
+   "lastSeenAt": 1791196200000,
+   "revoked": false
+  }
+ ]
+}
