@@ -8,6 +8,8 @@
 //   test/registration-race.test.ts, "Registration_norecheck: ...".
 // - Accounts_norecheck (formal/tla/Accounts_norecheck.cfg, RetriesAgree):
 //   test/registration-race.test.ts, "Accounts_norecheck: ...".
+// - Accounts_closedrace (formal/tla/Accounts_closedrace.cfg, RetriesAgree):
+//   test/registration-race.test.ts, "Accounts_closedrace: ...".
 // - SharedCheckin_old (formal/tla/SharedCheckin_old.cfg, LatestWins):
 //   test/checkins-rev.test.ts, "SharedCheckin_old: ...".
 // Replayed here:

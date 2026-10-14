@@ -112,7 +112,7 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 
 時間は `formal/run.sh all` での実測である。
 「遅い」は `SLOW_TLA` に入っており、`fast` では実行しない。
-`fast` は約 3 分（66 件）、`all` は約 12 分（78 件）かかる。
+`fast` は約 3 分（68 件）、`all` は約 12 分（80 件）かかる。
 活性の検査は状態数のわりに時間がかかるため、安全性と活性を別の設定に分け、活性は小さい境界で検査する設定がある。
 
 | 設定 | 内容 | 期待 | 時間 |
@@ -124,12 +124,12 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 | `Registration_gatefirst` | レート制限などを結果の回復より前に置く | `RecoverUngated` が破れる | 1 秒 |
 | `Registration_expiry` | 期限を DB 実行前に Worker が読んだ時刻で判定する（レビュー 6 の 7） | `CodeIffDevice` が破れる | 1 秒 |
 | `Registration_nounique` | UNIQUE 違反でコードの消費が巻き戻らない | `CodeIffDevice` が破れる | 1 秒 |
-| `RegistrationClient` | 現行のクライアント（後述の二つの所見は修正した形）。取消または解除、書込みの失敗、クラッシュか応答の消失、ゲートの拒否を各 1 回、期限切れ、鍵の設定、同期の実行 | 成立、分岐の到達 | 15 秒 |
+| `RegistrationClient` | 現行のクライアント。取消または解除、書込みの失敗、クラッシュか応答の消失、ゲートの拒否を各 1 回、期限切れ、鍵の設定、同期の実行 | 成立、分岐と場面（印の書き直し、不明な印のままの待機）の到達 | 16 秒 |
 | `RegistrationClient_2faults` | 同じく、クラッシュか応答の消失 2 回 | 成立 | 遅い（25 秒） |
-| `RegistrationClient_live` | 同じく活性（試行の終了と最終的な収束） | 成立 | 遅い（80 秒） |
+| `RegistrationClient_live` | 同じく活性（試行の終了と最終的な収束） | 成立 | 遅い（105 秒） |
 | `RegistrationClient_legacy` | 旧版が登録に結び付けずに保存した鍵を起動時に結び付ける | 成立 | 1 秒 |
-| `RegistrationClient_runread` | **所見**：現行の `SyncRun.current` | `RunRegMatches` が破れる | 2 秒 |
-| `RegistrationClient_unknownmark` | **所見**：現行の解除の印の読み方 | `TokenRecoverable` が破れる | 4 秒 |
+| `RegistrationClient_runread` | **所見（修正済み）**：修正前の `SyncRun.current`（登録を二度読む） | `RunRegMatches` が破れる | 2 秒 |
+| `RegistrationClient_unknownmark` | **所見（修正済み）**：修正前の、読み戻せない印の読み方と書込みの起点 | `TokenRecoverable` が破れる | 4 秒 |
 | `RegistrationClient_r2` | 照合と保存のあいだに取消が入れる修正前の方式（R2） | `CancelledNoEffect` が破れる | 1 秒 |
 | `RegistrationClient_f2`, `_f2report` | 間に合わなかった取消も保留要求を消す修正前の方式（F2） | `TokenRecoverable`、`FailureReported` が破れる | 1 秒 |
 | `RegistrationClient_r3` | `SharedPreferences.commit()` のまま（R3、F1） | `ReadyPersisted` が破れる | 1 秒 |
@@ -141,7 +141,7 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 | `Accounts_live` | 各要求が応答を得る（トークン 2 個） | 成立 | 3 秒 |
 | `Accounts_norecheck` | 0 行挿入の後に再照合しない（N3） | `RetriesAgree` が破れる | 1 秒 |
 | `Accounts_gatefirst` | 締切やレート制限を回復より前に置く | `RecoverUngated` が破れる | 1 秒 |
-| `Accounts_closedrace` | **所見**：現行の締切判定 | `RetriesAgree` が破れる | 1 秒 |
+| `Accounts_closedrace` | **所見（修正済み）**：締切で拒む前に回復を照会し直さない修正前の判定 | `RetriesAgree` が破れる | 1 秒 |
 | `Outbox` | 項目 3 個、登録 2 回、障害 1 回。暗号化と DB 確定の間のクラッシュを含む | 成立、到達 | 33 秒 |
 | `Outbox_2faults` | 同じく障害 2 回、安全性のみ | 成立 | 遅い（90 秒） |
 | `Outbox_nonatomic` | 行を書いてから seq と進捗を別トランザクションで進める旧方式 | `SameSlotSameCiphertext` が破れる | 1 秒 |
@@ -195,11 +195,11 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 `core` の `RegistrationMachine`、`PairingStore`、`DurableMap` と、アプリでの使い方（`Sync.scala` の `Registration`、`SyncConfig`、`SyncRun`）を表す。
 サーバは抽象化し、トークンに端末があればその端末を返す（冪等であることは `Registration` が確かめる）。
 
-- 保存：`DurableMap` を二つ持つ（`C`：登録と解除の印、`S`：トークン、鍵、保留要求）。書込みは `WriteBegin` と `DiskNew`/`DiskOld`/`DiskUnreadable` に分け、その間に何でも読める。読み出しはスナップショットを返し、読み戻せない失敗で変わったキーは不明（無い）として読む。クラッシュでは書込み中のファイルは旧か新のどちらかになる。
+- 保存：`DurableMap` を二つ持つ（`C`：登録と解除の印、`S`：トークン、鍵、保留要求）。書込みは `WriteBegin` と `DiskNew`/`DiskOld`/`DiskUnreadable` に分け、その間に何でも読める。読み出しはスナップショットを返し、読み戻せない失敗で変わったキーは不明として読む（印は「解除中」、ほかは無い）。不明なキーがあるときの次の書込みは、ファイルを読み直してその内容から始める（`WriteReadsBack`。モデルでは読み直しは成功するものとし、読み直せないときに不明なキーを推測で書く書込みをコードが拒むことは扱わない）。クラッシュでは書込み中のファイルは旧か新のどちらかになる。
 - 試行：`cur` は id、-id、0 のどれか。答えの取り込みも取消も一回の compare-and-set で、勝つのは片方だけである。-id のときの取消は何も変えない（F2）。
-- 解除：印 → 試行の無効化（`local` 上の reset）→ 同期の鍵の取得 → 登録、トークン、鍵、残り（保留要求、同期状態）の消去 → 印の消去。どの段階の間でもクラッシュでき、起動時に印から再開する。印がある間は `savePairing` を拒む。
+- 解除：印 → 試行の無効化（`local` 上の reset）→ 同期の鍵の取得 → 登録、トークン、鍵、残り（保留要求、同期状態）の消去 → 印の消去。どの段階の間でもクラッシュでき、起動時に印から再開する。印がある間（不明な間を含む）は `savePairing` を拒む。印の消去が読み戻せずに失敗したら書き直す（コードは 3 回まで。諦めた場合は印が不明のまま残り、「解除中」として読まれる）。
 - 鍵は設定した登録に結び付け、その登録でだけ使う。旧版の結び付いていない鍵は起動時に現在の登録に結び付ける。
-- 同期の実行（`SyncRun.current`）は同期の鍵の下で端末 ID と鍵を読み、その後で登録を読む。
+- 同期の実行（`SyncRun.current`）は同期の鍵の下で、登録、端末 ID、トークン、鍵を一度に読む（`PairingStore.session`）。
 
 保証すること：
 
@@ -224,7 +224,9 @@ AAD の端末 ID はサーバが割り当てた値なので、`slot_binding` が
 `POST /v1/accounts` の一要求を、回復（`recoverAccount`）、締切（`REGISTRATION`）、ゲート、`earlier()`、ユーザと端末の `db.batch`、再照合に分ける。
 保証すること：利用者数は `MAX_USERS` を超えない。アカウントができた後の同じトークンの最終応答はそのアカウントである（`RetriesAgree`、締切後の 200 を含む）。回復できる要求は締切でもゲートでも拒まれない（`RecoverUngated`）。
 `MaxUsers = 2` で、上限未満の UNIQUE の巻き戻しに到達する。
-保証しないこと：締切の判定は Worker が要求ごとに環境変数を読むので、締切の直前に受け付けた複製がアカウントを作る前に、別の複製が 403 を受けることがある（クライアントは諦め、アカウントは 7 日後の掃除で消える）。
+締切で 403 を返す前に回復を照会し直す（`RecheckClosed`）。
+保証しないこと：締切の判定は Worker が要求ごとに環境変数を読むので、別の複製がアカウントを作る前に、ある複製が 403 を受けることがある。
+アプリは、このプロセスで作って一度も送っていないトークンへの 403 だけを確定した拒否とし、以前に送った可能性のあるトークンは 2 分間、間隔を広げながら送り直す。その間にアカウントができれば、送り直しが回復で 200 を受ける。
 
 ### Outbox
 
@@ -320,19 +322,19 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 対応を保つため、次のテストが実装側でモデルの性質と反例を確かめる。
 
 - `server/test/conformance.test.ts`：実際の migration と SQL に乱数の操作列を流し、`CountersMatch`、`UnderCaps`、`UsersUnderMax`、`LatestWins`、`NoPhantom`、`AdminAbsorbing`、`StaleMeansSuperseded` を確かめ、各分岐（上限、競合、`stale`、`removed`）に到達したことも確かめる。
-- `server/test/tlc-replay.test.ts` ほか：TLC の反例（`BatchCommit_current`、`FeedResync_firstpage`、`Registration_norecheck`、`Accounts_norecheck`、`SharedCheckin_old`）を実際の関数と SQL で再現し、現行のコードでは起きないことを確かめる。
+- `server/test/tlc-replay.test.ts` ほか：TLC の反例（`BatchCommit_current`、`FeedResync_firstpage`、`Registration_norecheck`、`Accounts_norecheck`、`Accounts_closedrace`、`SharedCheckin_old`）を実際の関数と SQL で再現し、現行のコードでは起きないことを確かめる。
 - `server/test/protocol-constants.test.ts`：モデルが依る定数の関係（`D ≤ G` の余裕、カーソルと seq の範囲）を確かめる。
-- `core` の `DurableMapSuite`、`PairingStoreSuite`、`RegistrationMachineSuite`、`DeviceStatusSuite`：書込み中の読出し（F1）、解除の途中のクラッシュ、F2、ローテーション（F6）を実装の状態機械で確かめる。
+- `core` の `DurableMapSuite`、`PairingStoreSuite`、`RegistrationMachineSuite`、`DeviceStatusSuite`：書込み中の読出し（F1）、解除の途中のクラッシュ、F2、ローテーション（F6）、`RegistrationClient_runread` と `_unknownmark` の反例（後者は二つの経路）を実装の状態機械で確かめる。
 
 | モデルの動作 | 実装 |
 |---|---|
 | `Registration`：`SRecover*` / `SGate*` / `SStart*`, `SBatch*`, `SRecheck*`, `SFullCheck*` | `v1.ts` の `/devices/register` / `edgeAllowed`, `hitRateLimit`, `limitsOr503` / `devices.ts` の `registerWithCode`（`earlier`、`db.batch`、`CODE_USABLE`） |
-| `Accounts`：`SRecover*` / `SClosed` / `SBatch*` | `v1.ts` の `/accounts` / `registrationMode` / `accounts.ts` の `createAccount` |
-| `RegistrationClient`：`WriteBegin`, `Disk*`, `Rd` | `DurableMap.write`, `DurableMap.get`（`DurableFile.replace`） |
+| `Accounts`：`SRecover*` / `SClosed` / `SBatch*` | `v1.ts` の `/accounts` / `registrationMode` と回復の再照会 / `accounts.ts` の `createAccount` |
+| `RegistrationClient`：`WriteBegin`, `Disk*`, `Rd` | `DurableMap.write`（`settle`、`DurableFile.replace`）, `DurableMap.get`, `view` |
 | 同：`Start`, `Retry`, `Cancel`, `BeginCheck`…`FinishEnd`, `Drop`, `Reset` | `RegistrationMachine.start`, `retry`, `cancel`, `begin`, `finish`, `reset` |
 | 同：`SaveTok`, `SaveReg`, `KeyWrite`, `Adopt` | `PairingStore.savePairing`, `confirmKey`, `adoptLegacyKey` |
 | 同：`Unpair`, `UMark`…`UUnmarked`, `Resume` | `PairingStore.forget`, `resume`（`SyncConfig.forget`, `resumeUnpair`） |
-| 同：`RunStart`, `RunReg` | `SyncRun.current`（`SmallSyncWorker` の `SyncLock` の下） |
+| 同：`RunStart`, `RunReg` | `SyncRun.current`、`PairingStore.session`（`SmallSyncWorker` の `SyncLock` の下） |
 | `Outbox`：`Seal`, `Commit` / `Send`, `Receive` / `ArchOpen`, `ArchPart` | `Uploader.enqueue`（`Crypto.seal`, `Db.enqueueSealed`）/ `Uploader.flush` / `ArchiveSnapshot.open`, `ArchiveUpload.nextPart`, `uploadArchive` |
 | `BatchCommit`：`Start`, `Put`, `Commit`, `DelOwn` / `SweepScan`, `SweepDelete` | `batches.ts` の `putBatch` / `sweepOrphanBlobs` |
 | `StatusDownload`, `StatusRotation`：`Take`, `Trim`, `Fail`, `Succeed`, `RescanPage`, `RunStart` / 一実行の段階 | `StatusSyncState.take`, `trim`, `failed`, `succeeded`, `rescanned`, `rescanIfDue` / `PeerStatus.pull` |
@@ -341,31 +343,42 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 
 ## 検査で見つかった問題
 
-### このモデルで見つけ、まだコードにある問題
+### このモデルで見つけて直した問題
 
-次の三つは、現行のコードを表す設定（`**所見**`）で反例が出る。
-コードは変えておらず、モデルの主な設定は修正した形（`RunReadsOnce`、`UnknownMarkSet`、`RecheckClosed`）で検査している。
-コードを直したら、その設定の期待を `pass` に変える。
+次の三つは、修正前のコードを表す設定（`**所見（修正済み）**`）で反例が出る。
+これらの設定は修正前の振る舞いの再現として残し、期待は反例のままにする。
+モデルの主な設定は現行のコード（`RunReadsOnce`、`UnknownMarkSet`、`WriteReadsBack`、`RecheckClosed` がすべて `TRUE`）を表し、成り立つ。
+修正のコミット：（追記する）
 
 1. **同期の実行が、解除の印の付いた後の登録を読む**（`RegistrationClient_runread`、`RunRegMatches`）。
-   `SyncRun.current` は端末 ID、トークン、鍵（`masterKey` はその時点の登録で照合）を読んだ後で、`SyncConfig.registration` を改めて読む。
-   解除の印は同期の鍵の外で書かれるので、その間に印が付くと、実行は A の鍵と A の端末 ID を持ったまま登録 `""` を得る。
+   修正前の `SyncRun.current` は端末 ID、トークン、鍵（`masterKey` はその時点の登録で照合）を読んだ後で、`SyncConfig.registration` を改めて読んでいた。
+   解除の印は同期の鍵の外で書かれるので、その間に印が付くと、実行は A の鍵と A の端末 ID を持ったまま登録 `""` を得た。
    その実行は進捗や outbox を `""` の下で数え直し、A のスロットに seq 0 から送って 409 で止まる（解除がジョブを止めるまで）。
-   鍵が他の登録に渡るわけではないが、`SyncRun.reg` と鍵が食い違う。
-   修正案は、登録を一度だけ読み、その値で鍵を照合することである。
+   修正：`PairingStore.session` が設定の一つのスナップショットから URL、端末 ID、印を読み、その登録でトークンと鍵を照合して返す。
+   `savePairing`、`confirmKey`、`adoptLegacyKey` と同じロックの下で読むので、それらとは混ざらない。
+   同期の鍵の外で書かれるのは印だけであり、スナップショットはそれを含むか含まないかのどちらかである。
+   `SyncRun.current` はこの値だけを使う。
+   テスト：`PairingStoreSuite` の「a sync session reads the registration once」が、鍵を読む瞬間に印を付けて、旧来の二度の読出しでは登録が `""` になり、`session` では A のまま揃うことを確かめる。
 2. **読み戻せなかった印の消去で、新しい登録の保留要求を失う**（`RegistrationClient_unknownmark`、`TokenRecoverable`）。
-   解除の最後の `config.commit(Unpairing -> null)` が失敗して読み戻しもできないと、印は不明となり、`getBoolean(Unpairing, false)` は false を返す。ディスクには印が残りうる。
+   解除の最後の `config.commit(Unpairing -> null)` が失敗して読み戻しもできないと、印は不明となり、修正前は `getBoolean(Unpairing, false)` が false を返した。ディスクには印が残りうる。
    アプリは解除済みとして新しい登録を始め、トークンを保存して送る。
    サーバが端末を作った後、次の起動で `resume` が印を見て解除をやり直し、`Registration.reset()` と `clearRest` が保留要求を消す。
    利用者が手放していないトークンを失い、端末はサーバに残る。
-   また、不明な印のまま別の書込み（`savePairing` の `config.commit`）が成功すると、スナップショットの古い値（印あり）がファイルに書き戻され、登録直後に「解除中」に戻る。
-   修正案は、不明な印を「解除中」として読む（または読み戻せるまで書き直す）ことである。
-   発生には書込みの失敗と読み戻しの失敗が重なる必要があり、起こりにくい。
+   また、不明な印のまま別の書込み（`savePairing` の `config.commit`）が成功すると、スナップショットの古い値（印あり）がファイルに書き戻され、登録直後に「解除中」に戻った。
+   修正は三つである。
+   - 不明な印は「解除中」として読む（`PairingStore.unpairing`、`DurableMap.view`）。新しい登録は解除が終わるまで始まらない。
+   - 印の消去が読み戻せずに失敗したら、印が分かるまで書き直す（3 回まで）。諦めた場合は印が残り、次の起動の `resume` が解除を終える。
+   - `DurableMap` の書込みは、不明なキーがあるとき、まずファイルを読み直し、その内容から始める。読み直せなければ、不明なキーをすべて自ら設定する書込みだけを許し、ほかは拒む。他のキーの書込みが、失敗した書込みの置き換えたかもしれない値を書き戻すことはない。
+   テスト：`PairingStoreSuite` の「a mark that cannot be read back counts as set」が二つの経路（新しい登録が始まらないこと、後の登録が「解除中」に戻らないこと）を、ディスクに新旧どちらが残った場合も、再起動の有無も含めて確かめる。「an unmark that fails ... is written again」が書き直しを、`DurableMapSuite` の「a later write of other keys never writes back ...」が書き戻しのないことを確かめる。
+   モデルの主な設定では、印の書き直しと、不明な印のまま待つ場面に到達する（`reach:`）。
 3. **自己登録の締切と再送の競合**（`Accounts_closedrace`、`RetriesAgree`）。
-   同じトークンの複製 A、B が回復の照会を通り、A がアカウントを作り、運用者が登録を締め切った後に B が締切の判定に来ると、B は 403 を受ける。
+   同じトークンの複製 A、B が回復の照会を通り、A がアカウントを作り、運用者が登録を締め切った後に B が締切の判定に来ると、修正前の B は 403 を受けた。
    クライアントは 403 を確定した拒否として保留要求を消し、作られたアカウントを失う。
-   修正案は、締切で拒む直前に回復をもう一度照会することである。
-   応答の消失、並行した再送、締切の操作が重なる必要があり、起こりにくい。
+   修正：`POST /v1/accounts` は 403 `registration closed` を返す前に回復を照会し直し、このトークンのアカウントがあれば 200 でその端末 ID を返す。
+   403 `registration full` は `createAccount` が 0 行の後に照会し直す（N3 の修正）。429 と 503 はクライアントが送り直す応答で、送り直しは回復を先に通る。
+   テスト：`server/test/registration-race.test.ts` の「Accounts_closedrace: ...」が、B を回復の照会の直後で止め、A の作成の後で締切を読ませ、B が A と同じ端末 ID を 200 で受けることを確かめる。
+   残る場合：A が確定する前に B が締切で拒まれると、B は 403 を受ける（モデルの `RetriesAgree` もこの場合を対象外とする）。
+   アプリは、このプロセスで作って一度も送っていないトークンへの 403 だけを確定とする。以前に送った可能性のあるトークン（応答の消失、クラッシュ後、再試行）は、403 を受けても 2 分間、間隔を広げながら送り直し、その間に A が確定すれば回復で 200 を受ける。
 
 ### 以前に見つけて直した問題
 

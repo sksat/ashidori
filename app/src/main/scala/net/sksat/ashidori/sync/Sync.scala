@@ -41,6 +41,8 @@ object SyncConfig:
 
   def token: Option[String] = store.token
   def masterKey: Option[Array[Byte]] = store.masterKey
+  /** The registration, token and key from one read (see [[PairingStore.session]]); None unless ready. */
+  def session: Option[PairingStore.Session] = store.session
 
   /** Sets the key of the registration `reg`, once (see [[PairingStore.confirmKey]]).
     * Blocking: call off the main thread.
@@ -127,14 +129,15 @@ final case class SyncRun(reg: String, deviceId: String, batchKey: Array[Byte], c
 object SyncRun:
   final class Stopped extends RuntimeException("stopped")
 
-  /** None when sync is not set up (or the key is not confirmed yet). */
+  /** None when sync is not set up (or the key is not confirmed yet). The
+    * registration is read once ([[PairingStore.session]]): the key is checked
+    * against the same registration whose URL and device id the run uses and
+    * under which it keeps its progress, even if an unpairing marks itself
+    * meanwhile (it does so outside [[SyncLock]]).
+    */
   def current(stopped: () => Boolean = () => false): Option[SyncRun] =
-    val (url, dev) = (SyncConfig.serverUrl, SyncConfig.deviceId)
-    for
-      token <- SyncConfig.token
-      key <- SyncConfig.masterKey
-      if url.nonEmpty && dev.nonEmpty
-    yield SyncRun(SyncConfig.registration, dev, Crypto.batchKey(key), SyncClient(url, Some(token)), stopped)
+    SyncConfig.session.map(s =>
+      SyncRun(s.reg, s.deviceId, Crypto.batchKey(s.key), SyncClient(s.url, Some(s.token)), stopped))
 
 /** Device registration ([[RegistrationMachine]]): the request and token in
   * [[SecureStore]], the result in [[SyncConfig]], events on the main thread.
@@ -153,20 +156,49 @@ object Registration:
     def savePairing(p: PendingRegistration, deviceId: String): Unit =
       SyncConfig.savePairing(p.url, deviceId, p.token, newAccount = p.kind == "account")
 
-  /** Sends `p`; network errors are retried a few times. Blocking, on the network executor. */
+  /** Tokens made in this process and not sent yet. */
+  private val unsent = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  private def newToken(): String =
+    val t = Crypto.randomToken()
+    unsent.add(t)
+    t
+
+  /** How long a self-registration refused with 403 is sent again when an
+    * earlier copy of it may still be on its way (see [[send]]).
+    */
+  private val RefusedRetryNanos = TimeUnit.MINUTES.toNanos(2)
+
+  /** Sends `p`; network errors are retried a few times. Blocking, on the network executor.
+    *
+    * A 403 to `POST /v1/accounts` is final only for the first request with a
+    * token made in this process. Otherwise an earlier copy of the request
+    * (sent before a lost answer, a crash or a retry) may still be on its way
+    * and create the account after the server refused this one (registration
+    * closed meanwhile, or the last place taken); the server answers a later
+    * copy with that account (200, result recovery comes first). So the
+    * request is sent again with backoff for [[RefusedRetryNanos]] before the
+    * refusal counts.
+    */
   private def send(p: PendingRegistration): String =
     val c = SyncClient(p.url, None)
-    def attempt(n: Int): String =
+    val deadline = System.nanoTime() + RefusedRetryNanos
+    def attempt(n: Int, netErrors: Int, copies: Boolean): String =
       try if p.kind == "account" then c.createAccount(p.name, p.token) else c.register(p.code, p.name, p.token)
       catch
-        case e: java.io.IOException if n < 3 =>
+        case e: java.io.IOException if netErrors < 2 =>
           Log.w(s"registration attempt $n failed", e)
-          Thread.sleep(1000L * n * n)
-          attempt(n + 1)
-    attempt(1)
+          Thread.sleep(1000L * (netErrors + 1) * (netErrors + 1))
+          attempt(n + 1, netErrors + 1, copies = true)
+        case e: SyncClient.AccountRefused if copies && System.nanoTime() < deadline =>
+          Log.w(s"registration attempt $n refused (403); an earlier copy may still create the account", e)
+          Thread.sleep(math.min(2000L << math.min(n - 1, 4), 30_000L))
+          attempt(n + 1, netErrors, copies)
+        case e: SyncClient.AccountRefused => throw RegistrationRejected(e.getMessage)
+    attempt(1, 0, copies = !unsent.remove(p.token))
 
   private val machine = RegistrationMachine(
-    storage, send, () => Crypto.randomToken(), emit,
+    storage, send, () => newToken(), emit,
     java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-registration")),
     // One thread per attempt, so a stuck one blocks nothing else.
     java.util.concurrent.Executors.newCachedThreadPool(r => Thread(r, "ashidori-registration-net"))
@@ -266,13 +298,15 @@ final class SyncClient(base: String, token: Option[String]):
 
   /** Creates a user with this device as its first device (open registration
     * only), with the client-chosen `token`; idempotent like [[register]].
-    * Returns the device id.
+    * Returns the device id. A 403 (registration closed or full) throws
+    * [[SyncClient.AccountRefused]]: final only if no other copy of the
+    * request may reach the server later (see `Registration.send`).
     */
   def createAccount(deviceName: String, token: String): String =
     val r = request("POST", "/v1/accounts", ujson.write(ujson.Obj("deviceName" -> deviceName, "token" -> token)).getBytes(UTF_8))
     r.code match
       case 200 | 201 => r.json("deviceId").str
-      case 403 => throw RegistrationRejected("このサーバでは新規登録を受け付けていません")
+      case 403 => throw SyncClient.AccountRefused("このサーバでは新規登録を受け付けていません")
       case 429 => throw RuntimeException("登録の試行回数が上限に達しました。時間をおいて再度お試しください")
       case c if refused(c) => throw RegistrationRejected(s"登録に失敗しました ($c): ${r.text.take(200)}")
       case c => throw RuntimeException(s"登録に失敗しました ($c): ${r.text.take(200)}")
@@ -318,6 +352,9 @@ final class SyncClient(base: String, token: Option[String]):
     r.json
 
 object SyncClient:
+  /** `POST /v1/accounts` answered 403: registration closed, or the server full. */
+  final class AccountRefused(msg: String) extends RuntimeException(msg)
+
   /** Response caps: small JSON (devices, info, registration), and one listing page (≤1000 rows). */
   val DefaultMax: Int = 1024 * 1024
   val MaxListing: Int = 1024 * 1024

@@ -64,13 +64,61 @@ class DurableMapSuite extends munit.FunSuite:
       throw java.io.IOException("rename failed")
     intercept[java.io.IOException](m.commit("a" -> "3"))
     assertEquals(m.getString("a"), None)
+    assert(m.view.isUnknown("a"))
+    assert(!m.view.isUnknown("b"))
     assertEquals(m.getString("b"), Some("2"))
     f.unreadable = false
     f.onReplace = _ => ()
     m.commit("b" -> "4")
-    // The successful write wrote every record of the snapshot: the file matches it.
-    assertEquals(m.getString("a"), Some("1"))
-    assertEquals(DurableMap(f).snapshot, Map("a" -> "1", "b" -> "4"))
+    // The write read the file again first: "a" is what the disk held, not
+    // the value from before the failed write.
+    assertEquals(m.getString("a"), Some("3"))
+    assert(!m.view.isUnknown("a"))
+    assertEquals(DurableMap(f).snapshot, Map("a" -> "3", "b" -> "4"))
+  }
+
+  // The second trace of formal/tla/RegistrationClient_unknownmark.cfg at the
+  // level of the store: a key removed by a write that failed unreadably (the
+  // removal reached the disk) must not come back with a later write of
+  // another key. Before the fix that write started from the snapshot, which
+  // still held the removed value, and wrote it back.
+  test("a later write of other keys never writes back a value that a failed write may have replaced") {
+    val f = MemFile()
+    val m = DurableMap(f)
+    m.commit("mark" -> true, "x" -> "1")
+    f.onReplace = b =>
+      f.content = Some(b)
+      f.unreadable = true
+      throw java.io.IOException("rename failed")
+    intercept[java.io.IOException](m.commit("mark" -> null))
+    assert(m.view.isUnknown("mark"))
+    // Still unreadable: a write that leaves the unknown key to a guess is refused...
+    f.onReplace = _ => ()
+    val held = f.content
+    intercept[java.io.IOException](m.commit("x" -> "2"))
+    assert(f.content eq held, "the refused write replaced the file")
+    // ...and once the file reads again, the write starts from what it holds.
+    f.unreadable = false
+    m.commit("x" -> "2")
+    assertEquals(m.get("mark"), None)
+    assert(!m.view.isUnknown("mark"))
+    assertEquals(DurableMap(f).snapshot, Map[String, DurableMap.Value]("x" -> "2"))
+  }
+
+  test("a write that sets every unknown key goes ahead even if the file cannot be read back") {
+    val f = MemFile()
+    val m = DurableMap(f)
+    m.commit("mark" -> true, "x" -> "1")
+    f.onReplace = b =>
+      f.unreadable = true // the old records stay; reading back fails
+      throw java.io.IOException("rename failed")
+    intercept[java.io.IOException](m.commit("mark" -> null))
+    assert(m.view.isUnknown("mark"))
+    f.onReplace = _ => ()
+    m.commit("mark" -> null)
+    assert(!m.view.isUnknown("mark"))
+    f.unreadable = false
+    assertEquals(DurableMap(f).snapshot, Map[String, DurableMap.Value]("x" -> "1"))
   }
 
   test("a write that failed after the new records reached the disk counts as done") {

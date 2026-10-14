@@ -28,7 +28,12 @@ trait SecretStore:
 final class PairingStore(config: DurableMap, secrets: SecretStore):
   import PairingStore.*
 
-  def unpairing: Boolean = config.getBoolean(Unpairing, false)
+  /** Marked as unpairing. A mark whose last write failed and could not be
+    * read back counts as set: the file may still hold it, and the next start
+    * would then finish the unpairing, removing whatever was registered
+    * meanwhile.
+    */
+  def unpairing: Boolean = unpairingIn(config.view)
   def serverUrl: String = config.getString(Url).getOrElse("")
   def deviceId: String = config.getString(DeviceId).getOrElse("")
   /** This device created its user (self-registration), so no other device has a key yet. */
@@ -38,17 +43,36 @@ final class PairingStore(config: DurableMap, secrets: SecretStore):
   /** Identifies the registration (server URL and device id). Empty when not
     * registered or while unpairing.
     */
-  def registration: String =
-    val (u, d) = (serverUrl, deviceId)
-    if unpairing || u.isEmpty || d.isEmpty then "" else registrationOf(u, d)
+  def registration: String = registrationIn(config.view)
 
   /** The master key of the current registration. */
-  def masterKey: Option[Array[Byte]] =
-    val reg = registration
+  def masterKey: Option[Array[Byte]] = keyOf(registration)
+
+  private def keyOf(reg: String): Option[Array[Byte]] =
     if reg.isEmpty then None else secrets.get(Master).flatMap(unbind).collect { case (r, k) if r == reg => k }
 
   def paired: Boolean = registration.nonEmpty && token.isDefined
   def ready: Boolean = paired && masterKey.isDefined
+
+  /** Everything a sync run needs, from one read of the registration: its
+    * URL, device id and mark from one snapshot, and the token and the key
+    * checked against that same registration. None unless ready.
+    *
+    * The snapshot is taken under this store's lock, so no [[savePairing]],
+    * [[confirmKey]] or [[adoptLegacyKey]] interleaves. [[forget]] writes the
+    * mark outside it and clears everything else under the caller's sync
+    * lock: a run that holds that lock sees the mark either set (None) or not
+    * (the whole registration, consistent); unpairing then waits for the run
+    * to end.
+    */
+  def session: Option[Session] = synchronized {
+    val c = config.view
+    val reg = registrationIn(c)
+    for
+      tok <- if reg.isEmpty then None else token
+      key <- keyOf(reg)
+    yield Session(reg, c.getString(Url).getOrElse(""), c.getString(DeviceId).getOrElse(""), tok, key)
+  }
 
   /** Sets the key of the registration `reg`, once. Refuses (false) when a key
     * is already set or the registration changed since the key step began, so
@@ -87,8 +111,20 @@ final class PairingStore(config: DurableMap, secrets: SecretStore):
       secrets.remove(Token)
       secrets.remove(Master)
       clearRest()
-      config.commit(Unpairing -> null)
+      unmark()
     }
+
+  /** Removes the mark. A failed write that could not be read back leaves the
+    * mark unknown, which reads as set ([[unpairing]]): it is written again,
+    * a few times, until it is known. If it still fails, the mark stays (set
+    * or unknown), and [[resume]] finishes the unpairing at the next start.
+    */
+  private def unmark(): Unit =
+    def attempt(n: Int): Unit =
+      try config.commit(Unpairing -> null)
+      catch
+        case _: java.io.IOException if n < UnmarkAttempts && config.view.isUnknown(Unpairing) => attempt(n + 1)
+    attempt(1)
 
   /** A key stored by an earlier version carries no registration: it is
     * bound to the current one, once, at start (that version had no other
@@ -112,6 +148,17 @@ final class PairingStore(config: DurableMap, secrets: SecretStore):
       true
 
 object PairingStore:
+  /** What a sync run needs; see [[PairingStore.session]]. */
+  final case class Session(reg: String, url: String, deviceId: String, token: String, key: Array[Byte])
+
+  private val UnmarkAttempts = 3
+
+  private def unpairingIn(c: DurableMap.View): Boolean = c.isUnknown(Unpairing) || c.getBoolean(Unpairing, false)
+
+  private def registrationIn(c: DurableMap.View): String =
+    val (u, d) = (c.getString(Url).getOrElse(""), c.getString(DeviceId).getOrElse(""))
+    if unpairingIn(c) || u.isEmpty || d.isEmpty then "" else registrationOf(u, d)
+
   val Url = "url"
   val DeviceId = "deviceId"
   val NewAccount = "newAccount"

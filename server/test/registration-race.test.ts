@@ -38,6 +38,49 @@ function gatedDb(): Gate {
   return { db, bothWaiting, release: (i) => releases[i]!() };
 }
 
+/**
+ * A D1 binding whose first query (the request's recovery lookup) completes
+ * and then holds the request until `release`; `reached` resolves there.
+ */
+function holdAfterFirstQuery(): { db: D1Database; reached: Promise<void>; release: () => void } {
+  let onReached!: () => void;
+  let release!: () => void;
+  const reached = new Promise<void>((r) => (onReached = r));
+  const gate = new Promise<void>((r) => (release = r));
+  let first = true;
+  const held = (s: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(s, {
+      get(target, prop) {
+        if (prop === "bind") return (...args: unknown[]) => held(target.bind(...args));
+        if (prop === "first" || prop === "all" || prop === "run" || prop === "raw") {
+          return async (...args: unknown[]) => {
+            const r = await (Reflect.get(target, prop) as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+            onReached();
+            await gate;
+            return r;
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  const db = new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) => {
+          const stmt = target.prepare(sql);
+          if (!first) return stmt;
+          first = false;
+          return held(stmt);
+        };
+      }
+      const v = Reflect.get(target, prop);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { db, reached, release };
+}
+
 /** Runs `a` and `b` with the gate: both wait at their commit, then `a` commits and completes, then `b`. */
 async function race(
   a: (db: D1Database) => Promise<Response>,
@@ -142,6 +185,38 @@ describe("concurrent self-registration", () => {
     expect(await body(b)).toEqual({ status: 200, body: first.body });
     expect(await count("SELECT COUNT(*) AS n FROM users")).toBe(1);
     expect(await count("SELECT user_count AS n FROM server_usage")).toBe(1);
+  });
+
+  // Replays the TLC counterexample of formal/tla/Accounts_closedrace.cfg
+  // (RetriesAgree): copies A and B of one request both pass the recovery
+  // lookup; A creates the account; the operator closes registration; B then
+  // reaches the REGISTRATION check. Without the second lookup B got 403
+  // "registration closed", and the client gave up an account that exists.
+  // The Worker reads REGISTRATION after the recovery, so B's environment
+  // has it closed from the start: B reads it only after A completed.
+  it("Accounts_closedrace: a copy that passed the recovery before the account existed gets it after the close (200)", async () => {
+    const t = newToken();
+    const held = holdAfterFirstQuery();
+    const pb = selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin", DB: held.db });
+    await held.reached; // B's recovery found nothing
+    const a = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.1", OPEN));
+    expect(a.status).toBe(201);
+    held.release();
+    expect(await body(await pb)).toEqual({ status: 200, body: a.body });
+    expect(await count("SELECT COUNT(*) AS n FROM users")).toBe(1);
+  });
+
+  // The case the recheck does not cover: B is refused before A commits.
+  // The account exists afterwards; a later copy (the client sends again
+  // before it takes a 403 as final, see docs/sync-protocol.md) gets it.
+  it("a copy refused before the other copy committed: 403, and a later copy gets the account (200)", async () => {
+    const t = newToken();
+    const b = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin" }));
+    expect(b).toEqual({ status: 403, body: { error: "registration closed" } });
+    const a = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.1", OPEN));
+    expect(a.status).toBe(201);
+    const again = await body(await selfRegister({ deviceName: "pixel", token: t }, "192.0.2.2", { REGISTRATION: "admin" }));
+    expect(again).toEqual({ status: 200, body: a.body });
   });
 
   it("different tokens at MAX_USERS: the second is full", async () => {

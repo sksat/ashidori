@@ -49,10 +49,15 @@ object DurableFile:
   * nothing to undo, and after a restart the file is the truth.
   *
   * When a write fails and reading the file back cannot tell whether it
-  * holds the old or the new records, the keys that write changed read as
-  * absent until a later write succeeds (it writes every record, so the file
-  * then matches the snapshot again). A file that does not parse or whose
-  * checksum does not match reads as empty.
+  * holds the old or the new records, the keys that write changed are
+  * unknown: they read as absent ([[get]]), and [[view]] tells them apart
+  * from keys that are absent on disk, for a caller to whom absent is not the
+  * safe reading. The next write first reads the file again: if it can, the
+  * records found there are what the write starts from, so a write never puts
+  * back a value that the failed write may have replaced. If it still cannot
+  * read the file, a write that does not set every unknown key is refused,
+  * since it would have to guess them. A file that does not parse or whose
+  * checksum does not match reads as empty at start.
   *
   * The file is owned by this instance: nothing else may write it. Writes
   * are serialized and blocking.
@@ -60,22 +65,24 @@ object DurableFile:
 final class DurableMap(file: DurableFile):
   import DurableMap.*
 
-  private final case class State(values: Map[String, Value], unknown: Set[String])
-
   private val writeLock = Object()
-  @volatile private var state: State = State(load().getOrElse(Map.empty), Set.empty)
+  @volatile private var state: View = View(readBack().getOrElse(Map.empty), Set.empty)
 
-  private def load(): Option[Map[String, Value]] =
-    try file.read().flatMap(decode)
+  /** The records in the file; None when it cannot be read or does not parse. */
+  private def readBack(): Option[Map[String, Value]] =
+    try file.read() match
+      case None    => Some(Map.empty)
+      case Some(b) => decode(b)
     catch case _: Exception => None
 
-  /** The value of `k`, if it is on disk. Never blocks. */
-  def get(k: String): Option[Value] =
-    val s = state
-    if s.unknown(k) then None else s.values.get(k)
+  /** The records as one consistent snapshot, with the unknown keys. Never blocks. */
+  def view: View = state
 
-  def getString(k: String): Option[String] = get(k).collect { case v: String => v }
-  def getBoolean(k: String, default: Boolean): Boolean = get(k).collect { case v: Boolean => v }.getOrElse(default)
+  /** The value of `k`, if it is on disk (absent while unknown). Never blocks. */
+  def get(k: String): Option[Value] = state.get(k)
+
+  def getString(k: String): Option[String] = state.getString(k)
+  def getBoolean(k: String, default: Boolean): Boolean = state.getBoolean(k, default)
 
   /** All values that are on disk. */
   def snapshot: Map[String, Value] =
@@ -86,39 +93,68 @@ final class DurableMap(file: DurableFile):
     * disk. Throws [[IOException]] otherwise; the previous values then stay.
     */
   def commit(values: (String, Value | Null)*): Unit =
-    write(old => values.foldLeft(old) {
+    write(Some(values.map(_._1).toSet), old => values.foldLeft(old) {
       case (m, (k, null))       => m - k
       case (m, (k, v: String))  => m.updated(k, v)
       case (m, (k, v: Boolean)) => m.updated(k, v)
     })
 
   /** Removes every key and returns once that is on disk; throws like [[commit]]. */
-  def clear(): Unit = write(_ => Map.empty)
+  def clear(): Unit = write(None, _ => Map.empty)
 
-  private def write(change: Map[String, Value] => Map[String, Value]): Unit = writeLock.synchronized {
-    val before = state
-    val next = change(before.values)
-    val changed = (before.values.keySet ++ next.keySet).filter(k => before.values.get(k) != next.get(k))
-    try
-      file.replace(encode(next))
-      state = State(next, Set.empty)
-    catch
-      case e: Exception =>
-        // Old or new records: which one decides what may be read.
-        val written = load() match
-          case Some(m) if m == next => true
-          case Some(m) if m == before.values => false
-          case _ =>
-            state = before.copy(unknown = before.unknown ++ changed)
-            false
-        if written then state = State(next, Set.empty)
-        else throw e match
-          case io: IOException => io
-          case other           => IOException("write failed", other)
-  }
+  /** The records a write of `keys` (None: all) starts from. After a failed
+    * write that could not be read back, the file is read again and its
+    * records count. If it still cannot be read, the write may only go ahead
+    * when it sets every unknown key itself; the others keep their values.
+    */
+  private def settle(keys: Option[Set[String]]): Map[String, Value] =
+    val s = state
+    if s.unknown.isEmpty then s.values
+    else readBack() match
+      case Some(m) =>
+        state = View(m, Set.empty)
+        m
+      case None if keys.forall(ks => s.unknown.subsetOf(ks)) => s.values
+      case None =>
+        throw IOException(s"the file cannot be read back; not writing a guess for ${s.unknown.toSeq.sorted.mkString(", ")}")
+
+  private def write(keys: Option[Set[String]], change: Map[String, Value] => Map[String, Value]): Unit =
+    writeLock.synchronized {
+      val before = settle(keys)
+      val next = change(before)
+      val changed = (before.keySet ++ next.keySet).filter(k => before.get(k) != next.get(k))
+      try
+        file.replace(encode(next))
+        state = View(next, Set.empty)
+      catch
+        case e: Exception =>
+          // Old or new records: which one decides what may be read.
+          val written = readBack() match
+            case Some(m) if m == next   => true
+            case Some(m) if m == before =>
+              state = View(before, Set.empty)
+              false
+            case _ =>
+              state = View(before, state.unknown ++ changed)
+              false
+          if written then state = View(next, Set.empty)
+          else throw e match
+            case io: IOException => io
+            case other           => IOException("write failed", other)
+    }
 
 object DurableMap:
   type Value = String | Boolean
+
+  /** A snapshot of the records. `values` holds, for an unknown key, its value
+    * before the write that failed; [[get]] does not return it.
+    */
+  final case class View(values: Map[String, Value], unknown: Set[String]):
+    def get(k: String): Option[Value] = if unknown(k) then None else values.get(k)
+    def getString(k: String): Option[String] = get(k).collect { case v: String => v }
+    def getBoolean(k: String, default: Boolean): Boolean = get(k).collect { case v: Boolean => v }.getOrElse(default)
+    /** The file may hold either value of `k` (a failed write could not be read back). */
+    def isUnknown(k: String): Boolean = unknown(k)
 
   private[sync] def encode(m: Map[String, Value]): Array[Byte] =
     val values = ujson.Obj.from(m.toSeq.sortBy(_._1).map {

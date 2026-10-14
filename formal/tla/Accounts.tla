@@ -28,10 +28,11 @@
 (*                                                                         *)
 (* Mutations: RecheckOnZero = FALSE (N3: a 0-row insert answers "full"     *)
 (* without the recheck), RecoverFirst = FALSE (the mode and the gates come *)
-(* before the recovery). RecheckClosed = TRUE is a fix of a finding: the  *)
-(* code answers 403 to a copy that passed the recovery just before a       *)
-(* concurrent copy created the account, if the operator closed            *)
-(* registration in between. Not modelled: the 7-day deletion of unused    *)
+(* before the recovery), RecheckClosed = FALSE (the code before the fix of *)
+(* a finding of this model: it answered 403 to a copy that passed the      *)
+(* recovery just before a concurrent copy created the account, if the      *)
+(* operator closed registration in between; now the recovery is looked up *)
+(* again before the 403). Not modelled: the 7-day deletion of unused       *)
 (* accounts (a retry after it creates a new account, by design),           *)
 (* revocation, admin-created users other than OtherTok's.                  *)
 (***************************************************************************)
@@ -89,9 +90,10 @@ SRecoverMiss(r) ==
   /\ req[r].pc = "sent" /\ (RecoverFirst => ~Recoverable(Tok(r)))
   /\ req' = [req EXCEPT ![r].pc = "gate", ![r].rec = Recoverable(Tok(r))]
   /\ Same
-\* RecheckClosed (a fix of a finding of this model; the code is FALSE): the
-\* recovery is looked up again before the 403, since a concurrent copy of
-\* the request may have created the account after the first lookup.
+\* RecheckClosed (the code; FALSE before the fix of a finding of this
+\* model): the recovery is looked up again before the 403, since a
+\* concurrent copy of the request may have created the account after the
+\* first lookup.
 SClosed(r) ==
   /\ req[r].pc = "gate" /\ ~open
   /\ IF RecheckClosed /\ Recoverable(Tok(r))
@@ -162,7 +164,8 @@ EveryUserHasItsDevice == \A u \in users : \E d \in devices : d.user = u
 \* account exists is that account (no "full", no "closed"). (A copy refused
 \* with 403 "closed" before a concurrent copy created the account is not
 \* covered: the mode is read by the Worker, not in the batch. The client
-\* then gives up an account that exists; the 7-day sweep deletes it unused.)
+\* therefore sends a token it sent before again, for a bounded time, before
+\* it takes a 403 as final; a copy after the commit gets the account.)
 RetriesAgree ==
   /\ \A s \in Reqs : (Final(s) /\ req[s].known /\ Tok(s) # OtherTok)
                        => (Ok(s) /\ req[s].dev = TheDev(Tok(s)).id)

@@ -14,8 +14,14 @@
 (*   old          the write failed; the file holds the old records         *)
 (*   unreadable   the write failed and the file could not be read back:    *)
 (*                it holds the old or the new records; the changed keys    *)
-(*                read as absent until a later write succeeds              *)
-(* A read returns snap[k] unless k is unknown. A crash keeps the disk (old *)
+(*                are unknown (read as absent) until a later write         *)
+(* A read returns snap[k] unless k is unknown. With WriteReadsBack (the    *)
+(* code), a write after an unreadable failure first reads the file again   *)
+(* and starts from what it holds, which settles the unknown keys (the read *)
+(* back is assumed to succeed then; the code refuses a write that would    *)
+(* otherwise guess an unknown key it does not set). Without it, the write  *)
+(* started from the snapshot and wrote back the values from before the     *)
+(* failed write. A crash keeps the disk (old *)
 (* or new records for a write in flight: atomic rename); the restart reads *)
 (* it. Durable = FALSE is SharedPreferences.commit() instead (review R3,   *)
 (* F1): the memory takes the new value at WriteBegin and keeps it.         *)
@@ -37,22 +43,28 @@
 (* is refused while marked. A key stored by an earlier version (unbound)  *)
 (* is bound to the current registration at start.                          *)
 (*                                                                         *)
-(* Sync runs (under the sync lock) read the device id and the key, then    *)
-(* the registration in a separate read (SyncRun.current).                 *)
+(* Sync runs (under the sync lock) read the registration, device id, token *)
+(* and key in one read (SyncRun.current, PairingStore.session).            *)
 (*                                                                         *)
 (* Mutations: CancelSafe = FALSE (R2), TooLateNoop = FALSE (F2), Durable = *)
 (* FALSE (R3, F1), StoreBeforeSend = FALSE (N2: the request goes out      *)
 (* before the token is on disk), KeyBound = FALSE with UnpairMark = FALSE  *)
 (* (review 6 item 3).                                                      *)
 (*                                                                         *)
-(* Two settings model fixes of findings of this model (the code is FALSE): *)
+(* Three settings are fixes of findings of this model. TRUE is the code;   *)
+(* FALSE is the code before the fix (RegistrationClient_runread,           *)
+(* _unknownmark):                                                          *)
 (*   RunReadsOnce     SyncRun.current reads the registration once, with   *)
-(*                    the key (else an unpairing mark between the reads    *)
-(*                    gives a run the key of A and the registration "").   *)
-(*   UnknownMarkSet   a mark whose write failed unreadably reads as set   *)
-(*                    (else it reads as absent while the disk may hold    *)
-(*                    it: a new registration begins, and the next start   *)
-(*                    resumes the unpairing and removes its request).     *)
+(*                    the key (before: an unpairing mark between the reads *)
+(*                    gave a run the key of A and the registration "").    *)
+(*   UnknownMarkSet   a mark whose write failed unreadably reads as set,  *)
+(*                    and the unmark is written again (bounded in the      *)
+(*                    code: it may give up and stay marked) (before: it    *)
+(*                    read as absent while the disk might hold it: a new   *)
+(*                    registration began, and the next start resumed the   *)
+(*                    unpairing and removed its request).                  *)
+(*   WriteReadsBack   see Storage (before: a later write of other keys     *)
+(*                    wrote the old mark back).                            *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -65,7 +77,7 @@ CONSTANTS Tokens,        \* tokens the client may generate, in order (1, 2, ...)
           CanExpire,     \* the code may expire (then a token without a device gets 401)
           WithKey, WithRuns, LegacyKey,
           CancelSafe, TooLateNoop, Durable, StoreBeforeSend, KeyBound, UnpairMark,
-          RunReadsOnce, UnknownMarkSet,
+          RunReadsOnce, UnknownMarkSet, WriteReadsBack,
           ResumeAtStart  \* FALSE (mutation): a marked unpairing is not finished at start
 
 None == [none |-> TRUE]
@@ -125,12 +137,18 @@ Pending == Rd("S", "pend")
 Busy == Paired \/ Rd("C", "mark")
 
 \* A write of thread `by`: it waits for the result (w[s].res), then takes
-\* it (Release) and goes on.
+\* it (Release) and goes on. With unknown keys (only when Durable) and
+\* WriteReadsBack, it reads the file first: the snapshot becomes the disk.
 WriteBegin(s, k, v, by) ==
-  LET next == [snap[s] EXCEPT ![k] = v] IN
+  LET reread == WriteReadsBack /\ unk[s] # {}
+      base == IF reread THEN disk[s] ELSE snap[s]
+      next == [base EXCEPT ![k] = v]
+  IN
   /\ w[s] = None
   /\ w' = [w EXCEPT ![s] = [next |-> next, by |-> by, res |-> "pending"]]
-  /\ snap' = IF Durable THEN snap ELSE [snap EXCEPT ![s] = next]
+  /\ snap' = IF ~Durable THEN [snap EXCEPT ![s] = next]
+            ELSE IF reread THEN [snap EXCEPT ![s] = disk[s]] ELSE snap
+  /\ unk' = IF reread THEN [unk EXCEPT ![s] = {}] ELSE unk
 WriteDone(s, by) == w[s] # None /\ w[s].by = by /\ w[s].res # "pending"
 WriteOk(s) == w[s].res = "ok"
 Release(s) == w' = [w EXCEPT ![s] = None]
@@ -198,7 +216,7 @@ BeginCheck ==
   /\ IF cur # lt.id \/ Busy \/ Pending # 0
        THEN /\ ReleaseCur(lt.id) /\ FailedEvt(lt.id) /\ lt' = None
             /\ UNCHANGED <<StoreV, nws, nextTok>>
-       ELSE /\ WriteBegin("S", "pend", nextTok, "L") /\ UNCHANGED <<disk, unk>>
+       ELSE /\ WriteBegin("S", "pend", nextTok, "L") /\ UNCHANGED disk
             /\ nextTok' = nextTok + 1
             /\ IF StoreBeforeSend THEN UNCHANGED nws ELSE Spawn(lt.id, nextTok)
             /\ lt' = [lt EXCEPT !.step = "w", !.tok = nextTok]
@@ -244,7 +262,7 @@ SaveTok ==
   /\ At("finish", "save")
   /\ IF Rd("C", "mark")
        THEN LStep("fin") /\ FailedEvt(lt.id) /\ UNCHANGED StoreV
-       ELSE WriteBegin("S", "tok", lt.tok, "L") /\ LStep("tokw") /\ UNCHANGED <<disk, unk, lostFail>>
+       ELSE WriteBegin("S", "tok", lt.tok, "L") /\ LStep("tokw") /\ UNCHANGED <<disk, lostFail>>
   /\ UNCHANGED stale /\ LUnchanged
 SaveTokDone ==
   /\ At("finish", "tokw") /\ WriteDone("S", "L")
@@ -254,7 +272,7 @@ SaveTokDone ==
 SaveReg ==
   /\ At("finish", "reg")
   /\ WriteBegin("C", "reg", DevOf(lt.tok), "L") /\ LStep("regw")
-  /\ UNCHANGED <<disk, unk, stale, lostFail>> /\ LUnchanged
+  /\ UNCHANGED <<disk, stale, lostFail>> /\ LUnchanged
 \* Paired now. The pending request is removed (best effort).
 SaveRegDone ==
   /\ At("finish", "regw") /\ WriteDone("C", "L")
@@ -266,7 +284,7 @@ SaveRegDone ==
 SavePend ==
   /\ At("finish", "pend")
   /\ WriteBegin("S", "pend", 0, "L") /\ LStep("pendw")
-  /\ UNCHANGED <<disk, unk, stale, lostFail>> /\ LUnchanged
+  /\ UNCHANGED <<disk, stale, lostFail>> /\ LUnchanged
 SavePendDone ==
   /\ At("finish", "pendw") /\ WriteDone("S", "L")
   /\ Release("S") /\ LStep("fin")
@@ -277,7 +295,7 @@ SavePendDone ==
 Reject ==
   /\ At("finish", "reject")
   /\ WriteBegin("S", "pend", 0, "L") /\ LStep("rejectw")
-  /\ UNCHANGED <<disk, unk, stale, lostFail>> /\ LUnchanged
+  /\ UNCHANGED <<disk, stale, lostFail>> /\ LUnchanged
 Rejected ==
   /\ At("finish", "rejectw") /\ WriteDone("S", "L")
   /\ Release("S") /\ LStep("fin") /\ FailedEvt(lt.id)
@@ -295,7 +313,7 @@ FinishEnd ==
 Drop ==
   /\ At("drop", "check")
   /\ WriteBegin("S", "pend", 0, "L") /\ LStep("w")
-  /\ UNCHANGED <<disk, unk, stale, lostFail>> /\ LUnchanged
+  /\ UNCHANGED <<disk, stale, lostFail>> /\ LUnchanged
 Dropped ==
   /\ At("drop", "w") /\ WriteDone("S", "L")
   /\ Release("S") /\ lt' = None
@@ -307,7 +325,7 @@ Reset ==
   /\ cur' = 0
   /\ cancelled' = cancelled \cup (IF cur > 0 THEN {cur} ELSE {})
   /\ WriteBegin("S", "pend", 0, "L") /\ LStep("w")
-  /\ UNCHANGED <<disk, unk, NetV, ids, latest, lq, ThreadV, MiscV, dropped, stale, lostFail>>
+  /\ UNCHANGED <<disk, NetV, ids, latest, lq, ThreadV, MiscV, dropped, stale, lostFail>>
 \* The unpairing goes on (or, if the write failed, forget() throws).
 ResetDone ==
   /\ At("reset", "w") /\ WriteDone("S", "L")
@@ -416,8 +434,8 @@ UMark ==
   /\ upc = "mark"
   /\ IF UnpairMark
        THEN WriteBegin("C", "mark", TRUE, "U") /\ upc' = "markw"
-       ELSE upc' = "inval" /\ UNCHANGED <<w, snap>>
-  /\ UNCHANGED <<disk, unk, boot>> /\ UUnchanged
+       ELSE upc' = "inval" /\ UNCHANGED <<w, snap, unk>>
+  /\ UNCHANGED <<disk, boot>> /\ UUnchanged
 UMarked ==
   /\ upc = "markw" /\ WriteDone("C", "U")
   /\ Release("C")
@@ -443,7 +461,7 @@ Locked == upc \in {"lock", "creg", "cregw", "ctok", "ctokw", "ckey", "ckeyw", "c
 UClear(at, s, k, v) ==
   /\ upc = at
   /\ WriteBegin(s, k, v, "U") /\ upc' = at \o "w"
-  /\ UNCHANGED <<disk, unk, boot>> /\ UUnchanged
+  /\ UNCHANGED <<disk, boot>> /\ UUnchanged
 UCleared(at, s, then) ==
   /\ upc = at \o "w" /\ WriteDone(s, "U")
   /\ Release(s)
@@ -453,12 +471,18 @@ UUnmark ==
   /\ upc = "unmark"
   /\ IF UnpairMark
        THEN WriteBegin("C", "mark", FALSE, "U") /\ upc' = "unmarkw" /\ UNCHANGED boot
-       ELSE UDone /\ UNCHANGED <<w, snap>>
-  /\ UNCHANGED <<disk, unk>> /\ UUnchanged
+       ELSE UDone /\ UNCHANGED <<w, snap, unk>>
+  /\ UNCHANGED disk /\ UUnchanged
+\* UnknownMarkSet: an unmark that failed unreadably is written again until
+\* the mark is known; the code gives up after a few attempts (the mark then
+\* stays, read as set, for the next start).
 UUnmarked ==
   /\ upc = "unmarkw" /\ WriteDone("C", "U")
   /\ Release("C")
-  /\ IF WriteOk("C") THEN UDone ELSE UFail
+  /\ IF WriteOk("C") THEN UDone
+     ELSE IF UnknownMarkSet /\ "mark" \in unk["C"]
+       THEN (upc' = "unmark" /\ UNCHANGED boot) \/ UFail
+       ELSE UFail
   /\ UNCHANGED <<disk, snap, unk>> /\ UUnchanged
 
 \* An unpairing that stopped on a failed write stays marked; the next start
@@ -491,8 +515,8 @@ KeyWrite ==
   /\ IF kreg # 0 /\ kreg = Registration /\ MasterKey = NoKey
        THEN /\ WriteBegin("S", "key", [tag |-> kreg, bnd |-> IF KeyBound THEN kreg ELSE 0], "K")
             /\ kpc' = "w"
-       ELSE kpc' = "idle" /\ UNCHANGED <<w, snap>>
-  /\ UNCHANGED <<disk, unk, kreg>> /\ KUnchanged
+       ELSE kpc' = "idle" /\ UNCHANGED <<w, snap, unk>>
+  /\ UNCHANGED <<disk, kreg>> /\ KUnchanged
 KeyDone ==
   /\ kpc = "w" /\ WriteDone("S", "K")
   /\ Release("S") /\ kpc' = "idle"
@@ -506,16 +530,17 @@ Adopt ==
   /\ LET k == Rd("S", "key") IN
        IF KeyBound /\ k # NoKey /\ k.bnd = 0 /\ Registration # 0
          THEN WriteBegin("S", "key", [k EXCEPT !.bnd = Registration], "B") /\ boot' = "adoptw"
-         ELSE boot' = "none" /\ UNCHANGED <<w, snap>>
-  /\ UNCHANGED <<disk, unk>> /\ BUnchanged
+         ELSE boot' = "none" /\ UNCHANGED <<w, snap, unk>>
+  /\ UNCHANGED disk /\ BUnchanged
 Adopted ==
   /\ boot = "adoptw" /\ WriteDone("S", "B")
   /\ Release("S") /\ boot' = "none"
   /\ UNCHANGED <<disk, snap, unk>> /\ BUnchanged
 
 ----------------------------------------------------------------------------
-\* A sync run (SyncRun.current, under the sync lock): the device id and the
-\* key, then the registration (unless RunReadsOnce: all in one read).
+\* A sync run (SyncRun.current, under the sync lock): the registration,
+\* device id and key in one read (RunReadsOnce; before the fix: the device id
+\* and the key, then the registration in a second read).
 
 RUnchanged == UNCHANGED <<StoreV, NetV, MachV, upc, kpc, kreg, boot, MiscV, GhostV>>
 
@@ -579,8 +604,8 @@ Spec == Init /\ [][Next]_vars
 ReadReturnsPersisted == \A s \in Stores : \A k \in DOMAIN snap[s] : k \notin unk[s] => snap[s][k] = disk[s][k]
 
 \* Ready, as the app reads it, has its registration, token and key on disk.
-\* (The mark is not included: a mark whose write failed unreadably reads as
-\* absent; the restart then finishes the unpairing the user asked for.)
+\* (The mark is not included: before the UnknownMarkSet fix a mark whose
+\* write failed unreadably read as absent.)
 ReadyPersisted ==
   Ready => /\ disk["C"].reg = Registration
            /\ disk["S"].tok = Rd("S", "tok") /\ disk["S"].key = MasterKey
@@ -616,4 +641,13 @@ AttemptEnds == (cur # 0) ~> (cur = 0)
 \* and then unpairing does not satisfy it: <>[] asks for the final state.
 GaveUp == cur = 0 /\ Pending = 0 /\ nextTok \notin Tokens /\ upc = "idle"
 Converges == <>[](Ready \/ rejected \/ GaveUp)
+
+\* "This case never happens" (run.sh reach: each must be violated, so that
+\* the fixes of the unknown mark are exercised, not vacuous).
+\* An unmark failed unreadably and is about to be written again, from the
+\* file read back (WriteReadsBack).
+Unreached_UnmarkRewrite == ~(upc = "unmark" /\ "mark" \in unk["C"])
+\* The unpairing gave up with the mark unknown: the app goes on, reading
+\* the mark as set (UnknownMarkSet), until the next start finishes it.
+Unreached_UnknownMarkIdle == ~(upc = "idle" /\ "mark" \in unk["C"])
 =============================================================================

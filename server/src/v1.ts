@@ -179,6 +179,16 @@ v1.get("/info", async (c) => {
 // the rate limits, MAX_USERS and the limit variables): a client whose
 // response got lost gets its account back (200) even after the operator
 // closed registration. Only the creation of a new user is gated.
+//
+// A copy of the request may pass that recovery just before a concurrent copy
+// with the same token creates the account. So before a final refusal (403
+// "registration closed"; "registration full" is rechecked in createAccount)
+// the recovery is looked up again, and the account, if there is one now, is
+// the answer (formal/tla/Accounts_closedrace.cfg). 429 and 503 are not
+// final: the client sends the request again, and recovery comes first then.
+// A copy refused before the other copy commits still gets 403; the client
+// treats that as final only for a token it never sent before
+// (docs/sync-protocol.md, Registration requests).
 v1.post("/accounts", async (c) => {
   const parsed = await jsonBody(c);
   if (parsed instanceof Response) return parsed;
@@ -192,7 +202,11 @@ v1.post("/accounts", async (c) => {
   const known = await recoverAccount(c.env.DB, token);
   if (known !== null) return c.json({ deviceId: known }, 200);
 
-  if (registrationMode(c.env) !== "open") return jsonError(c, 403, "registration closed");
+  if (registrationMode(c.env) !== "open") {
+    const now = await recoverAccount(c.env.DB, token);
+    if (now !== null) return c.json({ deviceId: now }, 200);
+    return jsonError(c, 403, "registration closed");
+  }
   // Fail closed without the edge limiter (see ratelimit.ts).
   if (!selfRegistrationEdgeReady(c.env)) {
     console.error("REGISTRATION is open but the RL_ACCOUNT binding is missing; refusing self-registration");

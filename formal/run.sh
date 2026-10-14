@@ -165,9 +165,10 @@ run_tamarin() {
 #   reach:...     each named invariant (Unreached_*, "this case never
 #                 happens") must be violated in a run of the same config with
 #                 only that invariant: the case is reachable.
-# Configs named "finding" in their comment model the code as it is where
-# this model found a problem (see formal/README.md); the others model the
-# code, its fixes, or mutations that must break the property they name.
+# Configs named "finding, fixed" in their comment model the code before the
+# fix of a problem this model found (see formal/README.md); the others model
+# the code, earlier designs, or mutations that must break the property they
+# name.
 TLA_CHECKS="
 Registration Registration pass cover:SRecoverHit,SGateRefuse,SStartKnown,SBatchCreate,SBatchUnique,SBatchZero,SRecheckKnown,SRecheckNew,SFullCheckInvalid
 Registration_full Registration pass cover:SBatchCreate,SBatchZero,SFullCheckFull
@@ -217,7 +218,7 @@ StatusRotation_pages4 StatusRotation pass cover:RescanPage,RetryStep
 StatusRotation_pages5 StatusRotation pass
 StatusRotation_2dev StatusRotation pass
 StatusRotation_r5 StatusRotation live:StatusLive
-RegistrationClient RegistrationClient pass cover:Cancel,SaveRegDone,Rejected,ResetDone,UUnmarked,KeyDone,RunReg,DiskUnreadable,DiskOld,Crash,Lose,LateServe
+RegistrationClient RegistrationClient pass cover:Cancel,SaveRegDone,Rejected,ResetDone,UUnmarked,KeyDone,RunReg,DiskUnreadable,DiskOld,Crash,Lose,LateServe reach:Unreached_UnmarkRewrite,Unreached_UnknownMarkIdle
 RegistrationClient_2faults RegistrationClient pass
 RegistrationClient_legacy RegistrationClient pass cover:Adopted,RunReg
 RegistrationClient_live RegistrationClient pass
