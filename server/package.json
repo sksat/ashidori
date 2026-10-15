@@ -1,6 +1,7 @@
 {
   "name": "ashidori-server",
   "private": true,
+  "license": "AGPL-3.0-only",
   "version": "0.1.0",
   "type": "module",
   "packageManager": "pnpm@11.6.0",

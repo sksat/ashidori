@@ -22,9 +22,26 @@ val defaultServerHost: String? = (findProperty("ashidori.defaultServer") as Stri
     u.host.lowercase()
 }
 
+// Optional: the release signing key, kept outside the repository, e.g. in
+// ~/.gradle/gradle.properties:
+//   ashidori.release.storeFile=/path/to/release.p12
+//   ashidori.release.storePassword=...
+//   ashidori.release.keyAlias=ashidori
+// Without it, release builds are signed with the debug key (for local testing).
+val releaseStoreFile: String? = (findProperty("ashidori.release.storeFile") as String?)?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "net.sksat.ashidori"
     compileSdk = 37
+
+    signingConfigs {
+        if (releaseStoreFile != null) create("release") {
+            storeFile = file(releaseStoreFile)
+            storePassword = findProperty("ashidori.release.storePassword") as String?
+            keyAlias = findProperty("ashidori.release.keyAlias") as String? ?: "ashidori"
+            keyPassword = storePassword
+        }
+    }
 
     defaultConfig {
         applicationId = "net.sksat.ashidori"
@@ -51,7 +68,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {

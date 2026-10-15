@@ -173,6 +173,8 @@ JDK 17 と Android SDK（compileSdk 37）が必要。対応 OS は Android 13 �
 
 Gradle のプロパティ `ashidori.defaultServer=https://<ホスト>` を指定すると、同期設定の URL 欄にそのサーバを入力済みにし、そのホストの登録リンク（`https://<ホスト>/pair`）を App Links でアプリに開かせる。個人用のビルドでは、リポジトリの外の `~/.gradle/gradle.properties` に書く。指定しなければ URL 欄は空で、App Links は宣言しない。
 
+リリース版は、`ashidori.release.storeFile`、`ashidori.release.storePassword`、`ashidori.release.keyAlias` で指定した鍵で署名する（同じく `~/.gradle/gradle.properties` に書く）。指定しなければデバッグ用の鍵で署名する。
+
 デバッグ版では、シミュレーションによる記録を投入して画面を確認できる。
 
 ```sh
@@ -187,3 +189,20 @@ cd server
 pnpm install
 pnpm test
 ```
+
+## ライセンス
+
+[GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0-only）。改変した同期サーバをネットワーク越しに提供する場合は、その利用者にソースコードを提供する必要がある（第 13 条）。
+
+同梱・依存するライブラリは、それぞれのライセンスに従う。
+
+| 対象 | ライブラリ | ライセンス |
+| --- | --- | --- |
+| アプリ | Scala 3 標準ライブラリ、AndroidX（Core、Activity、AppCompat、WorkManager、CameraX）、Material Components、Tink、ZXing | Apache-2.0 |
+| アプリ | MapLibre Native | BSD-2-Clause |
+| アプリ | uJson | MIT |
+| サーバ | Hono | MIT |
+| Web | MapLibre GL JS、PMTiles | BSD-3-Clause |
+| Web | @hpke/core、fflate、hyparquet、qrcode-generator（`server/src/vendor/` に同梱） | MIT |
+
+データの出典は「[データの出典](#データの出典)」を参照。
