@@ -118,9 +118,9 @@ jobs:
 
       - name: Deploy
         env:
-          CF_ACCESS_TEAM_DOMAIN: ${{ vars.CF_ACCESS_TEAM_DOMAIN }}
-          CF_ACCESS_AUD: ${{ vars.CF_ACCESS_AUD }}
-          ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
+          CF_ACCESS_TEAM_DOMAIN: ${{ secrets.CF_ACCESS_TEAM_DOMAIN }}
+          CF_ACCESS_AUD: ${{ secrets.CF_ACCESS_AUD }}
+          ADMIN_EMAILS: ${{ secrets.ADMIN_EMAILS }}
           REGISTRATION: ${{ vars.REGISTRATION }}
           USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
           USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}

@@ -221,9 +221,9 @@ CI 用には、ユーザーではなくアカウントが所有する API トー
 | Secret | `CLOUDFLARE_API_TOKEN` | 環境 `production` | 2. のトークン |
 | Secret | `CLOUDFLARE_ACCOUNT_ID` | 環境 `production` | Account ID |
 | Secret | `D1_DATABASE_ID` | 環境 `production` | D1 データベースの ID |
-| Variable | `CF_ACCESS_TEAM_DOMAIN` | リポジトリ | Access の Team domain |
-| Variable | `CF_ACCESS_AUD` | リポジトリ | Access アプリケーションの AUD Tag |
-| Variable | `ADMIN_EMAILS` | リポジトリ | 管理者のメールアドレス（カンマ区切り） |
+| Secret | `CF_ACCESS_TEAM_DOMAIN` | 環境 `production` | Access の Team domain |
+| Secret | `CF_ACCESS_AUD` | 環境 `production` | Access アプリケーションの AUD Tag |
+| Secret | `ADMIN_EMAILS` | 環境 `production` | 管理者のメールアドレス（カンマ区切り） |
 | Variable | `REGISTRATION` | リポジトリ | `admin` または `open`（任意。未設定なら `admin`） |
 | Variable | `USER_QUOTA_BYTES`、`USER_MAX_BATCHES`、`USER_MAX_DEVICES`、`USER_MAX_SHARED_CHECKINS`、`MAX_USERS`、`MAX_TOTAL_BYTES` | リポジトリ | 上限（任意。未設定なら既定値。「[変数](#変数)」を参照） |
 | Variable | `ANDROID_CERT_SHA256` | リポジトリ | アプリの署名証明書の SHA-256 フィンガープリント（任意。「[登録リンクと App Links](#登録リンクと-app-links)」） |
@@ -240,13 +240,13 @@ gh api -X POST 'repos/{owner}/{repo}/environments/production/deployment-branch-p
 gh secret set CLOUDFLARE_API_TOKEN --env production
 gh secret set CLOUDFLARE_ACCOUNT_ID --env production
 gh secret set D1_DATABASE_ID --env production
-gh variable set CF_ACCESS_TEAM_DOMAIN --body '<team>.cloudflareaccess.com'
-gh variable set CF_ACCESS_AUD --body '<AUD Tag>'
-gh variable set ADMIN_EMAILS --body '<管理者のメールアドレス>'
+gh secret set CF_ACCESS_TEAM_DOMAIN --env production --body '<team>.cloudflareaccess.com'
+gh secret set CF_ACCESS_AUD --env production --body '<AUD Tag>'
+gh secret set ADMIN_EMAILS --env production --body '<管理者のメールアドレス>'
 gh variable set DEPLOY_SERVER --body true
 ```
 
-ワークフローは変数を `env:` で渡し、シェルでは `"$REGISTRATION"` のように参照する。変数の値をスクリプトに直接埋め込まないため、値にシェルのコードを含めても実行されない。デプロイの前に `node scripts/check-config.ts` で値を検証し、不正ならデプロイしない。
+Access の値と管理者のメールアドレスは、公開リポジトリでも実行ログに出ないよう Secret にする（Variable はログで伏せられない）。ワークフローは変数を `env:` で渡し、シェルでは `"$REGISTRATION"` のように参照する。変数の値をスクリプトに直接埋め込まないため、値にシェルのコードを含めても実行されない。デプロイの前に `node scripts/check-config.ts` で値を検証し、不正ならデプロイしない。
 
 GitHub Actions の IP アドレスは Azure と共有の広い範囲（7,000 件以上、毎週更新）のため、トークンの IP 制限には使わない。
 
