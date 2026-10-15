@@ -4,7 +4,7 @@ import { fromHex } from "../src/data/bytes";
 import { importBatchKey } from "../src/data/crypto";
 import { MemoryStore, Sessions, devSession, parseKeyText, signOut, type ViewerSession } from "../src/data/session";
 import { ViewerStore } from "../src/data/store";
-import { TOKEN, fakeServer, fixtureJson, syncMeta } from "./helpers";
+import { TOKEN, fakeServer, fixtureJson, listing, syncMeta } from "./helpers";
 
 const DEV_A = "0f5c2a8e-7d1b-4c3e-9a61-2b7d5e8f4a10";
 const DEV_B = "6a3e9b0c-1f2d-4e5a-8b7c-9d0e1f2a3b4c";
@@ -25,8 +25,8 @@ describe("ViewerStore over the app's batches", () => {
     expect(st.status.get(DEV_A)?.seq).toBe(1);
     expect(st.status.get(DEV_B)?.status?.recording.on).toBe(false);
     // The later snapshot of place 2 wins.
-    expect(st.places.find((p) => p.key === `${DEV_A}/2`)?.name).toBe("大手町オフィス");
-    expect(st.checkIns.map((c) => c.venue)).toEqual(["丸の内 オアゾ"]);
+    expect(st.places.find((p) => p.key === `${DEV_A}/2`)?.name).toBe("有明オフィス");
+    expect(st.checkIns.map((c) => c.venue)).toEqual(["有明ガーデン"]);
     expect(st.overrides).toHaveLength(1);
   });
 
@@ -49,11 +49,13 @@ describe("ViewerStore over the app's batches", () => {
   });
 
   it("keeps going when a batch cannot be read, and counts it", async () => {
-    const { store: st } = await store({ tamper: (p, b) => (p.endsWith("/archive/8") ? b.slice(0, -1) : b) });
+    // The motion file is the last archive batch, after the parts of the fixes.
+    const motion = Math.max(...listing().items.filter((i) => i.deviceId === DEV_A && i.stream === "archive").map((i) => i.seq));
+    const { store: st } = await store({ tamper: (p, b) => (p.endsWith(`/archive/${motion}`) ? b.slice(0, -1) : b) });
     await st.init();
     await st.loadMore(DEV_A, 7);
     expect(st.failures(DEV_A)).toBe(1);
-    // The motion file (archive/8, after the fixes parts) is missing: positions still show, steps do not.
+    // The motion file is missing: positions still show, steps do not.
     expect(st.day(DEV_A, "2026-10-05")!.summary.steps).toBe(0);
   });
 

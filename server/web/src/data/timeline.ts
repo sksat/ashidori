@@ -34,6 +34,7 @@ export const PARAMS = {
   gapMs: 90_000,
   minLegDurationMs: 2 * 60_000,
   minLegDistanceM: 250.0,
+  maxSurfacingMs: 3 * 60_000,
   maxPlausibleSpeedMps: 300.0,
 } as const;
 
@@ -497,6 +498,20 @@ export function legs(path: Fix[], motion: MotionIndex): Leg[] {
       else merged.push(r);
     }
     runs = merged;
+  }
+  // A brief vehicle-speed run between two GNSS outages is the same
+  // underground ride surfacing, not a car ride between two subway rides.
+  // Walking stays: that is a transfer.
+  let k = 1;
+  while (k < runs.length - 1) {
+    const r = runs[k]!;
+    const prev = runs[k - 1]!;
+    const next = runs[k + 1]!;
+    const vehicle = r[2] === Coarse.Vehicle || r[2] === Coarse.Mid;
+    if (vehicle && prev[2] === Coarse.Gap && next[2] === Coarse.Gap && runDur(r) < PARAMS.maxSurfacingMs) {
+      runs[k - 1] = [prev[0], next[1], Coarse.Gap];
+      runs.splice(k, 2);
+    } else k++;
   }
   return runs.map(([a, b]) => makeLeg(iv.slice(a, b + 1), motion));
 }

@@ -73,10 +73,10 @@ object WebFixtures:
     val sc = Scenarios
     put(devA, "places", Seq(
       ujson.Obj("id" -> 1, "lat" -> sc.Home.lat, "lon" -> sc.Home.lon, "r" -> 60.0, "name" -> "", "kind" -> "HOME", "ext" -> "", "updatedAt" -> num(now)),
-      ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "大手町オフィス", "kind" -> "WORK", "ext" -> "", "updatedAt" -> num(now)),
+      ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "有明オフィス", "kind" -> "WORK", "ext" -> "", "updatedAt" -> num(now)),
       ujson.Obj("id" -> 3, "lat" -> sc.Park.lat, "lon" -> sc.Park.lon, "r" -> 150.0, "name" -> "洞峰公園", "kind" -> "UNKNOWN", "ext" -> "", "updatedAt" -> num(now))))
     val lunch = today.minusDays(1).atTime(12, 50).atZone(Zone).toInstant.toEpochMilli
-    put(devA, "checkins", Seq(ujson.Obj("id" -> 7, "t" -> num(lunch), "lat" -> sc.Lunch.lat, "lon" -> sc.Lunch.lon, "venue" -> "丸の内 オアゾ",
+    put(devA, "checkins", Seq(ujson.Obj("id" -> 7, "t" -> num(lunch), "lat" -> sc.Lunch.lat, "lon" -> sc.Lunch.lon, "venue" -> "有明ガーデン",
       "cat" -> "", "ext" -> "", "place" -> ujson.Null, "comment" -> "", "private" -> 0, "updatedAt" -> num(lunch))))
     def status(t: Long, pct: Int, on: Boolean, at: LatLng, model: String) =
       DeviceStatus(t, pct, charging = !on, recording = on, mode = if on then "balanced" else "", since = if on then t - 72 * hour else 0L,
@@ -222,13 +222,13 @@ object WebFixtures:
     legacy = false
     // A later snapshot of place 2 wins.
     put(devA, "places", Seq(
-      ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "大手町オフィス",
+      ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "有明オフィス",
         "kind" -> "WORK", "ext" -> "", "updatedAt" -> num(t0 - 4 * hour))))
     put(devA, "overrides", overrides.map((s, e, m) =>
       ujson.Obj("s" -> num(s), "e" -> num(e), "mode" -> m.key, "updatedAt" -> num(t0 - 3 * hour))))
     val lunchAt = Date.atTime(12, 50).atZone(Zone).toInstant.toEpochMilli
     put(devA, "checkins", Seq(
-      ujson.Obj("id" -> 7, "t" -> num(lunchAt), "lat" -> sc.Lunch.lat, "lon" -> sc.Lunch.lon, "venue" -> "丸の内 オアゾ",
+      ujson.Obj("id" -> 7, "t" -> num(lunchAt), "lat" -> sc.Lunch.lat, "lon" -> sc.Lunch.lon, "venue" -> "有明ガーデン",
         "cat" -> "ショッピングモール", "ext" -> "node/1", "place" -> ujson.Null, "comment" -> "昼休み", "private" -> 0,
         "updatedAt" -> num(lunchAt))))
 

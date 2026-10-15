@@ -3,8 +3,8 @@
  "zone": "Asia/Tokyo",
  "overrides": [
   {
-   "s": 1791153950000,
-   "e": 1791154555000,
+   "s": 1791153350000,
+   "e": 1791153955000,
    "mode": "IN_PASSENGER_VEHICLE"
   }
  ],
@@ -12,190 +12,262 @@
   {
    "type": "visit",
    "start": 1791151200000,
-   "end": 1791153730000,
-   "lat": 36.1105684692929,
-   "lon": 140.10068131329362,
-   "radius": 83.54154715071259,
+   "end": 1791153150000,
+   "lat": 36.110498645596735,
+   "lon": 140.10079726978094,
+   "radius": 97.49093647168085,
    "fixCount": 22
   },
   {
    "type": "trip",
-   "start": 1791153730000,
-   "end": 1791158320000,
-   "pathSize": 563,
+   "start": 1791153150000,
+   "end": 1791159067000,
+   "pathSize": 853,
    "legs": [
     {
-     "start": 1791153730000,
-     "end": 1791153950000,
+     "start": 1791153150000,
+     "end": 1791153350000,
      "mode": "WALKING",
-     "distanceM": 301.9627137240469,
-     "steps": 376,
+     "distanceM": 263.3319590597374,
+     "steps": 347,
      "uncertain": 0,
      "confidence": 0.85
     },
     {
-     "start": 1791153950000,
-     "end": 1791154555000,
+     "start": 1791153350000,
+     "end": 1791153955000,
      "mode": "IN_BUS",
-     "distanceM": 2755.596251301692,
+     "distanceM": 2765.4740561243934,
      "steps": 0,
      "uncertain": 0,
      "confidence": 0.35
     },
     {
-     "start": 1791154555000,
-     "end": 1791154855000,
+     "start": 1791153955000,
+     "end": 1791154255000,
      "mode": "IN_SUBWAY",
-     "distanceM": 2936.3618387160354,
+     "distanceM": 2909.759637274769,
      "steps": 0,
      "uncertain": 1,
      "confidence": 0.55
     },
     {
-     "start": 1791154855000,
-     "end": 1791156875000,
+     "start": 1791154255000,
+     "end": 1791156270000,
      "mode": "IN_TRAIN",
-     "distanceM": 43691.24218986914,
+     "distanceM": 43425.26024896384,
      "steps": 0,
      "uncertain": 0,
      "confidence": 0.65
     },
     {
-     "start": 1791156875000,
-     "end": 1791158170000,
+     "start": 1791156270000,
+     "end": 1791157092000,
      "mode": "IN_SUBWAY",
-     "distanceM": 7947.354857787913,
+     "distanceM": 7472.435566667486,
      "steps": 0,
      "uncertain": 1,
      "confidence": 0.55
     },
     {
-     "start": 1791158170000,
-     "end": 1791158320000,
-     "mode": "WALKING",
-     "distanceM": 174.2651730270871,
-     "steps": 275,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791158320000,
-   "end": 1791168390000,
-   "lat": 35.68653082658734,
-   "lon": 139.7692159487219,
-   "radius": 104.17321688200454,
-   "fixCount": 51
-  },
-  {
-   "type": "trip",
-   "start": 1791168390000,
-   "end": 1791168810000,
-   "pathSize": 14,
-   "legs": [
-    {
-     "start": 1791168390000,
-     "end": 1791168810000,
-     "mode": "WALKING",
-     "distanceM": 155.32245593976697,
-     "steps": 245,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791168810000,
-   "end": 1791171750000,
-   "lat": 35.68869736297201,
-   "lon": 139.77080063327148,
-   "radius": 98.17592639530065,
-   "fixCount": 34
-  },
-  {
-   "type": "trip",
-   "start": 1791171750000,
-   "end": 1791171830000,
-   "pathSize": 9,
-   "legs": [
-    {
-     "start": 1791171750000,
-     "end": 1791171830000,
-     "mode": "WALKING",
-     "distanceM": 84.07690249034151,
-     "steps": 148,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791171830000,
-   "end": 1791189920000,
-   "lat": 35.68684514620093,
-   "lon": 139.76972362523557,
-   "radius": 52.543598188277905,
-   "fixCount": 68
-  },
-  {
-   "type": "trip",
-   "start": 1791189920000,
-   "end": 1791193633000,
-   "pathSize": 428,
-   "legs": [
-    {
-     "start": 1791189920000,
-     "end": 1791190140000,
-     "mode": "WALKING",
-     "distanceM": 251.80703490655517,
-     "steps": 402,
-     "uncertain": 0,
-     "confidence": 0.85
-    },
-    {
-     "start": 1791190140000,
-     "end": 1791191593000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 11065.144486089801,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791191593000,
-     "end": 1791193633000,
+     "start": 1791157092000,
+     "end": 1791157387000,
      "mode": "IN_TRAIN",
-     "distanceM": 43755.33552621257,
-     "steps": 78,
+     "distanceM": 2566.728895685126,
+     "steps": 0,
      "uncertain": 0,
-     "confidence": 0.65
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791193633000,
-   "end": 1791197393000,
-   "lat": 36.084086156724815,
-   "lon": 140.11167741305775,
-   "radius": 99.60732721920223,
-   "fixCount": 27
-  },
-  {
-   "type": "trip",
-   "start": 1791197393000,
-   "end": 1791197848000,
-   "pathSize": 91,
-   "legs": [
+     "confidence": 0.5
+    },
     {
-     "start": 1791197393000,
-     "end": 1791197848000,
+     "start": 1791157387000,
+     "end": 1791157512000,
+     "mode": "WALKING",
+     "distanceM": 150.29596111709884,
+     "steps": 219,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791157512000,
+     "end": 1791157812000,
      "mode": "IN_PASSENGER_VEHICLE",
-     "distanceM": 2726.3314012880696,
+     "distanceM": 988.083218802318,
+     "steps": 0,
+     "uncertain": 1,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791157812000,
+     "end": 1791158872000,
+     "mode": "IN_TRAIN",
+     "distanceM": 7606.6825737944155,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791158872000,
+     "end": 1791159067000,
+     "mode": "WALKING",
+     "distanceM": 192.54154187678913,
+     "steps": 281,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791159067000,
+   "end": 1791169537000,
+   "lat": 35.63025593636277,
+   "lon": 139.793657174221,
+   "radius": 105.41125481536996,
+   "fixCount": 61
+  },
+  {
+   "type": "trip",
+   "start": 1791169537000,
+   "end": 1791170047000,
+   "pathSize": 52,
+   "legs": [
+    {
+     "start": 1791169537000,
+     "end": 1791170047000,
+     "mode": "WALKING",
+     "distanceM": 609.2930156984919,
+     "steps": 921,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791170047000,
+   "end": 1791172927000,
+   "lat": 35.63684585616939,
+   "lon": 139.7924084941529,
+   "radius": 96.64499175319436,
+   "fixCount": 28
+  },
+  {
+   "type": "trip",
+   "start": 1791172927000,
+   "end": 1791173297000,
+   "pathSize": 38,
+   "legs": [
+    {
+     "start": 1791172927000,
+     "end": 1791173297000,
+     "mode": "WALKING",
+     "distanceM": 420.791754409867,
+     "steps": 694,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791173297000,
+   "end": 1791191487000,
+   "lat": 35.630070602331536,
+   "lon": 139.79415702096662,
+   "radius": 104.32493630145727,
+   "fixCount": 74
+  },
+  {
+   "type": "trip",
+   "start": 1791191487000,
+   "end": 1791196554000,
+   "pathSize": 775,
+   "legs": [
+    {
+     "start": 1791191487000,
+     "end": 1791191767000,
+     "mode": "WALKING",
+     "distanceM": 328.57184156701953,
+     "steps": 501,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791191767000,
+     "end": 1791192952000,
+     "mode": "IN_TRAIN",
+     "distanceM": 8539.895889318948,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791192952000,
+     "end": 1791193082000,
+     "mode": "WALKING",
+     "distanceM": 165.99785506930675,
+     "steps": 215,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791193082000,
+     "end": 1791193387000,
+     "mode": "WALKING",
+     "distanceM": 1112.5181005409495,
+     "steps": 0,
+     "uncertain": 0.9836065573770492,
+     "confidence": 0.6
+    },
+    {
+     "start": 1791193387000,
+     "end": 1791193682000,
+     "mode": "IN_TRAIN",
+     "distanceM": 2607.2244251352117,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791193682000,
+     "end": 1791194359000,
+     "mode": "IN_SUBWAY",
+     "distanceM": 6338.58876343859,
+     "steps": 0,
+     "uncertain": 1,
+     "confidence": 0.55
+    },
+    {
+     "start": 1791194359000,
+     "end": 1791196554000,
+     "mode": "IN_TRAIN",
+     "distanceM": 46831.25671954649,
+     "steps": 100,
+     "uncertain": 0,
+     "confidence": 0.65
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791196554000,
+   "end": 1791200304000,
+   "lat": 36.08419504286367,
+   "lon": 140.1116798623007,
+   "radius": 81.67096675847301,
+   "fixCount": 24
+  },
+  {
+   "type": "trip",
+   "start": 1791200304000,
+   "end": 1791200709000,
+   "pathSize": 82,
+   "legs": [
+    {
+     "start": 1791200304000,
+     "end": 1791200709000,
+     "mode": "IN_PASSENGER_VEHICLE",
+     "distanceM": 2738.4582894382706,
      "steps": 0,
      "uncertain": 0,
      "confidence": 0.5
@@ -204,202 +276,274 @@
   },
   {
    "type": "visit",
-   "start": 1791197848000,
-   "end": 1791204803000,
-   "lat": 36.110457506362074,
-   "lon": 140.10022516741324,
-   "radius": 75.36494889620215,
-   "fixCount": 34
+   "start": 1791200709000,
+   "end": 1791207669000,
+   "lat": 36.11058498376142,
+   "lon": 140.10012043285965,
+   "radius": 79.80287683167539,
+   "fixCount": 35
   }
  ],
  "segments": [
   {
    "type": "visit",
    "start": 1791151200000,
-   "end": 1791153730000,
-   "lat": 36.1105684692929,
-   "lon": 140.10068131329362,
-   "radius": 83.54154715071259,
+   "end": 1791153150000,
+   "lat": 36.110498645596735,
+   "lon": 140.10079726978094,
+   "radius": 97.49093647168085,
    "fixCount": 22
   },
   {
    "type": "trip",
-   "start": 1791153730000,
-   "end": 1791158320000,
-   "pathSize": 563,
+   "start": 1791153150000,
+   "end": 1791159067000,
+   "pathSize": 853,
    "legs": [
     {
-     "start": 1791153730000,
-     "end": 1791153950000,
+     "start": 1791153150000,
+     "end": 1791153350000,
      "mode": "WALKING",
-     "distanceM": 301.9627137240469,
-     "steps": 376,
+     "distanceM": 263.3319590597374,
+     "steps": 347,
      "uncertain": 0,
      "confidence": 0.85
     },
     {
-     "start": 1791153950000,
-     "end": 1791154555000,
+     "start": 1791153350000,
+     "end": 1791153955000,
      "mode": "IN_PASSENGER_VEHICLE",
-     "distanceM": 2755.596251301692,
+     "distanceM": 2765.4740561243934,
      "steps": 0,
      "uncertain": 0,
      "confidence": 1
     },
     {
-     "start": 1791154555000,
-     "end": 1791154855000,
+     "start": 1791153955000,
+     "end": 1791154255000,
      "mode": "IN_SUBWAY",
-     "distanceM": 2936.3618387160354,
+     "distanceM": 2909.759637274769,
      "steps": 0,
      "uncertain": 1,
      "confidence": 0.55
     },
     {
-     "start": 1791154855000,
-     "end": 1791156875000,
+     "start": 1791154255000,
+     "end": 1791156270000,
      "mode": "IN_TRAIN",
-     "distanceM": 43691.24218986914,
+     "distanceM": 43425.26024896384,
      "steps": 0,
      "uncertain": 0,
      "confidence": 0.65
     },
     {
-     "start": 1791156875000,
-     "end": 1791158170000,
+     "start": 1791156270000,
+     "end": 1791157092000,
      "mode": "IN_SUBWAY",
-     "distanceM": 7947.354857787913,
+     "distanceM": 7472.435566667486,
      "steps": 0,
      "uncertain": 1,
      "confidence": 0.55
     },
     {
-     "start": 1791158170000,
-     "end": 1791158320000,
-     "mode": "WALKING",
-     "distanceM": 174.2651730270871,
-     "steps": 275,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791158320000,
-   "end": 1791168390000,
-   "lat": 35.68653082658734,
-   "lon": 139.7692159487219,
-   "radius": 104.17321688200454,
-   "fixCount": 51
-  },
-  {
-   "type": "trip",
-   "start": 1791168390000,
-   "end": 1791168810000,
-   "pathSize": 14,
-   "legs": [
-    {
-     "start": 1791168390000,
-     "end": 1791168810000,
-     "mode": "WALKING",
-     "distanceM": 155.32245593976697,
-     "steps": 245,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791168810000,
-   "end": 1791171750000,
-   "lat": 35.68869736297201,
-   "lon": 139.77080063327148,
-   "radius": 98.17592639530065,
-   "fixCount": 34
-  },
-  {
-   "type": "trip",
-   "start": 1791171750000,
-   "end": 1791171830000,
-   "pathSize": 9,
-   "legs": [
-    {
-     "start": 1791171750000,
-     "end": 1791171830000,
-     "mode": "WALKING",
-     "distanceM": 84.07690249034151,
-     "steps": 148,
-     "uncertain": 0,
-     "confidence": 0.85
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791171830000,
-   "end": 1791189920000,
-   "lat": 35.68684514620093,
-   "lon": 139.76972362523557,
-   "radius": 52.543598188277905,
-   "fixCount": 68
-  },
-  {
-   "type": "trip",
-   "start": 1791189920000,
-   "end": 1791193633000,
-   "pathSize": 428,
-   "legs": [
-    {
-     "start": 1791189920000,
-     "end": 1791190140000,
-     "mode": "WALKING",
-     "distanceM": 251.80703490655517,
-     "steps": 402,
-     "uncertain": 0,
-     "confidence": 0.85
-    },
-    {
-     "start": 1791190140000,
-     "end": 1791191593000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 11065.144486089801,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791191593000,
-     "end": 1791193633000,
+     "start": 1791157092000,
+     "end": 1791157387000,
      "mode": "IN_TRAIN",
-     "distanceM": 43755.33552621257,
-     "steps": 78,
+     "distanceM": 2566.728895685126,
+     "steps": 0,
      "uncertain": 0,
-     "confidence": 0.65
-    }
-   ]
-  },
-  {
-   "type": "visit",
-   "start": 1791193633000,
-   "end": 1791197393000,
-   "lat": 36.084086156724815,
-   "lon": 140.11167741305775,
-   "radius": 99.60732721920223,
-   "fixCount": 27
-  },
-  {
-   "type": "trip",
-   "start": 1791197393000,
-   "end": 1791197848000,
-   "pathSize": 91,
-   "legs": [
+     "confidence": 0.5
+    },
     {
-     "start": 1791197393000,
-     "end": 1791197848000,
+     "start": 1791157387000,
+     "end": 1791157512000,
+     "mode": "WALKING",
+     "distanceM": 150.29596111709884,
+     "steps": 219,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791157512000,
+     "end": 1791157812000,
      "mode": "IN_PASSENGER_VEHICLE",
-     "distanceM": 2726.3314012880696,
+     "distanceM": 988.083218802318,
+     "steps": 0,
+     "uncertain": 1,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791157812000,
+     "end": 1791158872000,
+     "mode": "IN_TRAIN",
+     "distanceM": 7606.6825737944155,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791158872000,
+     "end": 1791159067000,
+     "mode": "WALKING",
+     "distanceM": 192.54154187678913,
+     "steps": 281,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791159067000,
+   "end": 1791169537000,
+   "lat": 35.63025593636277,
+   "lon": 139.793657174221,
+   "radius": 105.41125481536996,
+   "fixCount": 61
+  },
+  {
+   "type": "trip",
+   "start": 1791169537000,
+   "end": 1791170047000,
+   "pathSize": 52,
+   "legs": [
+    {
+     "start": 1791169537000,
+     "end": 1791170047000,
+     "mode": "WALKING",
+     "distanceM": 609.2930156984919,
+     "steps": 921,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791170047000,
+   "end": 1791172927000,
+   "lat": 35.63684585616939,
+   "lon": 139.7924084941529,
+   "radius": 96.64499175319436,
+   "fixCount": 28
+  },
+  {
+   "type": "trip",
+   "start": 1791172927000,
+   "end": 1791173297000,
+   "pathSize": 38,
+   "legs": [
+    {
+     "start": 1791172927000,
+     "end": 1791173297000,
+     "mode": "WALKING",
+     "distanceM": 420.791754409867,
+     "steps": 694,
+     "uncertain": 0,
+     "confidence": 0.85
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791173297000,
+   "end": 1791191487000,
+   "lat": 35.630070602331536,
+   "lon": 139.79415702096662,
+   "radius": 104.32493630145727,
+   "fixCount": 74
+  },
+  {
+   "type": "trip",
+   "start": 1791191487000,
+   "end": 1791196554000,
+   "pathSize": 775,
+   "legs": [
+    {
+     "start": 1791191487000,
+     "end": 1791191767000,
+     "mode": "WALKING",
+     "distanceM": 328.57184156701953,
+     "steps": 501,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791191767000,
+     "end": 1791192952000,
+     "mode": "IN_TRAIN",
+     "distanceM": 8539.895889318948,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791192952000,
+     "end": 1791193082000,
+     "mode": "WALKING",
+     "distanceM": 165.99785506930675,
+     "steps": 215,
+     "uncertain": 0,
+     "confidence": 0.85
+    },
+    {
+     "start": 1791193082000,
+     "end": 1791193387000,
+     "mode": "WALKING",
+     "distanceM": 1112.5181005409495,
+     "steps": 0,
+     "uncertain": 0.9836065573770492,
+     "confidence": 0.6
+    },
+    {
+     "start": 1791193387000,
+     "end": 1791193682000,
+     "mode": "IN_TRAIN",
+     "distanceM": 2607.2244251352117,
+     "steps": 0,
+     "uncertain": 0,
+     "confidence": 0.5
+    },
+    {
+     "start": 1791193682000,
+     "end": 1791194359000,
+     "mode": "IN_SUBWAY",
+     "distanceM": 6338.58876343859,
+     "steps": 0,
+     "uncertain": 1,
+     "confidence": 0.55
+    },
+    {
+     "start": 1791194359000,
+     "end": 1791196554000,
+     "mode": "IN_TRAIN",
+     "distanceM": 46831.25671954649,
+     "steps": 100,
+     "uncertain": 0,
+     "confidence": 0.65
+    }
+   ]
+  },
+  {
+   "type": "visit",
+   "start": 1791196554000,
+   "end": 1791200304000,
+   "lat": 36.08419504286367,
+   "lon": 140.1116798623007,
+   "radius": 81.67096675847301,
+   "fixCount": 24
+  },
+  {
+   "type": "trip",
+   "start": 1791200304000,
+   "end": 1791200709000,
+   "pathSize": 82,
+   "legs": [
+    {
+     "start": 1791200304000,
+     "end": 1791200709000,
+     "mode": "IN_PASSENGER_VEHICLE",
+     "distanceM": 2738.4582894382706,
      "steps": 0,
      "uncertain": 0,
      "confidence": 0.5
@@ -408,28 +552,28 @@
   },
   {
    "type": "visit",
-   "start": 1791197848000,
-   "end": 1791204803000,
-   "lat": 36.110457506362074,
-   "lon": 140.10022516741324,
-   "radius": 75.36494889620215,
-   "fixCount": 34
+   "start": 1791200709000,
+   "end": 1791207669000,
+   "lat": 36.11058498376142,
+   "lon": 140.10012043285965,
+   "radius": 79.80287683167539,
+   "fixCount": 35
   }
  ],
  "summary": {
   "distanceByMode": {
-   "WALKING": 967.4342800877976,
-   "IN_PASSENGER_VEHICLE": 5481.927652589762,
-   "IN_TRAIN": 87446.57771608171,
-   "IN_SUBWAY": 21948.861182593748
+   "WALKING": 3243.34202933926,
+   "IN_PASSENGER_VEHICLE": 6492.015564364981,
+   "IN_TRAIN": 111577.04875244403,
+   "IN_SUBWAY": 16720.783967380845
   },
   "durationByMode": {
-   "WALKING": 1090000,
-   "IN_PASSENGER_VEHICLE": 1060000,
-   "IN_TRAIN": 4060000,
-   "IN_SUBWAY": 3048000
+   "WALKING": 2115000,
+   "IN_PASSENGER_VEHICLE": 1310000,
+   "IN_TRAIN": 7045000,
+   "IN_SUBWAY": 1799000
   },
-  "steps": 2935,
+  "steps": 4991,
   "visits": 6
  }
 }

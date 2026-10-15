@@ -13,6 +13,8 @@ final case class TimelineParams(
     /** legs shorter than this (both) are merged into neighbours */
     minLegDurationMs: Long = 2 * 60_000L,
     minLegDistanceM: Double = 250.0,
+    /** a vehicle run shorter than this between two GNSS outages is part of the underground ride */
+    maxSurfacingMs: Long = 3 * 60_000L,
     /** faster than this between fixes is a position jump, not movement (~1080 km/h) */
     maxPlausibleSpeedMps: Double = 300.0
 )
@@ -154,6 +156,18 @@ object TimelineBuilder:
           merged(merged.size - 1) = (merged.last._1, r._2, r._3)
         else merged += r
       runs = merged
+    // A brief vehicle-speed run between two GNSS outages is the same
+    // underground ride surfacing (a station near the surface, an
+    // above-ground stretch), not a car ride between two subway rides.
+    // Walking stays: that is a transfer.
+    var k = 1
+    while k < runs.size - 1 do
+      val r = runs(k)
+      val vehicle = r._3 == Coarse.Vehicle || r._3 == Coarse.Mid
+      if vehicle && runs(k - 1)._3 == Coarse.Gap && runs(k + 1)._3 == Coarse.Gap && runDur(r) < p.maxSurfacingMs then
+        runs(k - 1) = (runs(k - 1)._1, runs(k + 1)._2, Coarse.Gap)
+        runs.remove(k, 2)
+      else k += 1
     runs.toVector.map { case (a, b, _) => makeLeg(iv.slice(a, b + 1), motion) }
 
   private final case class Interval(
