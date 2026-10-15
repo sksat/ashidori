@@ -173,7 +173,7 @@ JDK 17 と Android SDK（compileSdk 37）が必要。対応 OS は Android 13 �
 
 Gradle のプロパティ `ashidori.defaultServer=https://<ホスト>` を指定すると、同期設定の URL 欄にそのサーバを入力済みにし、そのホストの登録リンク（`https://<ホスト>/pair`）を App Links でアプリに開かせる。個人用のビルドでは、リポジトリの外の `~/.gradle/gradle.properties` に書く。指定しなければ URL 欄は空で、App Links は宣言しない。
 
-リリース版は、`ashidori.release.storeFile`、`ashidori.release.storePassword`、`ashidori.release.keyAlias` で指定した鍵で署名する（同じく `~/.gradle/gradle.properties` に書く）。指定しなければデバッグ用の鍵で署名する。
+リリース版は、`ashidori.release.storeFile`、`ashidori.release.storePassword`、`ashidori.release.keyAlias` で指定した鍵で署名する（同じく `~/.gradle/gradle.properties` に書く）。指定しなければデバッグ用の鍵で署名する。配布する APK は `tools/release/sign.sh` で署名し直し、以前の鍵からの引き継ぎ（APK Signature Scheme v3 の鍵のローテーション）を含める。これがないと、以前の版の上に更新できない。
 
 デバッグ版では、シミュレーションによる記録を投入して画面を確認できる。
 
