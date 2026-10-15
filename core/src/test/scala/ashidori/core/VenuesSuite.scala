@@ -29,3 +29,47 @@ class VenuesSuite extends munit.FunSuite:
     assert(!q.contains(");("), q)
     assert(q.startsWith("[out:json]"))
   }
+
+  test("an answer cut at the element limit is not complete") {
+    def answer(n: Int) = (1 to n).map(i => s"""{"type":"node","id":$i,"lat":35.658,"lon":139.7016,"tags":{"name":"V$i","shop":"yes"}}""")
+      .mkString("""{"elements":[""", ",", "]}")
+    assert(Overpass.parseAnswer(answer(3), 35.658, 139.7016)._2)
+    assert(!Overpass.parseAnswer(answer(Overpass.Limit), 35.658, 139.7016)._2)
+    assert(Overpass.query(35.0, 139.0).contains(s"out center ${Overpass.Limit};"))
+  }
+
+  test("a runtime error is a failure when nothing was found, and incomplete otherwise") {
+    val remark = "\"remark\":\"runtime error: Query timed out in \\\"query\\\" at line 1 after 10 seconds.\""
+    intercept[RuntimeException](Overpass.parseAnswer(s"""{"elements":[],$remark}""", 35.658, 139.7016))
+    val partial = s"""{"elements":[{"type":"node","id":1,"lat":35.658,"lon":139.7016,"tags":{"name":"A","shop":"yes"}}],$remark}"""
+    val (vs, complete) = Overpass.parseAnswer(partial, 35.658, 139.7016)
+    assertEquals(vs.map(_._1.name), Vector("A"))
+    assert(!complete)
+    // An empty spot is a complete answer.
+    assertEquals(Overpass.parseAnswer("""{"elements":[]}""", 35.658, 139.7016), (Vector.empty, true))
+  }
+
+  test("timeouts stay within the remaining budget and stop when it is spent") {
+    var left = Overpass.BudgetMs
+    var tried = 0
+    // Every instance uses its full timeouts (the worst case).
+    while Overpass.timeouts(tried, left).isDefined do
+      val (c, r) = Overpass.timeouts(tried, left).get
+      assert(c > 0 && r > 0 && c + r <= left, (tried, left, c, r))
+      left -= c + r
+      tried += 1
+    assert(tried >= 2, tried)
+    assert(left >= 0)
+    assertEquals(Overpass.timeouts(0, 1_000), None)
+  }
+
+  test("tries the last instance that answered first and recently failed ones last") {
+    val es = Seq("a", "b", "c", "d")
+    assertEquals(Overpass.order(es, None, Map.empty, 0), es)
+    assertEquals(Overpass.order(es, Some("c"), Map.empty, 0), Seq("c", "a", "b", "d"))
+    assertEquals(Overpass.order(es, None, Map("a" -> 1_000L, "b" -> 2_000L), 60_000), Seq("c", "d", "a", "b"))
+    // A failure long ago no longer counts.
+    assertEquals(Overpass.order(es, None, Map("a" -> 0L), 3_600_000), es)
+    assertEquals(Overpass.Endpoints.head, Overpass.Endpoint)
+    assertEquals(Overpass.Endpoints.distinct.size, Overpass.Endpoints.size)
+  }

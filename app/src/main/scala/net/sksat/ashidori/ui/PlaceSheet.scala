@@ -121,32 +121,51 @@ final class PlaceSheet(
         .map(c => Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon))
         .map(v => v -> v.latLng.distanceTo(place.latLng))
         .filter(_._2 <= 150).sortBy(_._2).distinctBy(_._1.name)
+      // Saved venues from earlier searches: nothing is sent.
+      val saved = scala.util.Try(VenueSearch.saved(place.latLng, 120)).toOption.flatten
       act.runOnUiThread { () =>
         candidates.removeAllViews()
         for (v, d) <- past.take(4) do candidates.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
-        if Settings.blockExternalLocation && VenueSearch.cached(place.latLng, 120).isEmpty then
+        if Settings.blockExternalLocation && !saved.exists(_.fresh) then
           // Sent only on an explicit request.
-          candidates.addView(caption("過去のチェックイン先のみを表示しています。検索すると、位置情報が OpenStreetMap のサーバに送られます。"))
+          val shown = showSaved(past, saved)
+          val note = caption(
+            (if shown.nonEmpty then "保存済みの施設を表示しています。" else "過去のチェックイン先のみを表示しています。") +
+              "検索すると、位置情報が OpenStreetMap のサーバに送られます。")
+          candidates.addView(note)
           lazy val once: View = outlined("周辺の施設を検索（位置情報を送信）") {
             candidates.removeView(once)
-            searchOnline(past, explicit = true)
+            candidates.removeView(note)
+            searchOnline(past ++ shown, None, explicit = true)
           }
           candidates.addView(once)
-        else searchOnline(past, explicit = false)
+        else searchOnline(past, saved, explicit = false)
       }
     }
 
-  /** OpenStreetMap venues near the place: sends its position to the server. */
-  private def searchOnline(past: Seq[(Venue, Double)], explicit: Boolean): Unit =
+  /** Saved venues not among `past`, marked as saved; returns those shown. */
+  private def showSaved(past: Seq[(Venue, Double)], saved: Option[VenueCache.Hit]): Seq[(Venue, Double)] =
+    val shown = saved.toVector.flatMap(_.venues).filterNot(x => past.exists(_._1.name == x._1.name)).take(6)
+    for (v, d) <- shown do candidates.addView(candidateRow(v, s"保存済み・${v.category}・${d.round}m"))
+    shown
+
+  /** OpenStreetMap venues near the place: sends its position to the server.
+    * When it fails, `saved` venues are shown instead. `past` are the
+    * candidates already shown.
+    */
+  private def searchOnline(past: Seq[(Venue, Double)], saved: Option[VenueCache.Hit], explicit: Boolean): Unit =
     val loading = caption("近くの施設を検索中…")
     candidates.addView(loading)
     VenueSearch.nearby(place.latLng, 120, explicit = explicit) { r =>
       candidates.removeView(loading)
       r.fold(
-        e => candidates.addView(caption(e match
-          case v: VenueError => v.message
-          case _             => "候補を取得できませんでした"
-        )),
+        e => {
+          val shown = showSaved(past, saved)
+          candidates.addView(caption(e match
+            case v: VenueError => if shown.nonEmpty then v.withCache else v.message
+            case _             => "候補を取得できませんでした"
+          ))
+        },
         vs =>
           val fresh = vs.filterNot(x => past.exists(_._1.name == x._1.name))
           if fresh.isEmpty && past.isEmpty then candidates.addView(caption("近くに候補がありません"))

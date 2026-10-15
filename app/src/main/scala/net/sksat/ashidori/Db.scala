@@ -43,6 +43,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     createRawLines(db)
     createSyncOutbox(db)
     addChangeCounter(db)
+    createVenueCache(db)
 
   /** Sealed batches not yet accepted by the server. A row is written in the
     * same transaction that claims its seq and records the source progress,
@@ -82,6 +83,20 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_ins AFTER INSERT ON $table BEGIN $bump END")
       db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_upd AFTER UPDATE OF ${cols.map(c => "\"" + c + "\"").mkString(",")} ON $table BEGIN $bump END")
 
+  /** Online venue search results kept on the device ([[VenueCache]]): one
+    * row per search, keyed by its cell and radius, and its venues. Not user
+    * data: never synced or exported, and safe to drop.
+    */
+  private def createVenueCache(db: SQLiteDatabase): Unit =
+    db.execSQL("""CREATE TABLE IF NOT EXISTS venue_cache(cell_y INTEGER NOT NULL, cell_x INTEGER NOT NULL,
+      |radius INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, fetched_at INTEGER NOT NULL,
+      |used_at INTEGER NOT NULL, PRIMARY KEY(cell_y, cell_x, radius))""".stripMargin)
+    db.execSQL("""CREATE TABLE IF NOT EXISTS venue_cache_items(cell_y INTEGER NOT NULL, cell_x INTEGER NOT NULL,
+      |radius INTEGER NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL, lat REAL NOT NULL,
+      |lon REAL NOT NULL, FOREIGN KEY(cell_y, cell_x, radius) REFERENCES venue_cache(cell_y, cell_x, radius)
+      |ON DELETE CASCADE)""".stripMargin)
+    db.execSQL("CREATE INDEX IF NOT EXISTS venue_cache_items_key ON venue_cache_items(cell_y, cell_x, radius)")
+
   /** Detail-session signals (GNSS raw/status/nav/NMEA, IMU) as GnssLogger-format
     * lines until their day is archived to Parquet.
     */
@@ -111,6 +126,8 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     if oldV < 5 then
       createSyncOutbox(db)
       addChangeCounter(db)
+    // Self-contained (IF NOT EXISTS): safe to run again from a later step.
+    if oldV < 6 then createVenueCache(db)
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -558,6 +575,57 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def pendingGnssFiles(): Vector[(Long, String)] =
     query("SELECT rowid, file FROM gnss_sessions WHERE uploaded=0 ORDER BY rowid")(c => (c.getLong(0), c.getString(1)))
 
+  // --- venue cache ------------------------------------------------------------
+
+  /** Every stored venue search with its venues. */
+  def venueCache(): Vector[VenueCache.Entry] =
+    val venues = query("SELECT cell_y,cell_x,radius,id,name,category,lat,lon FROM venue_cache_items") { c =>
+      VenueCache.Key(c.getInt(0), c.getInt(1), c.getInt(2)) -> Venue(c.getString(3), c.getString(4), c.getString(5), c.getDouble(6), c.getDouble(7))
+    }.groupMap(_._1)(_._2)
+    query("SELECT cell_y,cell_x,radius,lat,lon,fetched_at,used_at FROM venue_cache") { c =>
+      val k = VenueCache.Key(c.getInt(0), c.getInt(1), c.getInt(2))
+      VenueCache.Entry(k, c.getDouble(3), c.getDouble(4), c.getLong(5), c.getLong(6), venues.getOrElse(k, Vector.empty))
+    }
+
+  /** Writes a change of the venue cache in one transaction. */
+  def applyVenueCache(ch: VenueCache.Change): Unit = if !ch.isEmpty then tx { db =>
+    def args(k: VenueCache.Key) = Array(k.y.toString, k.x.toString, k.radiusM.toString)
+    val where = "cell_y=? AND cell_x=? AND radius=?"
+    for k <- ch.delete do db.delete("venue_cache", where, args(k))
+    val cv = ContentValues()
+    for e <- ch.put do
+      cv.clear()
+      cv.put("cell_y", Integer.valueOf(e.key.y))
+      cv.put("cell_x", Integer.valueOf(e.key.x))
+      cv.put("radius", Integer.valueOf(e.key.radiusM))
+      cv.put("lat", java.lang.Double.valueOf(e.lat))
+      cv.put("lon", java.lang.Double.valueOf(e.lon))
+      cv.put("fetched_at", java.lang.Long.valueOf(e.fetchedAt))
+      cv.put("used_at", java.lang.Long.valueOf(e.usedAt))
+      val exists = Using.resource(db.rawQuery(s"SELECT 1 FROM venue_cache WHERE $where", args(e.key)))(_.moveToFirst())
+      if exists then db.update("venue_cache", cv, where, args(e.key))
+      else db.insert("venue_cache", null, cv)
+      db.delete("venue_cache_items", where, args(e.key))
+      for v <- e.venues do
+        cv.clear()
+        cv.put("cell_y", Integer.valueOf(e.key.y))
+        cv.put("cell_x", Integer.valueOf(e.key.x))
+        cv.put("radius", Integer.valueOf(e.key.radiusM))
+        cv.put("id", v.id)
+        cv.put("name", v.name)
+        cv.put("category", v.category)
+        cv.put("lat", java.lang.Double.valueOf(v.lat))
+        cv.put("lon", java.lang.Double.valueOf(v.lon))
+        db.insert("venue_cache_items", null, cv)
+  }
+
+  /** Records only when entries were last used (no venue rows rewritten). */
+  def touchVenueCache(entries: Seq[VenueCache.Entry]): Unit = if entries.nonEmpty then tx { db =>
+    for e <- entries do
+      db.execSQL("UPDATE venue_cache SET used_at=? WHERE cell_y=? AND cell_x=? AND radius=?",
+        Array[AnyRef](java.lang.Long.valueOf(e.usedAt), Integer.valueOf(e.key.y), Integer.valueOf(e.key.x), Integer.valueOf(e.key.radiusM)))
+  }
+
   def markGnssUploaded(rowid: Long): Unit =
     w.execSQL("UPDATE gnss_sessions SET uploaded=1 WHERE rowid=?", Array[AnyRef](java.lang.Long.valueOf(rowid)))
 
@@ -573,7 +641,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   }
 
 object Db:
-  val Version = 5
+  val Version = 6
 
   /** A sealed batch waiting in the outbox. `cls` is the constraint class:
     * "small" (any allowed network) or "raw" (unmetered only).
