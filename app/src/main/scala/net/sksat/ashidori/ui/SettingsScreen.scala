@@ -20,6 +20,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       try ujson.read(in.readAllBytes())("attribution").arr.map(_.str).toSeq finally in.close()
     }.getOrElse(Seq.empty)
     val basemap = Basemap.attribution
+    val venues = VenueData.attribution
     def bullets(ls: Seq[String]) = ls.map("・" + _).mkString("\n")
     val lines = Seq(
       "■ 地名の検索（端末内で処理）",
@@ -36,8 +37,13 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "・OpenFreeMap: © OpenMapTiles、© OpenStreetMap contributors",
       "・国土地理院: 地理院タイル",
       "",
-      "■ 近くの施設の検索",
-      "・© OpenStreetMap contributors（ODbL）"
+      "■ 施設データ（端末内の施設の検索。ダウンロードして使用）",
+      if venues.nonEmpty then bullets(venues) else VenueStaticCredits,
+      "OpenStreetMap: https://www.openstreetmap.org/copyright",
+      "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。作り方: https://github.com/sksat/ashidori/tree/main/tools/venues",
+      "",
+      "■ 近くの施設の検索（最新を取得したとき）",
+      "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）"
     )
     val body = text(lines.mkString("\n"), 14f)
     body.setTextIsSelectable(true)
@@ -58,15 +64,21 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     "地図の配色: @protomaps/basemaps（BSD-3-Clause）"
   ).map("・" + _).mkString("\n")
 
+  /** Credits of the venue data before it is downloaded (tools/venues/build_index.py writes the same). */
+  private val VenueStaticCredits = Seq(
+    "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
+    "Geofabrik の日本の抽出（https://download.geofabrik.de/asia/japan.html）。加工: チェックインの対象となる施設を抜き出し、索引形式に変換（ashidori）"
+  ).map("・" + _).mkString("\n")
+
   /** オン・オフ・対象外 of the privacy switch, behind its info button. */
   private def showPrivacyInfo(): Unit =
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
       .setTitle("位置情報を外部サービスに送らない")
       .setMessage(
-        "地図の取得、地名の問い合わせ、施設の検索で、本アプリが位置情報を自動で送信することを止めます。\n\n" +
-        "オン: 地図は端末内の簡易地図で表示し、地名は端末内のデータで求めます。詳しい地図の表示と施設の検索は、操作したときのみ行い、その位置情報を送信します。詳しい地図は、選んだ地図（マップ、期間の画面のそれぞれ）でのみ、表示している間に取得します。その選択は再起動後も保ち、簡易地図に戻すか、この設定を切り替えると取り消します。\n\n" +
-        "オフ: 選択した地図をサーバから取得し、近くの施設を自動で検索します（OpenStreetMap）。端末内のデータで地名が求まらない場合は、Android の Geocoder に問い合わせます。\n\n" +
-        "対象外: 現在地の測位は端末の位置情報の設定に従います。地図アプリで開く、エクスポートを共有するなどの操作では、その位置情報を渡します。")
+        "地図の取得と地名の問い合わせで、本アプリが位置情報を自動で送信することを止めます。\n\n" +
+        "オン: 地図は端末内の簡易地図で表示し、地名は端末内のデータで求めます。詳しい地図の表示は、操作したときのみ行い、その位置情報を送信します。詳しい地図は、選んだ地図（マップ、期間の画面のそれぞれ）でのみ、表示している間に取得します。その選択は再起動後も保ち、簡易地図に戻すか、この設定を切り替えると取り消します。\n\n" +
+        "オフ: 選択した地図をサーバから取得します。端末内のデータで地名が求まらない場合は、Android の Geocoder に問い合わせます。\n\n" +
+        "対象外: 近くの施設は、設定によらず端末内のデータから表示し、「最新を取得」を押したときだけ位置情報を OpenStreetMap のサーバに送信します。現在地の測位は端末の位置情報の設定に従います。地図アプリで開く、エクスポートを共有するなどの操作では、その位置情報を渡します。")
       .setPositiveButton("閉じる", null)
       .show()
 
@@ -114,7 +126,13 @@ final class SettingsScreen(act: MainActivity) extends Screen:
   private var basemapRow: Option[ListRow] = None
   private val stopBasemap = BasemapDownload.listen(() =>
     basemapRow.foreach(_.setSubtitle(basemapLine(BasemapDownload.status))))
-  override def onDestroy(): Unit = stopBasemap()
+  /** The 施設データ row, likewise. */
+  private var venuesRow: Option[ListRow] = None
+  private val stopVenues = VenueDownload.listen(() =>
+    venuesRow.foreach(_.setSubtitle(VenueDataUi.rowLine(VenueDownload.status))))
+  override def onDestroy(): Unit =
+    stopBasemap()
+    stopVenues()
 
   override def onShow(): Unit =
     list.removeAllViews()
@@ -126,14 +144,21 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
     add(sectionHeader("プライバシー"), listGroup(
       switchRow("位置情報を外部サービスに送らない", Settings.blockExternalLocation,
-        "地図・地名・施設の検索", onInfo = Some(() => showPrivacyInfo())) { b =>
+        "地図・地名", onInfo = Some(() => showPrivacyInfo())) { b =>
         Settings.blockExternalLocation = b
         TrackMap.privacyChanged(act)
       }))
 
     val basemap = navRow("簡易地図", basemapLine(BasemapDownload.status))(BasemapUi.showDialog(act))
     basemapRow = Some(basemap)
-    add(sectionHeader("地図"), listGroup(basemap))
+    val venues = navRow("施設データ", VenueDataUi.rowLine(VenueDownload.status))(VenueDataUi.showDialog(act))
+    venuesRow = Some(venues)
+    // Open (check) the installed index, so an unreadable one shows here.
+    AshidoriApp.io.execute { () =>
+      VenueData.index()
+      VenueDownload.changed()
+    }
+    add(sectionHeader("地図"), listGroup(basemap, venues))
 
     val syncState =
       if SyncConfig.ready then s"同期中・${SyncConfig.serverUrl}"

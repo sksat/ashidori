@@ -1,0 +1,12 @@
+{
+  "format": "ashidori venues archive v1",
+  "version": "20261014",
+  "file": "ashidori-venues-20261014.zip",
+  "bytes": 18301286,
+  "sha256": "ca6cf2c987be76f8409429e74cec04ecac1e46a1dc6dd04f1a511a0892c62948",
+  "osmDate": "2026-10-14T20:21:12Z",
+  "source": "japan-261014.osm.pbf",
+  "venues": 1073493,
+  "contentBytes": 18301672,
+  "entries": 3
+}

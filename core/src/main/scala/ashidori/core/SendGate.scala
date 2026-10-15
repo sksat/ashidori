@@ -6,8 +6,7 @@ import scala.collection.mutable
   * 「位置情報を外部サービスに送らない」 (`block`).
   *
   * Every change of the setting starts a new generation. Work started
-  * without a user action (automatic: map snapshots, venue prefetch, the
-  * venue search a sheet starts by itself) takes a [[ticket]] when it is
+  * without a user action (automatic: map snapshots) takes a [[ticket]] when it is
   * asked for and checks it right before each send: it may send only with
   * the setting off and its ticket of the current generation. So work asked
   * for before a change never sends after it.

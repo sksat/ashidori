@@ -1,0 +1,13 @@
+n	1	3608270	14011120	railway	station	つくば	
+n	2	3608300	14011150	shop	convenience	ファミリーマート つくば駅前店	
+n	3	3608200	14011000	amenity	cafe	Starbucks	スターバックス
+w	4	3608400	14011300	leisure	park	中央公園	
+n	5	3608275	14011125	public_transport	platform	つくば 1番線	
+n	6	3609000	14012000	amenity	restaurant	遠いレストラン	
+n	10	3568120	13976710	railway	station	東京	
+n	11	3568150	13976700	amenity	restaurant	駅弁屋 祭	
+n	12	3568100	13976650	shop	convenience	ＮｅｗＤａｙｓ	
+r	13	3568000	13976500	tourism	hotel	東京ステーションホテル	
+n	14	3568130	13976720	amenity	bench	ベンチ	
+n	15	3568125	13976705	amenity	parking	駐車場	
+n	20	4306870	14135070	amenity	cafe	Cafe Sapporo	

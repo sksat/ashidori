@@ -4,6 +4,18 @@ package ashidori.core
 final case class Venue(id: String, name: String, category: String, lat: Double, lon: Double):
   def latLng: LatLng = LatLng(lat, lon)
 
+/** Candidates from several sources (places, the venue index, saved and
+  * online results), merged so that rows already shown stay where they are.
+  */
+object VenueMerge:
+  /** Of `more`, those not among `shown`: neither the same OpenStreetMap
+    * object (id) nor the same name; one per name, closest first.
+    */
+  def fresh(shown: Vector[(Venue, Double)], more: Vector[(Venue, Double)]): Vector[(Venue, Double)] =
+    val ids = shown.iterator.map(_._1.id).filter(_.nonEmpty).toSet
+    val names = shown.iterator.map(_._1.name).toSet
+    more.sortBy(_._2).filterNot(v => (v._1.id.nonEmpty && ids(v._1.id)) || names(v._1.name)).distinctBy(_._1.name)
+
 /** Nearby venue search on OpenStreetMap through the Overpass API. */
 object Overpass:
   val Endpoint = "https://overpass-api.de/api/interpreter"
@@ -98,8 +110,32 @@ object Overpass:
     "pharmacy" -> "薬局", "bank" -> "銀行", "post_office" -> "郵便局", "place_of_worship" -> "寺社",
     "attraction" -> "観光地", "viewpoint" -> "展望", "fuel" -> "ガソリンスタンド", "parking" -> "駐車場",
     "books" -> "書店", "clothes" -> "衣料品", "electronics" -> "家電", "department_store" -> "百貨店", "mall" -> "モール",
-    "aerodrome" -> "空港", "terminal" -> "ターミナル", "fitness_centre" -> "ジム", "cinema" -> "映画館", "karaoke_box" -> "カラオケ"
+    "aerodrome" -> "空港", "terminal" -> "ターミナル", "fitness_centre" -> "ジム", "cinema" -> "映画館", "karaoke_box" -> "カラオケ",
+    "kindergarten" -> "幼稚園", "social_facility" -> "福祉施設", "company" -> "会社", "hairdresser" -> "理容・美容室",
+    "community_centre" -> "公民館", "doctors" -> "医院", "dentist" -> "歯科", "police" -> "交番・警察",
+    "car" -> "自動車販売", "confectionery" -> "菓子店", "estate_agent" -> "不動産", "variety_store" -> "雑貨店",
+    "artwork" -> "アート", "massage" -> "マッサージ", "fire_station" -> "消防署", "alcohol" -> "酒店",
+    "bakery" -> "パン屋", "dry_cleaning" -> "クリーニング", "public_bath" -> "銭湯・温泉", "car_repair" -> "自動車整備",
+    "townhall" -> "役所", "government" -> "官公庁", "sports_centre" -> "スポーツ施設", "mobile_phone" -> "携帯電話",
+    "bicycle" -> "自転車", "prep_school" -> "塾", "doityourself" -> "ホームセンター", "florist" -> "花屋",
+    "nursing_home" -> "介護施設", "chemist" -> "ドラッグストア", "optician" -> "眼鏡店", "archaeological_site" -> "遺跡",
+    "laundry" -> "コインランドリー", "beauty" -> "美容", "public_building" -> "公共施設", "gift" -> "土産物",
+    "childcare" -> "保育所", "guest_house" -> "民宿", "veterinary" -> "動物病院", "adult_gaming_centre" -> "パチンコ",
+    "funeral_directors" -> "葬儀場", "motorcycle" -> "バイク", "golf_course" -> "ゴルフ場", "sports" -> "スポーツ用品",
+    "seafood" -> "鮮魚", "deli" -> "惣菜", "second_hand" -> "リサイクル", "car_rental" -> "レンタカー", "shoes" -> "靴",
+    "greengrocer" -> "八百屋", "furniture" -> "家具", "butcher" -> "精肉", "car_parts" -> "カー用品",
+    "camp_site" -> "キャンプ場", "stationery" -> "文具", "garden" -> "庭園", "pastry" -> "洋菓子", "pet" -> "ペット",
+    "college" -> "専門学校", "hardware" -> "金物", "insurance" -> "保険", "theatre" -> "劇場", "photo" -> "写真",
+    "monument" -> "記念碑", "sports_hall" -> "体育館", "jewelry" -> "宝飾", "toys" -> "おもちゃ", "cosmetics" -> "化粧品",
+    "bus_station" -> "バスターミナル", "tram_stop" -> "停留場", "halt" -> "駅", "ice_cream" -> "アイスクリーム",
+    "tea" -> "茶", "castle" -> "城", "ferry_terminal" -> "フェリー乗り場", "ruins" -> "史跡", "taxi" -> "タクシー乗り場",
+    "sauna" -> "サウナ", "amusement_arcade" -> "ゲームセンター", "outdoor" -> "アウトドア", "hostel" -> "ホステル",
+    "zoo" -> "動物園", "aquarium" -> "水族館", "theme_park" -> "テーマパーク", "stadium" -> "スタジアム",
+    "marketplace" -> "市場", "nightclub" -> "クラブ", "food_court" -> "フードコート", "biergarten" -> "ビアガーデン",
+    "arts_centre" -> "文化施設", "kiosk" -> "売店", "motel" -> "モーテル", "ticket" -> "きっぷ売り場",
+    "photo_booth" -> "証明写真", "building" -> "建物", "shrine" -> "神社", "temple" -> "寺院", "spa" -> "温泉", "onsen" -> "温泉"
   )
 
-  private def label(key: String, value: String): String =
+  /** Japanese label of a category tag, as shown under a venue's name. */
+  def label(key: String, value: String): String =
     Labels.getOrElse(value, if value == "yes" then key else value)

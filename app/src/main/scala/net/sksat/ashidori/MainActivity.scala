@@ -193,17 +193,7 @@ class MainActivity extends AppCompatActivity:
             Log.i(s"debug sync uploaded batches=$sent")
           catch case e: Exception => Log.e("debug sync failed", e)
         }
-    // Debug builds: the offline basemap without a release.
-    //   --es ashidori.basemapUrl http://10.0.2.2:8000  download <url>/<pinned file> ("" = pinned sources)
-    //   --ez ashidori.basemapImport true                install <external files>/basemap/<pinned file>
-    // Either way the archive must match the pin (app/src/main/assets/basemap-pin.json).
-    if debuggable then
-      Option(getIntent.getStringExtra("ashidori.basemapUrl")).foreach { u =>
-        BasemapDownload.debugUrl = u
-        if u.trim.nonEmpty then BasemapDownload.start(this, allowMetered = true)
-      }
-      if getIntent.getBooleanExtra("ashidori.basemapImport", false) then
-        Basemap.pin.foreach(p => BasemapDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"basemap/${p.file}")))
+    if debuggable then debugDownloads(getIntent)
     if debuggable && getIntent.getBooleanExtra("ashidori.sim", false) then
       AshidoriApp.io.execute { () =>
         val today = LocalDate.now(AshidoriApp.zone)
@@ -241,10 +231,32 @@ class MainActivity extends AppCompatActivity:
 
   override def onNewIntent(intent: Intent): Unit =
     super.onNewIntent(intent)
+    if BasemapDownload.debuggable then debugDownloads(intent)
     handleIntent(intent)
 
   /** A registration link that arrived during onboarding, opened when it ends. */
   private var pendingLink: Option[String] = None
+
+  /** Debug builds: the offline basemap and venue index without a release
+    * (also when the intent reaches a running activity).
+    *   --es ashidori.basemapUrl http://10.0.2.2:8000  download <url>/<pinned file> ("" = pinned sources)
+    *   --ez ashidori.basemapImport true                install <external files>/basemap/<pinned file>
+    *   --es ashidori.venuesUrl, --ez ashidori.venuesImport   the same for the venue index (venues/)
+    * Either way the archive must match the pin (app/src/main/assets/{basemap,venues}-pin.json).
+    */
+  private def debugDownloads(intent: Intent): Unit =
+    Option(intent.getStringExtra("ashidori.basemapUrl")).foreach { u =>
+      BasemapDownload.debugUrl = u
+      if u.trim.nonEmpty then BasemapDownload.start(this, allowMetered = true)
+    }
+    if intent.getBooleanExtra("ashidori.basemapImport", false) then
+      Basemap.pin.foreach(p => BasemapDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"basemap/${p.file}")))
+    Option(intent.getStringExtra("ashidori.venuesUrl")).foreach { u =>
+      VenueDownload.debugUrl = u
+      if u.trim.nonEmpty then VenueDownload.start(this, allowMetered = true)
+    }
+    if intent.getBooleanExtra("ashidori.venuesImport", false) then
+      VenueData.pin.foreach(p => VenueDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"venues/${p.file}")))
 
   private def handleIntent(intent: Intent): Unit =
     if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded then
@@ -402,9 +414,6 @@ class MainActivity extends AppCompatActivity:
     AshidoriApp.io.execute(() => LifeLog.checkState("アプリを表示"))
     maps.foreach(_.onResume())
     current.foreach(_.onShow())
-    // Warm the venue cache from the logger's latest position (no extra GNSS).
-    LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 10 * 60_000)
-      .foreach(f => VenueSearch.prefetch(f.latLng))
   override def onPause(): Unit =
     maps.foreach(_.onPause())
     super.onPause()

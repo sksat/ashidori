@@ -563,10 +563,6 @@ class LoggerService extends Service:
     LoggerState.changed()
     if estimator.current != before then
       motionSince = now
-      // Settled somewhere: look up nearby venues now so a check-in is instant.
-      if estimator.current == MotionState.Stationary then
-        LoggerState.lastFix.filter(f => System.currentTimeMillis() - f.time < 10 * 60_000)
-          .foreach(f => ui.VenueSearch.prefetch(f.latLng))
       evaluate(force = true)
     else evaluate()
 

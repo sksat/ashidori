@@ -34,6 +34,54 @@ class BasemapReleaseSuite extends munit.FunSuite:
     assert(BasemapPin.parse(String(Files.readAllBytes(f.toPath), "UTF-8")).isRight)
   }
 
+  test("the venue index has its own format, file names and release tag") {
+    val venues = PinnedKind.Venues
+    val json = descriptor(file = Some(venues.archiveName("20261014")), version = "20261014", format = venues.format)
+    val p = BasemapPin.parse(json, venues)
+    assertEquals(p, Right(BasemapPin("20261014", "ashidori-venues-20261014.zip", 1234, "a" * 64, venues)))
+    // Neither descriptor passes for the other kind.
+    assert(BasemapPin.parse(json).isLeft)
+    assert(BasemapPin.parse(descriptor(), venues).isLeft)
+    assertEquals(BasemapSource.githubUrl(p.toOption.get),
+      "https://github.com/sksat/ashidori/releases/download/venues-20261014/ashidori-venues-20261014.zip")
+    val f = File("../app/src/main/assets/venues-pin.json")
+    assume(f.isFile, "tools/venues/package.sh has not been run")
+    assertEquals(BasemapPin.parse(String(Files.readAllBytes(f.toPath), "UTF-8"), venues).map(_.kind), Right(venues))
+  }
+
+  test("a venue store requires the index, its manifest and attribution") {
+    val root = tmpDir()
+    val pin = BasemapPin("v1", PinnedKind.Venues.archiveName("v1"), 1, "c" * 64, PinnedKind.Venues)
+    val store = BasemapStore(root, PinnedKind.Venues.required)
+    val zip = File(root, "a.zip")
+    def write(names: Seq[String]): Unit =
+      val out = java.util.zip.ZipOutputStream(java.io.FileOutputStream(zip))
+      try names.foreach { n => out.putNextEntry(java.util.zip.ZipEntry(n)); out.write(1); out.closeEntry() }
+      finally out.close()
+    write(Seq("venues.aven", "manifest.json"))
+    intercept[java.io.IOException](store.install(zip, pin))
+    assertEquals(store.installed(pin), None)
+    write(Seq("ATTRIBUTION", "manifest.json", "venues.aven"))
+    store.install(zip, pin)
+    assertEquals(store.installed(pin).map(_.getName), Some("v1"))
+  }
+
+  test("extraction stops at the size limit while copying, not after") {
+    val root = tmpDir()
+    val zip = File(root, "bomb.zip")
+    val out = java.util.zip.ZipOutputStream(java.io.FileOutputStream(zip))
+    try
+      out.putNextEntry(java.util.zip.ZipEntry("a.bin"))
+      out.write(new Array[Byte](4 * 1024 * 1024))
+      out.closeEntry()
+    finally out.close()
+    assert(zip.length < 64 * 1024)
+    val dest = File(root, "x")
+    val e = intercept[java.io.IOException](BasemapStore.extract(zip, dest, maxTotal = 1024 * 1024))
+    assertEquals(e.getMessage, "archive too large")
+    assert(File(dest, "a.bin").length <= 1024 * 1024, File(dest, "a.bin").length)
+  }
+
   /** Under build/, not the system temp directory. */
   private def tmpDir(): File =
     val base = File("build/tmp/basemap-suite")

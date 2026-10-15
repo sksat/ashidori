@@ -12,9 +12,7 @@ import scala.collection.mutable
   * in the same cell with the same radius replaces the entry.
   *
   * - A lookup ([[lookup]]) unions the venues of every entry whose circle
-  *   comes near the spot, newest first per venue. It is
-  *   [[Hit.fresh]] when the spot's own cell was searched with at least that
-  *   radius within [[FreshMs]]: no automatic online search is needed then.
+  *   comes near the spot, newest first per venue.
   * - A complete result (not cut at [[Overpass.Limit]]) also removes, from
   *   older overlapping entries, venues inside its circle that it no longer
   *   lists (closed or renamed), so they do not come back from an old entry.
@@ -51,9 +49,7 @@ final class VenueCache private (initial: Iterable[VenueCache.Entry]):
       // Newest entry first, so a venue seen twice keeps its latest name and position.
       val venues = near.iterator.flatMap(_.venues).distinctBy(_.id).map(v => v -> v.latLng.distanceTo(p))
         .filter(_._2 <= limit).toVector.sortBy(_._2).distinctBy(_._1.name)
-      val own = key(p, radiusM)
-      val fresh = near.exists(e => e.key.y == own.y && e.key.x == own.x && e.key.radiusM >= radiusM && now - e.fetchedAt < FreshMs)
-      Some(Hit(venues, near.map(_.fetchedAt).max, fresh, near.map(_.key)))
+      Some(Hit(venues, near.map(_.fetchedAt).max, near.map(_.key)))
   }
 
   /** The entries of a lookup were used now (for least-recently-used eviction). */
@@ -108,8 +104,6 @@ object VenueCache:
   val CellLonDeg = 0.0025
   /** Entries are kept this long after they were fetched. */
   val KeepMs: Long = 90L * 86_400_000L
-  /** A search this recent in the same cell needs no automatic online search. */
-  val FreshMs: Long = 86_400_000L
   /** Size cap (~100 bytes per venue in SQLite: a few MB). */
   val MaxVenues = 20_000
   val MaxEntries = 5_000
@@ -130,10 +124,9 @@ object VenueCache:
     def isEmpty: Boolean = put.isEmpty && delete.isEmpty
 
   /** A lookup: venues with their distance, closest first; the newest fetch
-    * time among the entries used; whether the spot was searched recently
-    * enough ([[FreshMs]]); and the entries used.
+    * time among the entries used; and the entries used.
     */
-  final case class Hit(venues: Vector[(Venue, Double)], fetchedAt: Long, fresh: Boolean, keys: Vector[Key])
+  final case class Hit(venues: Vector[(Venue, Double)], fetchedAt: Long, keys: Vector[Key])
 
   /** The cache as stored, with expired entries and any excess dropped
     * (returned for the store to delete).

@@ -30,6 +30,9 @@ class AshidoriApp extends Application:
     // then queue the first download for an unmetered network.
     AshidoriApp.io.execute(() => Basemap.cleanup())
     BasemapDownload.autoStart(this)
+    // The offline venue index (施設データ), likewise.
+    AshidoriApp.io.execute(() => VenueData.cleanup())
+    VenueDownload.autoStart(this)
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
     // Archive finished days (and migrate pre-Parquet data) in the background.
@@ -78,14 +81,15 @@ object Settings:
   def lastDetailStart_=(t: Long): Unit = prefs.edit().putLong("lastDetailStart", t).apply()
 
   /** Never send positions, current or past, to external services on the
-    * app's own initiative: no platform geocoder, no automatic venue search
-    * (OpenStreetMap), and maps and their snapshots drawn from the on-device
-    * basemap only. An explicit user action may still send: a venue search,
+    * app's own initiative: no platform geocoder, and maps and their
+    * snapshots drawn from the on-device basemap only. An explicit user
+    * action may still send: a venue search (「最新を取得」, whatever this
+    * setting says; there is no automatic one),
     * the online map on the one map where the user chose it ("この範囲を詳しい
     * 地図で表示" or an online map in its picker; remembered for that map until
     * switched back or this setting changes), opening a position in another app (`geo:`), sharing an
-    * export. Off: venues are searched automatically, the platform geocoder
-    * fills names the offline index lacks, and the chosen base map is used.
+    * export. Off: the platform geocoder fills names the offline index
+    * lacks, and the chosen base map is used.
     *
     * It does not cover the OS location services: fixes come from the
     * fused / network providers as the device settings allow. Check-ins

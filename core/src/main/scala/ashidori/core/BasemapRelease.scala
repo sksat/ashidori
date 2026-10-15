@@ -5,42 +5,60 @@ import java.nio.file.{Files, StandardCopyOption}
 import java.security.MessageDigest
 import scala.util.Try
 
-/** One published version of the offline basemap archive
-  * (tools/basemap/package.sh): the app pins it, and whatever it downloads,
+/** A data set the app downloads as one pinned archive: the offline basemap
+  * (tools/basemap/) or the offline venue index (tools/venues/). Archives are
+  * `ashidori-<name>-<version>.zip`, published under the GitHub release tag
+  * `<name>-<version>`, and hold at least `required` at their root.
+  */
+final case class PinnedKind(name: String, format: String, required: Seq[String]):
+  def archiveName(version: String): String = s"ashidori-$name-$version.zip"
+  def descriptorName(version: String): String = s"ashidori-$name-$version.json"
+  def tag(version: String): String = s"$name-$version"
+
+object PinnedKind:
+  val Basemap: PinnedKind = PinnedKind("basemap", "ashidori basemap archive v1",
+    Seq("style.json", "manifest.json", "ATTRIBUTION", "japan.pmtiles", "world.pmtiles"))
+  /** tools/venues/package.sh. */
+  val Venues: PinnedKind = PinnedKind("venues", "ashidori venues archive v1",
+    Seq("venues.aven", "manifest.json", "ATTRIBUTION"))
+
+/** One published version of a pinned archive (tools/basemap/package.sh,
+  * tools/venues/package.sh): the app pins it, and whatever it downloads,
   * from whichever source, must have exactly this size and sha256. So neither
   * GitHub nor the sync server has to be trusted.
   */
-final case class BasemapPin(version: String, file: String, bytes: Long, sha256: String)
+final case class BasemapPin(version: String, file: String, bytes: Long, sha256: String,
+                            kind: PinnedKind = PinnedKind.Basemap)
 
 object BasemapPin:
-  val Format = "ashidori basemap archive v1"
+  val Format: String = PinnedKind.Basemap.format
   private val VersionRe = "[0-9A-Za-z][0-9A-Za-z._-]{0,63}".r
   private val ShaRe = "[0-9a-f]{64}".r
   /** Larger than any archive we would ship; guards against a bad descriptor. */
   val MaxBytes: Long = 2L * 1024 * 1024 * 1024
 
   def validVersion(v: String): Boolean = VersionRe.matches(v) && !v.contains("..")
-  def archiveName(version: String): String = s"ashidori-basemap-$version.zip"
-  def descriptorName(version: String): String = s"ashidori-basemap-$version.json"
+  def archiveName(version: String): String = PinnedKind.Basemap.archiveName(version)
+  def descriptorName(version: String): String = PinnedKind.Basemap.descriptorName(version)
 
-  /** Parses the descriptor (`ashidori-basemap-<version>.json`). */
-  def parse(json: String): Either[String, BasemapPin] =
+  /** Parses the descriptor (`ashidori-<kind>-<version>.json`). */
+  def parse(json: String, kind: PinnedKind = PinnedKind.Basemap): Either[String, BasemapPin] =
     for
       js <- Try(ujson.read(json)).toEither.left.map(_ => "not JSON")
       obj <- js.objOpt.toRight("not an object")
-      _ <- Either.cond(obj.get("format").flatMap(_.strOpt).contains(Format), (), "unknown format")
+      _ <- Either.cond(obj.get("format").flatMap(_.strOpt).contains(kind.format), (), "unknown format")
       version <- obj.get("version").flatMap(_.strOpt).filter(validVersion).toRight("invalid version")
-      file <- obj.get("file").flatMap(_.strOpt).filter(_ == archiveName(version)).toRight("invalid file name")
+      file <- obj.get("file").flatMap(_.strOpt).filter(_ == kind.archiveName(version)).toRight("invalid file name")
       bytes <- obj.get("bytes").flatMap(_.numOpt).filter(n => n > 0 && n <= MaxBytes && n == n.floor)
         .map(_.toLong).toRight("invalid size")
       sha <- obj.get("sha256").flatMap(_.strOpt).filter(ShaRe.matches).toRight("invalid sha256")
-    yield BasemapPin(version, file, bytes, sha)
+    yield BasemapPin(version, file, bytes, sha, kind)
 
 /** Where the archive can come from. */
 enum BasemapSource(val key: String, val label: String):
   /** The sync server this device is paired with (`GET /basemap/<version>/<file>`). */
   case Server extends BasemapSource("server", "サーバ")
-  /** GitHub Releases of the repository, tag `basemap-<version>`. */
+  /** GitHub Releases of the repository, tag `<kind>-<version>`. */
   case GitHub extends BasemapSource("github", "GitHub")
   /** Debug builds: a URL set for development. */
   case DebugUrl extends BasemapSource("debug-url", "開発用 URL")
@@ -53,11 +71,13 @@ object BasemapSource:
   def fromKey(k: String): Option[BasemapSource] = values.find(_.key == k)
 
   def githubUrl(pin: BasemapPin): String =
-    s"https://github.com/$Repository/releases/download/basemap-${pin.version}/${pin.file}"
+    s"https://github.com/$Repository/releases/download/${pin.kind.tag(pin.version)}/${pin.file}"
 
-  /** `base` is the sync server's URL, as paired. */
+  /** `base` is the sync server's URL, as paired. The server serves the
+    * basemap only.
+    */
   def serverUrl(base: String, pin: BasemapPin): String =
-    s"${base.stripSuffix("/")}/basemap/${pin.version}/${pin.file}"
+    s"${base.stripSuffix("/")}/${pin.kind.name}/${pin.version}/${pin.file}"
 
   /** `base` is a directory URL holding the archive. */
   def debugUrl(base: String, pin: BasemapPin): String = s"${base.stripSuffix("/")}/${pin.file}"
@@ -220,7 +240,7 @@ object Sha256:
   * its presence means it is complete. Callers serialize [[install]] and
   * [[cleanup]] (one process, one lock).
   */
-final class BasemapStore(val root: File):
+final class BasemapStore(val root: File, required: Seq[String] = BasemapStore.Required):
   import BasemapStore.*
 
   def versionDir(version: String): File = File(root, version)
@@ -229,7 +249,7 @@ final class BasemapStore(val root: File):
 
   /** The pinned version's directory, if installed. */
   def installed(pin: BasemapPin): Option[File] =
-    Some(versionDir(pin.version)).filter(d => Required.forall(r => File(d, r).isFile))
+    Some(versionDir(pin.version)).filter(d => required.forall(r => File(d, r).isFile))
 
   /** Extracts a verified archive and moves it into place as `pin.version`. */
   def install(archive: File, pin: BasemapPin): File =
@@ -238,7 +258,7 @@ final class BasemapStore(val root: File):
     deleteTree(tmp)
     try
       extract(archive, tmp)
-      val missing = Required.filterNot(r => File(tmp, r).isFile)
+      val missing = required.filterNot(r => File(tmp, r).isFile)
       if missing.nonEmpty then throw IOException(s"archive lacks ${missing.mkString(", ")}")
       val target = versionDir(pin.version)
       deleteTree(target)
@@ -264,8 +284,8 @@ final class BasemapStore(val root: File):
 object BasemapStore:
   val DownloadDir = ".download"
   val TmpPrefix = ".tmp-"
-  /** Files every archive has (tools/basemap/assemble.py). */
-  val Required: Seq[String] = Seq("style.json", "manifest.json", "ATTRIBUTION", "japan.pmtiles", "world.pmtiles")
+  /** Files every basemap archive has (tools/basemap/assemble.py). */
+  val Required: Seq[String] = PinnedKind.Basemap.required
   val MaxEntries = 5000
   val MaxExtracted: Long = 1024L * 1024 * 1024
 
@@ -280,7 +300,11 @@ object BasemapStore:
     name.nonEmpty && name.length <= 512 && !name.startsWith("/") &&
       name.stripSuffix("/").split('/').forall(s => Segment.matches(s) && s != "." && s != "..")
 
-  def extract(archive: File, dest: File): Unit =
+  /** Extracts `archive` into `dest`. The total size is limited while
+    * copying (`maxTotal`), so an archive that inflates far beyond what it
+    * declares cannot fill the disk.
+    */
+  def extract(archive: File, dest: File, maxTotal: Long = MaxExtracted): Unit =
     import scala.jdk.CollectionConverters.*
     val zip = java.util.zip.ZipFile(archive)
     try
@@ -288,6 +312,7 @@ object BasemapStore:
       if entries.size > MaxEntries then throw IOException("too many entries")
       var total = 0L
       val canonical = dest.getCanonicalPath + File.separator
+      val buf = new Array[Byte](256 * 1024)
       for e <- entries do
         if !safeEntry(e.getName) then throw IOException(s"unsafe entry ${e.getName}")
         val f = File(dest, e.getName)
@@ -295,14 +320,24 @@ object BasemapStore:
           throw IOException(s"unsafe entry ${e.getName}")
         if e.isDirectory then f.mkdirs()
         else
+          if e.getSize > maxTotal - total then throw IOException("archive too large")
           f.getParentFile.mkdirs()
           val in = zip.getInputStream(e)
-          val n =
-            try Files.copy(in, f.toPath, StandardCopyOption.REPLACE_EXISTING)
-            finally in.close()
+          var n = 0L
+          try
+            val out = java.io.FileOutputStream(f)
+            try
+              var r = in.read(buf)
+              while r >= 0 do
+                n += r
+                total += r
+                if total > maxTotal then throw IOException("archive too large")
+                if e.getSize >= 0 && n > e.getSize then throw IOException(s"${e.getName}: size mismatch")
+                out.write(buf, 0, r)
+                r = in.read(buf)
+            finally out.close()
+          finally in.close()
           if e.getSize >= 0 && n != e.getSize then throw IOException(s"${e.getName}: size mismatch")
-          total += n
-          if total > MaxExtracted then throw IOException("archive too large")
     finally zip.close()
 
   def deleteTree(f: File): Unit =

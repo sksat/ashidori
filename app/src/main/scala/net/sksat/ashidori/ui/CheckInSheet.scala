@@ -15,40 +15,28 @@ import net.sksat.ashidori.*
 import ashidori.core.*
 import Ui.*
 
-/** Why a venue search returned nothing: `message` alone, `withCache` when
-  * saved venues ([[VenueCache]]) are shown instead.
+/** Why an online venue search returned nothing: `message` alone,
+  * `withCache` when saved venues ([[VenueCache]]) are shown instead,
+  * `withIndex` when the venue index ([[VenueData]]) is.
   */
-enum VenueError(val message: String, val withCache: String) extends Exception(message):
+enum VenueError(val message: String, val withCache: String, val withIndex: String) extends Exception(message):
   case Offline extends VenueError("オフライン: よく行く場所と過去のチェックイン先を表示しています。",
-    "オフライン: 保存済みの施設を表示しています。")
+    "オフライン: 保存済みの施設を表示しています。", "オフライン: 端末内の施設データを表示しています。")
   case ServerBusy extends VenueError("検索サーバがすべて応答しません。名前でチェックインできます。",
-    "検索サーバがすべて応答しません。保存済みの施設を表示中です。")
-  case Blocked extends VenueError("「位置情報を外部サービスに送らない」がオンのため、自動の検索を中止しました。",
-    "自動の検索を中止しました。保存済みの施設を表示しています。")
+    "検索サーバがすべて応答しません。保存済みの施設を表示中です。", "検索サーバがすべて応答しません。端末内のデータを表示中です。")
 
-/** Venue search on OpenStreetMap, shared by the check-in sheet and the place
-  * sheet. Every result is kept on the device ([[VenueCache]], 90 days), and
-  * searches are prefetched when the app opens or the user settles
-  * somewhere, so the check-in sheet has candidates at once, also offline.
-  * A spot searched within a day is not searched again automatically.
-  *
-  * A search is explicit (the user pressed a search button) or automatic
-  * (prefetch, or a sheet searching by itself). An automatic one takes a
-  * ticket of 「位置情報を外部サービスに送らない」 when it is asked for and
-  * checks it right before it is sent and before each fallback server
-  * ([[SendGate]]): after a change of the setting, queued automatic searches
-  * end without sending and the one in flight is disconnected. Looking up
-  * the saved venues sends nothing.
+/** Online venue search on OpenStreetMap (Overpass), shared by the
+  * check-in sheet and the place sheet. It runs only when the user presses
+  * 「最新を取得（位置情報を送信）」: nothing sends a position to it by itself,
+  * whatever 「位置情報を外部サービスに送らない」 says (the press is the
+  * consent, as for any explicit action). The sheets show the venue index
+  * ([[VenueData]]) and the saved results ([[VenueCache]], 90 days) without
+  * sending anything; every online result is saved there.
   */
 object VenueSearch:
   private val net = Executors.newSingleThreadExecutor()
   /** Ends a connection at the end of the search's time budget. */
   private val timer = Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-venue-timer"))
-  /** The automatic search's connection in flight, to abort on a change of the setting. */
-  private val inflight = java.util.concurrent.atomic.AtomicReference[HttpURLConnection](null)
-  Settings.gate.onChange { () =>
-    Option(inflight.getAndSet(null)).foreach(c => Thread(() => c.disconnect(), "ashidori-venue-abort").start())
-  }
 
   /** Which instance answered last and when each last failed (this process only). */
   private object health:
@@ -82,25 +70,24 @@ object VenueSearch:
 
   private object OutOfTime extends Exception("time budget spent")
 
+  /** The answer of one search: the venues and the server that gave them. */
+  final case class Answer(venues: Vector[(Venue, Double)], server: String)
+
   /** Asks each instance in turn ([[Overpass.order]]) within
     * [[Overpass.BudgetMs]] in all; an HTTP error moves on at once.
-    * `allowed` is checked right before each server is asked. Returns the
-    * venues and whether the answer is complete.
     */
-  private def query(p: LatLng, radiusM: Int, allowed: () => Boolean, automatic: Boolean): (Vector[(Venue, Double)], Boolean) =
+  private def query(p: LatLng, radiusM: Int): (Vector[(Venue, Double)], Boolean, String) =
     val body = ("data=" + URLEncoder.encode(Overpass.query(p.lat, p.lon, radiusM), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)
     val start = System.currentTimeMillis()
     val order = health.synchronized(Overpass.order(Overpass.Endpoints, health.lastOk, health.failedAt, start))
-    val result = SendGate.firstSuccess(order.zipWithIndex, allowed) { (url, i) =>
+    // Explicit: the user asked for this search, so each server may be tried.
+    val result = SendGate.firstSuccess(order.zipWithIndex, () => true) { (url, i) =>
       val remaining = Overpass.BudgetMs - (System.currentTimeMillis() - start)
       val (connectMs, readMs) = Overpass.timeouts(i, remaining).getOrElse(throw OutOfTime)
       val conn = URL(url).openConnection().asInstanceOf[HttpURLConnection]
-      if automatic then inflight.set(conn)
       // Read timeouts are per read: a server that trickles is cut at the budget.
       val deadline = timer.schedule((() => conn.disconnect()): Runnable, remaining, TimeUnit.MILLISECONDS)
       try
-        // A change of the setting between the check and here: not sent.
-        if !allowed() then throw VenueError.Blocked
         conn.setRequestMethod("POST")
         conn.setDoOutput(true)
         conn.setConnectTimeout(connectMs)
@@ -110,59 +97,36 @@ object VenueSearch:
         val code = conn.getResponseCode
         if code != 200 then throw RuntimeException(s"HTTP $code")
         val json = Using.resource(conn.getInputStream)(in => String(in.readAllBytes(), StandardCharsets.UTF_8))
-        val answer = Overpass.parseAnswer(json, p.lat, p.lon)
+        val (vs, complete) = Overpass.parseAnswer(json, p.lat, p.lon)
         health.synchronized(health.lastOk = Some(url))
-        answer
+        (vs, complete, URL(url).getHost)
       catch
         case e: Exception =>
-          if e != VenueError.Blocked then health.synchronized {
+          health.synchronized {
             health.failedAt += url -> System.currentTimeMillis()
             if health.lastOk.contains(url) then health.lastOk = None
           }
           throw e
-      finally
-        deadline.cancel(false)
-        inflight.compareAndSet(conn, null)
+      finally deadline.cancel(false)
     }
     result match
       case Right(answer) => answer
-      case Left(SendGate.Blocked) => throw VenueError.Blocked
-      case Left(_) =>
-        if automatic && !allowed() then throw VenueError.Blocked
-        throw (if online then VenueError.ServerBusy else VenueError.Offline)
+      case Left(_) => throw (if online then VenueError.ServerBusy else VenueError.Offline)
 
-  /** Venues near `p`: the saved ones when this spot was searched within a
-    * day, otherwise from the server, saved on success (a failure leaves
-    * the saved venues as they are). `explicit`: the user asked for this
-    * search; otherwise it is automatic and ends with [[VenueError.Blocked]],
-    * sending nothing, once the setting does not allow it (see [[VenueSearch]]).
+  /** Venues near `p` from the server, always asked (no saved answer stands
+    * in for it), and saved on success; a failure leaves the saved venues as
+    * they are. Only for an explicit request of the user: it sends `p`.
     */
-  def nearby(p: LatLng, radiusM: Int = 200, explicit: Boolean)(done: Try[Vector[(Venue, Double)]] => Unit): Unit =
-    val gate = Settings.gate
-    val ticket = gate.ticket()
-    val allowed: () => Boolean = () => explicit || gate.automatic(ticket)
-    def deliver(r: Try[Vector[(Venue, Double)]]) = AshidoriApp.app.getMainExecutor.execute(() => done(r))
-    AshidoriApp.io.execute { () =>
-      Try(saved(p, radiusM)).toOption.flatten.filter(_.fresh) match
-        case Some(hit) => deliver(scala.util.Success(hit.venues))
-        case None if !allowed() => deliver(scala.util.Failure(VenueError.Blocked))
-        case None =>
-          net.execute { () =>
-            val r = Try {
-              // Queued behind other searches: the setting may have changed since.
-              if !allowed() then throw VenueError.Blocked
-              if !online then throw VenueError.Offline
-              val (vs, complete) = query(p, radiusM, allowed, automatic = !explicit)
-              Try(AshidoriApp.db.applyVenueCache(store.put(p, radiusM, System.currentTimeMillis(), vs.map(_._1), complete)))
-              vs
-            }
-            deliver(r)
-          }
+  def latest(p: LatLng, radiusM: Int = 200)(done: Try[Answer] => Unit): Unit =
+    net.execute { () =>
+      val r = Try {
+        if !online then throw VenueError.Offline
+        val (vs, complete, server) = query(p, radiusM)
+        Try(AshidoriApp.db.applyVenueCache(store.put(p, radiusM, System.currentTimeMillis(), vs.map(_._1), complete)))
+        Answer(vs, server)
+      }
+      AshidoriApp.app.getMainExecutor.execute(() => done(r))
     }
-
-  /** Fills the saved venues for a position in the background (no UI): automatic. */
-  def prefetch(p: LatLng): Unit =
-    if !Settings.blockExternalLocation then nearby(p, explicit = false)(_ => ())
 
 /** Swarm-style check-in as a bottom sheet: search on top, nearby venues,
   * then a short compose step. `at` checks in to a past visit instead of the
@@ -175,6 +139,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private var venues: Vector[(Venue, Double)] = Vector.empty
   /** Names of the candidates shown from saved venues and not (yet) in an online answer. */
   private var savedNames = Set.empty[String]
+  /** Matches of the typed text in the venue index (beyond the candidates near by). */
+  private var searchHits: Vector[(Venue, Double)] = Vector.empty
+  /** Candidates come from the venue index (installed and readable). */
+  private var indexed = false
 
   private val search = EditText(act)
   search.setHint("施設を検索、または名前を入力")
@@ -182,19 +150,27 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val NoLocation = "現在地を取得できませんでした。名前を入力してチェックインできます。"
   private val NoVenues = "施設を取得できませんでした。名前を入力してチェックインできます。"
   private val NoVenuesSaved = "施設を取得できませんでした。保存済みの施設を表示しています。"
+  private val NoVenuesIndex = "施設を取得できませんでした。端末内のデータを表示中です。"
   private val LocalOnly = "過去の場所とチェックイン先のみを表示しています。"
+  private val IndexBroken = "施設データを読み込めません。設定から再取得してください。"
   private def savedFrom(hit: VenueCache.Hit) =
     s"保存済みの施設（${CheckInSheet.age(System.currentTimeMillis() - hit.fetchedAt)}に取得）を表示しています。"
+  private def fromIndex(date: Option[String]) =
+    s"端末内の施設データ${date.fold("")(d => s"（$d）")}を表示しています。"
+  private def latestFrom(server: String) = s"最新の施設を取得しました（OpenStreetMap、$server）。"
+  private val SendNote = "「最新を取得」を押すと、位置情報を OpenStreetMap のサーバに送信します。"
   /** As tall as its longest message, empty or not, so the candidates below
     * stay where they are as the search goes on.
     */
   private val status = stableCaption(
-    VenueError.values.toSeq.flatMap(e => Seq(e.message, e.withCache)) ++
-      Seq(NoLocation, NoVenues, NoVenuesSaved, LocalOnly, "近くの施設を検索中…", "保存済みの施設（88日前に取得）を表示しています。"))
+    VenueError.values.toSeq.flatMap(e => Seq(e.message, e.withCache, e.withIndex)) ++
+      Seq(NoLocation, NoVenues, NoVenuesSaved, NoVenuesIndex, LocalOnly, IndexBroken, latestFrom("overpass.kumi.systems"),
+        "近くの施設を検索中…", "保存済みの施設（88日前に取得）を表示しています。",
+        fromIndex(Some("2026年12月31日時点"))))
   private val list = vbox()
-  /** Shown while sending location information is blocked: one explicit search. */
+  /** The only way to the online search: the user presses it (「最新を取得」). */
   private val searchOnce =
-    val b = outlined("周辺の施設を検索（位置情報を送信）")(here.foreach(searchOnline(_, explicit = true)))
+    val b = outlined("最新を取得（位置情報を送信）")(here.foreach(searchOnline))
     b.setVisibility(View.GONE)
     b
   private val footnote = caption("")
@@ -246,7 +222,9 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     dialog.show()
     search.addTextChangedListener(new TextWatcher:
       def beforeTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = ()
-      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit = render()
+      def onTextChanged(s: CharSequence, a: Int, b: Int, c: Int): Unit =
+        render()
+        searchIndex()
       def afterTextChanged(s: Editable): Unit = ()
     )
     here match
@@ -300,8 +278,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     * go below them, so a row does not move under the finger as results arrive.
     */
   private def merged(more: Vector[(Venue, Double)]): Vector[(Venue, Double)] =
-    val shown = venues.map(_._1.name).toSet
-    venues ++ more.filterNot(v => shown(v._1.name)).distinctBy(_._1.name).sortBy(_._2)
+    venues ++ CheckInSheet.fresh(venues, more)
 
   /** Once shown, the button keeps its room when hidden (INVISIBLE). */
   private def hideSearchOnce(): Unit =
@@ -309,64 +286,59 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
 
   /** Adds saved venues below what is shown, marked as saved. */
   private def showSaved(hit: VenueCache.Hit): Unit =
-    val shown = venues.map(_._1.name).toSet
-    savedNames ++= hit.venues.map(_._1.name).filterNot(shown)
-    venues = merged(hit.venues)
+    val added = CheckInSheet.fresh(venues, hit.venues)
+    savedNames ++= added.map(_._1.name)
+    venues = venues ++ added
 
   private def fetch(p: LatLng): Unit =
     here = Some(p)
-    // Local candidates and saved venues first (nothing is sent), so check-in
-    // works without a network.
+    // Local candidates, the venue index and saved venues: nothing is sent,
+    // so check-in works without a network. The online search runs only when
+    // the user presses 「最新を取得」.
     AshidoriApp.io.execute { () =>
       val local = localCandidates(p)
+      val offline = VenueData.lookup(p)
+      val date = VenueData.dateLabel
       val hit = Try(VenueSearch.saved(p)).toOption.flatten
       act.runOnUiThread { () =>
         venues = merged(local)
+        offline match
+          case VenueData.Lookup.Found(vs) => venues = merged(vs)
+          case _ => ()
         hit.foreach(showSaved)
         render()
-        if Settings.blockExternalLocation then
-          hit match
-            case Some(h) =>
-              status.setText(savedFrom(h))
-              if h.fresh then hideSearchOnce() else searchOnce.setVisibility(View.VISIBLE)
-            case None =>
-              status.setText(LocalOnly)
-              searchOnce.setVisibility(View.VISIBLE)
-          footnote.setText("検索すると、位置情報が OpenStreetMap のサーバに送られます。")
-        else hit.filter(_.fresh) match
-          // Searched here within a day: no new search.
-          case Some(h) =>
-            status.setText(savedFrom(h))
-            footnote.setText("近くの施設は OpenStreetMap から取得します（位置情報がそのサーバに送られます）。")
-          case None => searchOnline(p, explicit = false)
+        indexed = offline.isInstanceOf[VenueData.Lookup.Found]
+        status.setText(offline match
+          case VenueData.Lookup.Found(_) => fromIndex(date)
+          case VenueData.Lookup.Broken => IndexBroken
+          case VenueData.Lookup.Missing => hit.fold(LocalOnly)(savedFrom)
+        )
+        searchOnce.setVisibility(View.VISIBLE)
+        footnote.setText(SendNote)
       }
     }
 
-  /** Venue search on OpenStreetMap: sends the position to the server.
-    * `explicit`: the user pressed the search button; otherwise the sheet
-    * searches by itself (setting off) and stops if the setting turns on.
+  /** Venue search on OpenStreetMap: sends the position to the server. Only
+    * when the user pressed 「最新を取得」.
     */
-  private def searchOnline(p: LatLng, explicit: Boolean): Unit =
+  private def searchOnline(p: LatLng): Unit =
     hideSearchOnce()
-    footnote.setText("近くの施設は OpenStreetMap から取得します（位置情報がそのサーバに送られます）。")
     status.setText("近くの施設を検索中…")
-    VenueSearch.nearby(p, explicit = explicit) { r =>
+    VenueSearch.latest(p) { r =>
       r.fold(
         e => {
           val saved = savedNames.nonEmpty
           status.setText(e match
-            case v: VenueError => if saved then v.withCache else v.message
-            case _             => if saved then NoVenuesSaved else NoVenues
+            case v: VenueError => if indexed then v.withIndex else if saved then v.withCache else v.message
+            case _             => if indexed then NoVenuesIndex else if saved then NoVenuesSaved else NoVenues
           )
-          // Stopped by the setting: searching stays possible on request.
-          if e == VenueError.Blocked then
-            searchOnce.setVisibility(View.VISIBLE)
-            footnote.setText("検索すると、位置情報が OpenStreetMap のサーバに送られます。")
+          // It can be tried again.
+          searchOnce.setVisibility(View.VISIBLE)
         },
-        vs => {
-          venues = merged(vs)
-          savedNames --= vs.map(_._1.name)
-          status.setText("")
+        a => {
+          venues = merged(a.venues)
+          savedNames --= a.venues.map(_._1.name)
+          status.setText(latestFrom(a.server))
         }
       )
       render()
@@ -390,14 +362,37 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     r.setBackgroundResource(android.R.drawable.list_selector_background)
     r
 
+  private val handler = android.os.Handler(android.os.Looper.getMainLooper)
+  private val runSearch: Runnable = () =>
+    val q = search.getText.toString.trim
+    here.filter(_ => q.nonEmpty && indexed).foreach { p =>
+      AshidoriApp.io.execute { () =>
+        val hits = VenueData.search(q, p).getOrElse(Vector.empty)
+        act.runOnUiThread { () =>
+          if search.getText.toString.trim == q then
+            searchHits = hits
+            render()
+        }
+      }
+    }
+
+  /** Looks the typed text up in the venue index, once typing pauses. */
+  private def searchIndex(): Unit =
+    searchHits = Vector.empty
+    handler.removeCallbacks(runSearch)
+    handler.postDelayed(runSearch, 250)
+
   private def render(): Unit =
     val q = search.getText.toString.trim
     list.removeAllViews()
     if q.nonEmpty then
       list.addView(row(s"「$q」でチェックイン", "新しい場所")(select(Venue("", q, "", Double.NaN, Double.NaN))))
-    val shown = venues.filter((v, _) => q.isEmpty || v.name.toLowerCase.contains(q.toLowerCase) || v.category.contains(q))
+    val norm = VenueIndex.normalize(q)
+    val near = venues.filter((v, _) => q.isEmpty || VenueIndex.normalize(v.name).contains(norm) || v.category.contains(q))
+    // Matches farther away (the venue index) below the ones near by.
+    val shown = if q.isEmpty then near else near ++ CheckInSheet.fresh(near, searchHits).sortBy(_._2)
     for (v, d) <- shown.take(30) do
-      list.addView(row(v.name, s"${v.category}・${d.round}m", savedNames(v.name))(select(v)))
+      list.addView(row(v.name, s"${v.category}・${Ui.fmtDistance(d)}", savedNames(v.name))(select(v)))
 
   private def select(v: Venue): Unit =
     selected = Some(v)
@@ -432,6 +427,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     }
 
 object CheckInSheet:
+  /** See [[VenueMerge.fresh]]. */
+  def fresh(shown: Vector[(Venue, Double)], more: Vector[(Venue, Double)]): Vector[(Venue, Double)] =
+    VenueMerge.fresh(shown, more)
+
   /** "3時間前" style, for how old saved venues are. */
   def age(ms: Long): String =
     val h = ms / 3_600_000L

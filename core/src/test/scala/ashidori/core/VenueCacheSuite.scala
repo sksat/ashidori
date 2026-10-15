@@ -11,7 +11,7 @@ class VenueCacheSuite extends munit.FunSuite:
     assertEquals(VenueCache.empty.lookup(here, 200, 0), None)
   }
 
-  test("a stored search is found again, closest first, and fresh for a day") {
+  test("a stored search is found again, closest first") {
     val c = VenueCache.empty
     val ch = c.put(here, 200, 0, Seq(venue("node/2", north(here, 150)), venue("node/1", north(here, 20))), complete = true)
     assertEquals(ch.put.map(_.key), Vector(VenueCache.key(here, 200)))
@@ -19,30 +19,26 @@ class VenueCacheSuite extends munit.FunSuite:
     val hit = c.lookup(here, 200, Day - 1).get
     assertEquals(hit.venues.map(_._1.id), Vector("node/1", "node/2"))
     assertEqualsDouble(hit.venues.head._2, 20, 0.5)
-    assert(hit.fresh)
     assertEquals(hit.fetchedAt, 0L)
-    assert(!c.lookup(here, 200, Day).get.fresh)
   }
 
-  test("a neighbouring cell's search shows its venues near the spot but is not fresh for it") {
+  test("a neighbouring cell's search shows its venues near the spot") {
     val c = VenueCache.empty
     c.put(here, 200, 0, Seq(venue("node/1", north(here, 50)), venue("node/9", north(here, 2_000))), complete = true)
     val there = north(here, 300)
     assertNotEquals(VenueCache.key(there, 200), VenueCache.key(here, 200))
     val hit = c.lookup(there, 200, 1).get
     assertEquals(hit.venues.map(_._1.id), Vector("node/1"))
-    assert(!hit.fresh)
     // Far away: nothing.
     assertEquals(c.lookup(north(here, 5_000), 200, 1), None)
   }
 
-  test("a smaller-radius search is not fresh for a larger one, but the reverse is") {
+  test("searches of different radii in one cell are kept apart") {
     val c = VenueCache.empty
     c.put(here, 120, 0, Seq(venue("node/1", here)), complete = true)
-    assert(!c.lookup(here, 200, 1).get.fresh)
     c.put(here, 200, 0, Seq(venue("node/1", here)), complete = true)
-    assert(c.lookup(here, 120, 1).get.fresh)
     assertEquals(c.size, 2)
+    assertEquals(c.lookup(here, 120, 1).get.venues.map(_._1.id), Vector("node/1"))
   }
 
   test("kept for 90 days after the fetch, then expired") {

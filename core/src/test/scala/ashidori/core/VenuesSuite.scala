@@ -73,3 +73,13 @@ class VenuesSuite extends munit.FunSuite:
     assertEquals(Overpass.Endpoints.head, Overpass.Endpoint)
     assertEquals(Overpass.Endpoints.distinct.size, Overpass.Endpoints.size)
   }
+
+  test("merging keeps what is shown and adds the rest once, by OSM id and then by name, closest first") {
+    def v(id: String, name: String, d: Double) = Venue(id, name, "", 0, 0) -> d
+    val shown = Vector(v("", "自宅", 5), v("node/1", "東京", 30))
+    val more = Vector(v("node/1", "東京駅", 10), v("node/2", "東京", 20), v("node/4", "NewDays", 80),
+      v("way/3", "NewDays", 60), v("node/5", "自宅", 1))
+    assertEquals(VenueMerge.fresh(shown, more).map(_._1.id), Vector("way/3"))
+    assertEquals(VenueMerge.fresh(Vector.empty, more).map(_._1.name), Vector("自宅", "東京駅", "東京", "NewDays"))
+  }
+

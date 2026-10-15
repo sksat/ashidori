@@ -114,62 +114,82 @@ final class PlaceSheet(
     r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id)))
     r
 
-  /** Past check-ins nearby first (works offline), then OpenStreetMap venues. */
+  /** Past check-ins nearby first, then OpenStreetMap venues from the venue
+    * index and the saved results: nothing is sent. The online search runs
+    * only when the user presses 「最新を取得」.
+    */
+  /** Candidate rows, then one status line (updated as the search goes on), then the button. */
+  private val candidateRows = vbox()
+  private val candidateStatus = caption("")
+
+  private def setStatus(text: String): Unit =
+    candidateStatus.setText(text)
+    candidateStatus.setVisibility(if text.isEmpty then View.GONE else View.VISIBLE)
+
   private def loadCandidates(): Unit =
     AshidoriApp.io.execute { () =>
       val past = AshidoriApp.db.checkIns(0, Long.MaxValue)
         .map(c => Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon))
         .map(v => v -> v.latLng.distanceTo(place.latLng))
         .filter(_._2 <= 150).sortBy(_._2).distinctBy(_._1.name)
-      // Saved venues from earlier searches: nothing is sent.
+      // The venue index and saved venues from earlier searches: nothing is sent.
+      val offline = VenueData.lookup(place.latLng, 120)
       val saved = scala.util.Try(VenueSearch.saved(place.latLng, 120)).toOption.flatten
       act.runOnUiThread { () =>
         candidates.removeAllViews()
-        for (v, d) <- past.take(4) do candidates.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
-        if Settings.blockExternalLocation && !saved.exists(_.fresh) then
-          // Sent only on an explicit request.
-          val shown = showSaved(past, saved)
-          val note = caption(
-            (if shown.nonEmpty then "保存済みの施設を表示しています。" else "過去のチェックイン先のみを表示しています。") +
-              "検索すると、位置情報が OpenStreetMap のサーバに送られます。")
-          candidates.addView(note)
-          lazy val once: View = outlined("周辺の施設を検索（位置情報を送信）") {
-            candidates.removeView(once)
-            candidates.removeView(note)
-            searchOnline(past ++ shown, None, explicit = true)
-          }
-          candidates.addView(once)
-        else searchOnline(past, saved, explicit = false)
+        candidateRows.removeAllViews()
+        candidates.addView(candidateRows)
+        candidates.addView(candidateStatus)
+        for (v, d) <- past.take(4) do candidateRows.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
+        val fromIndex = offline match
+          case VenueData.Lookup.Found(vs) => CheckInSheet.fresh(past.toVector, vs).take(6)
+          case _ => Vector.empty
+        for (v, d) <- fromIndex do candidateRows.addView(candidateRow(v, s"${v.category}・${d.round}m"))
+        val shown = past ++ fromIndex ++ showSaved(past ++ fromIndex, saved)
+        setStatus(
+          if offline == VenueData.Lookup.Broken then "施設データを読み込めません。設定から再取得してください。"
+          else if shown.isEmpty then "近くに候補がありません"
+          else "")
+        latestButton(shown)
       }
     }
 
   /** Saved venues not among `past`, marked as saved; returns those shown. */
   private def showSaved(past: Seq[(Venue, Double)], saved: Option[VenueCache.Hit]): Seq[(Venue, Double)] =
-    val shown = saved.toVector.flatMap(_.venues).filterNot(x => past.exists(_._1.name == x._1.name)).take(6)
-    for (v, d) <- shown do candidates.addView(candidateRow(v, s"保存済み・${v.category}・${d.round}m"))
+    val shown = CheckInSheet.fresh(past.toVector, saved.toVector.flatMap(_.venues)).take(6)
+    for (v, d) <- shown do candidateRows.addView(candidateRow(v, s"保存済み・${v.category}・${d.round}m"))
     shown
 
-  /** OpenStreetMap venues near the place: sends its position to the server.
-    * When it fails, `saved` venues are shown instead. `past` are the
-    * candidates already shown.
+  /** 「最新を取得」: the only way to the online search. */
+  private def latestButton(shown: Seq[(Venue, Double)]): Unit =
+    lazy val once: View = outlined("最新を取得（位置情報を送信）") {
+      candidates.removeView(once)
+      searchOnline(shown)
+    }
+    candidates.addView(once)
+
+  /** OpenStreetMap venues near the place: sends its position to the server,
+    * only when the user pressed 「最新を取得」. `shown` are the candidates
+    * already shown; new ones go below them, and the status line says how
+    * the search ended.
     */
-  private def searchOnline(past: Seq[(Venue, Double)], saved: Option[VenueCache.Hit], explicit: Boolean): Unit =
-    val loading = caption("近くの施設を検索中…")
-    candidates.addView(loading)
-    VenueSearch.nearby(place.latLng, 120, explicit = explicit) { r =>
-      candidates.removeView(loading)
+  private def searchOnline(shown: Seq[(Venue, Double)]): Unit =
+    setStatus("近くの施設を検索中…")
+    VenueSearch.latest(place.latLng, 120) { r =>
       r.fold(
         e => {
-          val shown = showSaved(past, saved)
-          candidates.addView(caption(e match
-            case v: VenueError => if shown.nonEmpty then v.withCache else v.message
+          setStatus(e match
+            case v: VenueError => if VenueData.installed then v.withIndex else if shown.nonEmpty then v.withCache else v.message
             case _             => "候補を取得できませんでした"
-          ))
+          )
+          latestButton(shown)
         },
-        vs =>
-          val fresh = vs.filterNot(x => past.exists(_._1.name == x._1.name))
-          if fresh.isEmpty && past.isEmpty then candidates.addView(caption("近くに候補がありません"))
-          for (v, d) <- fresh.take(6) do candidates.addView(candidateRow(v, s"${v.category}・${d.round}m"))
+        a =>
+          val fresh = CheckInSheet.fresh(shown.toVector, a.venues)
+          for (v, d) <- fresh.take(6) do candidateRows.addView(candidateRow(v, s"${v.category}・${d.round}m"))
+          setStatus(
+            if fresh.isEmpty && shown.isEmpty then "近くに候補がありません（OpenStreetMap、" + a.server + "）"
+            else s"最新の施設を取得しました（OpenStreetMap、${a.server}）。")
       )
     }
 
