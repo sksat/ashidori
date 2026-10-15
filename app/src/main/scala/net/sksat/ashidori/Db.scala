@@ -316,7 +316,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     cv.put("country", country)
     w.update("places", cv, "id=?", Array(id.toString))
 
-  /** Approximate area names ("三軒茶屋付近") for places the user has not named. */
+  /** Approximate area names ("天王台付近") for places the user has not named. */
   def placeAreas(): Map[Long, String] =
     query("SELECT id, area FROM places WHERE area IS NOT NULL")(c => c.getLong(0) -> c.getString(1)).toMap
 

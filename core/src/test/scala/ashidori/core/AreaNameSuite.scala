@@ -2,7 +2,7 @@ package ashidori.core
 
 class AreaNameSuite extends munit.FunSuite:
   test("strips country, postal code, prefecture and block numbers") {
-    assertEquals(AreaName.fromAddressLine("日本、〒154-0024 東京都世田谷区三軒茶屋２丁目１１−２"), Some("世田谷区三軒茶屋"))
+    assertEquals(AreaName.fromAddressLine("日本、〒305-8577 茨城県つくば市天王台１丁目１−１"), Some("つくば市天王台"))
     assertEquals(AreaName.fromAddressLine("日本、〒100-0004 東京都千代田区大手町1丁目"), Some("千代田区大手町"))
     assertEquals(AreaName.fromAddressLine("〒060-0005 北海道札幌市中央区北五条西4丁目"), Some("札幌市中央区北五条西"))
     assertEquals(AreaName.fromAddressLine("日本、〒530-0001 大阪府大阪市北区梅田3丁目1"), Some("大阪市北区梅田"))

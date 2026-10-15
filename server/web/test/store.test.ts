@@ -49,11 +49,11 @@ describe("ViewerStore over the app's batches", () => {
   });
 
   it("keeps going when a batch cannot be read, and counts it", async () => {
-    const { store: st } = await store({ tamper: (p, b) => (p.endsWith("/archive/6") ? b.slice(0, -1) : b) });
+    const { store: st } = await store({ tamper: (p, b) => (p.endsWith("/archive/8") ? b.slice(0, -1) : b) });
     await st.init();
     await st.loadMore(DEV_A, 7);
     expect(st.failures(DEV_A)).toBe(1);
-    // The motion file (archive/6) is missing: positions still show, steps do not.
+    // The motion file (archive/8, after the fixes parts) is missing: positions still show, steps do not.
     expect(st.day(DEV_A, "2026-10-05")!.summary.steps).toBe(0);
   });
 

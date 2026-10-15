@@ -108,7 +108,7 @@ final case class Place(
     kind: PlaceKind = PlaceKind.Other,
     /** OSM element id like `node/123`, when the place came from venue search */
     externalId: String = "",
-    /** approximate area from reverse geocoding, e.g. "三軒茶屋" */
+    /** approximate area from reverse geocoding, e.g. "天王台" */
     area: String = ""
 ):
   def latLng: LatLng = LatLng(lat, lon)

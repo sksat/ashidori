@@ -9,7 +9,7 @@ object AreaName:
   private val Repeated = """^(.*?)(.{2,})\2$""".r
   private val Numbers ="""([0-9０-９]|[一二三四五六七八九十]+丁目).*$""".r
 
-  /** "日本、〒154-0024 東京都世田谷区三軒茶屋２丁目１１−２" → "世田谷区三軒茶屋".
+  /** "日本、〒305-8577 茨城県つくば市天王台１丁目１−１" → "つくば市天王台".
     * Returns None when nothing useful is left (e.g. a bare prefecture).
     */
   def fromAddressLine(line: String): Option[String] =

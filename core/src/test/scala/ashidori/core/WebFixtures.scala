@@ -74,7 +74,7 @@ object WebFixtures:
     put(devA, "places", Seq(
       ujson.Obj("id" -> 1, "lat" -> sc.Home.lat, "lon" -> sc.Home.lon, "r" -> 60.0, "name" -> "", "kind" -> "HOME", "ext" -> "", "updatedAt" -> num(now)),
       ujson.Obj("id" -> 2, "lat" -> sc.Office.lat, "lon" -> sc.Office.lon, "r" -> 80.0, "name" -> "大手町オフィス", "kind" -> "WORK", "ext" -> "", "updatedAt" -> num(now)),
-      ujson.Obj("id" -> 3, "lat" -> sc.Park.lat, "lon" -> sc.Park.lon, "r" -> 150.0, "name" -> "代々木公園", "kind" -> "UNKNOWN", "ext" -> "", "updatedAt" -> num(now))))
+      ujson.Obj("id" -> 3, "lat" -> sc.Park.lat, "lon" -> sc.Park.lon, "r" -> 150.0, "name" -> "洞峰公園", "kind" -> "UNKNOWN", "ext" -> "", "updatedAt" -> num(now))))
     val lunch = today.minusDays(1).atTime(12, 50).atZone(Zone).toInstant.toEpochMilli
     put(devA, "checkins", Seq(ujson.Obj("id" -> 7, "t" -> num(lunch), "lat" -> sc.Lunch.lat, "lon" -> sc.Lunch.lon, "venue" -> "丸の内 オアゾ",
       "cat" -> "", "ext" -> "", "place" -> ujson.Null, "comment" -> "", "private" -> 0, "updatedAt" -> num(lunch))))

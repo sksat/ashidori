@@ -46,9 +46,11 @@ class TimelineE2ESuite extends munit.FunSuite:
     // Fixes from another continent in the middle of the day (e.g. emulator default).
     val mid = out.fixes(out.fixes.size / 2).time
     val far = (0 until 20).map(i => Fix(mid + i * 1000L + 1, 37.42, -122.08, 10f))
-    val segs = TimelineBuilder.build((out.fixes ++ far).sortBy(_.time), out.motion)
-    val dist = segs.collect { case t: Trip => t.distanceM }.sum
-    assert(dist < 60_000, s"distance $dist")
+    def travelled(fixes: Vector[Fix]) = TimelineBuilder.build(fixes, out.motion).collect { case t: Trip => t.distanceM }.sum
+    val base = travelled(out.fixes)
+    val dist = travelled((out.fixes ++ far).sortBy(_.time))
+    // The day itself is about 120 km; the jump would add some 16,000 km.
+    assert(dist < base + 10_000, s"distance $dist (without the jump $base)")
   }
 
   test("legs without good positions are marked uncertain") {
