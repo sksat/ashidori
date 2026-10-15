@@ -10,6 +10,14 @@ class AshidoriApp extends Application:
   override def onCreate(): Unit =
     super.onCreate()
     AshidoriApp.instance = this
+    // Lifecycle log for 設定 › 端末診断: crashes on any thread, this start,
+    // and the exits the OS recorded since the last start.
+    LifeLog.installCrashHandler()
+    LifeLog.add(LifeKind.ProcessStart, s"記録=${if Settings.loggingEnabled then "オン" else "オフ"}")
+    AshidoriApp.io.execute { () =>
+      LifeLog.recordExitReasons()
+      LifeLog.checkState("起動時")
+    }
     val nm = getSystemService(classOf[NotificationManager])
     nm.createNotificationChannel(
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)

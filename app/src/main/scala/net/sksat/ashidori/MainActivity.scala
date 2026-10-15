@@ -237,9 +237,6 @@ class MainActivity extends AppCompatActivity:
       val tab = Option(savedInstanceState).map(_.getInt(MainActivity.StateTab, MainActivity.TabTimeline))
         .filter(tabs.contains).getOrElse(MainActivity.TabTimeline)
       nav.setSelectedItemId(tab)
-      // Resume logging after an app update or a force stop.
-      if Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
-        LoggerService.send(this, LoggerService.ActionStart)
       if fresh then handleIntent(getIntent)
 
   override def onNewIntent(intent: Intent): Unit =
@@ -396,6 +393,13 @@ class MainActivity extends AppCompatActivity:
     maps.foreach(_.onStart())
   override def onResume(): Unit =
     super.onResume()
+    // Resume logging after an app update, a force stop, or a stop the
+    // background could not recover from (the "記録が止まっています"
+    // notification leads here). On every resume, not only in onCreate: the
+    // activity may have outlived the service.
+    if Settings.onboarded && Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
+      LoggerService.send(this, LoggerService.ActionStart)
+    AshidoriApp.io.execute(() => LifeLog.checkState("アプリを表示"))
     maps.foreach(_.onResume())
     current.foreach(_.onShow())
     // Warm the venue cache from the logger's latest position (no extra GNSS).

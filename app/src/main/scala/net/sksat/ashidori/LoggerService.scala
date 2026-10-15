@@ -71,6 +71,20 @@ class LoggerService extends Service:
   private var stepsDay = java.time.LocalDate.now(AshidoriApp.zone)
   private var lastSpeed = Double.NaN
   private var lastSpeedAt = 0L
+  /** Steps while stationary that mean moving again (accelerometer off). */
+  private val stepWake = StepWake()
+  /** Lifecycle log: still mode as last logged, what ended it, the provider. */
+  private var stillLogged = false
+  private var wakeReason = ""
+  private var loggedProvider = ""
+  /** Held from a significant-motion trigger until the new plan is applied:
+    * the trigger's own wake lock ends when onTrigger returns, before the
+    * logger thread has turned GNSS and the accelerometer back on.
+    */
+  private lazy val motionWake =
+    val w = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ashidori:motion")
+    w.setReferenceCounted(false)
+    w
 
   // --- service lifecycle ------------------------------------------------------
 
@@ -83,21 +97,46 @@ class LoggerService extends Service:
     handler = Handler(thread.getLooper)
 
   override def onStartCommand(intent: Intent, flags: Int, startId: Int): Int =
+    // A null intent is a restart by the OS after the process was killed (START_STICKY).
+    val sticky = intent == null
     val action = Option(intent).flatMap(i => Option(i.getAction)).getOrElse(ActionStart)
     action match
       case ActionStop =>
+        stopReason = "user"
         Settings.loggingEnabled = false
         stopSelf()
       // Sticky restarts arrive here without a permission check.
       case _ if !LoggerService.hasLocationPermission(this) =>
-        Log.w("logger: no location permission, not starting")
+        LifeLog.add(LifeKind.ForegroundFailed, s"${if sticky then "自動再起動" else action.split('.').last}: 位置情報の権限なし")
+        LifeLog.notifyStopped(this, "位置情報の権限がありません")
+        stopReason = "no-permission"
         stopSelf()
         return Service.START_NOT_STICKY
       case _ =>
         if action == ActionBurst then Settings.burstUntil = System.currentTimeMillis() + BurstMs
-        startForeground(NotificationId, notification("記録を開始しています"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        // Started from the background (a sticky restart, boot, the watchdog)
+        // without 「常に許可」, this throws SecurityException (Android 14+).
+        // Uncaught, it crashed the process, the sticky restart a second later
+        // crashed again, and the OS gave up on the app until it was opened.
+        try startForeground(NotificationId, notification("記録を開始しています"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        catch case e: Exception =>
+          LifeLog.add(LifeKind.ForegroundFailed, s"${if sticky then "自動再起動" else action.split('.').last}: ${LifeLog.describe(e)}")
+          LifeLog.notifyStopped(this, "バックグラウンドから再開できませんでした")
+          stopReason = "fgs-failed"
+          stopSelf()
+          return Service.START_NOT_STICKY
+        if sticky || !startLogged then
+          startLogged = true
+          if sticky then LifeLog.add(LifeKind.StickyRestart)
+          else LifeLog.add(LifeKind.ServiceStart, action.split('.').last)
+          LifeLog.clearStopped(this)
+          AshidoriApp.io.execute(() => LifeLog.checkState("記録サービス開始"))
         handler.post(() => start())
     Service.START_STICKY
+
+  private var startLogged = false
+  /** Why this service is ending, for the lifecycle log; null = not asked to. */
+  private var stopReason: String = null
 
   private var started = false
   private def start(): Unit =
@@ -128,6 +167,10 @@ class LoggerService extends Service:
     evaluate(force = true)
 
   override def onDestroy(): Unit =
+    // "user…" marks a stop on purpose (RecordingGaps tells it from the others).
+    val why = Option(stopReason).orElse(Option(LoggerService.stopRequested)).getOrElse("onDestroy（アプリからの停止要求なし）")
+    LoggerService.stopRequested = null
+    LifeLog.add(LifeKind.ServiceStop, why)
     LoggerState.flushSensors = () => ()
     handler.post { () =>
       handler.removeCallbacksAndMessages(null)
@@ -229,7 +272,13 @@ class LoggerService extends Service:
           .build()
         lm.requestLocationUpdates(provider, req, exec, locationListener)
         locReg = Some(want)
-      catch case e: SecurityException => Log.w("location permission missing", e)
+        // Indoor GNSS probes switch every few minutes: not worth a log entry each.
+        if provider != loggedProvider && p.replanInMs == 0 then
+          loggedProvider = provider
+          LifeLog.add(LifeKind.Source, s"$provider・${p.describe}")
+      catch case e: SecurityException =>
+        Log.w("location permission missing", e)
+        LifeLog.add(LifeKind.Note, s"位置情報の要求を拒否された: ${LifeLog.describe(e)}")
 
     // Satellite status for the sky plot while the GNSS engine is on anyway.
     val wantStatus = p.source == LocationSource.Gnss
@@ -276,8 +325,17 @@ class LoggerService extends Service:
       accelReg = p.accelHz
 
     updatePdr()
-    if p.accelHz == 0 && estimator.current == MotionState.Stationary then armSigMotion()
-    else disarmSigMotion()
+    val still = p.accelHz == 0 && estimator.current == MotionState.Stationary
+    if still then armSigMotion() else disarmSigMotion()
+    if still != stillLogged then
+      stillLogged = still
+      if still then
+        stepWake.reset()
+        LifeLog.add(LifeKind.StillEnter,
+          (if sigMotionArmed then "significant motion で再開" else "significant motion なし: 歩数でのみ再開") + s"・${p.describe}")
+      else
+        LifeLog.add(LifeKind.StillExit, (if wakeReason.nonEmpty then wakeReason else "設定・状態の変化") + s"・${p.describe}")
+    wakeReason = ""
     LoggerState.sensors = SensorState(accelReg, if accelReg > 0 then p.accelBatchMs else 0L, sigMotionArmed, pdrSensors,
       recorder.map(_.imuHz).getOrElse(0), accelSince)
 
@@ -314,11 +372,15 @@ class LoggerService extends Service:
 
   private val sigMotionListener = new TriggerEventListener:
     override def onTrigger(event: TriggerEvent): Unit =
+      motionWake.acquire(10_000)
       handler.post { () =>
-        sigMotionArmed = false
-        estimator.wake()
-        motionSince = System.currentTimeMillis()
-        evaluate(force = true)
+        try
+          sigMotionArmed = false
+          wakeReason = "significant motion"
+          estimator.wake()
+          motionSince = System.currentTimeMillis()
+          evaluate(force = true)
+        finally motionWake.release()
       }
 
   private def armSigMotion(): Unit =
@@ -337,8 +399,9 @@ class LoggerService extends Service:
   private val locationListener = new LocationListener:
     override def onLocationChanged(l: Location): Unit = onLocations(Seq(l))
     override def onLocationChanged(ls: java.util.List[Location]): Unit = onLocations(ls.asScala.toSeq)
-    override def onProviderDisabled(provider: String): Unit = ()
-    override def onProviderEnabled(provider: String): Unit = ()
+    // The request stays registered: fixes resume when the provider is back.
+    override def onProviderDisabled(provider: String): Unit = LifeLog.add(LifeKind.Provider, s"$provider 無効（位置情報オフ）")
+    override def onProviderEnabled(provider: String): Unit = LifeLog.add(LifeKind.Provider, s"$provider 有効")
 
   private def onLocations(ls: Seq[Location]): Unit =
     for l <- ls do
@@ -467,10 +530,15 @@ class LoggerService extends Service:
                 LoggerState.recentSteps = (LoggerState.recentSteps :+ (wall, d)).filter(_._1 >= wall - 5 * 60_000)
               }
               // Steps while "stationary" (accelerometer off) mean we are moving.
-              if accelReg == 0 && estimator.current == MotionState.Stationary && d >= 10 then
-                estimator.wake()
-                motionSince = System.currentTimeMillis()
-                evaluate(force = true)
+              // Counted across deliveries: the counter may report each step
+              // on its own, so "10 in one delivery" could never happen.
+              if accelReg == 0 && estimator.current == MotionState.Stationary then
+                if stepWake.add(wall, d) then
+                  wakeReason = "歩数"
+                  estimator.wake()
+                  motionSince = System.currentTimeMillis()
+                  evaluate(force = true)
+              else stepWake.reset()
           lastStepCount = total
         case _ => ()
 
@@ -563,12 +631,36 @@ object LoggerService:
       // Starting a foreground service only to stop it crashes the app when
       // startForeground() is never reached: stop it directly instead.
       Settings.loggingEnabled = false
+      stopRequested = "user"
       ctx.stopService(Intent(ctx, classOf[LoggerService]))
     // A location service without location permission is refused by the OS
     // (e.g. settings restored or imported before permissions were granted).
     else if hasLocationPermission(ctx) then
       ctx.startForegroundService(Intent(ctx, classOf[LoggerService]).setAction(action))
     else Log.w(s"not starting the logger ($action): no location permission")
+
+  /** Set by [[send]] before stopping the service: why it ends. */
+  @volatile private[ashidori] var stopRequested: String = null
+
+  /** Starts logging again from the background (boot, the watchdog). Failures
+    * are logged and shown to the user instead of being lost in logcat.
+    */
+  def restart(ctx: Context, where: String): Unit =
+    val bgLocation =
+      ctx.checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    if !hasLocationPermission(ctx) then
+      LifeLog.add(LifeKind.ForegroundFailed, s"$where: 位置情報の権限なし")
+      LifeLog.notifyStopped(ctx, "位置情報の権限がありません")
+    // Without 「常に許可」 Android 14+ refuses a location foreground service
+    // started from the background (SecurityException in startForeground).
+    else if !bgLocation then
+      LifeLog.add(LifeKind.ForegroundFailed, s"$where: 位置情報が「常に許可」でないため開始できない")
+      LifeLog.notifyStopped(ctx, "位置情報が「常に許可」ではありません")
+    else
+      try send(ctx, ActionStart)
+      catch case e: Exception =>
+        LifeLog.add(LifeKind.ForegroundFailed, s"$where: ${LifeLog.describe(e)}")
+        LifeLog.notifyStopped(ctx, "バックグラウンドから再開できませんでした")
 
   def hasLocationPermission(ctx: Context): Boolean =
     Seq(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)

@@ -29,6 +29,10 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val sections = mutable.LinkedHashMap.empty[String, String]
   private val body = mono("")
   private val probeButton = button("GNSS 60秒テスト（屋外で）", tonal = true)(runProbe())
+  /** Recording in the background: what allows it, gaps, and the lifecycle log. */
+  private val recording = vbox()
+  /** The same as plain text, for the copied report. */
+  private var recordingText = ""
 
   private val debuggable =
     (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -53,12 +57,14 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
             else Nil
           ))*
         ),
+        recording,
         card(body),
         spacer(24)
       )
     )
 
   override def onShow(): Unit =
+    showRecording()
     sections.clear()
     sections("device") = device()
     sections("gnss") = gnss()
@@ -82,8 +88,111 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
 
   private def copy(): Unit =
     val cm = act.getSystemService(classOf[ClipboardManager])
-    cm.setPrimaryClip(ClipData.newPlainText("ashidori diagnostics", s"ashidori ${BuildInfo.versionName}\n" + body.getText))
+    cm.setPrimaryClip(ClipData.newPlainText("ashidori diagnostics",
+      s"ashidori ${BuildInfo.versionName}\n" + recordingText + "\n\n" + body.getText))
     Toast.makeText(act, "コピーしました", Toast.LENGTH_SHORT).show()
+
+  // --- recording in the background ----------------------------------------------------
+
+  private val stampFmt = java.time.format.DateTimeFormatter.ofPattern("M/d HH:mm")
+  private val fullFmt = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+  private def stamp(t: Long) = java.time.Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(stampFmt)
+  private def full(t: Long) = java.time.Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(fullFmt)
+
+  /** Rows shown; the copied report has every entry. */
+  private val EventRows = 60
+  private val GapMinMs = 30 * 60_000L
+  private val GapDays = 7
+
+  private def row(title: String, sub: CharSequence = "", value: CharSequence = "", bad: Boolean = false)(onTap: Option[() => Unit] = None): ListRow =
+    val r = ListRow(act)
+    r.title.setText(title)
+    r.setSubtitle(sub)
+    r.setValue(value)
+    if bad then (if value.length > 0 then r.value else r.title).setTextColor(color(attr.error))
+    onTap.foreach { f =>
+      r.onTap(f())
+      r.trailing(icon(net.sksat.ashidori.R.drawable.ic_chevron_right))
+    }
+    r
+
+  private def openAppSettings(): Unit =
+    act.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+      android.net.Uri.parse(s"package:${act.getPackageName}")))
+
+  private def showRecording(): Unit =
+    val h = LifeLog.health(act)
+    // Pixel's 「アプリの電池使用量」: 制限なし = exempt from battery
+    // optimization, 制限 = background restricted, otherwise 最適化.
+    val battery =
+      if h.backgroundRestricted then "制限" else if h.batteryExempt then "制限なし" else "最適化"
+    val location =
+      if !h.fineLocation then "許可なし" else if h.backgroundLocation then "常に許可" else "使用中のみ"
+    val running = LoggerState.running
+    recording.removeAllViews()
+    recording.addView(sectionHeader("バックグラウンドでの記録"))
+    recording.addView(listGroup(
+      row("記録サービス", if Settings.loggingEnabled then "" else "記録はオフ",
+        if running then "動作中" else "停止中", bad = Settings.loggingEnabled && !running)(),
+      row("位置情報の許可", "自動での再開に「常に許可」が必要",
+        location, bad = location != "常に許可")(Some(() => openAppSettings())),
+      row("アプリの電池使用量", "自動での再開に「制限なし」が必要",
+        battery, bad = battery != "制限なし")(Some(() =>
+          if battery == "最適化" then
+            act.startActivity(android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+              android.net.Uri.parse(s"package:${act.getPackageName}")))
+          else openAppSettings())),
+      row("端末の位置情報", "", if h.locationOn then "オン" else "オフ", bad = !h.locationOn)(),
+      row("アプリスタンバイ", "定期確認の頻度を OS が決める区分", PlatformCodes.standbyBucket(h.standbyBucket))()
+    ))
+    val gapsBox = vbox()
+    val eventsBox = vbox()
+    recording.addView(sectionHeader(s"記録の途切れ（直近${GapDays}日・${GapMinMs / 60_000}分以上）"))
+    recording.addView(gapsBox)
+    recording.addView(supportingText("精度 100 m 以内の測位がない時間。原因は下の動作の記録から推定する。静止中の途切れは正常。"))
+    recording.addView(sectionHeader("動作の記録"))
+    recording.addView(eventsBox)
+    recording.addView(supportingText(s"新しい順に${EventRows}件。「レポートをコピー」にはすべて（最大${LifeLog.Keep * 2}件）を含める。位置は記録しない。"))
+    recordingText = s"## recording\nservice=${if running then "running" else "stopped"} enabled=${Settings.loggingEnabled} ${h.summary}"
+    gapsBox.addView(listGroup(row("読み込み中…")()))
+    AshidoriApp.io.execute { () =>
+      LifeLog.recordExitReasons()
+      val events = LifeLog.read()
+      val now = System.currentTimeMillis()
+      val from = now - GapDays * 86_400_000L
+      val times = scala.util.Try(AshidoriApp.db.fixesSampled(from, now, 60_000L).map(_.time)).getOrElse(Vector.empty) ++
+        LoggerState.recentFixes.filter(f => !f.hasAccuracy || f.accuracy < 100).map(_.time)
+      // Before the first event there is nothing to explain a gap with.
+      val start = math.max(from, events.headOption.map(_.time).getOrElse(now))
+      val gaps = RecordingGaps.explain(RecordingGaps.find(times, start, now, GapMinMs), events).reverse
+      act.runOnUiThread { () =>
+        gapsBox.removeAllViews()
+        gapsBox.addView(listGroup(
+          (if gaps.isEmpty then Seq(row("なし")())
+           else gaps.take(30).map { g =>
+             val bad = g.cause == GapCause.ServiceDown || g.cause == GapCause.Unknown
+             row(s"${stamp(g.start)} – ${stamp(g.end)}（${fmtDuration(g.durationMs)}）",
+               g.cause.label + (if g.events.nonEmpty then s"・その間の記録 ${g.events.size}件" else ""))()
+               .tap(r => if bad then r.subtitle.setTextColor(color(attr.error)))
+           })*))
+        eventsBox.removeAllViews()
+        eventsBox.addView(listGroup(
+          (if events.isEmpty then Seq(row("まだありません")())
+           else events.reverse.take(EventRows).map { e =>
+             // The time stays quiet; a problem shows in the title.
+             val r = row(e.label, e.detail, stamp(e.time))()
+             r.value.setTextColor(color(attr.onSurfaceVariant))
+             if e.problem then r.title.setTextColor(color(attr.error))
+             r
+           })*))
+        recordingText = recordingText +
+          "\n\n## gaps\n" + (if gaps.isEmpty then "none" else gaps.map(g =>
+            s"${full(g.start)} - ${full(g.end)} (${fmtDuration(g.durationMs)}) ${g.cause} events=${g.events.size}").mkString("\n")) +
+          "\n\n## lifecycle\n" + events.map(e => s"${full(e.time)} ${e.kind.key} ${e.detail}").mkString("\n")
+      }
+    }
+
+  extension (r: ListRow) private def tap(f: ListRow => Unit): ListRow = { f(r); r }
 
   // --- sections -----------------------------------------------------------------
 
