@@ -15,9 +15,17 @@ import Ui.*
 
 /** The day's route drawn without a map: legs in transport mode colors and
   * stays as dots, fitted to the view. Cheap enough for every card in a feed
-  * and works offline.
+  * and works offline. With [[grid]] it is drawn on a faint square grid:
+  * the picture stands for a map that is missing, not one still loading.
   */
 final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Seq[LatLng]) extends View(c):
+  private var gridOn = false
+  def grid: Boolean = gridOn
+  def grid_=(on: Boolean): Unit =
+    if on != gridOn then
+      gridOn = on
+      invalidate()
+  private val gridPaint = MapGrid.paint(c)
   private given Context = c
   private val line = Paint(Paint.ANTI_ALIAS_FLAG)
   line.setStyle(Paint.Style.STROKE)
@@ -33,6 +41,7 @@ final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Se
     val h = getHeight.toFloat
     val r = Ui.dp(12).toFloat
     canvas.drawRoundRect(RectF(0, 0, w, h), r, r, bg)
+    if gridOn then MapGrid.draw(canvas, w, h, gridPaint)
     val pts = legs.flatMap(_._1) ++ stays
     if pts.isEmpty then return
     // Equirectangular projection around the day's mean latitude.

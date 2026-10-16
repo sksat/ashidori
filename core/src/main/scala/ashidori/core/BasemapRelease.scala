@@ -130,6 +130,10 @@ object ResumableDownload:
     * fix; `status` is the HTTP status when that was the answer.
     */
   final class Refused(msg: String, val status: Option[Int] = None) extends IOException(msg)
+  /** The server answered an HTTP status that may change later (5xx, 408,
+    * 429, an unexpected redirect): worth retrying after a while.
+    */
+  final class HttpFailure(msg: String, val status: Int) extends IOException(msg)
 
   enum Plan:
     /** 206 from where the partial file ends: append. */
@@ -185,7 +189,8 @@ object ResumableDownload:
               part.delete()
               if attempts >= 2 then throw Refused("range not satisfiable")
             case Plan.Fail(r) =>
-              if res.code == 404 || res.code == 410 || res.code == 403 then throw Refused(r, Some(res.code))
+              if DownloadRetry.permanentStatus(res.code) then throw Refused(r, Some(res.code))
+              else if res.code >= 300 then throw HttpFailure(r, res.code)
               else throw IOException(r)
         finally res.close()
         val now = if part.isFile then part.length else 0L

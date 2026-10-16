@@ -43,8 +43,8 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
   * Without the on-device map's data ([[Outcome.NoBasemap]]) it draws the
   * routes and stays on a plain canvas, still panned and zoomed as a map.
   * With the setting on, a card then offers the download and this view's
-  * online map; with it off (the user chose the offline map), only a small
-  * 「地図なし」 mark shows, and the settings offer the download.
+  * online map; with it off (the user chose the offline map), the chip of
+  * the timeline's cards ([[NoBasemapChip]]) says so and offers the download.
   */
 final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
@@ -143,7 +143,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   // ---- without a base map (setting on): why, and the two ways to a map ----
   private val noMapTitle = Ui.text("", 13f, bold = true)(using act)
   private val downloadButton =
-    compact(Ui.button(BasemapUi.downloadLabel)(BasemapUi.requestDownload(act))(using act))
+    compact(Ui.button(BasemapUi.downloadLabel(BasemapDownload.status))(BasemapUi.requestDownload(act))(using act))
   private val grantButton =
     val b = compact(Ui.button("", tonal = true)(setDetailed(true))(using act))
     b.setText(TrackMap.twoLines(TrackMap.DetailLabel, TrackMap.KeptLine))
@@ -168,9 +168,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     card.setVisibility(android.view.View.GONE)
     card
 
-  /** Without a base map and with the setting off: a quiet mark only. */
+  /** Without a base map and with the setting off: the chip of the
+    * timeline's cards ([[NoBasemapChip]]) where the detail button would be.
+    */
   private val noMapBadge =
-    val b = DayMap.noMapBadge(act)
+    val b = NoBasemapChip(act)
     val m = Ui.dp(10)(using act)
     val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
       (if controlsOnTop then Gravity.TOP else Gravity.BOTTOM) | Gravity.END)
@@ -186,10 +188,15 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private def updateNoMap(): Unit =
     val offer = shown.exists(o => BaseMapPolicy.offerAlternatives(Settings.blockExternalLocation, o))
     noMapCard.setVisibility(if offer then android.view.View.VISIBLE else android.view.View.GONE)
-    noMapBadge.setVisibility(if noMap && !offer then android.view.View.VISIBLE else android.view.View.GONE)
+    noMapBadge.show(noMap && !offer)
     if offer then
       val st = BasemapDownload.status
       noMapTitle.setText(BasemapUi.cardTitle(st))
+      // A failure is the exception: its reason in the error colour.
+      noMapTitle.setTextColor(Ui.color(st match
+        case _: BasemapStatus.Failed => Ui.attr.error
+        case _ => Ui.attr.onSurface)(using act))
+      downloadButton.setText(BasemapUi.downloadLabel(st))
       downloadButton.setVisibility(if BasemapUi.offersDownload(st) then android.view.View.VISIBLE else android.view.View.GONE)
 
   private def updateDetailButton(): Unit =

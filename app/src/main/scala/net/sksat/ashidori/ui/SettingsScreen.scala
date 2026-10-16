@@ -116,20 +116,28 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     row.value.setTextColor(ModeInfo.color(m))
     row.setSubtitle(ModeInfo.battery(m))
 
-  private def basemapLine(st: BasemapStatus): String =
-    (Seq(BasemapUi.statusLine(st)) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty)).mkString("・")
+  /** A download row's one line, in the error colour while its last attempt failed. */
+  private def showDownload(row: ListRow, st: BasemapStatus, line: String): Unit =
+    row.setSubtitle(line)
+    row.subtitle.setTextColor(color(st match
+      case _: BasemapStatus.Failed => attr.error
+      case _ => attr.onSurfaceVariant))
+  private def showBasemap(row: ListRow): Unit =
+    val st = BasemapDownload.status
+    showDownload(row, st, BasemapUi.rowLine(st, Basemap.sizeLabel))
+  private def showVenues(row: ListRow): Unit =
+    val st = VenueDownload.status
+    showDownload(row, st, VenueDataUi.rowLine(st))
 
   private val list = vbox()
   val view: View = scroll(list)
 
   /** The 簡易地図 row, kept current while the download runs. */
   private var basemapRow: Option[ListRow] = None
-  private val stopBasemap = BasemapDownload.listen(() =>
-    basemapRow.foreach(_.setSubtitle(basemapLine(BasemapDownload.status))))
+  private val stopBasemap = BasemapDownload.listen(() => basemapRow.foreach(showBasemap))
   /** The 施設データ row, likewise. */
   private var venuesRow: Option[ListRow] = None
-  private val stopVenues = VenueDownload.listen(() =>
-    venuesRow.foreach(_.setSubtitle(VenueDataUi.rowLine(VenueDownload.status))))
+  private val stopVenues = VenueDownload.listen(() => venuesRow.foreach(showVenues))
   override def onDestroy(): Unit =
     stopBasemap()
     stopVenues()
@@ -149,9 +157,11 @@ final class SettingsScreen(act: MainActivity) extends Screen:
         TrackMap.privacyChanged(act)
       }))
 
-    val basemap = navRow("簡易地図", basemapLine(BasemapDownload.status))(BasemapUi.showDialog(act))
+    val basemap = navRow("簡易地図", " ")(BasemapUi.showDialog(act))
+    showBasemap(basemap)
     basemapRow = Some(basemap)
-    val venues = navRow("施設データ", VenueDataUi.rowLine(VenueDownload.status))(VenueDataUi.showDialog(act))
+    val venues = navRow("施設データ", " ")(VenueDataUi.showDialog(act))
+    showVenues(venues)
     venuesRow = Some(venues)
     // Open (check) the installed index, so an unreadable one shows here.
     AshidoriApp.io.execute { () =>

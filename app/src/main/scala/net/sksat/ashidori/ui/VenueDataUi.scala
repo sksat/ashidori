@@ -12,17 +12,13 @@ object VenueDataUi:
     "施設データは日本全体をまとめて取得するため、位置情報は送信しません。端末内での施設の検索も送信しません。"
 
   def statusLine(st: BasemapStatus): String = st match
-    case BasemapStatus.Unavailable => "このビルドでは利用できません"
-    case BasemapStatus.Missing => "未取得"
-    case BasemapStatus.Waiting(metered) => if metered then "ダウンロード待ち" else "未取得（Wi-Fi 接続時にダウンロード）"
-    case BasemapStatus.Running(d, t, _) => s"ダウンロード中 ${BasemapUi.percent(d, t)}%"
-    case BasemapStatus.Installed(v, _) => if VenueData.broken then s"読み込めません（v$v、再取得してください）" else s"取得済み v$v"
-    case BasemapStatus.Failed(msg, retrying) => s"失敗: $msg" + (if retrying then "（自動で再試行します）" else "")
-    case BasemapStatus.NotPublished => "施設データは現在配信されていません"
+    case BasemapStatus.Installed(v, _) if VenueData.broken => s"読み込めません（v$v、再取得してください）"
+    case _ => BasemapUi.pinnedStatusLine(st)
 
-  /** Settings row: status and size. */
-  def rowLine(st: BasemapStatus): String =
-    (Seq(statusLine(st)) ++ Option(VenueData.sizeLabel).filter(_.nonEmpty)).mkString("・")
+  /** Settings row: status and size (not with a failure: one line). */
+  def rowLine(st: BasemapStatus): String = st match
+    case BasemapStatus.Installed(_, _) if VenueData.broken => statusLine(st)
+    case _ => BasemapUi.rowLine(st, VenueData.sizeLabel)
 
   private def metered(act: MainActivity): Boolean =
     act.getSystemService(classOf[ConnectivityManager]).isActiveNetworkMetered
@@ -51,7 +47,7 @@ object VenueDataUi:
       "チェックインの候補となる日本の施設（OpenStreetMap）のデータです。端末内で検索するため、通信できない場所でも候補を表示します。",
       "",
       "状態: " + statusLine(st)
-    ) ++ date ++ BasemapUi.sourceLine(st) ++ Option(VenueData.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++
+    ) ++ BasemapUi.failureLines(st) ++ date ++ BasemapUi.sourceLine(st) ++ Option(VenueData.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++
       Seq("", PrivacyNote)
     val b = MaterialAlertDialogBuilder(act).setTitle("施設データ").setMessage(body.mkString("\n"))
     st match
@@ -63,8 +59,8 @@ object VenueDataUi:
         b.setNegativeButton("中止して削除", (_, _) => VenueDownload.delete(act))
         if st == BasemapStatus.Waiting(false) then
           b.setPositiveButton("今すぐダウンロード", (_, _) => requestDownload(act))
-      case BasemapStatus.Failed(_, _) | BasemapStatus.NotPublished =>
-        b.setPositiveButton("再試行", (_, _) => requestDownload(act))
+      case BasemapStatus.Failed(_, _, _) =>
+        b.setPositiveButton("今すぐ再試行", (_, _) => requestDownload(act))
         b.setNegativeButton("削除", (_, _) => VenueDownload.delete(act))
       case BasemapStatus.Missing =>
         b.setPositiveButton("ダウンロード", (_, _) => requestDownload(act))

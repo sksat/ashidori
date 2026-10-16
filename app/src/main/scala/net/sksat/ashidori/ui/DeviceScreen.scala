@@ -180,9 +180,9 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
         stopMap()
         frame.addView(PositionSketchView(act, acc / (2 * half), dotColor),
           FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        val badge = DayMap.noMapBadge(act)
-        badge.setVisibility(View.VISIBLE)
-        frame.addView(badge)
+        val chip = DayMap.noMapChip(act)
+        frame.addView(chip)
+        chip.show(true)
         return frame
     val dLat = half / 111_320.0
     val dLon = half / (111_320.0 * math.cos(math.toRadians(f.lat)))
@@ -242,8 +242,11 @@ final class PositionSketchView(c: android.content.Context, accFraction: Double, 
   private val fill = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
   private val stroke = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
   stroke.setStyle(android.graphics.Paint.Style.STROKE)
+  private val grid = MapGrid.paint(c)
 
   override def onDraw(canvas: android.graphics.Canvas): Unit =
+    // No base map (it is only drawn so): the same grid as the timeline's cards.
+    MapGrid.draw(canvas, getWidth.toFloat, getHeight.toFloat, grid)
     val (cx, cy) = (getWidth / 2f, getHeight / 2f)
     val r = (accFraction * math.min(getWidth, getHeight)).toFloat
     if r > 0 then

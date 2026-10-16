@@ -61,10 +61,11 @@ enum BasemapStatus:
   case Waiting(metered: Boolean)
   case Running(done: Long, total: Long, source: BasemapSource)
   case Installed(version: String, source: Option[BasemapSource])
-  /** `retrying`: WorkManager runs it again later by itself. */
-  case Failed(message: String, retrying: Boolean)
-  /** No source has the pinned archive (each answered 404): not published yet. */
-  case NotPublished
+  /** The last attempt failed (`failure`, with its cause and when). `queued`:
+    * it runs again by itself, at `failure.retryAt` or as soon as allowed
+    * (on an unmetered network unless `metered`).
+    */
+  case Failed(failure: DownloadFailure, queued: Boolean, metered: Boolean)
 
 /** Downloads the pinned basemap archive once, in the background
   * ([[BasemapWorker]]). See [[PinnedDownload]].
@@ -91,9 +92,6 @@ object VenueDownload extends PinnedDownload(VenueData, "venues", "venues-downloa
   */
 class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: String,
                      worker: Class[? <: ListenableWorker], val server: Boolean):
-  /** Runs before the error is shown as final; later runs only by request or at the next start. */
-  val MaxAttempts = 4
-
   private def prefs = AshidoriApp.app.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
   def debuggable: Boolean =
@@ -109,8 +107,13 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
   /** Where the installed copy came from. */
   def installedSource: Option[BasemapSource] = BasemapSource.fromKey(prefs.getString("source", ""))
 
-  /** Stored as the error when no source has the archive. */
-  private val NotPublishedError = "not-published"
+  /** The stored failure, if it is about the pinned version. */
+  def failure: Option[DownloadFailure] =
+    data.pin.flatMap(p => DownloadRetry.current(storedFailure, p.version))
+  private def storedFailure: Option[DownloadFailure] =
+    Option(prefs.getString("failure", "")).flatMap(DownloadFailure.decode)
+  private def putFailure(e: android.content.SharedPreferences.Editor, f: Option[DownloadFailure]) =
+    e.putString("failure", f.fold("")(DownloadFailure.encode)).remove("error")
 
   @volatile private var progress: Option[(Long, Long, BasemapSource)] = None
 
@@ -124,12 +127,13 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
             progress match
               case Some((d, t, s)) => BasemapStatus.Running(d, t, s)
               case None =>
-                val err = prefs.getString("error", "")
                 val queued = prefs.getBoolean("queued", false)
-                if err == NotPublishedError && !queued then BasemapStatus.NotPublished
-                else if err.nonEmpty && err != NotPublishedError then BasemapStatus.Failed(err, queued)
-                else if queued then BasemapStatus.Waiting(prefs.getBoolean("metered", false))
-                else BasemapStatus.Missing
+                val metered = prefs.getBoolean("metered", false)
+                failure match
+                  case Some(f) => BasemapStatus.Failed(f, queued, metered)
+                  case None =>
+                    if queued then BasemapStatus.Waiting(metered)
+                    else BasemapStatus.Missing
 
   // ---- listeners (main thread) ----
   private val listeners = scala.collection.mutable.LinkedHashSet.empty[() => Unit]
@@ -139,39 +143,46 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
   /** Tells the UI (on the main thread) that [[status]] or the installed data changed. */
   def changed(): Unit = AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
 
-  private def request(allowMetered: Boolean, data: Data = Data.EMPTY): OneTimeWorkRequest =
-    OneTimeWorkRequest.Builder(worker)
+  /** `delayMs`: not before then (the cool-down after a run given up). */
+  private def request(allowMetered: Boolean, delayMs: Long = 0): OneTimeWorkRequest =
+    val b = OneTimeWorkRequest.Builder(worker)
       .setConstraints(Constraints.Builder()
         .setRequiredNetworkType(if allowMetered then NetworkType.CONNECTED else NetworkType.UNMETERED)
         .setRequiresStorageNotLow(true)
         .build())
+      // Transient failures only ([[DownloadRetry]]): 1, 2, 4 minutes.
       .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
-      .setInputData(data)
-      .build()
+    if delayMs > 0 then b.setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+    b.build()
 
   /** The user asked for the download (or a retry). Replaces queued work, so
-    * a confirmation for a metered network takes effect at once.
+    * a confirmation for a metered network takes effect at once. The last
+    * failure stays shown until it succeeds; its cool-down starts over.
     */
   def start(ctx: Context, allowMetered: Boolean): Unit =
     if data.pin.nonEmpty then
-      prefs.edit().putBoolean("queued", true).putBoolean("metered", allowMetered)
-        .putString("error", "").putBoolean("declined", false).apply()
+      val e = prefs.edit().putBoolean("queued", true).putBoolean("metered", allowMetered).putBoolean("declined", false)
+      putFailure(e, DownloadRetry.userRetry(failure)).apply()
       WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.REPLACE, request(allowMetered))
       changed()
 
-  /** At app start: queue the first download on an unmetered network, unless
-    * it is there or the user deleted it. Leaves queued work as it is.
+  /** At app start: queue the download on an unmetered network, unless it is
+    * there or the user deleted it; after a run given up, not before its
+    * cool-down ends. Leaves queued work (also a scheduled retry) as it is.
     */
   def autoStart(ctx: Context): Unit =
-    if data.pin.nonEmpty && !data.installed && !prefs.getBoolean("declined", false) then
-      val metered = prefs.getBoolean("queued", false) && prefs.getBoolean("metered", false)
-      prefs.edit().putBoolean("queued", true).putBoolean("metered", metered).putString("error", "").apply()
-      WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(metered))
+    data.pin.foreach { p =>
+      if !data.installed && !prefs.getBoolean("declined", false) then
+        val metered = prefs.getBoolean("queued", false) && prefs.getBoolean("metered", false)
+        prefs.edit().putBoolean("queued", true).putBoolean("metered", metered).remove("error").apply()
+        val delay = DownloadRetry.autoStartDelay(storedFailure, p.version, System.currentTimeMillis())
+        WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(metered, delay))
+    }
 
   /** Debug builds: installs `file` (pushed with adb) instead of downloading. */
   def importFile(ctx: Context, file: File): Unit =
     if debuggable && data.pin.nonEmpty then
-      prefs.edit().putBoolean("queued", true).putString("error", "").putBoolean("declined", false).apply()
+      putFailure(prefs.edit().putBoolean("queued", true).putBoolean("declined", false), None).apply()
       WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.REPLACE,
         OneTimeWorkRequest.Builder(worker)
           .setInputData(Data.Builder().putString(BasemapWorker.ImportKey, file.getAbsolutePath).build()).build())
@@ -188,7 +199,7 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
   /** Stops a download and deletes all its files; no automatic download until [[start]]. */
   def delete(ctx: Context): Unit =
     WorkManager.getInstance(ctx).cancelUniqueWork(WorkName)
-    prefs.edit().putBoolean("declined", true).putBoolean("queued", false).putString("error", "").remove("source").apply()
+    putFailure(prefs.edit().putBoolean("declined", true).putBoolean("queued", false).remove("source"), None).apply()
     progress = None
     AshidoriApp.io.execute { () =>
       data.deleteAll()
@@ -201,17 +212,26 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     changed()
   private[ashidori] def succeeded(source: BasemapSource): Unit =
     progress = None
-    prefs.edit().putString("source", source.key).putBoolean("queued", false).putString("error", "").commit()
+    putFailure(prefs.edit().putString("source", source.key).putBoolean("queued", false), None).commit()
     changed()
-  private[ashidori] def failed(message: String, retrying: Boolean): Unit =
+  /** Attempt `runAttempt` of a run failed: stores the failure and says
+    * whether the run retries ([[DownloadRetry]]). A run given up schedules
+    * the next one after its cool-down, appended to this one (which must
+    * then end as a success, or WorkManager would drop the appended run).
+    */
+  private[ashidori] def failed(ctx: Context, version: String, cause: DownloadCause,
+                               sources: Seq[(String, DownloadCause)], runAttempt: Int): DownloadRetry.Next =
     progress = None
-    prefs.edit().putString("error", message).putBoolean("queued", retrying).commit()
+    val now = System.currentTimeMillis()
+    val (f, next) = DownloadRetry.afterFailure(version, now, cause, sources, runAttempt, storedFailure)
+    putFailure(prefs.edit().putBoolean("queued", true), Some(f)).commit()
+    next match
+      case DownloadRetry.Next.Later(at) =>
+        WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.APPEND_OR_REPLACE,
+          request(prefs.getBoolean("metered", false), math.max(0L, at - now)))
+      case DownloadRetry.Next.Backoff => ()
     changed()
-  /** Every source answered that it has no such file: not retried until asked for. */
-  private[ashidori] def notPublished(): Unit =
-    progress = None
-    prefs.edit().putString("error", NotPublishedError).putBoolean("queued", false).commit()
-    changed()
+    next
 
 /** HttpURLConnection for [[ResumableDownload]]: a plain GET (no token, no
   * cookies), uncompressed so byte ranges mean bytes of the file.
@@ -274,7 +294,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
             val (archive, source) = Option(getInputData.getString(ImportKey)).filter(_ => dl.debuggable) match
               case Some(path) =>
                 val f = File(path)
-                if !Sha256.matches(f, pin) then throw BasemapError(s"${f.getName} は指定のファイルと一致しません")
+                if !Sha256.matches(f, pin) then throw PinnedFailure(DownloadCause.Mismatch)
                 (f, BasemapSource.LocalFile)
               case None => download(pin)
             data.lock.synchronized {
@@ -294,21 +314,20 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
           case _: ResumableDownload.Cancelled =>
             dl.reportProgress(None)
             ListenableWorker.Result.retry()
-          case _: NotPublished =>
-            Log.w(s"$name ${pin.version}: no source has it")
-            dl.notPublished()
-            ListenableWorker.Result.failure()
+          // Replaced or cancelled meanwhile (e.g. a retry the user asked
+          // for): what this run ran into no longer matters.
+          case _: Exception if isStopped =>
+            dl.reportProgress(None)
+            ListenableWorker.Result.retry()
           case e: Exception =>
-            Log.w(s"$name download failed", e)
-            val last = getRunAttemptCount + 1 >= dl.MaxAttempts
-            dl.failed(message(e), retrying = !last)
-            if last then ListenableWorker.Result.failure() else ListenableWorker.Result.retry()
-
-  private def message(e: Exception): String = e match
-    case _: java.net.UnknownHostException | _: java.net.ConnectException | _: java.net.SocketTimeoutException =>
-      "接続できませんでした"
-    case e: BasemapError => e.getMessage
-    case e => s"取得できませんでした（${Option(e.getMessage).getOrElse(e.getClass.getSimpleName).take(100)}）"
+            val (cause, sources) = e match
+              case f: PinnedFailure => (f.problem, f.sources)
+              case other => (DownloadCause.of(other), Seq.empty)
+            Log.w(s"$name ${pin.version} failed (attempt ${getRunAttemptCount + 1}): ${DownloadCause.label(cause)}", e)
+            dl.failed(getApplicationContext, pin.version, cause, sources, getRunAttemptCount) match
+              case DownloadRetry.Next.Backoff => ListenableWorker.Result.retry()
+              // The next run is appended to this one: it must end as a success.
+              case DownloadRetry.Next.Later(_) => ListenableWorker.Result.success()
 
   /** The pinned archive in the download directory, and where it came from. */
   private def download(pin: BasemapPin): (File, BasemapSource) =
@@ -318,7 +337,8 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     // Room for the rest of the archive and its extraction.
     val need = (pin.bytes - (if part.isFile then part.length else 0L)) + pin.bytes + 16L * 1024 * 1024
     if part.getParentFile.getUsableSpace < need then
-      throw BasemapError(s"空き容量が不足しています（約 ${need / 1_000_000} MB 必要）")
+      Log.w(s"$name: about ${need / 1_000_000} MB needed")
+      throw PinnedFailure(DownloadCause.Storage)
 
     val sources: Seq[(BasemapSource, String)] = dl.debugUrl match
       case Some(base) => Seq(BasemapSource.DebugUrl -> BasemapSource.debugUrl(base, pin))
@@ -333,8 +353,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
           case s => s -> BasemapSource.githubUrl(pin)
         }
 
-    var lastError: Exception = IOException("no source")
-    val errors = scala.collection.mutable.ArrayBuffer.empty[Exception]
+    val errors = scala.collection.mutable.ArrayBuffer.empty[(BasemapSource, DownloadCause)]
     val found = sources.iterator.map { (source, url) =>
       try
         var shown = -1L
@@ -348,23 +367,23 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
         else
           // Bytes from either source must be the pinned ones; start over.
           part.delete()
-          lastError = BasemapError(s"データの照合に失敗しました（${source.label}）")
-          errors += lastError
+          Log.w(s"$name from ${source.key}: checksum mismatch")
+          errors += source -> DownloadCause.Mismatch
           None
       catch
         case e: ResumableDownload.Cancelled => throw e
         case e: Exception =>
           Log.w(s"$name from ${source.key} failed", e)
-          lastError = e
-          errors += e
+          errors += source -> DownloadCause.of(e)
           None
     }.collectFirst { case Some(r) => r }
-    found.getOrElse(throw (if BasemapSource.notPublished(errors.toSeq) then NotPublished() else lastError))
+    // The first source tried is the reason shown; each one's is kept.
+    found.getOrElse(throw PinnedFailure(errors.headOption.fold(DownloadCause.Network)(_._2),
+      errors.toSeq.map((s, c) => s.label -> c)))
 
 object BasemapWorker:
   val ImportKey = "import"
-  /** No source has the pinned archive. */
-  final class NotPublished extends IOException("not published")
 
-/** A failure with a message for the user. */
-final class BasemapError(message: String) extends IOException(message)
+/** A failed run, with the cause shown and each source's cause. */
+final class PinnedFailure(val problem: DownloadCause, val sources: Seq[(String, DownloadCause)] = Seq.empty)
+  extends IOException(DownloadCause.label(problem))

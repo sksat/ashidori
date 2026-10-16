@@ -23,23 +23,43 @@ import Ui.*
   * a time and cached; without tiles (offline) the plain sketch stays.
   *
   * Without a base map to draw ([[Outcome.NoBasemap]]: the offline map is
-  * needed and not downloaded) MapLibre is not run: the card shows the
-  * sketch, marked 「地図なし」. When the basemap is installed (or removed),
-  * the snapshots of the offline map are dropped and the cards drawn again.
+  * needed and not downloaded) MapLibre is not run: the card, at the same
+  * height, shows the sketch on a faint grid with a chip saying so and
+  * offering the download ([[NoBasemapChip]], top left, clear of the feed's
+  * button). While a snapshot is pending it is the plain sketch. When the
+  * basemap is installed (or removed), the snapshots of the offline map are
+  * dropped and the cards drawn again.
   *
   * Jobs pick their base map right before they start, and a change of
   * 「位置情報を外部サービスに送らない」 drops the queued ones and cancels the
-  * running one ([[SnapshotQueue]]). Main thread only.
+  * running one ([[SnapshotQueue]]); every card is then drawn again, so none
+  * is left waiting for a dropped job. Main thread only.
   */
 object DayMap:
   private val cache = android.util.LruCache[String, Bitmap](40)
   /** The running snapshotter is its handle: referenced until it calls back. */
   private val queue = SnapshotQueue[MapSnapshotter](Settings.gate)
-  Settings.gate.onChange(() => AshidoriApp.app.getMainExecutor.execute(() => queue.invalidate().foreach(_.cancel())))
+  Settings.gate.onChange(() => AshidoriApp.app.getMainExecutor.execute { () =>
+    queue.invalidate().foreach(_.cancel())
+    // Cards whose job was dropped would keep the plain sketch.
+    cards.asScala.toSeq.foreach(_.invalidateMap())
+  })
 
   /** A card's frame; `redraw` picks its base map again. */
   private final class MapCard(c: Context) extends FrameLayout(c):
     var redraw: () => Unit = () => ()
+    private var stale = false
+    /** Now if shown; a detached card (an old feed, another tab) when it comes back. */
+    def invalidateMap(): Unit =
+      if isAttachedToWindow then
+        stale = false
+        redraw()
+      else stale = true
+    override def onAttachedToWindow(): Unit =
+      super.onAttachedToWindow()
+      if stale then
+        stale = false
+        redraw()
 
   /** Cards built so far, while something still shows them. */
   private val cards = java.util.Collections.newSetFromMap(java.util.WeakHashMap[MapCard, java.lang.Boolean]())
@@ -51,24 +71,21 @@ object DayMap:
       // Snapshots of the old data (keyed by its version) are stale.
       val stale = s"${MapStyle.Offline.key}@"
       cache.snapshot().keySet().asScala.filter(_.startsWith(stale)).foreach(cache.remove)
-      cards.asScala.toSeq.foreach(_.redraw())
+      cards.asScala.toSeq.foreach(_.invalidateMap())
   }
 
-  /** The small 「地図なし」 mark on a sketch drawn in place of a map. */
-  def noMapBadge(c: Context): View =
-    given Ctx = c
-    val t = text("地図なし", 11f, colorAttr = attr.onSurfaceVariant)
-    t.setPadding(dp(6), dp(1), dp(6), dp(2))
-    val bg = GradientDrawable()
-    bg.setCornerRadius(dp(6).toFloat)
-    bg.setColor((color(attr.surface) & 0x00ffffff) | 0xcc000000)
-    t.setBackground(bg)
+  /** The chip on a picture drawn without a base map, at its top left: the
+    * feed's floating button covers the bottom right of a card near the
+    * bottom of the screen.
+    */
+  def noMapChip(act: MainActivity): NoBasemapChip =
+    given Ctx = act
+    val chip = NoBasemapChip(act)
     val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-      Gravity.BOTTOM | Gravity.END)
-    lp.setMargins(0, 0, dp(8), dp(8))
-    t.setLayoutParams(lp)
-    t.setVisibility(View.GONE)
-    t
+      Gravity.TOP | Gravity.START)
+    lp.setMargins(dp(8), dp(8), dp(8), dp(8))
+    chip.setLayoutParams(lp)
+    chip
 
   def view(act: MainActivity, tl: DayTimeline): Option[View] = view(act, Seq(tl), tl.date.toString)
 
@@ -97,8 +114,8 @@ object DayMap:
     val frame = MapCard(act)
     frame.addView(sketch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     frame.addView(img, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-    val badge = noMapBadge(act)
-    frame.addView(badge)
+    val chip = noMapChip(act)
+    frame.addView(chip)
     val bg = GradientDrawable()
     bg.setCornerRadius(dp(12).toFloat)
     bg.setColor(color(attr.surfaceContainerHigh))
@@ -114,11 +131,18 @@ object DayMap:
     // The snapshot draws the base map's attribution itself.
     def show(b: Bitmap): Unit =
       img.setImageBitmap(b)
-      badge.setVisibility(View.GONE)
-    // No base map: the sketch is the picture.
+      sketch.grid = false
+      chip.show(false)
+    // No base map: the sketch on a grid is the picture.
     def sketchOnly(): Unit =
       img.setImageDrawable(null)
-      badge.setVisibility(View.VISIBLE)
+      sketch.grid = true
+      chip.show(true)
+    // A snapshot is coming: the plain sketch meanwhile.
+    def pending(): Unit =
+      img.setImageDrawable(null)
+      sketch.grid = false
+      chip.show(false)
 
     def start(style: MapStyle): Option[MapSnapshotter] =
       val density = dm.density
@@ -161,7 +185,12 @@ object DayMap:
           show(s.getBitmap)
           queue.finished(snap)
         },
-        (_: String) => queue.finished(snap) // offline or no tiles: keep the sketch
+        (_: String) => {
+          // Offline or no tiles: keep the sketch. The basemap removed
+          // meanwhile: say so.
+          if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()
+          queue.finished(snap)
+        }
       )
       Some(snap)
 
@@ -171,7 +200,7 @@ object DayMap:
         Option(cache.get(key(style))) match
           case Some(b) => show(b)
           case None =>
-            badge.setVisibility(View.GONE)
+            pending()
             queue.enqueue { block =>
               // Rendered while scrolling, without the user asking for that area:
               // the offline map while 「位置情報を外部サービスに送らない」 is on,
