@@ -64,7 +64,7 @@ class ArchiveSuite extends munit.FunSuite:
   private val recorderLines: Seq[String] =
     import GnssLogFormat.row
     val t = 1_791_801_000_000L
-    val raw = Seq.fill[Any](GnssLogFormat.RawHeader.split(',').length - 1)("").updated(0, t).updated(10, 7).updated(35, "C")
+    val raw = Seq.fill[Any](GnssLogFormat.RawHeader.split(',').length - 1)("").updated(0, t).updated(10, 7).updated(34, "C")
     Seq(
       row(("Raw" +: raw)*),
       row("Status", t, 40, 0, 1, 7, 1.57542e9, 38.5f, 120f, 45f, true, true, false, Float.NaN),
@@ -104,4 +104,26 @@ class ArchiveSuite extends munit.FunSuite:
     assertEquals(back(10), 555L)
     assertEquals(back(12), 0)
     assertEquals(Archive.lineOf(t, back), line)
+  }
+
+  test("parse: every recorder line converts like rowOf; a missing value is null, a bad one an error") {
+    for l <- recorderLines do
+      val (t, row) = Archive.parse(l, 1_791_801_000_000L).fold(e => fail(s"$l: $e"), identity)
+      val (t2, row2) = Archive.rowOf(l, 1_791_801_000_000L).get
+      assertEquals(t, t2)
+      assertEquals(row.map(String.valueOf), row2.toIndexedSeq.map(String.valueOf))
+    // Missing values are fine.
+    assert(Archive.parse("Accel,1000,555,,0.2,", 0).isRight)
+    // A value that does not parse, or a lossy one, is an error.
+    assert(Archive.parse("Accel,1000,555,x,0.2,0.3", 0).isLeft)
+    assert(Archive.parse("Status,1000,40,1.5,1,7,1.5e9,38,1,2,1,1,1,", 0).isLeft) // SignalIndex 1.5
+    assertEquals(Archive.parse("Status,1000,40,2.0,1,7,1.5e9,38,1,2,1,1,1,", 0).map(_._2(2)), Right(2))
+    // No time, too many fields, unknown kinds.
+    assert(Archive.parse("Accel,,555,0.1,0.2,0.3", 0).isLeft)
+    assert(Archive.parse("Accel,1000,555,0.1,0.2,0.3,9", 0).isLeft)
+    assert(Archive.parse(recorderLines.last.replace(",1791801000000,", ",,"), 0).isLeft)
+    assert(Archive.parse(recorderLines.head + ",extra", 0).isLeft)
+    assert(Archive.parse("NMEA,GPGGA,1,x", 0).isLeft)
+    assert(Archive.parse("OrientationDeg,1,2,3,4", 0).isLeft)
+    assert(Archive.parse("UncalAccel,1000,2,3,4,5,6,7", 0).isLeft)
   }

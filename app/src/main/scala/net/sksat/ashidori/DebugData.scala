@@ -14,6 +14,18 @@ import ashidori.core.GnssLogFormat.row
 object DebugData:
   @volatile var progress = ""
 
+  /** Odd raw lines at 12:00 of `day`: 5 that do not convert (kept in SQLite
+    * for good) and 20 IMU lines whose own time is 3 minutes before their
+    * stored time (out of order beyond the reorder window). Returns (odd, late).
+    */
+  def insertOdd(day: LocalDate): (Int, Int) =
+    val t = day.atTime(12, 0).atZone(AshidoriApp.zone).toInstant.toEpochMilli
+    val odd = Seq("Accel,%d,1,x,0.2,0.3".format(t), "OrientationDeg,%d,1,2,3".format(t), "Accel,%d,1,0.1,0.2,0.3,9".format(t),
+      "Gyro,,1,0.1,0.2,0.3", s"Status,$t,40,1.5,1,7,1.5e9,38,1,2,1,1,1,").map(l => (t, l))
+    val late = (0 until 20).map(i => (t + i, row("Gyro", t - 180_000 + i, 9_000_000L + i, 0.5f, 0.25f, 0.125f)))
+    AshidoriApp.db.insertRawLines(odd ++ late)
+    (odd.size, late.size)
+
   /** Inserts `hours` of lines from `startMinute` (10:00) of `day`. Returns the lines. */
   def insertRaw(day: LocalDate, hours: Double, startMinute: Int = 600): Long =
     val db = AshidoriApp.db

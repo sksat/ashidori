@@ -45,7 +45,7 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       val batch = buffer.toVector
       buffer.clear()
       lastFlush = System.currentTimeMillis()
-      LoggerWrites.submit(batch.size, raw = true, "詳細ログ")(_.insertRawLines(batch))
+      LoggerWrites.rawLines(batch)
 
   // IMU at 50 Hz (100 Hz when logging everything), alongside GNSS.
   private val sm = ctx.getSystemService(classOf[android.hardware.SensorManager])

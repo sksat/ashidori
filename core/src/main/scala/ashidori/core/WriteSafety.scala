@@ -4,51 +4,83 @@ package ashidori.core
   *
   * Every batch is counted from the moment it is handed over until it is
   * committed. The queue is bounded: a batch that would push its class over
-  * its cap is dropped (and counted) instead of growing memory until the
-  * process dies, which would lose everything queued. Raw signal lines are
-  * bulky and capped low; positions, motion, battery and GNSS status are
-  * tiny and capped high. Not thread-safe: the app synchronizes.
+  * its cap is not queued. Raw signal lines are bulky and capped low (the
+  * app writes such a batch to a file instead, and imports it later);
+  * positions, motion, battery and GNSS status are tiny and capped high
+  * (days of positions: reached only if SQLite cannot be written at all).
+  * Not thread-safe: the app synchronizes.
   */
 final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = WriteBacklog.MaxOtherRows,
                          noteEveryMs: Long = WriteBacklog.NoteEveryMs, slowMs: Long = WriteBacklog.SlowMs):
   private var pendingRaw = 0L
   private var pendingOther = 0L
-  private var droppedRaw = 0L
-  private var droppedOther = 0L
+  private var nextId = 0L
+  // Batches queued and not yet done: id -> when queued (uptime).
+  private val queued = scala.collection.mutable.TreeMap.empty[Long, Long]
+  // Since the last note.
+  private var lostRaw = 0L
+  private var lostOther = 0L
+  private var spilled = 0L
   private var slowest = 0L
   private var lastNote = Long.MinValue / 2
+  /** Totals since the start (the app keeps them on disk). */
+  var totalLost = 0L
+  var totalSpilled = 0L
 
   def pending: Long = pendingRaw + pendingOther
 
-  /** A batch of `rows` is about to be queued; false if it must be dropped. */
-  def offer(rows: Int, raw: Boolean): Boolean =
-    if raw then
-      if pendingRaw + rows > maxRaw then { droppedRaw += rows; false }
-      else { pendingRaw += rows; true }
-    else if pendingOther + rows > maxOther then { droppedOther += rows; false }
-    else { pendingOther += rows; true }
+  /** When the oldest batch still waiting was queued (uptime), if any. */
+  def oldestQueued: Option[Long] = queued.headOption.map(_._2)
 
-  /** A queued batch left the queue (committed, or given up after `lost`). */
-  def done(rows: Int, raw: Boolean, waitedMs: Long, lost: Boolean = false): Unit =
+  /** A batch of `rows` is about to be queued: its id, or None if it is over
+    * the cap (raw: spill it; other: it is lost, counted).
+    */
+  def offer(rows: Int, raw: Boolean, now: Long): Option[Long] =
+    val ok =
+      if raw then pendingRaw + rows <= maxRaw
+      else pendingOther + rows <= maxOther
+    if !ok then
+      if !raw then
+        lostOther += rows
+        totalLost += rows
+      None
+    else
+      if raw then pendingRaw += rows else pendingOther += rows
+      nextId += 1
+      queued(nextId) = now
+      Some(nextId)
+
+  /** A raw batch over the cap went to a file instead. */
+  def spill(rows: Int): Unit =
+    spilled += rows
+    totalSpilled += rows
+
+  /** A queued batch left the queue: committed, or given up (`lost`). */
+  def done(id: Long, rows: Int, raw: Boolean, now: Long, lost: Boolean = false): Unit =
     if raw then pendingRaw -= rows else pendingOther -= rows
-    if lost then if raw then droppedRaw += rows else droppedOther += rows
-    slowest = math.max(slowest, waitedMs)
+    queued.remove(id).foreach(t => slowest = math.max(slowest, now - t))
+    if lost then
+      if raw then lostRaw += rows else lostOther += rows
+      totalLost += rows
 
-  /** A line for the lifecycle log when rows were dropped, or a batch waited
-    * longer than `slowMs`, since the last note; at most every `noteEveryMs`.
+  /** A line for the lifecycle log when rows were lost or spilled, or a
+    * batch waited longer than `slowMs`, since the last note; at most every
+    * `noteEveryMs` (the totals are kept at once by the app).
     */
   def note(now: Long): Option[String] =
-    if droppedRaw + droppedOther == 0 && slowest < slowMs then None
+    if lostRaw + lostOther + spilled == 0 && slowest < slowMs then None
     else if now - lastNote < noteEveryMs then None
     else
       val parts = Seq(
-        Option.when(droppedOther > 0)(s"位置・動きなど ${droppedOther} 行を保存できず"),
-        Option.when(droppedRaw > 0)(s"詳細ログ ${droppedRaw} 行を保存できず"),
+        Option.when(lostOther > 0)(s"位置・動きなど ${lostOther} 行を保存できず"),
+        Option.when(lostRaw > 0)(s"詳細ログ ${lostRaw} 行を保存できず"),
+        Option.when(spilled > 0)(s"詳細ログ ${spilled} 行をファイルに退避"),
         Option.when(slowest >= slowMs)(s"保存待ち最大 ${slowest / 1000} 秒"),
         Some(s"待ち $pending 行")
       ).flatten
-      droppedRaw = 0
-      droppedOther = 0
+      lostRaw = 0
+      lostOther = 0
+      spilled = 0
       slowest = 0
       lastNote = now
       Some(parts.mkString("・"))
@@ -71,6 +103,14 @@ object WriteBacklog:
 object WriteStall:
   val MinMs: Long = 15 * 60_000L
   val MarginMs: Long = 5 * 60_000L
+  /** A batch (positions, raw lines, any) waiting longer than this is a
+    * stall too, whatever else was saved meanwhile (the write retries a
+    * locked database for a minute).
+    */
+  val OldestMs: Long = 3 * 60_000L
+
+  def queuedTooLong(oldestQueued: Option[Long], nowUptime: Long): Boolean =
+    oldestQueued.exists(nowUptime - _ > OldestMs)
 
   def thresholdMs(intervalMs: Long, maxBatchDelayMs: Long): Long =
     math.max(MinMs, 2 * math.max(intervalMs, maxBatchDelayMs) + MarginMs)

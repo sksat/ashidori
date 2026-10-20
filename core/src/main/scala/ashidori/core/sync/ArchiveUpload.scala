@@ -76,6 +76,26 @@ object ArchiveUpload:
   def resume(stored: Option[Progress], gen: Long): Progress =
     stored.filter(p => p.gen == gen && p.part >= 0 && p.bytes >= 0).getOrElse(Progress(gen, 0, 0))
 
+  /** Mark of a file handed over completely: its generation. Earlier app
+    * versions marked a file with 1 once, and wrote each archive file whole.
+    */
+  val LegacyMark = 1L
+
+  /** Whether the file's version `gen` is handed over already (`mark` 0: never).
+    * A file that changed since (a day archived in portions, late rows) has
+    * another generation and is sent again.
+    */
+  def handedOver(mark: Long, gen: Long): Boolean = mark == LegacyMark || (mark != 0 && mark == markOf(gen))
+
+  /** The mark stored for generation `gen` (never 0 or the legacy mark). */
+  def markOf(gen: Long): Long = if gen <= LegacyMark then gen + 2 else gen
+
+  /** A month file need not be sent when an earlier version sent every day
+    * it merged (legacy marks; days sent by generation do not count, their
+    * month is sent).
+    */
+  def monthCoveredByLegacyDays(dayMarks: Seq[Long]): Boolean = dayMarks.nonEmpty && dayMarks.forall(_ == LegacyMark)
+
   /** The generation is complete: every part was enqueued, and their bytes add
     * up to the size of that very version.
     */

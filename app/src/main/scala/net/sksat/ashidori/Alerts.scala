@@ -59,7 +59,7 @@ object Alerts:
       if n > 0 then notify(CrashId, s"ashidori が異常終了しました（直近24時間で ${n} 回）")
     val since = math.max(Maintenance.build(), Maintenance.SafeMode.resetAt)
     if !Maintenance.SafeMode.active && CrashLoop.tripped(exits.map(_.getTimestamp), now, since) then
-      Maintenance.SafeMode.set()
+      Maintenance.SafeMode.set(ctx)
       LifeLog.add(LifeKind.SafeMode,
         s"異常終了が続いたため、記録のまとめと同期を停止（記録は継続。アプリの更新か「記録をまとめ直す」で再開）")
 
@@ -78,7 +78,8 @@ object Alerts:
   def issue(now: Long = System.currentTimeMillis()): Option[String] =
     val crashes = recentCrashes(now)
     val stalled = now - lastStall < DayMs
-    if crashes == 0 && !stalled then None
+    if Maintenance.SafeMode.active then Some("異常終了が続いたため、自動のまとめ・同期を停止中")
+    else if crashes == 0 && !stalled then None
     else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止がありました")
     else if crashes > 0 then Some(s"直近24時間に異常終了が ${crashes} 回ありました")
     else Some("記録が保存されない時間がありました")

@@ -43,6 +43,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val crashRow = row("異常終了（直近24時間）", "", "…")()
   private val pendingRow = row("保存待ち", "", "…")()
   private val archiveRow = row("記録のまとめ", "", "…")()
+  private val syncRow = row("自動の同期", "", "…")(Some(() => resumeSync()))
   /** One line for the backup and maintenance below: progress, result or error. */
   private val dataStatus = caption("")
   dataStatus.setSingleLine(true)
@@ -58,7 +59,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     scroll(
       vbox(
         sectionHeader("記録の保存"),
-        listGroup(savedRow, crashRow, pendingRow, archiveRow),
+        listGroup(savedRow, crashRow, pendingRow, archiveRow, syncRow),
         card(
           text("記録データ", 16f, bold = true),
           caption("バックアップは記録を端末内の形式のまま ZIP にまとめます。地図と施設データは含みません。"),
@@ -121,7 +122,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val fix = Try(AshidoriApp.db.lastFix()).toOption.flatten.map(_.time)
       val crashes = Alerts.recentCrashes(now)
       val skipped = Try(Maintenance.Guard.skipped()).getOrElse(Nil)
-      val safe = Maintenance.SafeMode.active
+      val safe = Maintenance.SafeMode.maintenanceStopped
+      val syncStopped = Maintenance.SafeMode.syncStopped
+      val lost = LoggerWrites.Losses.total
       act.runOnUiThread { () =>
         savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
         val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
@@ -131,15 +134,21 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         val pending = LoggerWrites.pending
         pendingRow.setValue(s"$pending 行")
         val commit = LoggerWrites.lastCommitAt
-        pendingRow.setSubtitle(if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}")
+        pendingRow.setSubtitle(
+          (if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}") +
+            (if lost > 0 then s"・保存できなかった行 累計 $lost" else ""))
+        pendingRow.subtitle.setTextColor(color(if lost > 0 then attr.error else attr.onSurfaceVariant))
+        syncRow.setSubtitle(if syncStopped then "異常終了が続いたため停止中（タップで再開）" else "")
+        syncRow.setValue(if syncStopped then "停止中" else "動作")
+        syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))
         archiveRow.setSubtitle(
-          if safe then "異常終了が続いたため自動では行いません"
+          if safe then "異常終了が続いたため停止中（「記録をまとめ直す」で再開）"
           else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
           else "充電中、または起動の30分後に自動で行います")
         archiveRow.setValue(if safe then "停止中" else if skipped.nonEmpty then "保留あり" else "自動")
         archiveRow.value.setTextColor(color(if safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
         savingText = s"saving=lastFix:${fix.map(full).getOrElse("none")} crashes24h=$crashes pending=$pending " +
-          s"safeMode=$safe skipped=${skipped.mkString(",")}"
+          s"safeMode=$safe syncStopped=$syncStopped lost=$lost skipped=${skipped.mkString(",")}"
       }
     }
 
@@ -185,6 +194,12 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         }
       , "ashidori-backup").start()
     }
+
+  private def resumeSync(): Unit =
+    if Maintenance.SafeMode.syncStopped then
+      Maintenance.SafeMode.resumeSync(act)
+      Toast.makeText(act, "自動の同期を再開しました", Toast.LENGTH_SHORT).show()
+      showSaving()
 
   private def runMaintenance(): Unit =
     backupLine = None

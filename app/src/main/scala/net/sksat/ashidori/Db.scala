@@ -13,6 +13,9 @@ import ashidori.core.*
   * improvements apply retroactively.
   */
 final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, Db.Version, Db.KeepOnCorruption):
+  // A commit is on disk when it returns (Android's WAL default, NORMAL, can
+  // lose the last commits in a power loss): every connection, both processes.
+  setOpenParams(SQLiteDatabase.OpenParams.Builder().setSynchronousMode("FULL").build())
 
   override def onConfigure(db: SQLiteDatabase): Unit =
     db.enableWriteAheadLogging()
@@ -52,10 +55,21 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     */
   override def onOpen(db: SQLiteDatabase): Unit =
     super.onOpen(db)
-    if !db.isReadOnly then createArchiveBookkeeping(db)
+    if !db.isReadOnly then
+      db.beginTransaction()
+      try
+        createArchiveBookkeeping(db)
+        // Rows an older app version inserted (it ignores the floor) are below it again.
+        Db.ArchivedTables.keys.foreach(t => db.execSQL(ArchiveSql.raiseFloor(t)))
+        db.setTransactionSuccessful()
+      finally db.endTransaction()
+      val sync = Using.resource(db.rawQuery("PRAGMA synchronous", null))(c => if c.moveToFirst() then c.getInt(0) else -1)
+      if sync != 2 then
+        Log.w(s"database synchronous=$sync, not FULL")
+        LifeLog.add(LifeKind.Note, s"データベースの同期書き込みが FULL ではない（synchronous=$sync）")
 
   private def createArchiveBookkeeping(db: SQLiteDatabase): Unit =
-    db.execSQL("CREATE TABLE IF NOT EXISTS rowid_floor(tbl TEXT PRIMARY KEY, next INTEGER NOT NULL)")
+    db.execSQL(ArchiveSql.CreateFloor)
     db.execSQL("CREATE TABLE IF NOT EXISTS legacy_import(file TEXT PRIMARY KEY, lines INTEGER NOT NULL)")
 
   /** Sealed batches not yet accepted by the server. A row is written in the
@@ -165,11 +179,8 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     * be switched to).
     */
   private def claimRowids(db: SQLiteDatabase, table: String, n: Int): Long =
-    def one(sql: String, args: String*): Long =
-      Using.resource(db.rawQuery(sql, args.toArray))(c => if c.moveToFirst() && !c.isNull(0) then c.getLong(0) else 0L)
-    val first = math.max(one(s"SELECT MAX(rowid) FROM $table") + 1, one("SELECT next FROM rowid_floor WHERE tbl=?", table))
-    db.execSQL("INSERT OR REPLACE INTO rowid_floor(tbl, next) VALUES(?, ?)",
-      Array[AnyRef](table, java.lang.Long.valueOf(first + n)))
+    val first = Using.resource(db.rawQuery(ArchiveSql.nextRowid(table), null))(c => if c.moveToFirst() then c.getLong(0) else 1L)
+    db.execSQL(ArchiveSql.takeRowids(table, first + n))
     first
 
   private def nanToNull(cv: ContentValues, k: String, v: Double): Unit =
@@ -191,7 +202,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       nanToNull(cv, "bearing", f.bearing)
       cv.put("provider", f.provider)
       cv.put("sats", java.lang.Integer.valueOf(f.satellites))
-      db.insert("fixes", null, cv)
+      db.insertOrThrow("fixes", null, cv)
   }
 
   def insertMotion(ws: Iterable[MotionWindow], src: String = null): Unit = tx { db =>
@@ -207,7 +218,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
       nanToNull(cv, "mean", m.accelMean)
       cv.put("steps", java.lang.Integer.valueOf(m.steps))
       cv.put("src", src)
-      db.insert("motion", null, cv)
+      db.insertOrThrow("motion", null, cv)
   }
 
   def insertBattery(time: Long, pct: Int, charging: Boolean, screenOn: Boolean, mode: String, plan: String): Unit =
@@ -220,7 +231,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     cv.put("plan", plan)
     tx { db =>
       cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "battery", 1)))
-      db.insert("battery", null, cv)
+      db.insertOrThrow("battery", null, cv)
     }
 
   def insertGnssSession(start: Long, end: Long, file: String, reason: String): Unit =
@@ -229,7 +240,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     cv.put("end", java.lang.Long.valueOf(end))
     cv.put("file", file)
     cv.put("reason", reason)
-    w.insert("gnss_sessions", null, cv)
+    w.insertOrThrow("gnss_sessions", null, cv)
 
   private def query[A](sql: String, args: Any*)(row: Cursor => A): Vector[A] =
     Using.resource(r.rawQuery(sql, args.map(_.toString).toArray)) { c =>
@@ -242,37 +253,43 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   private def flt(c: Cursor, i: Int): Float = if c.isNull(i) then Float.NaN else c.getFloat(i)
 
   /** Positions in [from, to): archived days from Parquet, recent ones from SQLite. */
-  def fixes(from: Long, to: Long): Vector[Fix] =
+  def fixes(from: Long, to: Long): Vector[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
     (AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf) ++ hotFixes(from, to)).sortBy(_.time)
+  }
 
   def hotFixes(from: Long, to: Long): Vector[Fix] =
     query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? ORDER BY time", from, to) { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }
 
-  def lastFix(): Option[Fix] = hotLastFix().orElse(AshidoriApp.archive.lastRow(Archive.Fixes).map(Archive.fixOf))
+  def lastFix(): Option[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
+    hotLastFix().orElse(AshidoriApp.archive.lastRow(Archive.Fixes).map(Archive.fixOf))
+  }
 
   private def hotLastFix(): Option[Fix] =
     query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes ORDER BY time DESC LIMIT 1") { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }.headOption
 
-  def motion(from: Long, to: Long): Vector[MotionWindow] =
+  def motion(from: Long, to: Long): Vector[MotionWindow] = AshidoriApp.archive.reading(Archive.Motion) {
     (AshidoriApp.archive.read(Archive.Motion, from, to).map(Archive.motionOf) ++ hotMotion(from, to)).sortBy(_.start)
+  }
 
   private def hotMotion(from: Long, to: Long): Vector[MotionWindow] =
     query("SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? ORDER BY start", from, to) { c =>
       MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4))
     }
 
-  def steps(from: Long, to: Long): Int =
+  def steps(from: Long, to: Long): Int = AshidoriApp.archive.reading(Archive.Motion) {
     AshidoriApp.archive.read(Archive.Motion, from, to).map(r => Option(r(4)).map(_.asInstanceOf[Int]).getOrElse(0)).sum +
       query("SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?", from, to)(_.getInt(0)).head
+  }
 
-  def battery(from: Long): Vector[DrainEstimator.Sample] =
+  def battery(from: Long): Vector[DrainEstimator.Sample] = AshidoriApp.archive.reading(Archive.Battery) {
     AshidoriApp.archive.read(Archive.Battery, from, Long.MaxValue).map { r =>
       DrainEstimator.Sample(r(0).asInstanceOf[Long], r(1).asInstanceOf[Int], r(2) == 1, r(3) == 1)
     } ++ hotBattery(from)
+  }
 
   private def hotBattery(from: Long): Vector[DrainEstimator.Sample] =
     query("SELECT time,pct,charging,screen_on FROM battery WHERE time>=? ORDER BY time", from) { c =>
@@ -383,11 +400,12 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     w.update("places", cv, "id=?", Array(id.toString))
 
   /** One fix per time bucket, for drawing long periods cheaply. */
-  def fixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
+  def fixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
     val archived = AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf)
       .filter(f => !f.hasAccuracy || f.accuracy < 100)
       .groupBy(_.time / bucketMs).values.map(_.minBy(_.time)).toVector
     (archived ++ hotFixesSampled(from, to, bucketMs)).sortBy(_.time)
+  }
 
   private def hotFixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
     query(
@@ -431,16 +449,17 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     nanToNull(cv, "acc", acc)
     tx { db =>
       cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "gnss_status", 1)))
-      db.insert("gnss_status", null, cv)
+      db.insertOrThrow("gnss_status", null, cv)
     }
 
-  def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
+  def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] = AshidoriApp.archive.reading(Archive.GnssStatus) {
     AshidoriApp.archive.read(Archive.GnssStatus, from, Long.MaxValue).map { r =>
       def i(k: Int) = Option(r(k)).map(_.asInstanceOf[Int]).getOrElse(0)
       (GnssSnapshot(r(0).asInstanceOf[Long], i(1), i(2), Option(r(3)).map(_.asInstanceOf[Double]).getOrElse(0.0), i(4)),
         scala.util.Try(Environment.valueOf(r(5).toString)).getOrElse(Environment.Unknown),
         Option(r(6)).map(_.asInstanceOf[Float]).getOrElse(Float.NaN))
     } ++ hotGnssStatus(from)
+  }
 
   private def hotGnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
     query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? ORDER BY time", from) { c =>
@@ -460,7 +479,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
         st.bindLong(1, id)
         st.bindLong(2, t)
         st.bindString(3, l)
-        st.executeInsert()
+        if st.executeInsert() < 0 then throw android.database.SQLException(s"raw line not inserted (rowid $id)")
         id += 1
     finally st.close()
 
@@ -491,39 +510,53 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     * only rows up to these, so rows the logger inserts meanwhile (also late
     * ones of the day being archived) are left for the next run.
     */
-  def maxRowids(): Map[String, Long] =
-    Db.ArchivedTables.map { (t, _) =>
-      t -> query(s"SELECT COALESCE(MAX(rowid), 0) FROM $t")(_.getLong(0)).head
+  def maxRowids(): Map[String, Long] = tx { db =>
+    // The floor of new rowids is raised above them in the same transaction
+    // (see ArchiveSql).
+    Db.ArchivedTables.keys.map { t =>
+      db.execSQL(ArchiveSql.raiseFloor(t))
+      t -> Using.resource(db.rawQuery(ArchiveSql.maxRowid(t), null))(c => if c.moveToFirst() then c.getLong(0) else 0L)
     }.toMap
+  }
 
   /** One chunk of raw lines of [from, to) with rowid <= `maxRowid`, in
     * (time, rowid) order after `after`: (rowid, time, line).
     */
   def rawLinesAfter(from: Long, to: Long, maxRowid: Long, after: ArchiveMerge.Cursor, limit: Int): Vector[(Long, Long, String)] =
-    query(
-      "SELECT rowid, time, line FROM raw_lines WHERE time>=? AND time<? AND rowid<=? AND (time>? OR rowid>?) " +
-        "ORDER BY time, rowid LIMIT ?",
-      math.max(from, after.time), to, maxRowid, after.time, after.rowid, limit
-    )(c => (c.getLong(0), c.getLong(1), c.getString(2)))
+    val (sql, args) = ArchiveSql.rawAfter(from, to, maxRowid, after, limit)
+    query(sql, args*)(c => (c.getLong(0), c.getLong(1), c.getString(2)))
 
-  /** Raw lines of [from, to) up to `maxRowid` that sort at or before
-    * `upTo` in (time, rowid) order: the rows a compaction portion read.
+  /** Raw lines by rowid (the late ones a portion kept): (rowid, time, line). */
+  def rawLinesById(rowids: Seq[Long]): Vector[(Long, Long, String)] =
+    rowids.grouped(500).flatMap { ids =>
+      query(s"SELECT rowid, time, line FROM raw_lines WHERE rowid IN (${ids.mkString(",")})")(c => (c.getLong(0), c.getLong(1), c.getString(2)))
+    }.toVector
+
+  /** The raw lines a compaction portion read: after `after` (where it
+    * started) up to `upTo`, of [from, to) and rowid <= `maxRowid`.
     */
-  def countRawUpTo(from: Long, to: Long, maxRowid: Long, upTo: ArchiveMerge.Cursor): Long =
-    query("SELECT COUNT(*) FROM raw_lines WHERE time>=? AND time<? AND rowid<=? AND (time<? OR (time=? AND rowid<=?))",
-      from, to, maxRowid, upTo.time, upTo.time, upTo.rowid)(_.getLong(0)).head
+  def countRawPortion(from: Long, to: Long, maxRowid: Long, after: ArchiveMerge.Cursor, upTo: ArchiveMerge.Cursor): Long =
+    val (where, args) = ArchiveSql.rawPortion(from, to, maxRowid, after, upTo)
+    query(s"SELECT COUNT(*) FROM raw_lines WHERE $where", args*)(_.getLong(0)).head
 
   /** Deletes the raw lines a compaction portion archived (see
-    * [[countRawUpTo]]), in small transactions so the logger is never kept
-    * waiting for the write lock (another process may hold it at most this
-    * long; SQLite gives up after a few seconds). Returns the rows deleted.
+    * [[countRawPortion]]) but `except` (lines it did not archive), in small
+    * transactions so the logger is never kept waiting for the write lock.
     */
-  def deleteRawUpTo(from: Long, to: Long, maxRowid: Long, upTo: ArchiveMerge.Cursor, except: Seq[Long] = Nil): Long =
-    // `except`: lines that were not archived (numbers, written inline).
-    val keep = if except.isEmpty then "" else except.mkString(" AND rowid NOT IN (", ",", ")")
-    deleteChunked("raw_lines",
-      "time>=? AND time<? AND rowid<=? AND (time<? OR (time=? AND rowid<=?))" + keep,
-      Seq(from, to, maxRowid, upTo.time, upTo.time, upTo.rowid))
+  def deleteRawPortion(from: Long, to: Long, maxRowid: Long, after: ArchiveMerge.Cursor, upTo: ArchiveMerge.Cursor,
+                       except: Seq[Long] = Nil): Long =
+    val (where, args) = ArchiveSql.rawPortion(from, to, maxRowid, after, upTo)
+    deleteChunked("raw_lines", ArchiveSql.except(where, except), args)
+
+  /** Deletes raw lines by rowid (late lines archived in a sorted pass). */
+  def deleteRawById(rowids: Seq[Long]): Long =
+    rowids.grouped(500).map(ids => tx(_.delete("raw_lines", s"rowid IN (${ids.mkString(",")})", null).toLong)).sum
+
+  /** Whether any archived table still holds rows of [from, to) in SQLite. */
+  def hasHotRows(from: Long, to: Long): Boolean =
+    Db.ArchivedTables.exists { (t, col) =>
+      query(s"SELECT EXISTS(SELECT 1 FROM $t WHERE $col>=? AND $col<?)", from, to)(_.getInt(0)).head == 1
+    }
 
   /** Rows of an archived table in [from, to) up to `maxRowid`. */
   def countArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
@@ -536,7 +569,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     deleteChunked(table, s"$col>=? AND $col<? AND rowid<=?", Seq(from, to, maxRowid))
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
-    val st = w.compileStatement(s"DELETE FROM $table WHERE rowid IN (SELECT rowid FROM $table WHERE $where LIMIT ${Db.DeleteChunk})")
+    val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, Db.DeleteChunk))
     try
       args.zipWithIndex.foreach((v, i) => st.bindLong(i + 1, v))
       var total = 0L
@@ -586,51 +619,15 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
   def lastPersistedFixTime(): Option[Long] =
     query("SELECT MAX(time) FROM fixes")(c => if c.isNull(0) then None else Some(c.getLong(0))).head
 
-  /** The main database file for reading (a backup), through one descriptor
-    * kept open for the life of the process. Closing any descriptor of the
-    * database file drops every POSIX lock this process's SQLite connections
-    * hold on it (sqlite.org/howtocorrupt.html, 2.2); another process (the
-    * maintenance one, or a shell) could then take the file for unused and
-    * checkpoint or reset the WAL under them, corrupting the database. So
-    * this descriptor is never closed while it names the database file.
+  /** A consistent copy of the whole database in `dest` (a backup): VACUUM
+    * INTO on a read-only connection of its own, which reads one snapshot
+    * (WAL: the logger keeps writing meanwhile, nothing waits for it).
     */
-  def mainFile(): java.nio.channels.FileChannel = Db.synchronized {
-    val path = getReadableDatabase.getPath
-    val ino = android.system.Os.stat(path).st_ino
-    Db.mainFd match
-      case Some((ch, i)) if i == ino && ch.isOpen => ch
-      case _ =>
-        // None yet, or the file was replaced (another inode): the old
-        // descriptor's locks are not the current file's, so it may go.
-        val in = java.io.FileInputStream(path)
-        val ch = in.getChannel
-        Db.mainFd = Some((ch, android.system.Os.fstat(in.getFD).st_ino))
-        ch
-  }
-
-  /** For a backup: copies the database files consistently while the logger
-    * keeps writing. Checkpoints are switched off on this process's write
-    * connection and the WAL is checkpointed into the main file; from then on
-    * the main file does not change (in WAL mode only a checkpoint writes it)
-    * and is copied without a lock. The WAL, which takes the commits made
-    * meanwhile, is copied last under the write lock, briefly. Other
-    * processes write only while holding the archive lock (see
-    * [[ArchiveStore.withLock]]), which the backup holds throughout.
-    */
-  def copyForBackup(copyMain: java.nio.channels.FileChannel => Unit, copyWal: java.io.File => Unit): Unit =
-    val db = w
-    val path = java.io.File(db.getPath)
-    def pragma(sql: String): Long =
-      Using.resource(db.rawQuery(sql, null))(c => if c.moveToFirst() then c.getLong(0) else 0L)
-    // In a transaction the statements run on the write connection (the one
-    // that commits, and so checkpoints).
-    val saved = tx(_ => pragma("PRAGMA wal_autocheckpoint"))
-    tx(_ => pragma("PRAGMA wal_autocheckpoint=0"))
-    try
-      Using.resource(db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null))(_.moveToFirst())
-      copyMain(mainFile())
-      tx(_ => copyWal(java.io.File(path.getPath + "-wal")))
-    finally tx(_ => pragma(s"PRAGMA wal_autocheckpoint=${if saved > 0 then saved else 1000}"))
+  def snapshotTo(dest: java.io.File): Unit =
+    dest.delete()
+    val ro = SQLiteDatabase.openDatabase(getReadableDatabase.getPath, null, SQLiteDatabase.OPEN_READONLY)
+    try ro.execSQL("VACUUM INTO ?", Array[AnyRef](dest.getPath))
+    finally ro.close()
 
   // --- sync ---------------------------------------------------------------------
 
@@ -824,7 +821,6 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
 object Db:
   val Version = 6
 
-  @volatile private var mainFd: Option[(java.nio.channels.FileChannel, Long)] = None
 
   /** On corruption, keep the files (and say so): Android's default handler
     * deletes the database, which would lose everything recorded.

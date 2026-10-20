@@ -30,15 +30,19 @@ object Exporter:
     */
   private def dayRows(t: Archive.TableDef, d: LocalDate)(out: IndexedSeq[Any] => Unit): Long =
     val (a, b) = (startOf(d), startOf(d.plusDays(1)))
-    val (archived, close) = AshidoriApp.archive.stream(t, a, b)
-    try
-      val hot =
-        if Archive.RawTables.contains(t) then
-          hotLines(a, b).flatMap((time, line) => scala.util.Try(Archive.rowOf(line, time)).toOption.flatten)
-            .collect { case (`t`, row) => row.toIndexedSeq }
-        else AshidoriApp.db.hotRows(t, a, b).iterator.map(_.toIndexedSeq)
-      ArchiveMerge.merge(archived, hot, out)
-    finally close()
+    // No commit moves rows from SQLite to the archive while the day is read:
+    // each row is read once, from one or the other.
+    AshidoriApp.archive.reading(t) {
+      val (archived, close) = AshidoriApp.archive.stream(t, a, b)
+      try
+        val hot =
+          if Archive.RawTables.contains(t) then
+            hotLines(a, b).flatMap((time, line) => scala.util.Try(Archive.rowOf(line, time)).toOption.flatten)
+              .collect { case (`t`, row) => row.toIndexedSeq }
+          else AshidoriApp.db.hotRows(t, a, b).iterator.map(_.toIndexedSeq)
+        ArchiveMerge.merge(archived, hot, out)
+      finally close()
+    }
 
   /** The ZIP entry stays open when the Parquet writer is done with it. */
   private final class KeepOpen(out: OutputStream) extends FilterOutputStream(out):
@@ -88,15 +92,17 @@ object Exporter:
         val (a, b) = (startOf(d), startOf(d.plusDays(1)))
         // Archived days come back as rows (streamed, merged in time order);
         // days not archived yet are still raw lines.
-        val streams = Archive.RawTables.map(t => (t, AshidoriApp.archive.stream(t, a, b)))
-        try
-          val archived = streams.map((t, s) => s._1.map(r => (t, r)).map { case (t, r) => Vector[Any](r(0), Archive.lineOf(t, r)) })
-            .foldLeft(Iterator.empty[IndexedSeq[Any]])(ArchiveStore.mergeSorted).map(_(1).asInstanceOf[String])
-          for l <- archived ++ hotLines(a, b).map(_._2) do
-            out.write(l)
-            out.write("\n")
-            lines += 1
-        finally streams.foreach(_._2._2())
+        AshidoriApp.archive.reading(Archive.RawTables*) {
+          val streams = Archive.RawTables.map(t => (t, AshidoriApp.archive.stream(t, a, b)))
+          try
+            val archived = streams.map((t, s) => s._1.map(r => (t, r)).map { case (t, r) => Vector[Any](r(0), Archive.lineOf(t, r)) })
+              .foldLeft(Iterator.empty[IndexedSeq[Any]])(ArchiveStore.mergeSorted).map(_(1).asInstanceOf[String])
+            for l <- archived ++ hotLines(a, b).map(_._2) do
+              out.write(l)
+              out.write("\n")
+              lines += 1
+          finally streams.foreach(_._2._2())
+        }
       out.flush()
       zip.closeEntry()
     }

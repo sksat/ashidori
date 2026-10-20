@@ -33,6 +33,10 @@ class AshidoriApp extends Application:
       Alerts.checkExits()
       Maintenance.schedule(this)
     }
+    // An archive commit a crash interrupted is finished now, so the timeline
+    // does not show its rows twice (in the archive and in SQLite).
+    Thread(() => scala.util.Try(AshidoriApp.archive.recover(AshidoriApp.db)).failed
+      .foreach(e => Log.w("archive recovery failed", e)), "ashidori-recover").start()
     LoggerWatchdog.schedule(this)
     Settings.migrate()
     // An unpairing cut short by a crash is finished before anything syncs.

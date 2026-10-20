@@ -45,7 +45,7 @@ object Maintenance:
 
   /** Queues the automatic runs (idempotent: a pending job is kept). */
   def schedule(c: Context): Unit =
-    if SafeMode.active then return
+    if SafeMode.maintenanceStopped then return
     val js = c.getSystemService(classOf[JobScheduler])
     if js.getPendingJob(JobIdle) == null then
       js.schedule(job(JobIdle).setRequiresCharging(true).setRequiresDeviceIdle(true).build())
@@ -57,7 +57,7 @@ object Maintenance:
     * switch (the user asked for it).
     */
   def runNow(c: Context): Unit =
-    SafeMode.clear()
+    SafeMode.resumeMaintenance()
     val extras = PersistableBundle()
     extras.putBoolean("manual", true)
     c.getSystemService(classOf[JobScheduler]).schedule(job(JobManual).setExtras(extras).setOverrideDeadline(0).build())
@@ -123,24 +123,50 @@ object Maintenance:
         .flatMap(n => Try(LocalDate.parse(n.drop(4))).toOption)
         .filter(d => get(d).exists(_.attempts >= CompactionGuard.MaxAttempts)).sorted
 
+  /** Days whose archiving finished (what is left in SQLite does not
+    * convert): their files are complete, for the upload.
+    */
+  object Complete:
+    private def file(d: LocalDate) = File(dir, s"complete-$d")
+    def mark(d: LocalDate): Unit = Try(write(file(d), "1"))
+    def clear(d: LocalDate): Unit = file(d).delete()
+    def is(d: LocalDate): Boolean = file(d).exists
+
   // --- crash-loop switch -----------------------------------------------------------------
 
-  /** Set when the main process crashed repeatedly ([[CrashLoop]]): no
-    * maintenance or sync runs on its own until the app is updated or the
-    * user runs maintenance by hand.
+  /** Set when the main process crashed repeatedly ([[CrashLoop]]): neither
+    * maintenance nor sync runs on its own until the app is updated, or the
+    * user resumes it (each on its own: 「記録をまとめ直す」, 「同期を再開」 in
+    * 端末診断). Jobs already queued are cancelled, and check it again when
+    * they start.
     */
   object SafeMode:
-    private def file = File(dir, "safe-mode")
+    private def maintenanceFile = File(dir, "safe-mode")
+    private def syncFile = File(dir, "safe-mode-sync")
     private def resetFile = File(dir, "safe-mode-reset")
+    private def setIn(f: File): Boolean =
+      Try(String(java.nio.file.Files.readAllBytes(f.toPath), UTF_8).trim.toLong).toOption.contains(build())
 
-    def active: Boolean =
-      Try(String(java.nio.file.Files.readAllBytes(file.toPath), UTF_8).trim.toLong).toOption.contains(build())
+    def maintenanceStopped: Boolean = setIn(maintenanceFile)
+    def syncStopped: Boolean = setIn(syncFile)
+    def active: Boolean = maintenanceStopped || syncStopped
 
-    def set(): Unit = Try(write(file, build().toString))
+    def set(c: Context): Unit =
+      Try(write(maintenanceFile, build().toString))
+      Try(write(syncFile, build().toString))
+      Try(Seq(JobIdle, JobDelayed, JobManual).foreach(c.getSystemService(classOf[JobScheduler]).cancel))
+      Try(net.sksat.ashidori.sync.SyncScheduler.cancelAll(c))
 
-    def clear(): Unit =
-      file.delete()
-      Try(write(resetFile, System.currentTimeMillis().toString))
+    private def reset(): Unit = Try(write(resetFile, System.currentTimeMillis().toString))
+
+    def resumeMaintenance(): Unit =
+      maintenanceFile.delete()
+      reset()
+
+    def resumeSync(c: Context): Unit =
+      syncFile.delete()
+      reset()
+      net.sksat.ashidori.sync.SyncScheduler.schedule(c)
 
     /** Crashes before this do not count again. */
     def resetAt: Long =
@@ -161,6 +187,8 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
+      // A commit a crash interrupted is finished (or dropped) first.
+      archive.recover(db)
       val legacy = Option(ctx.getExternalFilesDir(null)).map(File(_, "gnss"))
       legacy.foreach(d => Try(archive.migrateLegacyLogs(db, d)).failed.foreach(e => Log.w("legacy log migration failed", e)))
       val now = System.currentTimeMillis()
@@ -185,6 +213,7 @@ object Maintenance:
             // On disk before the work: if the process dies in it, the next
             // run sees the attempt.
             Guard.put(d, next)
+            Complete.clear(d)
             if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していたまとめを再試行")
             val t0 = System.currentTimeMillis()
             try
@@ -192,6 +221,7 @@ object Maintenance:
               if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 詳細ログのうち ${r.unconverted} 行は変換できないため端末内に残す")
               if r.done then
                 Guard.clear(d)
+                Complete.mark(d)
                 val s = (System.currentTimeMillis() - t0) / 1000
                 if s >= 60 || retry then LifeLog.add(LifeKind.Archive, s"$d: まとめ完了（詳細ログ ${r.lines} 行・${s}秒）")
               else
@@ -208,7 +238,7 @@ object Maintenance:
                 LifeLog.add(LifeKind.Note, s"$d: まとめに失敗（データは端末内に保持）: ${LifeLog.describe(e)}")
                 Log.w(s"archiving $d failed; kept in SQLite", e)
       if !halt() then
-        try archive.mergeMonths(LocalDate.now(AshidoriApp.zone), halt)
+        try archive.mergeMonths(db, LocalDate.now(AshidoriApp.zone), halt)
         catch
           case e: OutOfMemoryError => Log.w("monthly merge: out of memory", e)
           case NonFatal(e) => Log.w("monthly merge failed", e)
@@ -224,6 +254,8 @@ class ArchiveJobService extends JobService:
   override def onStartJob(params: JobParameters): Boolean =
     stopped = false
     val manual = params.getExtras.getBoolean("manual", false)
+    // Switched off after repeated crashes (a job queued before): not run.
+    if Maintenance.SafeMode.maintenanceStopped && !manual then return false
     val t = Thread(() =>
       Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
       val left =

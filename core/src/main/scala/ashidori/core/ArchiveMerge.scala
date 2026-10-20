@@ -60,13 +60,26 @@ object ArchiveMerge:
       i += 1
     mix(h ^ 0x4L)
 
-  /** Passes rows on to `out`, dropping a row equal (by [[hash]]) to one
-    * already passed with the same time. Expects rows in time order; out of
-    * order rows are kept, only repeats might then be missed.
+  /** Whether two rows hold the same values (as [[hash]] sees them: Int like
+    * Long, Float like Double, NaN like null).
+    */
+  def same(a: Row, b: Row): Boolean =
+    def norm(v: Any): Any = v match
+      case d: Double if d.isNaN => null
+      case f: Float if f.isNaN  => null
+      case n: Int               => n.toLong
+      case f: Float             => f.toDouble
+      case other                => other
+    a.size == b.size && a.indices.forall(i => norm(a(i)) == norm(b(i)))
+
+  /** Passes rows on to `out`, dropping a row equal to one already passed
+    * with the same time: rows of the current time are kept by their
+    * [[hash]], and compared value by value when hashes match. Expects rows
+    * in time order.
     */
   final class Distinct(out: Row => Unit):
     private var current = Long.MinValue
-    private val seen = mutable.HashSet.empty[Long]
+    private val seen = mutable.HashMap.empty[Long, List[Row]]
     var written = 0L
     var dropped = 0L
 
@@ -75,10 +88,13 @@ object ArchiveMerge:
       if k != current then
         current = k
         seen.clear()
-      if seen.add(hash(r)) then
+      val h = hash(r)
+      val same = seen.getOrElse(h, Nil)
+      if same.exists(ArchiveMerge.same(_, r)) then dropped += 1
+      else
+        seen(h) = r :: same
         out(r)
         written += 1
-      else dropped += 1
 
   /** Merges `existing` (sorted) with rows pushed in time order: before each
     * pushed row, the existing rows up to its time are written (existing rows
@@ -105,21 +121,22 @@ object ArchiveMerge:
     * stored time, and a gyroscope or magnetometer line stored by older
     * versions has the time of the record before it, up to seconds off its
     * own. Rows of equal time keep their order. Memory: the rows of one
-    * window. A row later than the window is passed on as it comes (out of
-    * order; nothing is lost); [[late]] counts them.
+    * window. A row older than one already passed on would break the order:
+    * it goes to `tooLate` instead (the caller keeps it for a later, sorted
+    * pass), and [[late]] counts them.
     */
-  final class Reorder(windowMs: Long, out: Row => Unit):
-    private val held = mutable.PriorityQueue.empty[(Long, Long, Row)](using
-      Ordering.by[(Long, Long, Row), (Long, Long)](x => (x._1, x._2)).reverse)
+  final class Reorder[T](windowMs: Long, keyOf: T => Long, out: T => Unit, tooLate: T => Unit = (_: T) => ()):
+    private val held = mutable.PriorityQueue.empty[(Long, Long, T)](using
+      Ordering.by[(Long, Long, T), (Long, Long)](x => (x._1, x._2)).reverse)
     private var seq = 0L
     private var emitted = Long.MinValue
     var late = 0L
 
-    def push(r: Row, watermark: Long): Unit =
-      val k = key(r)
+    def push(r: T, watermark: Long): Unit =
+      val k = keyOf(r)
       if k < emitted then
         late += 1
-        out(r)
+        tooLate(r)
       else
         held.enqueue((k, seq, r))
         seq += 1

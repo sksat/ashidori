@@ -98,3 +98,24 @@ class ArchiveUploadSuite extends munit.FunSuite:
       assert(ArchiveUpload.complete(ArchiveUpload.resume(None, empty.generation), 0))
     finally empty.close()
   }
+
+  tmp.test("a file handed over is sent again once it changed (a day archived in portions)") { dir =>
+    val f = File(dir, "imu-2026-10-19.parquet")
+    Files.write(f.toPath, Array.fill[Byte](100)(1))
+    val first = ArchiveSnapshot.open(f, stat(f))
+    val g1 = try first.generation finally first.close()
+    // Handed over at g1: the mark is that generation.
+    assert(ArchiveUpload.handedOver(ArchiveUpload.markOf(g1), g1))
+    // The next portion rewrote the file: another generation, not handed over.
+    replace(f, Array.fill[Byte](250)(2))
+    val second = ArchiveSnapshot.open(f, stat(f))
+    val g2 = try second.generation finally second.close()
+    assertNotEquals(g1, g2)
+    assert(!ArchiveUpload.handedOver(ArchiveUpload.markOf(g1), g2))
+    assert(!ArchiveUpload.handedOver(0L, g2))
+    // Marks of earlier versions (whole files) still count.
+    assert(ArchiveUpload.handedOver(ArchiveUpload.LegacyMark, g2))
+    assert(ArchiveUpload.monthCoveredByLegacyDays(Seq(1L, 1L)))
+    assert(!ArchiveUpload.monthCoveredByLegacyDays(Seq(1L, g1)))
+    assert(!ArchiveUpload.monthCoveredByLegacyDays(Nil))
+  }

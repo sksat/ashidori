@@ -524,7 +524,9 @@ object Uploader:
     FileStat(st.st_size, Seq(st.st_dev, st.st_ino, st.st_mtim.tv_sec, st.st_mtim.tv_nsec))
 
   /** Sends archived files not sent yet, as `archive` batches of ≤3 MiB parts.
-    * A month file is skipped when every day it merged was already sent.
+    * A file is sent again when it changed since it was handed over (marked
+    * with its generation); a day still being archived waits until done. A
+    * month file is skipped when an earlier version sent every day it merged.
     *
     * Each file is opened once ([[ArchiveSnapshot]]): its size, its generation
     * and every part come from that one open descriptor, so a file replaced
@@ -551,19 +553,30 @@ object Uploader:
       val up = key("up", t, name)
       val (genKey, partKey, bytesKey) = (key("upgen", t, name), key("uppart", t, name), key("upbytes", t, name))
       val isMonth = name.length == "YYYY-MM.parquet".length
-      val alreadyCovered =
-        db.syncValue(up) != 0 ||
+      val mark = db.syncValue(up)
+      val legacyCovered =
+        mark == ArchiveUpload.LegacyMark ||
           (isMonth && {
             val month = java.time.YearMonth.parse(name.take(7))
-            (1 to month.lengthOfMonth).forall(d => db.syncValue(key("up", t, s"${month.atDay(d)}.parquet")) != 0)
+            ArchiveUpload.monthCoveredByLegacyDays((1 to month.lengthOfMonth).map(d => db.syncValue(key("up", t, s"${month.atDay(d)}.parquet"))))
           })
+      // A day still being archived (rows left in SQLite) is sent once it is
+      // complete; a file handed over is sent again only when it changed.
+      val inProgress = !isMonth && scala.util.Try(java.time.LocalDate.parse(name.take(10))).toOption.exists(d =>
+        !net.sksat.ashidori.Maintenance.Complete.is(d) &&
+          AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1))))
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
-        if alreadyCovered then None
+        if legacyCovered || inProgress then None
         else
-          try Some(ArchiveSnapshot.open(f, fstat))
+          try Some(ArchiveSnapshot.open(f, fstat)).filter { snap =>
+            val fresh = !ArchiveUpload.handedOver(mark, snap.generation)
+            if !fresh then snap.close()
+            fresh
+          }
           catch case _: java.io.FileNotFoundException => None
       snapshot.foreach { snap =>
+        val handed = up -> ArchiveUpload.markOf(snap.generation)
         try
           val stored = Option.when(db.syncValue(genKey) != 0)(
             ArchiveUpload.Progress(db.syncValue(genKey), db.syncValue(partKey), db.syncValue(bytesKey)))
@@ -574,7 +587,7 @@ object Uploader:
             ArchiveUpload.nextPart(snap, p) match
               case None =>
                 // Only an empty file ends here: other files end with their last part.
-                if ArchiveUpload.complete(p, snap.size) then db.updateSync(Seq(up -> 1L), Seq(genKey, partKey, bytesKey))
+                if ArchiveUpload.complete(p, snap.size) then db.updateSync(Seq(handed), Seq(genKey, partKey, bytesKey))
                 else throw IllegalStateException(s"${t.name}/$name: ${p.bytes} bytes enqueued of ${snap.size}")
                 done = true
               case Some(_) if db.outboxBytes(run.reg, cls) > MaxOutboxBytes =>
@@ -585,7 +598,7 @@ object Uploader:
                   "part" -> ujson.Num(part.index.toDouble), "parts" -> ujson.Num(part.parts.toDouble),
                   "data" -> java.util.Base64.getEncoder.encodeToString(part.data))))
                 // nextPart checked that the last part completes this generation.
-                if part.last then enqueue(run, cls, "archive", plain, Seq(up -> 1L), Seq(genKey, partKey, bytesKey))
+                if part.last then enqueue(run, cls, "archive", plain, Seq(handed), Seq(genKey, partKey, bytesKey))
                 else enqueue(run, cls, "archive", plain,
                   Seq(genKey -> snap.generation, partKey -> part.next.part, bytesKey -> part.next.bytes))
                 p = part.next
@@ -634,7 +647,7 @@ private val LockWaitMs = 3 * 60_000L
 class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
     // After repeated crashes only a sync the user asked for runs.
-    if net.sksat.ashidori.Maintenance.SafeMode.active && !getTags.contains(SyncScheduler.ManualTag) then
+    if net.sksat.ashidori.Maintenance.SafeMode.syncStopped && !getTags.contains(SyncScheduler.ManualTag) then
       return ListenableWorker.Result.success()
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
@@ -665,7 +678,7 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
 
 class RawLogSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
-    if net.sksat.ashidori.Maintenance.SafeMode.active then return ListenableWorker.Result.success()
+    if net.sksat.ashidori.Maintenance.SafeMode.syncStopped then return ListenableWorker.Result.success()
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
         Try(Uploader.uploadRawLogs(run)).fold(

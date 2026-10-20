@@ -117,7 +117,8 @@ class ArchiveMergeSuite extends munit.FunSuite:
 
   test("Reorder puts nearly ordered rows in order, keeping the order of equal times") {
     val out = ArrayBuffer.empty[Row]
-    val ro = Reorder(100L, out += _)
+    val late = ArrayBuffer.empty[Row]
+    val ro = Reorder[Row](100L, key, out += _, late += _)
     // (row time, stored time): gyro-like rows stored with the previous record's time.
     val in = Seq((1000L, "a", 1000L), (1003L, "g", 1000L), (1001L, "b", 1001L), (1001L, "c", 1001L), (995L, "m", 1001L),
       (1200L, "d", 1200L), (1500L, "e", 1500L))
@@ -127,9 +128,10 @@ class ArchiveMergeSuite extends munit.FunSuite:
     ro.flush()
     assertEquals(out.map(_(1)).toSeq, Seq("m", "a", "b", "c", "g", "d", "e"))
     assertEquals(ro.late, 0L)
-    // A row older than what was passed on: passed on as it comes, counted.
+    // A row older than what was passed on: not written out of order, handed back.
     ro.push(r(10L, "x"), 1600L)
-    assertEquals(out.last(1), "x")
+    assertEquals(late.map(_(1)).toSeq, Seq("x"))
+    assertEquals(out.last(1), "e")
     assertEquals(ro.late, 1L)
   }
 
@@ -138,7 +140,7 @@ class ArchiveMergeSuite extends munit.FunSuite:
     val rows = (0 until 3000).map(i => (r(1000L + i * 3 + (if i % 3 == 1 then 2 else 0), s"v$i"), 1000L + (i / 3) * 9))
     def sorted(src: Seq[(Row, Long)]) =
       val out = ArrayBuffer.empty[Row]
-      val ro = Reorder(60_000L, out += _)
+      val ro = Reorder[Row](60_000L, key, out += _)
       src.foreach((row, w) => ro.push(row, w))
       ro.flush()
       out.toSeq
