@@ -102,12 +102,34 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   private val locks = Archive.All.map(t => t.name -> TableLock(File(root, s".lock-${t.name}"))).toMap
 
   /** Runs `f` with the tables' locks held shared: no commit replaces their
-    * files or deletes their rows from SQLite meanwhile.
+    * files or deletes their rows from SQLite meanwhile. A commit left
+    * unfinished by a process that died is finished first (or `f` does not
+    * run: the error is thrown).
     */
-  def reading[A](tables: Archive.TableDef*)(f: => A): A = locked(tables.map(_.name).distinct.sorted, exclusive = false, f)
+  def reading[A](tables: Archive.TableDef*)(f: => A): A =
+    val names = tables.map(_.name).distinct.sorted
+    var out: Option[A] = None
+    while out.isEmpty do
+      // Only a commit of these tables holds them up (not one of others).
+      if pendingTouches(names) then resolvePending()
+      locked(names, exclusive = false, {
+        // A commit of these tables that died after we checked: finish it first.
+        if !pendingTouches(names) then out = Some(f)
+      })
+    out.get
 
   /** Runs `f` with the tables' locks held exclusive (commits). */
-  def writing[A](tables: Seq[String])(f: => A): A = locked(tables.distinct.sorted, exclusive = true, f)
+  private def writing[A](tables: Seq[String])(f: => A): A = locked(tables.distinct.sorted, exclusive = true, f)
+
+  /** Whether an unfinished commit (its record on disk) concerns any of `names`. */
+  private def pendingTouches(names: Seq[String]): Boolean =
+    intentFile.exists && {
+      val text = Try(String(java.nio.file.Files.readAllBytes(intentFile.toPath), UTF_8)).toOption
+      text.flatMap(CommitIntent.decode).forall(i => tablesOf(i).exists(names.contains))
+    }
+
+  /** Finishes an unfinished commit, if there is one (throws if it cannot). */
+  def resolvePending(): Unit = if intentFile.exists then recover(AshidoriApp.db)
 
   private def locked[A](names: Seq[String], exclusive: Boolean, f: => A): A = names match
     case Seq() => f
@@ -179,7 +201,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * synced), then the deletion, then the record is removed.
     */
   private def commit(db: Db, intent: CommitIntent, tables: Seq[String], check: () => Unit = () => ()): Unit =
+    resolvePending()
     writing(tables) {
+      // Never over an unfinished commit's record (its recovery failed).
+      if intentFile.exists then throw IllegalStateException("an earlier archive commit is unfinished")
       // Under the lock: SQLite still holds exactly the rows written.
       check()
       Maintenance.write(intentFile, CommitIntent.encode(intent))
@@ -249,6 +274,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     CommitIntent.recovery(intent, disk) match
       case CommitIntent.Recovery.Finish(renames) =>
         renames.foreach(rename)
+        // A rename seen on disk may not be durable yet (the process died
+        // before its directory was synced): every file and directory the
+        // commit relies on is synced before anything is deleted.
+        for t <- intent.files do
+          syncFile(file(t.path))
+          syncDir(file(t.path).getParentFile)
         runDelete(db, intent.delete)
         LifeLog.add(LifeKind.Archive, "中断されたまとめを完了")
       case CommitIntent.Recovery.Drop =>
@@ -475,6 +506,12 @@ object ArchiveStore:
     */
   def syncDir(d: File): Unit =
     val fd = android.system.Os.open(d.getPath, android.system.OsConstants.O_RDONLY, 0)
+    try android.system.Os.fsync(fd)
+    finally android.system.Os.close(fd)
+
+  /** fsync of a file (not the database: see [[Db]]). Throws. */
+  def syncFile(f: File): Unit =
+    val fd = android.system.Os.open(f.getPath, android.system.OsConstants.O_RDONLY, 0)
     try android.system.Os.fsync(fd)
     finally android.system.Os.close(fd)
 

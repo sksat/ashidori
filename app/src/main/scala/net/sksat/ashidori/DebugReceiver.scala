@@ -9,6 +9,7 @@ import java.time.LocalDate
   *
   *   am broadcast -n <pkg>/net.sksat.ashidori.DebugReceiver -a ashidori.debug.SYNTH --ei hours 5 [--ei startMinute 600] [--ei daysAgo 1] (or --ei minutes N)
   *   ... -a ashidori.debug.ODD [--ei daysAgo 1]       raw lines that do not convert, and late ones
+  *   ... -a ashidori.debug.CORRUPT_TEST                a corrupt test database is kept (not deleted)
   *   ... -a ashidori.debug.LOG --es mode max        start recording in a mode
   *   ... -a ashidori.debug.STOP                       stop recording
   *   ... -a ashidori.debug.MAINTAIN                   archive maintenance now (a job)
@@ -29,6 +30,8 @@ class DebugReceiver extends BroadcastReceiver:
       case "ashidori.debug.ODD" =>
         val ago = intent.getIntExtra("daysAgo", 1)
         Thread(() => Log.i(s"odd raw lines: ${DebugData.insertOdd(LocalDate.now(AshidoriApp.zone).minusDays(ago))}"), "ashidori-odd").start()
+      case "ashidori.debug.CORRUPT_TEST" =>
+        Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()
       case "ashidori.debug.LOG" =>
         Settings.onboarded = true
         Settings.mode = ashidori.core.LoggingMode.fromKey(Option(intent.getStringExtra("mode")).getOrElse("max"))

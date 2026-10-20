@@ -15,8 +15,12 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
   private var pendingRaw = 0L
   private var pendingOther = 0L
   private var nextId = 0L
-  // Batches queued and not yet done: id -> when queued (uptime).
-  private val queued = scala.collection.mutable.TreeMap.empty[Long, Long]
+  // Batches queued and not yet done: id -> (kind, when queued (uptime)).
+  private val queued = scala.collection.mutable.TreeMap.empty[Long, (String, Long)]
+  // Per kind: since when data of it failed to be saved (until one of its
+  // batches is saved again), and when it was last saved.
+  private val failedSince = scala.collection.mutable.Map.empty[String, Long]
+  private val savedAt = scala.collection.mutable.Map.empty[String, Long]
   // Since the last note.
   private var lostRaw = 0L
   private var lostOther = 0L
@@ -29,13 +33,24 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
 
   def pending: Long = pendingRaw + pendingOther
 
-  /** When the oldest batch still waiting was queued (uptime), if any. */
-  def oldestQueued: Option[Long] = queued.headOption.map(_._2)
+  /** Per kind, since when its data has not been saved (uptime): the oldest
+    * batch still waiting, or the oldest that failed since its last save. A
+    * kind that saves fine shows nothing, whatever the other kinds do.
+    */
+  def unsavedSince: Map[String, Long] =
+    val waiting = queued.values.groupBy(_._1).view.mapValues(_.map(_._2).min).toMap
+    (waiting.keySet ++ failedSince.keySet).map(k => k -> (waiting.get(k) ++ failedSince.get(k)).min).toMap
+
+  /** The oldest of [[unsavedSince]]: (kind, since). */
+  def oldestUnsaved: Option[(String, Long)] = unsavedSince.minByOption(_._2)
+
+  /** When data of `kind` was last saved (uptime), if in this process. */
+  def lastSaved(kind: String): Option[Long] = savedAt.get(kind)
 
   /** A batch of `rows` is about to be queued: its id, or None if it is over
     * the cap (raw: spill it; other: it is lost, counted).
     */
-  def offer(rows: Int, raw: Boolean, now: Long): Option[Long] =
+  def offer(rows: Int, raw: Boolean, kind: String, now: Long): Option[Long] =
     val ok =
       if raw then pendingRaw + rows <= maxRaw
       else pendingOther + rows <= maxOther
@@ -43,11 +58,12 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
       if !raw then
         lostOther += rows
         totalLost += rows
+        failedSince.getOrElseUpdate(kind, now)
       None
     else
       if raw then pendingRaw += rows else pendingOther += rows
       nextId += 1
-      queued(nextId) = now
+      queued(nextId) = (kind, now)
       Some(nextId)
 
   /** A raw batch over the cap went to a file instead. */
@@ -58,7 +74,13 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
   /** A queued batch left the queue: committed, or given up (`lost`). */
   def done(id: Long, rows: Int, raw: Boolean, now: Long, lost: Boolean = false): Unit =
     if raw then pendingRaw -= rows else pendingOther -= rows
-    queued.remove(id).foreach(t => slowest = math.max(slowest, now - t))
+    queued.remove(id).foreach { (kind, t) =>
+      slowest = math.max(slowest, now - t)
+      if lost then failedSince.getOrElseUpdate(kind, t)
+      else
+        failedSince.remove(kind)
+        savedAt(kind) = now
+    }
     if lost then
       if raw then lostRaw += rows else lostOther += rows
       totalLost += rows
@@ -109,8 +131,8 @@ object WriteStall:
     */
   val OldestMs: Long = 3 * 60_000L
 
-  def queuedTooLong(oldestQueued: Option[Long], nowUptime: Long): Boolean =
-    oldestQueued.exists(nowUptime - _ > OldestMs)
+  def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
+    unsavedSince.exists(nowUptime - _ > OldestMs)
 
   def thresholdMs(intervalMs: Long, maxBatchDelayMs: Long): Long =
     math.max(MinMs, 2 * math.max(intervalMs, maxBatchDelayMs) + MarginMs)

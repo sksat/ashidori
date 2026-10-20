@@ -525,8 +525,9 @@ object Uploader:
 
   /** Sends archived files not sent yet, as `archive` batches of ≤3 MiB parts.
     * A file is sent again when it changed since it was handed over (marked
-    * with its generation); a day still being archived waits until done. A
-    * month file is skipped when an earlier version sent every day it merged.
+    * with its generation; earlier versions' marks are of no generation, so
+    * such files are sent once more); a day still being archived waits until
+    * done.
     *
     * Each file is opened once ([[ArchiveSnapshot]]): its size, its generation
     * and every part come from that one open descriptor, so a file replaced
@@ -554,12 +555,6 @@ object Uploader:
       val (genKey, partKey, bytesKey) = (key("upgen", t, name), key("uppart", t, name), key("upbytes", t, name))
       val isMonth = name.length == "YYYY-MM.parquet".length
       val mark = db.syncValue(up)
-      val legacyCovered =
-        mark == ArchiveUpload.LegacyMark ||
-          (isMonth && {
-            val month = java.time.YearMonth.parse(name.take(7))
-            ArchiveUpload.monthCoveredByLegacyDays((1 to month.lengthOfMonth).map(d => db.syncValue(key("up", t, s"${month.atDay(d)}.parquet"))))
-          })
       // A day still being archived (rows left in SQLite) is sent once it is
       // complete; a file handed over is sent again only when it changed.
       val inProgress = !isMonth && scala.util.Try(java.time.LocalDate.parse(name.take(10))).toOption.exists(d =>
@@ -567,7 +562,7 @@ object Uploader:
           AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1))))
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
-        if legacyCovered || inProgress then None
+        if inProgress then None
         else
           try Some(ArchiveSnapshot.open(f, fstat)).filter { snap =>
             val fresh = !ArchiveUpload.handedOver(mark, snap.generation)

@@ -13,7 +13,8 @@ import ashidori.core.Archive
   * Android 12+, so this is the way out).
   *
   * Contents: a copy of the SQLite database (`databases/ashidori.db`), the
-  * Parquet archive (`files/archive/`), the lifecycle log, and a short
+  * Parquet archive (`files/archive/`), raw lines spilled to files and not
+  * imported yet (`files/overflow/`), the lifecycle log, and a short
   * description. Not the basemap or venue data (downloaded again).
   *
   * Consistency: with the archive's locks held shared (no commit moves rows
@@ -42,13 +43,26 @@ object Backup:
     ArchiveStore.ensureDir(dir)
     val snapshot = File(dir, "ashidori.db")
     val dbPath = File(db.getReadableDatabase.getPath)
-    val need = dbPath.length + File(dbPath.getPath + "-wal").length
-    if dir.getUsableSpace < need + (64L << 20) then
+    // Measured (6.45 million raw lines, 728 MB database, logging meanwhile):
+    // the copy is as large as the database, the WAL did not grow, and the
+    // ZIP (often on the same storage) is about 35% of it: 1.25 times at the
+    // peak. Ask for half as much again.
+    val db0 = dbPath.length + File(dbPath.getPath + "-wal").length
+    val need = db0 + db0 / 2 + (64L << 20)
+    if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量が足りません（${need >> 20} MB 必要）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     try
       archive.reading(Archive.All*) {
-        db.snapshotTo(snapshot)
+        // No overflow file is imported (and deleted) meanwhile: each one is
+        // either in the copy with its import mark, or in the ZIP unimported.
+        val overflow = LoggerWrites.Overflow
+        overflow.lock.lock()
+        try
+          db.snapshotTo(snapshot)
+          for f <- Option(overflow.dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(_.getName) do
+            opened += (("files/overflow/" + f.getName, f, FileInputStream(f)))
+        finally overflow.lock.unlock()
         def walk(f: File): Seq[File] =
           if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk) else Seq(f)
         for f <- walk(archive.root) if f.getName.endsWith(".parquet") do
@@ -114,6 +128,7 @@ object Backup:
              |written ${java.time.Instant.now()}
              |databases/ashidori.db: SQLite, a consistent copy (VACUUM INTO)
              |files/archive/<table>/<YYYY-MM[-DD]>.parquet: archived days and months
+             |files/overflow/raw-*.txt: raw lines not in the database yet (time TAB line)
              |files/lifecycle.log: lifecycle log (no positions)
              |""".stripMargin
         zip.putNextEntry(ZipEntry("ashidori-backup.txt"))

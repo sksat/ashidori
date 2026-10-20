@@ -14,6 +14,38 @@ import ashidori.core.GnssLogFormat.row
 object DebugData:
   @volatile var progress = ""
 
+  /** Checks that a corrupt database is kept, through the app's own open
+    * paths (the helper and the backup's read-only connection): a test
+    * database is written, corrupted on disk and read again. Returns a
+    * report line.
+    */
+  def corruptionTest(c: android.content.Context): String =
+    val name = "corrupt-test.db"
+    c.deleteDatabase(name)
+    val f = c.getDatabasePath(name)
+    val db = Db(c, name)
+    db.insertRawLines((0 until 20_000).map(i => (i.toLong, s"Accel,$i,1,0.1,0.2,0.3")))
+    db.close()
+    // No connection is open now: garbage over pages in the middle.
+    val raf = java.io.RandomAccessFile(f, "rw")
+    try
+      raf.seek(f.length / 2)
+      raf.write(Array.fill[Byte](16_384)(0x55))
+      raf.getFD.sync()
+    finally raf.close()
+    val before = Db.KeepOnCorruption.reported
+    val db2 = Db(c, name)
+    val query = scala.util.Try(db2.rawLines(0L, Long.MaxValue).size)
+    val snap = java.io.File(c.getCacheDir, "corrupt-snapshot.db")
+    val vacuum = scala.util.Try(db2.snapshotTo(snap))
+    val reports = Db.KeepOnCorruption.reported - before
+    val kept = f.exists && f.length > 0
+    scala.util.Try(db2.close())
+    snap.delete()
+    c.deleteDatabase(name)
+    s"corruption test: query=${query.fold(e => e.getClass.getSimpleName, n => s"$n rows")} " +
+      s"snapshot=${vacuum.fold(e => e.getClass.getSimpleName, _ => "ok")} handledByKeepOnCorruption=$reports fileKept=$kept"
+
   /** Odd raw lines at 12:00 of `day`: 5 that do not convert (kept in SQLite
     * for good) and 20 IMU lines whose own time is 3 minutes before their
     * stored time (out of order beyond the reorder window). Returns (odd, late).

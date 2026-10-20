@@ -41,7 +41,7 @@ object LoggerWrites:
     */
   def submit(rows: Int, raw: Boolean, what: String, lines: Seq[(Long, String)] = Nil)(write: Db => Unit): Unit =
     val now = SystemClock.uptimeMillis()
-    backlog.synchronized(backlog.offer(rows, raw, now)) match
+    backlog.synchronized(backlog.offer(rows, raw, what, now)) match
       case None =>
         if raw && lines.nonEmpty then
           // Over the cap: to a file, imported later (Overflow).
@@ -63,6 +63,8 @@ object LoggerWrites:
               Log.w(s"saving $what failed", e)
               lostNow(rows, s"$what: ${LifeLog.describe(e)}")
           finally
+            val waited = SystemClock.uptimeMillis() - now
+            if waited > 1000 then Log.i(s"write of $rows $what took $waited ms from hand-over")
             backlog.synchronized(backlog.done(id, rows, raw, SystemClock.uptimeMillis(), lost))
             note()
           if !lost then Overflow.importSome(() => backlog.synchronized(backlog.pending))
@@ -110,6 +112,16 @@ object LoggerWrites:
   /** Rows waiting to be committed. */
   def pending: Long = backlog.synchronized(backlog.pending)
 
+  /** Per kind (位置, 動き, 詳細ログ, ...): how long ago it was last saved in
+    * this process, and for how long it has not been (ms), for 端末診断.
+    */
+  def progress(kinds: Seq[String]): Seq[(String, Option[Long], Option[Long])] =
+    val now = SystemClock.uptimeMillis()
+    backlog.synchronized {
+      val unsaved = backlog.unsavedSince
+      kinds.map(k => (k, backlog.lastSaved(k).map(now - _), unsaved.get(k).map(now - _)))
+    }
+
   /** The logger (re)started: the stall clock starts now, and lines left in
     * overflow files are imported.
     */
@@ -125,21 +137,33 @@ object LoggerWrites:
   def checkStall(plan: Option[SamplingPlan]): Unit =
     val threshold = WriteStall.thresholdMs(plan.map(_.intervalMs).getOrElse(0L), plan.map(_.maxBatchDelayMs).getOrElse(0L))
     val now = SystemClock.uptimeMillis()
-    val oldest = backlog.synchronized(backlog.oldestQueued)
+    // Per kind: a position batch that failed or waits stays visible however
+    // many battery rows are saved meanwhile.
+    val oldest = backlog.synchronized(backlog.oldestUnsaved)
     val noCommit = WriteStall.stalled(lastCommitUptime, now, threshold)
-    if !stallReported && (noCommit || WriteStall.queuedTooLong(oldest, now)) then
+    if !stallReported && (noCommit || WriteStall.queuedTooLong(oldest.map(_._2), now)) then
       stallReported = true
       val detail =
         if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
-        else s"${(now - oldest.get) / 60_000}分前からの記録が保存されていません"
+        else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
       LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
       Alerts.stall()
 
   /** Count of rows given up, kept on disk (shown in 端末診断). */
   object Losses:
     private def file = File(Maintenance.dir, "write-losses")
+    /** Rows lost that could not be counted on disk (shown as well). */
+    @volatile var uncounted = 0L
     def total: Long = Try(String(java.nio.file.Files.readAllBytes(file.toPath), UTF_8).trim.toLong).getOrElse(0L)
-    def add(rows: Int): Unit = synchronized(Try(Maintenance.write(file, (total + rows).toString)))
+    def add(rows: Int): Unit = synchronized {
+      try
+        Maintenance.write(file, (total + uncounted + rows).toString)
+        uncounted = 0
+      catch case NonFatal(e) =>
+        uncounted += rows
+        Log.w("counting lost rows on disk failed", e)
+        LifeLog.add(LifeKind.Note, s"失われた行数をファイルに記録できず（$rows 行）: ${LifeLog.describe(e)}")
+    }
 
   /** Raw-line batches the queue had no room for, in files (one per batch,
     * fsynced) until imported. An import inserts a file's lines and records
@@ -147,8 +171,10 @@ object LoggerWrites:
     * between does not import it twice.
     */
   object Overflow:
-    private def dir = File(AshidoriApp.app.getFilesDir, "overflow")
+    def dir: File = File(AshidoriApp.app.getFilesDir, "overflow")
     private var seq = 0L
+    /** Held by an import of a file, and by a backup while it takes its copy. */
+    val lock = java.util.concurrent.locks.ReentrantLock()
 
     def spill(lines: Seq[(Long, String)]): Unit = synchronized {
       ArchiveStore.ensureDir(dir)
@@ -170,15 +196,23 @@ object LoggerWrites:
     def importSome(pending: () => Long): Unit =
       val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(_.getName)
       for f <- files.take(20) if pending() < WriteBacklog.MaxRawRows / 2 do
+        lock.lock()
         try
           val db = AshidoriApp.db
           val key = s"overflow|${f.getName}"
-          if db.legacyImported(key) == 0 then
-            val lines = String(java.nio.file.Files.readAllBytes(f.toPath), UTF_8).linesIterator.flatMap { l =>
-              val i = l.indexOf('\t')
-              if i <= 0 then None else l.take(i).toLongOption.map(_ -> l.drop(i + 1))
-            }.toVector
-            db.insertLegacyChunk(lines, key, lines.size.max(1).toLong)
-          f.delete()
-          db.legacyDone(key)
+          OverflowImport.run(new OverflowImport.Ops:
+            def marked = db.legacyImported(key) != 0
+            def insertMarked(): Unit =
+              val lines = String(java.nio.file.Files.readAllBytes(f.toPath), UTF_8).linesIterator.flatMap { l =>
+                val i = l.indexOf('\t')
+                if i <= 0 then None else l.take(i).toLongOption.map(_ -> l.drop(i + 1))
+              }.toVector
+              db.insertLegacyChunk(lines, key, lines.size.max(1).toLong)
+            def deleteFile(): Boolean = f.delete() || !f.exists
+            def syncDir(): Unit = ArchiveStore.syncDir(dir)
+            def unmark(): Unit = db.legacyDone(key)
+          ) match
+            case OverflowImport.Result.Kept => Log.w(s"overflow $f imported but not deleted; kept marked")
+            case _ => ()
         catch case NonFatal(e) => Log.w(s"overflow import of $f failed", e)
+        finally lock.unlock()

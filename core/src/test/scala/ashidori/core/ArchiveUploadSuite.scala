@@ -113,9 +113,7 @@ class ArchiveUploadSuite extends munit.FunSuite:
     assertNotEquals(g1, g2)
     assert(!ArchiveUpload.handedOver(ArchiveUpload.markOf(g1), g2))
     assert(!ArchiveUpload.handedOver(0L, g2))
-    // Marks of earlier versions (whole files) still count.
-    assert(ArchiveUpload.handedOver(ArchiveUpload.LegacyMark, g2))
-    assert(ArchiveUpload.monthCoveredByLegacyDays(Seq(1L, 1L)))
-    assert(!ArchiveUpload.monthCoveredByLegacyDays(Seq(1L, g1)))
-    assert(!ArchiveUpload.monthCoveredByLegacyDays(Nil))
+    // A mark of an earlier version is of no known generation: sent once more.
+    assert(!ArchiveUpload.handedOver(ArchiveUpload.LegacyMark, g2))
+    assert(ArchiveUpload.markOf(0L) != ArchiveUpload.LegacyMark && ArchiveUpload.markOf(1L) != ArchiveUpload.LegacyMark)
   }

@@ -42,6 +42,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val savedRow = row("最後に保存された測位", "", "…")()
   private val crashRow = row("異常終了（直近24時間）", "", "…")()
   private val pendingRow = row("保存待ち", "", "…")()
+  private val kindRow = row("種類ごとの最後の保存", "", "")()
   private val archiveRow = row("記録のまとめ", "", "…")()
   private val syncRow = row("自動の同期", "", "…")(Some(() => resumeSync()))
   /** One line for the backup and maintenance below: progress, result or error. */
@@ -59,7 +60,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     scroll(
       vbox(
         sectionHeader("記録の保存"),
-        listGroup(savedRow, crashRow, pendingRow, archiveRow, syncRow),
+        listGroup(savedRow, crashRow, pendingRow, kindRow, archiveRow, syncRow),
         card(
           text("記録データ", 16f, bold = true),
           caption("バックアップは記録を端末内の形式のまま ZIP にまとめます。地図と施設データは含みません。"),
@@ -124,7 +125,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val skipped = Try(Maintenance.Guard.skipped()).getOrElse(Nil)
       val safe = Maintenance.SafeMode.maintenanceStopped
       val syncStopped = Maintenance.SafeMode.syncStopped
-      val lost = LoggerWrites.Losses.total
+      val lost = LoggerWrites.Losses.total + LoggerWrites.Losses.uncounted
       act.runOnUiThread { () =>
         savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
         val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
@@ -138,6 +139,11 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
           (if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}") +
             (if lost > 0 then s"・保存できなかった行 累計 $lost" else ""))
         pendingRow.subtitle.setTextColor(color(if lost > 0 then attr.error else attr.onSurfaceVariant))
+        val kinds = LoggerWrites.progress(Seq("位置", "動き", "詳細ログ"))
+        kindRow.setSubtitle(kinds.map { (k, saved, unsaved) =>
+          s"$k " + unsaved.map(u => s"${fmtDuration(u)}前から未保存").orElse(saved.map(a => s"${fmtDuration(a)}前")).getOrElse("—")
+        }.mkString("・"))
+        kindRow.subtitle.setTextColor(color(if kinds.exists(_._3.exists(_ > WriteStall.OldestMs)) then attr.error else attr.onSurfaceVariant))
         syncRow.setSubtitle(if syncStopped then "異常終了が続いたため停止中（タップで再開）" else "")
         syncRow.setValue(if syncStopped then "停止中" else "動作")
         syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))

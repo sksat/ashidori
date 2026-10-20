@@ -12,10 +12,13 @@ import ashidori.core.*
   * editable. Timelines are recomputed from raw signals, so algorithm
   * improvements apply retroactively.
   */
-final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, Db.Version, Db.KeepOnCorruption):
+final class Db(ctx: Context, name: String = "ashidori.db")
+    extends SQLiteOpenHelper(ctx, name, null, Db.Version, Db.KeepOnCorruption):
   // A commit is on disk when it returns (Android's WAL default, NORMAL, can
   // lose the last commits in a power loss): every connection, both processes.
-  setOpenParams(SQLiteDatabase.OpenParams.Builder().setSynchronousMode("FULL").build())
+  // The open parameters replace the constructor's: the error handler that
+  // keeps a corrupt database (Android's default deletes it) is set again.
+  setOpenParams(SQLiteDatabase.OpenParams.Builder().setSynchronousMode("FULL").setErrorHandler(Db.KeepOnCorruption).build())
 
   override def onConfigure(db: SQLiteDatabase): Unit =
     db.enableWriteAheadLogging()
@@ -625,7 +628,7 @@ final class Db(ctx: Context) extends SQLiteOpenHelper(ctx, "ashidori.db", null, 
     */
   def snapshotTo(dest: java.io.File): Unit =
     dest.delete()
-    val ro = SQLiteDatabase.openDatabase(getReadableDatabase.getPath, null, SQLiteDatabase.OPEN_READONLY)
+    val ro = SQLiteDatabase.openDatabase(getReadableDatabase.getPath, null, SQLiteDatabase.OPEN_READONLY, Db.KeepOnCorruption)
     try ro.execSQL("VACUUM INTO ?", Array[AnyRef](dest.getPath))
     finally ro.close()
 
@@ -826,7 +829,10 @@ object Db:
     * deletes the database, which would lose everything recorded.
     */
   object KeepOnCorruption extends android.database.DatabaseErrorHandler:
+    /** Corruptions reported to this handler in this process (a test checks it is the one in effect). */
+    @volatile var reported = 0
     override def onCorruption(db: SQLiteDatabase): Unit =
+      reported += 1
       Log.e(s"database corruption reported: ${db.getPath}; files kept")
       LifeLog.add(LifeKind.Note, "データベースの破損を検出（ファイルは削除せずに保持）")
 
