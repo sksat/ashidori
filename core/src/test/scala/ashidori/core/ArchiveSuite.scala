@@ -57,3 +57,51 @@ class ArchiveSuite extends munit.FunSuite:
     assertEquals(back.steps, 12)
     assert(back.accelMean.isNaN)
   }
+
+  /** One line of every kind the detail recorder writes (as GnssRecorder
+    * formats them, NaN and null as empty fields).
+    */
+  private val recorderLines: Seq[String] =
+    import GnssLogFormat.row
+    val t = 1_791_801_000_000L
+    val raw = Seq.fill[Any](GnssLogFormat.RawHeader.split(',').length - 1)("").updated(0, t).updated(10, 7).updated(35, "C")
+    Seq(
+      row(("Raw" +: raw)*),
+      row("Status", t, 40, 0, 1, 7, 1.57542e9, 38.5f, 120f, 45f, true, true, false, Float.NaN),
+      row("Nav", 7, 257, 1, 3, 1, "1,2,3"),
+      row("NMEA", "$GPGGA,1,2", t),
+      row("Accel", t, 123L, 0.1f, 0.2f, 9.8f),
+      row("Gyro", t, 124L, 0.01f, 0.02f, 0.03f),
+      row("Mag", t, 125L, 20f, -5f, 40f),
+      row("Fix", "gps", 35.1, 139.2, 40.5, 1.5f, 4f, 90f, t, 0.3f, 2f, 555L, 3f, false, null, null, null)
+    )
+
+  test("every kind the recorder writes has a table, and no line kind is lost") {
+    val kinds = recorderLines.map(_.takeWhile(_ != ','))
+    assertEquals(kinds.toSet, Set("Raw", "Status", "Nav", "NMEA", "Accel", "Gyro", "Mag", "Fix"))
+    val lines = (0 until 50).flatMap(_ => recorderLines)
+    val before = lines.groupBy(_.takeWhile(_ != ',')).view.mapValues(_.size).toMap
+    val rows = lines.map(l => Archive.rowOf(l, 1_791_801_000_000L))
+    assert(rows.forall(_.isDefined), "a line had no table")
+    rows.flatten.foreach((t, r) => assertEquals(r.size, t.columns.size, t.name))
+    val after = rows.flatten.groupBy(_._1).view.mapValues(_.size).toMap
+    assertEquals(after(Archive.GnssRaw), before("Raw"))
+    assertEquals(after(Archive.GnssSat), before("Status"))
+    assertEquals(after(Archive.GnssNav), before("Nav"))
+    assertEquals(after(Archive.Nmea), before("NMEA"))
+    assertEquals(after(Archive.Imu), before("Accel") + before("Gyro") + before("Mag"))
+    assertEquals(after(Archive.GnssFix), before("Fix"))
+    assertEquals(after.keySet, Archive.RawTables.toSet)
+  }
+
+  test("detail-log Fix lines keep every field and turn back into the same line") {
+    val line = recorderLines.last
+    val (t, row) = Archive.rowOf(line, 0).get
+    assertEquals(t, Archive.GnssFix)
+    val back = roundTrip(t, Seq(row)).rowIterator.next()
+    assertEquals(back(0), 1_791_801_000_000L)
+    assertEquals(back(1), "gps")
+    assertEquals(back(10), 555L)
+    assertEquals(back(12), 0)
+    assertEquals(Archive.lineOf(t, back), line)
+  }

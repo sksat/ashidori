@@ -16,14 +16,14 @@ import ashidori.core.GnssLogFormat.row
   * gyroscope, magnetometer). Lines use the GnssLogger text format and go to
   * SQLite (`raw_lines`) in batches; finished days are archived to Parquet.
   *
-  * Callbacks arrive on the logger thread; batches are written on the I/O
-  * thread so storage never blocks sensor delivery.
+  * Callbacks arrive on the logger thread; batches (every 3 s or 2000 lines)
+  * are written on the logger's write thread ([[LoggerWrites]]) so storage never blocks sensor
+  * delivery.
   */
 final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fullTracking: Boolean, val reason: String):
   val startedAt: Long = System.currentTimeMillis()
   /** Shown in the UI while recording. */
   val label: String = s"${java.time.Instant.ofEpochMilli(startedAt).atZone(AshidoriApp.zone).toLocalTime.withNano(0)} から"
-  private val io = AshidoriApp.io
   private val exec: Executor = r => handler.post(r)
   @volatile private var closed = false
   var measurementEvents = 0L
@@ -45,7 +45,7 @@ final class GnssRecorder(ctx: Context, lm: LocationManager, handler: Handler, fu
       val batch = buffer.toVector
       buffer.clear()
       lastFlush = System.currentTimeMillis()
-      io.execute(() => AshidoriApp.db.insertRawLines(batch))
+      LoggerWrites.submit(batch.size, raw = true, "詳細ログ")(_.insertRawLines(batch))
 
   // IMU at 50 Hz (100 Hz when logging everything), alongside GNSS.
   private val sm = ctx.getSystemService(classOf[android.hardware.SensorManager])

@@ -13,15 +13,26 @@ class AshidoriApp extends Application:
     // Lifecycle log for 設定 › 端末診断: crashes on any thread, this start,
     // and the exits the OS recorded since the last start.
     LifeLog.installCrashHandler()
+    // Archive maintenance runs in its own process (Maintenance): none of the
+    // app's start belongs there.
+    if !AshidoriApp.isMaintenanceProcess then startMain()
+
+  private def startMain(): Unit =
     LifeLog.add(LifeKind.ProcessStart, s"記録=${if Settings.loggingEnabled then "オン" else "オフ"}")
-    AshidoriApp.io.execute { () =>
-      LifeLog.recordExitReasons()
-      LifeLog.checkState("起動時")
-    }
     val nm = getSystemService(classOf[NotificationManager])
     nm.createNotificationChannel(
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)
     )
+    Alerts.createChannel(this)
+    AshidoriApp.io.execute { () =>
+      LifeLog.recordExitReasons()
+      LifeLog.checkState("起動時")
+      // Abnormal exits: a notification, and after repeated crashes no
+      // optional background work. Then archive maintenance: not now, see
+      // Maintenance.schedule.
+      Alerts.checkExits()
+      Maintenance.schedule(this)
+    }
     LoggerWatchdog.schedule(this)
     Settings.migrate()
     // An unpairing cut short by a crash is finished before anything syncs.
@@ -35,8 +46,6 @@ class AshidoriApp extends Application:
     VenueDownload.autoStart(this)
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
-    // Archive finished days (and migrate pre-Parquet data) in the background.
-    AshidoriApp.io.execute(() => AshidoriApp.maintainArchive())
 
 object AshidoriApp:
   val ChannelLogging = "logging"
@@ -46,11 +55,13 @@ object AshidoriApp:
   lazy val db: Db = Db(instance)
   lazy val archive: ArchiveStore = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
 
-  /** Due archive work; call on [[io]]. */
-  def maintainArchive(): Unit =
-    try archive.maintain(db, java.io.File(instance.getExternalFilesDir(null), "gnss"), step => io.execute(() => step()))
-    catch case e: Exception => Log.w("archive maintenance failed", e)
-  /** Single background thread for DB and file I/O so the UI never blocks. */
+  /** The `:maintenance` process (archive maintenance), not the app's main one. */
+  lazy val isMaintenanceProcess: Boolean = Application.getProcessName.endsWith(":maintenance")
+
+  /** Background thread for the UI's DB and file I/O so the UI never blocks.
+    * The logger does not use it ([[LoggerWrites]]), nor does archiving
+    * (another process).
+    */
   lazy val io: ExecutorService = Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-io"))
   def zone: ZoneId = ZoneId.systemDefault()
 

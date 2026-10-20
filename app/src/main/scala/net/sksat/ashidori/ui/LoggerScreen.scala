@@ -244,10 +244,13 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   /** The user's other devices; first, since it is about all of them. */
   private val peers = PeerPanel(act)
   private val sensorPanel = SensorPanel(act)
+  /** Abnormal exits or unsaved data in the last day. */
+  private val banner = AlertBanner(act)
 
   val view: View =
     scroll(
       vbox((Seq(
+        banner.view,
         peers.view,
         card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, modeNote, indoorNote, spacer(4), controls),
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
@@ -270,6 +273,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   override def onShow(): Unit =
     // onShow comes again on resume without an onHide: observe only once.
     unobserve()
+    banner.refresh()
     unobserve = LoggerState.observe(() => refresh())
     peers.onShow()
     paintModes()

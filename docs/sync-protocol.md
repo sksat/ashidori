@@ -393,7 +393,7 @@ by device id.
   - `lat`/`lon` are rounded to 1e-6°, `acc` (metres, may be null) to 0.1 m.
   - `authcut: {deviceId, seq, sha256}`: the cut-over record `C` the device knows (v1.1; omitted while it knows none). See [Blob authentication](#blob-authentication-v11).
 - **Cut-over record** (stream `authcut`): normally one per user (two apps approving a first browser at the same time can make two; any one that verifies serves): `{deviceId, stream, below, digest}` per line. See [Blob authentication](#blob-authentication-v11).
-- **Archive** (stream `archive`): the logged signals are not uploaded row by row. The device keeps the current day in SQLite; once a day is over, it writes each table of that day to a Parquet file `<table>/YYYY-MM-DD.parquet`, and once a month is over, it merges the month's day files into `<table>/YYYY-MM.parquet`. Each such file is uploaded once, split into chunks of at most 3 MiB, one batch per chunk:
+- **Archive** (stream `archive`): the logged signals are not uploaded row by row. The device keeps the current day in SQLite; once a day is over, it writes each table of that day to a Parquet file `<table>/YYYY-MM-DD.parquet`, and once a month is over, it merges the month's day files into `<table>/YYYY-MM.parquet`. Since app 0.21 the raw signal tables (`gnss_raw`, `gnss_sat`, `gnss_nav`, `nmea`, `imu`) are no longer merged into months: they stay as day files (earlier versions may have sent month files of them). Each such file is uploaded once, split into chunks of at most 3 MiB, one batch per chunk:
   `{file: "<table>/<YYYY-MM-DD or YYYY-MM>.parquet", gen, part, parts, data}`
   - `data` is base64 of the chunk; concatenating `part` 0 to `parts - 1` of one (`file`, `gen`) gives the Parquet file.
   - `gen` identifies the file version (hex, derived from the size, device, inode and modification time of the open file). If a file changes while it is being uploaded, it is sent again from part 0 under a new `gen` and new seqs. A reader assembles parts per (`file`, `gen`) and uses a complete generation.
@@ -410,6 +410,7 @@ by device id.
     - `gnss_nav`: `time, Svid, Type, Status, MessageId, SubmessageId, Data` (`time` is the preceding record's time)
     - `nmea`: `time, message`
     - `imu`: `time, elapsedRealtimeNanos, sensor (Accel, Gyro or Mag), x, y, z`
+    - `gnss_fix` (since app 0.21): the columns of a GnssLogger `Fix` line, `UnixTimeMillis` first (earlier versions did not archive these lines)
   - The small-stream job uploads `fixes`, `motion`, `battery` and `gnss_status`; the raw-log job uploads `gnss_raw`, `gnss_sat`, `gnss_nav`, `nmea` and `imu`.
 - Seqs of a stream can have gaps (see the upgrade rule under "Upload outbox on the device").
 - Earlier app versions uploaded raw GNSS logs as stream `gnss` (`{file, part, parts, data}` with chunks of the GnssLogger text file) and the signal tables as JSON Lines streams `fixes`, `motion` and `battery`. Servers may still hold such batches.

@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Debug builds only: allow http:// to a local `wrangler dev` sync server
-     (e.g. via `adb reverse tcp:8787 tcp:8787`). Release builds are https-only. -->
+     (e.g. via `adb reverse tcp:8787 tcp:8787`). Release builds are https-only.
+     DebugReceiver: test hooks for emulators (see DebugReceiver.scala). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:usesCleartextTraffic="true" />
+    <application android:usesCleartextTraffic="true">
+        <receiver
+            android:name="net.sksat.ashidori.DebugReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+        <service
+            android:name="net.sksat.ashidori.DebugMaintenanceService"
+            android:exported="false"
+            android:process=":maintenance" />
+    </application>
 </manifest>

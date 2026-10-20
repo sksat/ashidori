@@ -633,6 +633,9 @@ private val LockWaitMs = 3 * 60_000L
 
 class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
+    // After repeated crashes only a sync the user asked for runs.
+    if net.sksat.ashidori.Maintenance.SafeMode.active && !getTags.contains(SyncScheduler.ManualTag) then
+      return ListenableWorker.Result.success()
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
         val up = Try(Uploader.uploadSmall(run))
@@ -662,6 +665,7 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
 
 class RawLogSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
+    if net.sksat.ashidori.Maintenance.SafeMode.active then return ListenableWorker.Result.success()
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
         Try(Uploader.uploadRawLogs(run)).fold(
@@ -681,6 +685,8 @@ object SyncScheduler:
   private val SmallWork = "sync-small"
   private val RawWork = "sync-raw"
   val SyncNow = "sync-now"
+  /** Tag of a sync the user asked for (runs also after repeated crashes). */
+  val ManualTag = "manual"
 
   /** A full quota does not clear by retrying soon: end this run without
     * backoff retries and let the next periodic run try again.
@@ -735,7 +741,7 @@ object SyncScheduler:
     WorkManager.getInstance(ctx).enqueueUniqueWork(
       SyncNow,
       ExistingWorkPolicy.KEEP,
-      OneTimeWorkRequest.Builder(classOf[SmallSyncWorker]).setConstraints(c).build()
+      OneTimeWorkRequest.Builder(classOf[SmallSyncWorker]).setConstraints(c).addTag(ManualTag).build()
     )
 
   def deviceName: String = s"${Build.MANUFACTURER} ${Build.MODEL}"

@@ -57,6 +57,16 @@ class MainActivity extends AppCompatActivity:
   private val fileLauncher =
     registerForActivityResult(ActivityResultContracts.OpenDocument(), (uri: android.net.Uri) => if uri != null then filePicked(uri))
 
+  private var docCreated: android.net.Uri => Unit = _ => ()
+  private val createLauncher =
+    registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip"),
+      (uri: android.net.Uri) => if uri != null then docCreated(uri))
+
+  /** Asks where to save a new ZIP file (SAF), suggesting `name`. */
+  def createZip(name: String)(onCreated: android.net.Uri => Unit): Unit =
+    docCreated = onCreated
+    createLauncher.launch(name)
+
   def pickFile(onPicked: android.net.Uri => Unit): Unit =
     filePicked = onPicked
     fileLauncher.launch(Array("application/json", "*/*"))
@@ -259,6 +269,9 @@ class MainActivity extends AppCompatActivity:
       VenueData.pin.foreach(p => VenueDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"venues/${p.file}")))
 
   private def handleIntent(intent: Intent): Unit =
+    if intent.getBooleanExtra(MainActivity.ExtraOpenDiagnostics, false) && Settings.onboarded then
+      intent.removeExtra(MainActivity.ExtraOpenDiagnostics)
+      openDiagnostics()
     if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded then
       stack.clear()
       nav.setSelectedItemId(MainActivity.TabLogger)
@@ -279,6 +292,12 @@ class MainActivity extends AppCompatActivity:
         stack.clear()
         if tabId == MainActivity.TabSettings then show(tabs(tabId)) else nav.setSelectedItemId(MainActivity.TabSettings)
         push(SyncSettingsScreen(this, Some(link)))
+
+  /** 設定 › 端末診断 (from an alert or the status tab's banner). */
+  def openDiagnostics(): Unit =
+    stack.clear()
+    if tabId == MainActivity.TabSettings then show(tabs(tabId)) else nav.setSelectedItemId(MainActivity.TabSettings)
+    push(DiagnosticsScreen(this))
 
   private def finishOnboarding(): Unit =
     Settings.onboarded = true
@@ -454,6 +473,8 @@ class MainActivity extends AppCompatActivity:
 object MainActivity:
   /** Intent extra: open the recording screen (from the notification). */
   val ExtraOpenLogger = "ashidori.openLogger"
+  /** From an alert notification: 設定 › 端末診断. */
+  val ExtraOpenDiagnostics = "ashidori.openDiagnostics"
   val TabTimeline = 1
   val TabFeed = 2
   val TabLogger = 4

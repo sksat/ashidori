@@ -37,9 +37,36 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val debuggable =
     (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
+  // --- saving, backup and archive maintenance ---------------------------------------
+
+  private val savedRow = row("最後に保存された測位", "", "…")()
+  private val crashRow = row("異常終了（直近24時間）", "", "…")()
+  private val pendingRow = row("保存待ち", "", "…")()
+  private val archiveRow = row("記録のまとめ", "", "…")()
+  /** One line for the backup and maintenance below: progress, result or error. */
+  private val dataStatus = caption("")
+  dataStatus.setSingleLine(true)
+  dataStatus.setEllipsize(android.text.TextUtils.TruncateAt.END)
+  @volatile private var backupRunning = false
+  private var backupLine: Option[String] = None
+  private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup())
+  private val maintainButton = outlined("記録をまとめ直す")(runMaintenance())
+  private val ticker = Handler(Looper.getMainLooper)
+  private val tick: Runnable = () => { showDataStatus(); ticker.postDelayed(tick, 1000) }
+
   val view: View =
     scroll(
       vbox(
+        sectionHeader("記録の保存"),
+        listGroup(savedRow, crashRow, pendingRow, archiveRow),
+        card(
+          text("記録データ", 16f, bold = true),
+          caption("バックアップは記録を端末内の形式のまま ZIP にまとめます。地図と施設データは含みません。"),
+          spacer(8),
+          backupButton,
+          maintainButton,
+          dataStatus
+        ),
         card(
           (Seq(
             text("端末診断", 18f, bold = true),
@@ -64,6 +91,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     )
 
   override def onShow(): Unit =
+    showSaving()
+    ticker.removeCallbacks(tick)
+    tick.run()
     showRecording()
     sections.clear()
     sections("device") = device()
@@ -83,13 +113,91 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       )
     )
 
+  override def onHide(): Unit = ticker.removeCallbacks(tick)
+
+  private def showSaving(): Unit =
+    AshidoriApp.io.execute { () =>
+      val now = System.currentTimeMillis()
+      val fix = Try(AshidoriApp.db.lastFix()).toOption.flatten.map(_.time)
+      val crashes = Alerts.recentCrashes(now)
+      val skipped = Try(Maintenance.Guard.skipped()).getOrElse(Nil)
+      val safe = Maintenance.SafeMode.active
+      act.runOnUiThread { () =>
+        savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
+        val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
+        savedRow.value.setTextColor(color(if stale then attr.error else attr.onSurfaceVariant))
+        crashRow.setValue(s"$crashes 回")
+        crashRow.value.setTextColor(color(if crashes > 0 then attr.error else attr.onSurfaceVariant))
+        val pending = LoggerWrites.pending
+        pendingRow.setValue(s"$pending 行")
+        val commit = LoggerWrites.lastCommitAt
+        pendingRow.setSubtitle(if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}")
+        archiveRow.setSubtitle(
+          if safe then "異常終了が続いたため自動では行いません"
+          else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
+          else "充電中、または起動の30分後に自動で行います")
+        archiveRow.setValue(if safe then "停止中" else if skipped.nonEmpty then "保留あり" else "自動")
+        archiveRow.value.setTextColor(color(if safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
+        savingText = s"saving=lastFix:${fix.map(full).getOrElse("none")} crashes24h=$crashes pending=$pending " +
+          s"safeMode=$safe skipped=${skipped.mkString(",")}"
+      }
+    }
+
+  private var savingText = ""
+
+  private def showDataStatus(): Unit =
+    val line = backupLine.orElse {
+      Maintenance.Progress.get().map { (t, running, l) =>
+        if running then s"まとめています: $l" else s"記録のまとめ: $l（${stamp(t)}）"
+      }
+    }
+    dataStatus.setText(line.getOrElse(" "))
+    val maintaining = Maintenance.Progress.get().exists(_._2)
+    backupButton.setEnabled(!backupRunning)
+    maintainButton.setEnabled(!maintaining)
+
+  private def mb(b: Long) = f"${b / 1e6}%.0f MB"
+
+  private def startBackup(): Unit =
+    act.createZip(Backup.defaultName()) { uri =>
+      backupRunning = true
+      backupLine = Some("書き出しの準備をしています")
+      showDataStatus()
+      Thread(() =>
+        val result =
+          try
+            val n = Backup.write(act, uri, (done, total) =>
+              act.runOnUiThread { () =>
+                backupLine = Some(s"書き出し中… ${mb(done)} / ${mb(total)}")
+                showDataStatus()
+              })
+            s"書き出しました（${mb(n)}）"
+          catch
+            case e: Throwable =>
+              Log.w("backup failed", e)
+              Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
+              s"書き出せませんでした: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
+        LifeLog.add(LifeKind.Note, s"バックアップ: $result")
+        act.runOnUiThread { () =>
+          backupRunning = false
+          backupLine = Some(result)
+          showDataStatus()
+        }
+      , "ashidori-backup").start()
+    }
+
+  private def runMaintenance(): Unit =
+    backupLine = None
+    Maintenance.runNow(act)
+    showDataStatus()
+
   private def render(): Unit =
     body.setText(sections.map((k, v) => s"## $k\n$v").mkString("\n\n"))
 
   private def copy(): Unit =
     val cm = act.getSystemService(classOf[ClipboardManager])
     cm.setPrimaryClip(ClipData.newPlainText("ashidori diagnostics",
-      s"ashidori ${BuildInfo.versionName}\n" + recordingText + "\n\n" + body.getText))
+      s"ashidori ${BuildInfo.versionName}\n" + savingText + "\n" + recordingText + "\n\n" + body.getText))
     Toast.makeText(act, "コピーしました", Toast.LENGTH_SHORT).show()
 
   // --- recording in the background ----------------------------------------------------

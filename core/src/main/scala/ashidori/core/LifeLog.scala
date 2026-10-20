@@ -28,6 +28,13 @@ enum LifeKind(val key: String, val label: String, val problem: Boolean = false):
   case Provider extends LifeKind("provider", "位置情報プロバイダ")
   case State extends LifeKind("state", "権限・電池の設定")
   case Note extends LifeKind("note", "注意", problem = true)
+  /** Archiving finished days (a separate process). */
+  case Archive extends LifeKind("archive", "記録のまとめ")
+  case ArchiveSkip extends LifeKind("archiveskip", "記録のまとめを保留", problem = true)
+  /** Logging on, but nothing reached the database for too long. */
+  case WriteStall extends LifeKind("stall", "記録の保存が停止", problem = true)
+  /** Repeated crashes: optional background work switched off. */
+  case SafeMode extends LifeKind("safemode", "自動処理を停止", problem = true)
 
 object LifeKind:
   def fromKey(k: String): Option[LifeKind] = values.find(_.key == k)

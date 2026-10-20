@@ -95,6 +95,7 @@ class LoggerService extends Service:
     thread = HandlerThread("ashidori-logger")
     thread.start()
     handler = Handler(thread.getLooper)
+    LoggerWrites.markStart()
 
   override def onStartCommand(intent: Intent, flags: Int, startId: Int): Int =
     // A null intent is a restart by the OS after the process was killed (START_STICKY).
@@ -197,6 +198,8 @@ class LoggerService extends Service:
     */
   private def tick(): Unit =
     evaluate()
+    flush()
+    LoggerWrites.checkStall(plan)
     handler.postDelayed(() => tick(), 60_000)
 
   // --- policy ------------------------------------------------------------------
@@ -212,8 +215,10 @@ class LoggerService extends Service:
       lastBatterySample = now
       val p = plan
       val screen = pm.isInteractive
+      val mode = Settings.mode.key
+      LoggerWrites.submit(1, raw = false, "電池")(_.insertBattery(now, pct, charging, screen, mode, p.map(_.describe).getOrElse("")))
+      // A read: on the UI's I/O thread, not the logger's write path.
       AshidoriApp.io.execute { () =>
-        db.insertBattery(now, pct, charging, screen, Settings.mode.key, p.map(_.describe).getOrElse(""))
         drain = DrainEstimator.screenOffDrain(db.battery(now - 4 * 3_600_000L), now)
       }
 
@@ -363,7 +368,7 @@ class LoggerService extends Service:
     recorder.foreach { r =>
       r.stop()
       val end = System.currentTimeMillis()
-      AshidoriApp.io.execute(() => db.insertGnssSession(r.startedAt, end, "", r.reason))
+      LoggerWrites.submit(1, raw = false, "詳細ログの区間")(_.insertGnssSession(r.startedAt, end, "", r.reason))
     }
     recorder = None
     LoggerState.onMain { LoggerState.detailFile = None }
@@ -475,7 +480,7 @@ class LoggerService extends Service:
       if now - lastStatusSaved >= 10_000 then
         lastStatusSaved = now
         val acc = LoggerState.lastFix.filter(f => now - f.time < 30_000).map(_.accuracy).getOrElse(Float.NaN)
-        AshidoriApp.io.execute(() => db.insertGnssStatus(snap, env, acc))
+        LoggerWrites.submit(1, raw = false, "GNSS の状態")(_.insertGnssStatus(snap, env, acc))
       if env != before then evaluate(force = true)
       LoggerState.changed()
 
@@ -568,19 +573,26 @@ class LoggerService extends Service:
 
   // --- persistence ----------------------------------------------------------------------
 
+  /** Hands buffered positions and motion windows to [[LoggerWrites]]: at
+    * once when [[FlushMs]] passed since the last hand-over, otherwise from a
+    * timer [[FlushMs]] later. So nothing sits here longer than that (of
+    * awake time; asleep, nothing new arrives either).
+    */
   private def flush(force: Boolean = false): Unit =
     val now = System.currentTimeMillis()
-    if force || pendingFixes.size + pendingMotion.size >= 50 || now - lastFlush >= 60_000 then
+    if pendingFixes.isEmpty && pendingMotion.isEmpty then ()
+    else if force || pendingFixes.size + pendingMotion.size >= 50 || now - lastFlush >= LoggerService.FlushMs then
       lastFlush = now
+      handler.removeCallbacks(flushLater)
       val fs = pendingFixes.toVector
       val ms = pendingMotion.toVector
       pendingFixes.clear()
       pendingMotion.clear()
-      if fs.nonEmpty || ms.nonEmpty then
-        AshidoriApp.io.execute { () =>
-          if fs.nonEmpty then db.insertFixes(fs)
-          if ms.nonEmpty then db.insertMotion(ms)
-        }
+      LoggerWrites.fixes(fs)
+      if ms.nonEmpty then LoggerWrites.submit(ms.size, raw = false, "動き")(_.insertMotion(ms))
+    else if !handler.hasCallbacks(flushLater) then handler.postDelayed(flushLater, LoggerService.FlushMs)
+
+  private val flushLater: Runnable = () => flush(force = true)
 
   // --- notification ------------------------------------------------------------------------
 
@@ -621,6 +633,10 @@ object LoggerService:
   val ActionRefresh = "net.sksat.ashidori.REFRESH"
   val NotificationId = 1
   val BurstMs: Long = 5 * 60_000L
+  /** Positions and motion windows wait at most this long before they are
+    * handed to the database.
+    */
+  val FlushMs: Long = 5_000L
 
   def send(ctx: Context, action: String): Unit =
     if action == ActionStop then

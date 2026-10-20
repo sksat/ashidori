@@ -33,6 +33,8 @@ object Ui:
     val onTertiaryContainer: Int = com.google.android.material.R.attr.colorOnTertiaryContainer
     val onSecondaryContainer: Int = com.google.android.material.R.attr.colorOnSecondaryContainer
     val error: Int = androidx.appcompat.R.attr.colorError
+    val errorContainer: Int = com.google.android.material.R.attr.colorErrorContainer
+    val onErrorContainer: Int = com.google.android.material.R.attr.colorOnErrorContainer
     val outlineVariant: Int = com.google.android.material.R.attr.colorOutlineVariant
 
   def matchWrap: LinearLayout.LayoutParams =

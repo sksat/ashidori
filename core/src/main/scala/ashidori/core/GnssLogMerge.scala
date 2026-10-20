@@ -11,7 +11,7 @@ object GnssLogMerge:
     val a = line.split(",", -1)
     def at(i: Int) = if i < a.length then a(i).toLongOption.orElse(a(i).toDoubleOption.map(_.toLong)) else None
     a(0) match
-      case "Raw" | "Status" | "Accel" => at(1)
+      case "Raw" | "Status" | "Accel" | "Gyro" | "Mag" => at(1)
       case "Fix"                      => at(8)
       case "NMEA"                     => at(a.length - 1)
       case _                          => None

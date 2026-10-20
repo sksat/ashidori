@@ -28,18 +28,25 @@ object LifeLog:
     val e = LifeEvent(time, kind, LifeEvent.clean(detail).take(400))
     Log.i(s"life ${kind.key}: ${e.detail}")
     try
-      val f = file
-      if lineCount < 0 then lineCount = if f.exists then readLines(f).size else 0
-      val out = FileOutputStream(f, true)
-      try out.write((LifeEvent.encode(e) + "\n").getBytes(UTF_8))
-      finally out.close()
-      lineCount += 1
-      if LifeEvent.needsCompaction(lineCount, Keep) then
-        val kept = LifeEvent.compact(readLines(f), Keep)
-        val tmp = File(f.getPath + ".tmp")
-        java.nio.file.Files.write(tmp.toPath, kept.map(_ + "\n").mkString.getBytes(UTF_8))
-        if !tmp.renameTo(f) then throw java.io.IOException("rename failed")
-        lineCount = kept.size
+      // The maintenance process writes here too: appends and compaction
+      // hold a file lock shared by the processes.
+      scala.util.Using.resource(java.io.RandomAccessFile(File(ctx.getFilesDir, "lifecycle.lock"), "rw")) { lock =>
+        val l = lock.getChannel.lock()
+        try
+          val f = file
+          if lineCount < 0 then lineCount = if f.exists then readLines(f).size else 0
+          val out = FileOutputStream(f, true)
+          try out.write((LifeEvent.encode(e) + "\n").getBytes(UTF_8))
+          finally out.close()
+          lineCount += 1
+          if LifeEvent.needsCompaction(lineCount, Keep) then
+            val kept = LifeEvent.compact(readLines(f), Keep)
+            val tmp = File(f.getPath + ".tmp")
+            java.nio.file.Files.write(tmp.toPath, kept.map(_ + "\n").mkString.getBytes(UTF_8))
+            if !tmp.renameTo(f) then throw java.io.IOException("rename failed")
+            lineCount = kept.size
+        finally l.release()
+      }
     catch case ex: Exception => Log.w("lifecycle log write failed", ex)
   }
 
@@ -67,7 +74,8 @@ object LifeLog:
     Thread.setDefaultUncaughtExceptionHandler { (t, e) =>
       try
         val at = e.getStackTrace.headOption.map(s => s" at ${s.getClassName}.${s.getMethodName}:${s.getLineNumber}").getOrElse("")
-        add(LifeKind.Crash, s"${t.getName}: ${describe(e)}$at")
+        val proc = if AshidoriApp.isMaintenanceProcess then "まとめ処理 " else ""
+        add(LifeKind.Crash, s"$proc${t.getName}: ${describe(e)}$at")
       catch case _: Throwable => ()
       if prev != null then prev.uncaughtException(t, e)
     }
@@ -83,8 +91,9 @@ object LifeLog:
         .filter(_.getTimestamp > seen).sortBy(_.getTimestamp)
       for i <- infos do
         val desc = Option(i.getDescription).filter(_.nonEmpty).map(" " + _).getOrElse("")
+        val proc = if i.getProcessName != null && i.getProcessName.endsWith(":maintenance") then "まとめ処理 " else ""
         add(LifeKind.ProcessExit,
-          s"${PlatformCodes.exitReason(i.getReason)} importance=${PlatformCodes.importance(i.getImportance)} status=${i.getStatus}$desc",
+          s"$proc${PlatformCodes.exitReason(i.getReason)} importance=${PlatformCodes.importance(i.getImportance)} status=${i.getStatus}$desc",
           i.getTimestamp)
       if infos.nonEmpty then prefs.edit().putLong("exitSeen", infos.map(_.getTimestamp).max).apply()
     catch case ex: Exception => Log.w("exit reasons", ex)

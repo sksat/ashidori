@@ -55,8 +55,20 @@ object Archive:
     Column("time", Int64), Column("elapsedRealtimeNanos", Int64), Column("sensor", Str),
     Column("x", Float32), Column("y", Float32), Column("z", Float32)))
 
+  /** The detail log's copy of each position (GnssLogger "Fix"), with what
+    * the `fixes` table does not keep: speed, bearing and vertical accuracy,
+    * elapsed realtime, mock flag. The time (UnixTimeMillis) comes first.
+    */
+  val GnssFix = TableDef("gnss_fix", Seq(
+    Column("UnixTimeMillis", Int64), Column("Provider", Str), Column("LatitudeDegrees", Float64),
+    Column("LongitudeDegrees", Float64), Column("AltitudeMeters", Float64), Column("SpeedMps", Float32),
+    Column("AccuracyMeters", Float32), Column("BearingDegrees", Float32), Column("SpeedAccuracyMps", Float32),
+    Column("BearingAccuracyDegrees", Float32), Column("elapsedRealtimeNanos", Int64), Column("VerticalAccuracyMeters", Float32),
+    Column("MockLocation", Int32), Column("NumberOfUsedSignals", Int32), Column("VerticalSpeedAccuracyMps", Float32),
+    Column("SolutionType", Str)))
+
   /** Tables built from raw lines (kind = first CSV field). */
-  val RawTables: Seq[TableDef] = Seq(GnssRaw, GnssSat, GnssNav, Nmea, Imu)
+  val RawTables: Seq[TableDef] = Seq(GnssRaw, GnssSat, GnssNav, Nmea, Imu, GnssFix)
   val All: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus) ++ RawTables
 
   /** Which raw table a line belongs to. */
@@ -66,12 +78,14 @@ object Archive:
     case "Nav"                     => Some(GnssNav)
     case "NMEA"                    => Some(Nmea)
     case "Accel" | "Gyro" | "Mag"  => Some(Imu)
+    case "Fix"                     => Some(GnssFix)
     case _                         => None
 
   private def cell(s: String, t: ColType): Any =
     if s.isEmpty then null
     else t match
-      case Int32   => s.toIntOption.orElse(s.toDoubleOption.map(_.toInt)).orNull
+      case Int32   => s.toIntOption.orElse(s.toDoubleOption.map(_.toInt))
+        .orElse(s match { case "true" => Some(1); case "false" => Some(0); case _ => None }).orNull
       case Int64   => s.toLongOption.orElse(s.toDoubleOption.map(_.toLong)).orNull
       case Float32 => s.toFloatOption.orNull
       case Float64 => s.toDoubleOption.orNull
@@ -90,6 +104,11 @@ object Archive:
         Nmea -> Seq(a.last.toLongOption.getOrElse(lastTime), a.slice(1, a.length - 1).mkString(","))
       case Imu =>
         Imu -> Seq(cell(a(1), Int64), cell(a(2), Int64), a(0), cell(a(3), Float32), cell(a(4), Float32), cell(a(5), Float32))
+      case GnssFix =>
+        // Line order: Provider, Lat, Lon, Alt, Speed, Acc, Bearing, UnixTimeMillis, then the rest.
+        def f(i: Int) = a.lift(i).getOrElse("")
+        val order = Seq(8, 1, 2, 3, 4, 5, 6, 7) ++ (9 to 16)
+        GnssFix -> GnssFix.columns.zip(order).map((c, i) => cell(f(i), c.tpe))
       case other => other -> Nil
     }
 
@@ -102,6 +121,7 @@ object Archive:
       case GnssNav => ("Nav" +: row.drop(1).take(5).map(s)).mkString(",") + "," + s(row(6)).replace(' ', ',')
       case Nmea    => s"NMEA,${s(row(1))},${s(row(0))}"
       case Imu     => s"${s(row(2))},${s(row(0))},${s(row(1))},${s(row(3))},${s(row(4))},${s(row(5))}"
+      case GnssFix => ("Fix" +: (row.slice(1, 8) ++ Seq(row(0)) ++ row.drop(8)).map(s)).mkString(",")
       case _       => row.map(s).mkString(",")
 
   def fixRow(f: Fix): Seq[Any] = Seq(f.time, f.lat, f.lon, f.accuracy, f.altitude, f.speed, f.bearing, f.provider)

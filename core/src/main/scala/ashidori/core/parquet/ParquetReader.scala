@@ -19,42 +19,92 @@ object ParquetReader:
       val arrays = columns.map(c => data(c.name)).toIndexedSeq
       Iterator.range(0, rows).map(i => arrays.map(_(i)))
 
-  def read(bytes: Array[Byte]): Table =
-    require(bytes.length >= 12 && String(bytes.take(4), UTF_8) == "PAR1" && String(bytes.takeRight(4), UTF_8) == "PAR1", "not parquet")
-    val footerLen = ByteBuffer.wrap(bytes, bytes.length - 8, 4).order(ByteOrder.LITTLE_ENDIAN).getInt
-    val meta = ThriftReader(bytes, bytes.length - 8 - footerLen).struct()
+  /** Footer of a file: the schema, the total row count and where each row
+    * group's column chunks lie (absolute byte offsets).
+    */
+  final case class Meta(columns: Seq[Column], rows: Long, groups: Seq[Group])
+
+  /** One row group: its row count, and per column the chunk's codec, start
+    * and length.
+    */
+  /** `time`: min and max of the first column, when the file has statistics. */
+  final case class Group(rows: Int, chunks: Seq[Chunk], time: Option[(Long, Long)] = None):
+    /** Whether the group may hold times in [from, to). */
+    def overlaps(from: Long, to: Long): Boolean = time.forall((lo, hi) => hi >= from && lo < to)
+    def start: Long = chunks.map(_.offset).minOption.getOrElse(0L)
+    def end: Long = chunks.map(c => c.offset + c.length).maxOption.getOrElse(0L)
+
+  /** A column chunk: codec, where its (one) data page starts, its size
+    * compressed and not, its values and their encoding.
+    */
+  final case class Chunk(codec: Int, offset: Long, length: Long, uncompressed: Long = 0, values: Long = 0, encoding: Int = 0)
+
+  private def parseMeta(bytes: Array[Byte], at: Int): Meta =
+    val meta = ThriftReader(bytes, at).struct()
     val schemaEls = meta(2).asInstanceOf[Seq[Map[Int, Any]]]
     val columns = schemaEls.tail.map { e =>
       val tpe = ColType.values.find(_.physical == e(1).asInstanceOf[Long].toInt).get
-      Column(e(4).asInstanceOf[String], tpe)
+      Column(e(4).toString, tpe)
     }
-    val total = meta(3).asInstanceOf[Long].toInt
-    val out = columns.map(c => c.name -> new Array[Any](total)).toMap
+    def le(b: Array[Byte]): Long = b.indices.foldLeft(0L)((acc, k) => acc | ((b(k) & 0xffL) << (8 * k)))
+    def signed(v: Long, width: Int): Long = if width == 4 then v.toInt.toLong else v
+    val groups = meta.getOrElse(4, Nil).asInstanceOf[Seq[Map[Int, Any]]].map { rg =>
+      val metas = rg(1).asInstanceOf[Seq[Map[Int, Any]]].map(_(3).asInstanceOf[Map[Int, Any]])
+      val chunks = metas.map { cm =>
+        val encoding = cm.get(2).collect { case es: Seq[?] => es }.flatMap(_.headOption).map(_.asInstanceOf[Long].toInt).getOrElse(0)
+        Chunk(cm(4).asInstanceOf[Long].toInt, cm(9).asInstanceOf[Long], cm(7).asInstanceOf[Long],
+          cm.get(6).map(_.asInstanceOf[Long]).getOrElse(0L), cm.get(5).map(_.asInstanceOf[Long]).getOrElse(0L), encoding)
+      }
+      val time = metas.headOption.flatMap(_.get(12)).collect { case st: Map[?, ?] =>
+        val m = st.asInstanceOf[Map[Int, Any]]
+        for
+          case hi: Bin <- m.get(5)
+          case lo: Bin <- m.get(6)
+          if (hi.bytes.length == 8 || hi.bytes.length == 4) && lo.bytes.length == hi.bytes.length
+        yield (signed(le(lo.bytes), lo.bytes.length), signed(le(hi.bytes), hi.bytes.length))
+      }.flatten
+      Group(rg(3).asInstanceOf[Long].toInt, chunks, time)
+    }
+    Meta(columns, meta(3).asInstanceOf[Long], groups)
+
+  private def footerLength(tail: Array[Byte]): Int =
+    require(String(tail, tail.length - 4, 4, UTF_8) == "PAR1", "not parquet")
+    ByteBuffer.wrap(tail, tail.length - 8, 4).order(ByteOrder.LITTLE_ENDIAN).getInt
+
+  /** Decodes row group `g` into `out` at row `base`. `bytes` holds the file
+    * from absolute offset `origin` on.
+    */
+  private def decodeGroup(bytes: Array[Byte], origin: Long, columns: Seq[Column], g: Group, out: Seq[Array[Any]], base: Int): Unit =
+    for ((chunk, c), k) <- g.chunks.zip(columns).zipWithIndex do
+      var pos = (chunk.offset - origin).toInt
+      var filled = 0
+      while filled < g.rows do
+        val tr = ThriftReader(bytes, pos)
+        val ph = tr.struct()
+        pos = tr.position
+        val compressed = ph(3).asInstanceOf[Long].toInt
+        val dph = ph(5).asInstanceOf[Map[Int, Any]]
+        val count = dph(1).asInstanceOf[Long].toInt
+        val page = java.util.Arrays.copyOfRange(bytes, pos, pos + compressed)
+        pos += compressed
+        val body = chunk.codec match
+          case 0 => page
+          case 2 => GZIPInputStream(ByteArrayInputStream(page)).readAllBytes()
+          case x => throw IllegalArgumentException(s"unsupported codec $x")
+        decodePage(body, count, c.tpe, dph(2).asInstanceOf[Long].toInt, out(k), base + filled)
+        filled += count
+
+  def read(bytes: Array[Byte]): Table =
+    require(bytes.length >= 12 && String(bytes.take(4), UTF_8) == "PAR1", "not parquet")
+    val footerLen = footerLength(bytes)
+    val meta = parseMeta(bytes, bytes.length - 8 - footerLen)
+    val total = meta.rows.toInt
+    val arrays = meta.columns.map(_ => new Array[Any](total))
     var base = 0
-    for rg <- meta.getOrElse(4, Nil).asInstanceOf[Seq[Map[Int, Any]]] do
-      val n = rg(3).asInstanceOf[Long].toInt
-      for (chunk, c) <- rg(1).asInstanceOf[Seq[Map[Int, Any]]].zip(columns) do
-        val cm = chunk(3).asInstanceOf[Map[Int, Any]]
-        val codec = cm(4).asInstanceOf[Long].toInt
-        var pos = cm(9).asInstanceOf[Long].toInt
-        var filled = 0
-        while filled < n do
-          val tr = ThriftReader(bytes, pos)
-          val ph = tr.struct()
-          pos = tr.position
-          val compressed = ph(3).asInstanceOf[Long].toInt
-          val dph = ph(5).asInstanceOf[Map[Int, Any]]
-          val count = dph(1).asInstanceOf[Long].toInt
-          val page = bytes.slice(pos, pos + compressed)
-          pos += compressed
-          val body = codec match
-            case 0 => page
-            case 2 => GZIPInputStream(ByteArrayInputStream(page)).readAllBytes()
-            case x => throw IllegalArgumentException(s"unsupported codec $x")
-          decodePage(body, count, c.tpe, dph(2).asInstanceOf[Long].toInt, out(c.name), base + filled)
-          filled += count
-      base += n
-    Table(columns, total, out)
+    for g <- meta.groups do
+      decodeGroup(bytes, 0L, meta.columns, g, arrays, base)
+      base += g.rows
+    Table(meta.columns, total, meta.columns.map(_.name).zip(arrays).toMap)
 
   def readFile(path: String): Table =
     val f = RandomAccessFile(path, "r")
@@ -63,6 +113,72 @@ object ParquetReader:
       f.readFully(bytes)
       read(bytes)
     finally f.close()
+
+  /** A file opened for reading one row group at a time: memory stays at
+    * about one group however large the file is.
+    */
+  final class FileReader private[ParquetReader] (raf: RandomAccessFile, val meta: Meta) extends AutoCloseable:
+    def columns: Seq[Column] = meta.columns
+    def rows: Long = meta.rows
+    def groups: Int = meta.groups.size
+
+    /** Row group `i` alone. */
+    /** The bytes of row group `i` as stored (its column chunks, in order). */
+    def rawGroup(i: Int): Array[Byte] =
+      val g = meta.groups(i)
+      val bytes = new Array[Byte]((g.end - g.start).toInt)
+      raf.seek(g.start)
+      raf.readFully(bytes)
+      bytes
+
+    def readGroup(i: Int): Table =
+      val g = meta.groups(i)
+      val bytes = new Array[Byte]((g.end - g.start).toInt)
+      raf.seek(g.start)
+      raf.readFully(bytes)
+      val arrays = meta.columns.map(_ => new Array[Any](g.rows))
+      decodeGroup(bytes, g.start, meta.columns, g, arrays, 0)
+      Table(meta.columns, g.rows, meta.columns.map(_.name).zip(arrays).toMap)
+
+    /** Every row in file order, decoding one row group at a time. */
+    def rowIterator: Iterator[IndexedSeq[Any]] =
+      Iterator.range(0, groups).flatMap(i => readGroup(i).rowIterator)
+
+    /** The rows of the groups that may hold times in [from, to) (all groups
+      * of a file without statistics), one group at a time. Not filtered
+      * by row.
+      */
+    def rowsBetween(from: Long, to: Long): Iterator[IndexedSeq[Any]] =
+      Iterator.range(0, groups).filter(i => meta.groups(i).overlaps(from, to)).flatMap(i => readGroup(i).rowIterator)
+
+    def close(): Unit = raf.close()
+
+  def open(path: String): FileReader =
+    val raf = RandomAccessFile(path, "r")
+    try FileReader(raf, readMeta(raf))
+    catch
+      case e: Throwable =>
+        raf.close()
+        throw e
+
+  private def readMeta(raf: RandomAccessFile): Meta =
+    val len = raf.length
+    require(len >= 12, "not parquet")
+    val tail = new Array[Byte](8)
+    raf.seek(len - 8)
+    raf.readFully(tail)
+    val footerLen = footerLength(tail)
+    require(footerLen > 0 && footerLen <= len - 12, "bad footer length")
+    val footer = new Array[Byte](footerLen)
+    raf.seek(len - 8 - footerLen)
+    raf.readFully(footer)
+    parseMeta(footer, 0)
+
+  /** The footer of a file alone (row counts, groups), without reading data. */
+  def meta(path: String): Meta =
+    val raf = RandomAccessFile(path, "r")
+    try readMeta(raf)
+    finally raf.close()
 
   private def decodePage(body: Array[Byte], count: Int, t: ColType, encoding: Int, into: Array[Any], at: Int): Unit =
     val bb = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN)
@@ -184,8 +300,12 @@ object ParquetReader:
         p += groups
     out.take(count).toArray
 
+/** A Thrift binary value: bytes, or (toString) the UTF-8 string. */
+private final class Bin(val bytes: Array[Byte]):
+  override def toString: String = String(bytes, UTF_8)
+
 /** Thrift compact protocol reader: structs become Map[fieldId, value]
-  * (i32/i64 as Long, binary as String, lists as Seq).
+  * (i32/i64 as Long, binary as [[Bin]], lists as Seq).
   */
 private final class ThriftReader(b: Array[Byte], start: Int):
   var position: Int = start
@@ -221,7 +341,7 @@ private final class ThriftReader(b: Array[Byte], start: Int):
       v
     case 8 =>
       val len = varint().toInt
-      val s = String(b, position, len, UTF_8)
+      val s = Bin(java.util.Arrays.copyOfRange(b, position, position + len))
       position += len
       s
     case 9 | 10 =>

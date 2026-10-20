@@ -60,8 +60,51 @@ class ParquetSuite extends munit.FunSuite:
       assertEquals(row(4), e(4))
   }
 
+  test("a file is read one row group at a time, and its footer alone gives the row count") {
+    val f = File.createTempFile("groups", ".parquet")
+    f.deleteOnExit()
+    Using.resource(FileOutputStream(f))(o => writeTo(o, 2345, 1000))
+    val meta = ParquetReader.meta(f.getPath)
+    assertEquals(meta.rows, 2345L)
+    assertEquals(meta.groups.map(_.rows), Seq(1000, 1000, 345))
+    assertEquals(meta.columns, schema)
+    val whole = ParquetReader.readFile(f.getPath)
+    Using.resource(ParquetReader.open(f.getPath)) { r =>
+      assertEquals(r.groups, 3)
+      assertEquals(r.readGroup(2).rows, 345)
+      assertEquals(r.readGroup(1).rowIterator.next(), whole.rowIterator.drop(1000).next())
+      assertEquals(r.rowIterator.toVector, whole.rowIterator.toVector)
+    }
+  }
+
+  test("an empty file has no row groups") {
+    val f = File.createTempFile("empty", ".parquet")
+    f.deleteOnExit()
+    Using.resource(FileOutputStream(f))(o => writeTo(o, 0, 1000))
+    assertEquals(ParquetReader.meta(f.getPath).rows, 0L)
+    Using.resource(ParquetReader.open(f.getPath))(r => assertEquals(r.rowIterator.size, 0))
+  }
+
   test("write a file for external read-back when requested") {
     sys.env.get("ASHIDORI_PARQUET_OUT").foreach { path =>
       Using.resource(FileOutputStream(File(path)))(o => writeTo(o, 120_000, 50_000))
     }
+  }
+
+  test("row groups carry the time range; a window reads only the groups it overlaps") {
+    val f = File.createTempFile("stats", ".parquet")
+    f.deleteOnExit()
+    Using.resource(FileOutputStream(f))(o => writeTo(o, 2345, 1000))
+    val meta = ParquetReader.meta(f.getPath)
+    val t0 = 1_700_000_000_000L
+    assertEquals(meta.groups.map(_.time), Seq(Some((t0, t0 + 999)), Some((t0 + 1000, t0 + 1999)), Some((t0 + 2000, t0 + 2344))))
+    assert(!meta.groups(0).overlaps(t0 + 1000, t0 + 1500))
+    assert(meta.groups(1).overlaps(t0 + 1000, t0 + 1500))
+    Using.resource(ParquetReader.open(f.getPath)) { r =>
+      // Whole groups of the window: the second only.
+      assertEquals(r.rowsBetween(t0 + 1200, t0 + 1300).map(_(0)).toVector, (t0 + 1000 until t0 + 2000).toVector)
+      assertEquals(r.rowsBetween(t0 + 5000, t0 + 6000).size, 0)
+    }
+    // A file without statistics (earlier versions): every group may overlap.
+    assert(ParquetReader.Group(10, Nil).overlaps(0L, 1L))
   }

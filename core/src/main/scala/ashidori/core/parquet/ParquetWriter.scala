@@ -36,6 +36,13 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
   private val defined = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Boolean])
   private var rowsInGroup = 0
   private var totalRows = 0L
+  // Min and max of the first column (the time) in this row group, written as
+  // the chunk's statistics so a reader can skip groups outside a time window.
+  private val timeStats = schema.headOption.exists(c => c.tpe == ColType.Int64 || c.tpe == ColType.Int32)
+  private var minTime = Long.MaxValue
+  private var maxTime = Long.MinValue
+  // A group with a row without a time gets no statistics (such rows sort last).
+  private var nullTime = false
   private val rowGroups = Vector.newBuilder[RowGroupMeta]
 
   def write(row: Seq[Any]): Unit =
@@ -47,9 +54,15 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
         case f: Float if f.isNaN   => false
         case _                     => true
       defined(i) += present
+      if i == 0 && !present then nullTime = true
       if present then
         c.tpe match
-          case ColType.Int32 | ColType.Int64     => longs(i) += long(v)
+          case ColType.Int32 | ColType.Int64 =>
+            val l = long(v)
+            longs(i) += l
+            if i == 0 then
+              if l < minTime then minTime = l
+              if l > maxTime then maxTime = l
           case ColType.Float32 | ColType.Float64 => doubles(i) += double(v)
           case ColType.Str =>
             val bytes = v.toString.getBytes(UTF_8)
@@ -118,15 +131,39 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
         val hdr = header.bytes
         sink.write(hdr)
         sink.write(zipped)
-        ChunkMeta(c, offset, hdr.length + raw.length, hdr.length + zipped.length, rowsInGroup, encoding)
+        val stats = Option.when(i == 0 && timeStats && !nullTime && minTime <= maxTime)((minTime, maxTime))
+        ChunkMeta(c, offset, hdr.length + raw.length, hdr.length + zipped.length, rowsInGroup, encoding, stats)
       }
       rowGroups += RowGroupMeta(chunks, rowsInGroup)
       totalRows += rowsInGroup
       rowsInGroup = 0
+      minTime = Long.MaxValue
+      maxTime = Long.MinValue
+      nullTime = false
       strings.foreach(_.reset())
       longs.foreach(_.clear())
       doubles.foreach(_.clear())
       defined.foreach(_.clear())
+
+  /** Rows written so far, in finished row groups and the one being filled. */
+  def rows: Long = totalRows + rowsInGroup
+
+  /** Appends row group `g` of another file of the same schema as it is
+    * stored (`bytes`: [[ParquetReader.FileReader.rawGroup]]), without
+    * decoding it. Ends the row group being filled first.
+    */
+  def copyGroup(bytes: Array[Byte], g: ParquetReader.Group): Unit =
+    require(g.chunks.size == schema.size, s"group of ${g.chunks.size} columns, schema ${schema.size}")
+    require(bytes.length.toLong == g.end - g.start, "bytes are not the group")
+    flushGroup()
+    val base = sink.count
+    sink.write(bytes)
+    val chunks = schema.zip(g.chunks).zipWithIndex.map { case ((c, ch), i) =>
+      ChunkMeta(c, base + (ch.offset - g.start), ch.uncompressed.toInt, ch.length.toInt, g.rows, ch.encoding,
+        if i == 0 && timeStats then g.time else None, ch.codec)
+    }
+    rowGroups += RowGroupMeta(chunks, g.rows)
+    totalRows += g.rows
 
   /** Writes the footer; does not close the underlying stream. */
   def close(): Unit =
@@ -163,11 +200,20 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
                       t.rawI32(3) // RLE (definition levels)
                     }
                     t.listField(3, Thrift.Binary, 1)(t.rawString(ch.column.name))
-                    t.i32(4, 2) // GZIP
+                    t.i32(4, ch.codec)
                     t.i64(5, ch.rows)
                     t.i64(6, ch.uncompressed)
                     t.i64(7, ch.compressed)
                     t.i64(9, ch.offset)
+                    ch.stats.foreach { (lo, hi) =>
+                      // Statistics: max_value, min_value (plain little-endian).
+                      val width = if ch.column.tpe == ColType.Int32 then 4 else 8
+                      def bytes(v: Long) = Array.tabulate[Byte](width)(k => ((v >>> (8 * k)) & 0xff).toByte)
+                      t.structField(12) {
+                        t.binary(5, bytes(hi))
+                        t.binary(6, bytes(lo))
+                      }
+                    }
                   }
                 }
             }
@@ -188,7 +234,8 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
 object ParquetWriter:
   private val Magic = "PAR1".getBytes(UTF_8)
 
-  private final case class ChunkMeta(column: Column, offset: Long, uncompressed: Int, compressed: Int, rows: Int, encoding: Int)
+  private final case class ChunkMeta(column: Column, offset: Long, uncompressed: Int, compressed: Int, rows: Int, encoding: Int,
+                                     stats: Option[(Long, Long)] = None, codec: Int = 2)
 
   val Plain = 0
   val DeltaBinaryPacked = 5
@@ -285,6 +332,10 @@ private[parquet] final class Thrift:
   def i32(id: Int, v: Int): Unit = { fieldHeader(id, I32); varint(b, zigzag(v.toLong)) }
   def i64(id: Int, v: Long): Unit = { fieldHeader(id, I64); varint(b, zigzag(v)) }
   def string(id: Int, s: String): Unit = { fieldHeader(id, Binary); rawString(s) }
+  def binary(id: Int, bytes: Array[Byte]): Unit =
+    fieldHeader(id, Binary)
+    varint(b, bytes.length.toLong)
+    b.write(bytes)
   def rawI32(v: Int): Unit = varint(b, zigzag(v.toLong))
   def rawString(s: String): Unit =
     val bytes = s.getBytes(UTF_8)

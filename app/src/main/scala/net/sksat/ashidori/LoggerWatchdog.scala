@@ -29,7 +29,11 @@ class LoggerWatchdog(ctx: Context, params: WorkerParameters) extends Worker(ctx,
       (if LoggerState.sensors.motionTrigger then "・動き検知待ち" else "")
     if LoggerWatchdog.shouldLog(finding, now) then LifeLog.add(LifeKind.Watchdog, detail)
     if enabled && !running then LoggerService.restart(c, "定期確認")
-    AshidoriApp.io.execute(() => AshidoriApp.maintainArchive())
+    // Received is not saved: also from here (the service's own check runs
+    // on its thread, which may be the one in trouble).
+    if enabled && running then LoggerWrites.checkStall(LoggerState.plan)
+    // Days that ended are archived by a job in its own process, not here.
+    Maintenance.schedule(c)
     ListenableWorker.Result.success()
 
 object LoggerWatchdog:
