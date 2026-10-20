@@ -131,6 +131,20 @@ object WriteStall:
     */
   val OldestMs: Long = 3 * 60_000L
 
+  /** The stall alert's state: raised when either condition holds, cleared
+    * only when both are resolved (every kind saved again), not by any write
+    * that succeeds.
+    */
+  final class Monitor:
+    var reported = false
+
+    /** Some(true): report the stall now; Some(false): it is over now. */
+    def update(noCommit: Boolean, unsavedTooLong: Boolean): Option[Boolean] =
+      val stalled = noCommit || unsavedTooLong
+      if stalled && !reported then { reported = true; Some(true) }
+      else if !stalled && reported then { reported = false; Some(false) }
+      else None
+
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)
 

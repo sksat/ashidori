@@ -29,6 +29,9 @@ import ashidori.core.Archive
   * fastest level; Parquet files are compressed already and stored.
   */
 object Backup:
+  /** Free space kept for the logger while a backup runs (hours of 全力ログ). */
+  val LoggingMargin: Long = 256L << 20
+
   def defaultName(now: Long = System.currentTimeMillis()): String =
     val t = java.time.Instant.ofEpochMilli(now).atZone(AshidoriApp.zone)
     s"ashidori-backup-${t.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmm"))}.zip"
@@ -45,12 +48,18 @@ object Backup:
     val dbPath = File(db.getReadableDatabase.getPath)
     // Measured (6.45 million raw lines, 728 MB database, logging meanwhile):
     // the copy is as large as the database, the WAL did not grow, and the
-    // ZIP (often on the same storage) is about 35% of it: 1.25 times at the
-    // peak. Ask for half as much again.
+    // database in the ZIP (often on the same storage) is about 35% of it.
+    // Asked for: the copy, half of it again for the ZIP, the archive and
+    // overflow files (stored as they are), and room for the logger.
+    def size(f: File): Long = if f.isDirectory then Option(f.listFiles()).toSeq.flatten.map(size).sum else f.length
     val db0 = dbPath.length + File(dbPath.getPath + "-wal").length
-    val need = db0 + db0 / 2 + (64L << 20)
+    val need = db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量が足りません（${need >> 20} MB 必要）")
+    // While it runs: stop before the logger has no room left.
+    def checkSpace(): Unit =
+      if dir.getUsableSpace < LoggingMargin then
+        throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB を切ったため中断しました（記録の領域を残すため）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     try
       archive.reading(Archive.All*) {
@@ -86,6 +95,7 @@ object Backup:
             done += n
             if done - reported >= (4 << 20) then
               reported = done
+              checkSpace()
               progress(done, total)
             n = in.read(buf)
           zip.closeEntry()
@@ -117,6 +127,7 @@ object Backup:
             done += k
             if done - reported >= (4 << 20) then
               reported = done
+              checkSpace()
               progress(done, total)
           zip.closeEntry()
         Using.resource(FileInputStream(snapshot))(in => copy(in, "databases/ashidori.db", System.currentTimeMillis()))

@@ -34,7 +34,7 @@ object LoggerWrites:
   /** Wall time of the last commit (0: none in this process). */
   @volatile var lastCommitAt = 0L
   @volatile private var lastCommitUptime = SystemClock.uptimeMillis()
-  @volatile private var stallReported = false
+  private val stall = WriteStall.Monitor()
 
   /** Queues `write` (of `rows` rows) for the database. Raw batches carry
     * their lines, so they can be spilled to a file.
@@ -96,10 +96,6 @@ object LoggerWrites:
           Thread.sleep(500L * failures)
     lastCommitAt = System.currentTimeMillis()
     lastCommitUptime = SystemClock.uptimeMillis()
-    if stallReported then
-      stallReported = false
-      LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
-      Alerts.clearStall()
 
   /** Rows given up: on disk at once, and in the lifecycle log. */
   private def lostNow(rows: Int, what: String): Unit =
@@ -141,13 +137,18 @@ object LoggerWrites:
     // many battery rows are saved meanwhile.
     val oldest = backlog.synchronized(backlog.oldestUnsaved)
     val noCommit = WriteStall.stalled(lastCommitUptime, now, threshold)
-    if !stallReported && (noCommit || WriteStall.queuedTooLong(oldest.map(_._2), now)) then
-      stallReported = true
-      val detail =
-        if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
-        else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
-      LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
-      Alerts.stall()
+    // Cleared only once every kind is saved again (not by any write).
+    stall.synchronized(stall.update(noCommit, WriteStall.queuedTooLong(oldest.map(_._2), now))) match
+      case Some(true) =>
+        val detail =
+          if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
+          else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
+        LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
+        Alerts.stall()
+      case Some(false) =>
+        LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
+        Alerts.clearStall()
+      case None => ()
 
   /** Count of rows given up, kept on disk (shown in 端末診断). */
   object Losses:
@@ -195,8 +196,9 @@ object LoggerWrites:
     /** Imports overflow files while the queue is short (on the write thread). */
     def importSome(pending: () => Long): Unit =
       val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(_.getName)
-      for f <- files.take(20) if pending() < WriteBacklog.MaxRawRows / 2 do
-        lock.lock()
+      // A backup holds the lock while it copies the database: the import waits
+      // for the next commit then, the logger's writes never wait for it.
+      for f <- files.take(20) if pending() < WriteBacklog.MaxRawRows / 2 && lock.tryLock() do
         try
           val db = AshidoriApp.db
           val key = s"overflow|${f.getName}"

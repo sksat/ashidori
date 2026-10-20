@@ -10,6 +10,7 @@ import java.time.LocalDate
   *   am broadcast -n <pkg>/net.sksat.ashidori.DebugReceiver -a ashidori.debug.SYNTH --ei hours 5 [--ei startMinute 600] [--ei daysAgo 1] (or --ei minutes N)
   *   ... -a ashidori.debug.ODD [--ei daysAgo 1]       raw lines that do not convert, and late ones
   *   ... -a ashidori.debug.CORRUPT_TEST                a corrupt test database is kept (not deleted)
+  *   ... -a ashidori.debug.SPILL --ei files 100        overflow files, as if the write queue had been full
   *   ... -a ashidori.debug.LOG --es mode max        start recording in a mode
   *   ... -a ashidori.debug.STOP                       stop recording
   *   ... -a ashidori.debug.MAINTAIN                   archive maintenance now (a job)
@@ -30,6 +31,15 @@ class DebugReceiver extends BroadcastReceiver:
       case "ashidori.debug.ODD" =>
         val ago = intent.getIntExtra("daysAgo", 1)
         Thread(() => Log.i(s"odd raw lines: ${DebugData.insertOdd(LocalDate.now(AshidoriApp.zone).minusDays(ago))}"), "ashidori-odd").start()
+      case "ashidori.debug.SPILL" =>
+        // Overflow files as if the queue had been full: `files` of 2000 lines.
+        val n = intent.getIntExtra("files", 100)
+        Thread(() =>
+          val t0 = System.currentTimeMillis()
+          for k <- 0 until n do
+            LoggerWrites.Overflow.spill((0 until 2000).map(i => (t0 + k * 2000L + i, s"Accel,${t0 + k * 2000L + i},$i,0.1,0.2,9.8")))
+          Log.i(s"spilled $n overflow files")
+        , "ashidori-spill").start()
       case "ashidori.debug.CORRUPT_TEST" =>
         Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()
       case "ashidori.debug.LOG" =>

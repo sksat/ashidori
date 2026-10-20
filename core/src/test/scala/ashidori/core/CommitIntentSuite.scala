@@ -28,7 +28,11 @@ class CommitIntentSuite extends munit.FunSuite:
     // Died before any rename (both verified tmp files there): finish it too.
     assertEquals(recovery(raw, Map(a -> OnDisk(None, Some((1000, 5000))), b -> OnDisk(Some((150, 2500)), Some((200, 3000))))),
       Recovery.Finish(Seq(a, b)))
-    // A tmp file that is not the verified one (cut short): nothing is deleted.
-    assertEquals(recovery(raw, Map(a -> OnDisk(None, Some((10, 77))), b -> OnDisk(Some((200, 3000)), None))), Recovery.Drop)
+    // Nothing published and a tmp file that is not the verified one: forget
+    // it (nothing was renamed or deleted).
+    assertEquals(recovery(raw, Map(a -> OnDisk(Some((900, 4000)), Some((10, 77))), b -> OnDisk(Some((150, 2500)), None))), Recovery.Drop)
     assertEquals(recovery(raw, Map.empty), Recovery.Drop)
+    // One file published, the other's verified tmp gone: neither finished
+    // nor undone; the record stays.
+    assertEquals(recovery(raw, Map(a -> OnDisk(None, Some((10, 77))), b -> OnDisk(Some((200, 3000)), None))), Recovery.Stuck)
   }

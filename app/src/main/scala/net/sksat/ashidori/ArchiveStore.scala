@@ -121,6 +121,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   /** Runs `f` with the tables' locks held exclusive (commits). */
   private def writing[A](tables: Seq[String])(f: => A): A = locked(tables.distinct.sorted, exclusive = true, f)
 
+  /** Whether the commit record on disk names this archive file. */
+  private def intentNames(path: String): Boolean =
+    intentFile.exists &&
+      Try(String(java.nio.file.Files.readAllBytes(intentFile.toPath), UTF_8)).toOption.flatMap(CommitIntent.decode)
+        .forall(_.files.exists(_.path == path))
+
   /** Whether an unfinished commit (its record on disk) concerns any of `names`. */
   private def pendingTouches(names: Seq[String]): Boolean =
     intentFile.exists && {
@@ -188,9 +194,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         Try(out.close())
         existing.foreach(e => Try(e.close()))
 
+    /** Drops the new version, unless a commit record names it: from then on
+      * only finishing the commit (recovery) may use or remove it.
+      */
     def abort(): Unit =
       close()
-      tmp.delete()
+      if !intentNames(root.toPath.relativize(dest.toPath).toString) then tmp.delete()
 
   // --- commits ----------------------------------------------------------------------------
 
@@ -208,7 +217,9 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       // Under the lock: SQLite still holds exactly the rows written.
       check()
       Maintenance.write(intentFile, CommitIntent.encode(intent))
-      for t <- intent.files do rename(t.path)
+      for (t, i) <- intent.files.zipWithIndex do
+        if i == 1 then debugFailPoint("fail-second-rename")
+        rename(t.path)
       debugCrashPoint("crash-after-rename")
       runDelete(db, intent.delete)
       intentFile.delete()
@@ -225,6 +236,15 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       if f.delete() then
         Log.w(s"debug: dying at $name")
         android.os.Process.killProcess(android.os.Process.myPid())
+
+  /** Debug builds: an I/O error here once if `files/maintenance/<name>`
+    * exists (to test a commit that fails after part of it is published).
+    */
+  private def debugFailPoint(name: String): Unit =
+    val app = AshidoriApp.app
+    if (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
+      File(Maintenance.dir, name).delete()
+    then throw java.io.IOException(s"debug: failing at $name")
 
   /** `<path>.tmp` over `<path>`, atomically and durably (a reader or an
     * upload that opened the old file keeps reading it whole).
@@ -285,6 +305,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       case CommitIntent.Recovery.Drop =>
         intent.files.foreach(t => File(file(t.path).getPath + ".tmp").delete())
         LifeLog.add(LifeKind.Note, "中断されたまとめを取り消し（記録は端末内に保持）")
+      case CommitIntent.Recovery.Stuck =>
+        // Part published, the rest lost: neither finished nor undone. The
+        // record stays, so nothing reads or commits these tables until a
+        // person looks at it (the rows are still in SQLite).
+        LifeLog.add(LifeKind.Note, "中断されたまとめを完了できない（記録は端末内に保持、まとめを停止）")
+        throw IllegalStateException("an interrupted archive commit cannot be finished")
     intentFile.delete()
     syncDir(intentFile.getParentFile)
 
@@ -304,7 +330,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     // Rows inserted from here on (rowid above these) are left for the next run.
     val max = db.maxRowids()
     // Leftovers of a run that died while writing.
-    for t <- Archive.All do File(root, Archive.dayFile(t, d) + ".tmp").delete()
+    for t <- Archive.All if !intentNames(Archive.dayFile(t, d)) do File(root, Archive.dayFile(t, d) + ".tmp").delete()
     for t <- Seq(Archive.Fixes, Archive.Motion, Archive.Battery, Archive.GnssStatus) if !stop() do
       val table = t.name
       val rows = db.hotRows(t, from, to, max(table))

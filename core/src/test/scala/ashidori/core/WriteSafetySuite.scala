@@ -72,3 +72,25 @@ class WriteSafetySuite extends munit.FunSuite:
     assert(!CrashLoop.tripped(Seq(now - 5 * h, now - 2 * h, now - h), now, since = now - 3 * h))
     assert(!CrashLoop.tripped(Nil, now, 0L))
   }
+
+  test("stall alert: a battery write does not clear it while positions keep failing") {
+    val b = WriteBacklog()
+    val m = WriteStall.Monitor()
+    def check(now: Long) = m.update(noCommit = false, WriteStall.queuedTooLong(b.oldestUnsaved.map(_._2), now))
+    val f = b.offer(5, raw = false, "位置", now = 0L).get
+    b.done(f, 5, raw = false, now = 10L, lost = true)
+    val t = WriteStall.OldestMs + 1
+    val bt = b.offer(1, raw = false, "電池", now = t - 5).get
+    b.done(bt, 1, raw = false, now = t - 4)
+    assertEquals(check(t), Some(true))
+    // Battery saved again, positions still failing: the alert stays.
+    val bt2 = b.offer(1, raw = false, "電池", now = t + 10).get
+    b.done(bt2, 1, raw = false, now = t + 11)
+    assertEquals(check(t + 20), None)
+    assert(m.reported)
+    // Positions saved again: over.
+    val f2 = b.offer(5, raw = false, "位置", now = t + 30).get
+    b.done(f2, 5, raw = false, now = t + 31)
+    assertEquals(check(t + 40), Some(false))
+    assertEquals(check(t + 50), None)
+  }

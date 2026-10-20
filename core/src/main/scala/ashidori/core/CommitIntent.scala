@@ -33,8 +33,12 @@ object CommitIntent:
   enum Recovery:
     /** Rename these tmp files into place, then do the deletion. */
     case Finish(renames: Seq[String])
-    /** The commit did not get far enough: forget it. */
+    /** Nothing was published (no file renamed): forget it. */
     case Drop
+    /** Some files are published and others cannot be: keep the record and
+      * stop (no reader, backup or commit of these tables goes on).
+      */
+    case Stuck
 
   def recovery(i: CommitIntent, disk: Map[String, OnDisk]): Recovery =
     val states = i.files.map(t => t -> disk.getOrElse(t.path, OnDisk(None, None)))
@@ -43,7 +47,8 @@ object CommitIntent:
     // file: finishing the commit is what it was about to do.
     if states.forall((t, s) => is(s.dest, t) || is(s.tmp, t)) then
       Recovery.Finish(states.collect { case (t, s) if !is(s.dest, t) => t.path })
-    else Recovery.Drop
+    else if states.forall((t, s) => !is(s.dest, t)) then Recovery.Drop
+    else Recovery.Stuck
 
   private def cursor(c: ArchiveMerge.Cursor) = s"${c.time}:${c.rowid}"
   private def cursorOf(s: String) = s.split(':') match
