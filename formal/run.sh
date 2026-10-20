@@ -314,13 +314,38 @@ RegistrationClient_f2report RegistrationClient inv:FailureReported
 RegistrationClient_r3 RegistrationClient inv:ReadyPersisted
 RegistrationClient_applypersist RegistrationClient inv:TokenRecoverable
 RegistrationClient_unpair RegistrationClient inv:NoForeignKey
+DetailLog DetailLog pass cover:Create,CreateDirSync,Deliver,Write,Drop,Sync,Rotate,RecLoss,RecClose,Build,Verify,VerifyFails,Rename,DirSyncF,CommitF,DeleteJournal,GFreeze,GSync,GRename,GDirSync,GPublish,GC,RList,ROpen,RDone,AppCrash,FinFail,PowerLoss reach:Unreached_LateAfterFreeze,Unreached_RetrySame,Unreached_MultiDay,Unreached_GapReported,Unreached_ReaderAcrossPublish
+DetailLog_2faults DetailLog pass
+DetailLog_big DetailLog pass
+DetailLog_live DetailLog pass
+DetailLog_closefirst DetailLog pass
+DetailLog_nocreatesync DetailLog inv:Durability
+DetailLog_nofsync DetailLog inv:Durability
+DetailLog_nodirsync DetailLog inv:Durability
+DetailLog_earlydelete DetailLog inv:Durability
+DetailLog_normal DetailLog inv:Durability
+DetailLog_childfirst DetailLog inv:Durability
+DetailLog_noreadback DetailLog inv:Durability
+DetailLog_alllive DetailLog inv:Durability
+DetailLog_noscan DetailLog inv:LossReported
+DetailLog_tailonly DetailLog inv:LossReported
+DetailLog_nounique DetailLog inv:NoDup
+DetailLog_nonatomic DetailLog inv:NoDup
+DetailLog_gcread DetailLog inv:ReaderOK
+DetailLog_mixedread DetailLog inv:ReaderOK
+DetailMigrate DetailMigrate pass cover:InsertLate,Build,Commit,DeleteRows,Crash reach:Unreached_LateBetween,Unreached_RetrySame,Unreached_OutOfOrderBatch,Unreached_QuarantineKept
+DetailMigrate_rowid DetailMigrate inv:Durability
+DetailMigrate_bytime DetailMigrate inv:Durability
+DetailMigrate_halfimport DetailMigrate inv:NoDup
+DetailMigrate_reimport DetailMigrate inv:NoDup
+DetailMigrate_nounique DetailMigrate inv:NoDup
 "
 
 # Configs that take 30 s or more here (several times that on a CI runner).
 # `fast` skips them; CI runs them daily and on demand (.github/workflows/formal.yml).
 SLOW_TLA="RegistrationClient_2faults RegistrationClient_live Outbox_2faults StatusDownload StatusDownload_hostile
   StatusDownload_fixed StatusDownload_fixed1 StatusDownload_fakes StatusDownload_manyfakes StatusDownload_manyfakes_pre
-  StatusRotation_2dev Accounts_other"
+  StatusRotation_2dev Accounts_other DetailLog_big"
 SLOW_TLA="${SLOW_TLA//$'\n'/ }"
 
 # The PROPERTY / PROPERTIES names of a config file.

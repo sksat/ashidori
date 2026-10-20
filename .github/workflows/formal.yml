@@ -8,6 +8,8 @@ on:
     paths:
       - "formal/**"
       - "docs/sync-protocol.md"
+      - "docs/design/detail-log-format.md"
+      - "app/src/main/scala/net/sksat/ashidori/GnssRecorder.scala"
       - "server/src/**"
       - "server/migrations/**"
       - "app/src/main/scala/net/sksat/ashidori/sync/**"
@@ -21,6 +23,8 @@ on:
     paths:
       - "formal/**"
       - "docs/sync-protocol.md"
+      - "docs/design/detail-log-format.md"
+      - "app/src/main/scala/net/sksat/ashidori/GnssRecorder.scala"
       - "server/src/**"
       - "server/migrations/**"
       - "app/src/main/scala/net/sksat/ashidori/sync/**"
