@@ -21,7 +21,13 @@ import ashidori.core.*
   * system sends while awake.
   */
 final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, onChange: () => Unit):
-  private val tracker = EnergyTracker(EnergyRecorder.nextBoot())
+  // Made once this process has a recorder number on disk (EnergyBoot); until
+  // then the state is not recorded (tried again at the next change).
+  private var trackerNow: Option[EnergyTracker] = None
+  private var unrecorded = 0L
+  private def tracker: Option[EnergyTracker] =
+    if trackerNow.isEmpty then trackerNow = EnergyRecorder.nextBoot().map(EnergyTracker(_))
+    trackerNow
   /** Screen and charger as last broadcast. */
   var screenOn: Boolean = true
   var plugged: Boolean = false
@@ -55,26 +61,32 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
     if registered then
       scala.util.Try(ctx.unregisterReceiver(receiver))
       registered = false
-    if tracker.update(now, None) then submit(now)
+    tracker.foreach(t => if t.update(now, None) then submit(t, now))
 
   /** Records a new span and a battery reading when the state changed. */
   def update(now: Long, st: EnergyState, plan: String): Unit =
-    if tracker.update(now, Some(st)) then
-      LoggerWrites.small(SmallRecord.Battery(reading(now, st.screenOn), plan))
-      submit(now)
+    tracker match
+      case Some(t) =>
+        if t.update(now, Some(st)) then
+          LoggerWrites.small(SmallRecord.Battery(reading(now, st.screenOn), plan))
+          submit(t, now)
+      case None =>
+        unrecorded += 1
+        if unrecorded == 1 then LifeLog.add(LifeKind.Note, "記録の状態の通し番号を得られないため、状態の変化を保存しない（次の変化で再試行）")
 
   /** The current state still holds at `now`: stored as the checkpoint, with
     * any change not confirmed yet. Called with the 5-minute battery reading.
     */
-  def heartbeat(now: Long): Unit = if tracker.current.isDefined || tracker.unconfirmed > 0 then submit(now)
+  def heartbeat(now: Long): Unit =
+    trackerNow.foreach(t => if t.current.isDefined || t.unconfirmed > 0 then submit(t, now))
 
-  private def submit(now: Long): Unit =
-    val r = tracker.record(now)
+  private def submit(t: EnergyTracker, now: Long): Unit =
+    val r = t.record(now)
     val upTo = r.transitions.lastOption.map(_.seq)
-    LoggerWrites.small(r, () => upTo.foreach(tracker.confirmed))
-    if tracker.dropped > lostNoted then
-      LifeLog.add(LifeKind.Note, s"記録の状態の変化 ${tracker.dropped - lostNoted} 件を保存できず")
-      lostNoted = tracker.dropped
+    LoggerWrites.small(r, () => upTo.foreach(t.confirmed))
+    if t.dropped > lostNoted then
+      LifeLog.add(LifeKind.Note, s"記録の状態の変化 ${t.dropped - lostNoted} 件を保存できず")
+      lostNoted = t.dropped
 
   private def sticky(): Option[Intent] =
     scala.util.Try(Option(ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED)))
@@ -104,20 +116,21 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
 object EnergyRecorder:
   private def bootFile = java.io.File(AshidoriApp.app.getFilesDir, "energy-boot")
 
-  /** This process's recorder number: one above every earlier one, kept on
-    * disk before it is used (atomically, fsynced). Above the highest the
-    * database has seen as well, in case the file was lost (data restored
-    * from a backup) or could not be written last time. Ordering by it, not
-    * by the clock, keeps restarts in order when the clock goes back.
+  /** This process's recorder number ([[EnergyBoot]]): above the counter
+    * file, the database and every spilled record (`.rec`, `.rec.tmp`), and
+    * on disk (atomically, fsynced) before it is used. None if any of them
+    * cannot be read or the counter cannot be written: no number is used then.
     */
-  def nextBoot(): Long = synchronized {
-    val onFile = scala.util.Try(String(java.nio.file.Files.readAllBytes(bootFile.toPath), "UTF-8").trim.toLong).getOrElse(0L)
-    val inDb = scala.util.Try(AshidoriApp.db.energyMaxBoot()).getOrElse(0L)
-    val n = math.max(onFile, inDb) + 1
-    try Maintenance.write(bootFile, n.toString)
-    catch case scala.util.control.NonFatal(e) =>
-      Log.w("boot counter not saved", e)
-      LifeLog.add(LifeKind.Note, s"記録の状態の通し番号を保存できず: ${LifeLog.describe(e)}")
+  def nextBoot(): Option[Long] = synchronized {
+    val f = bootFile
+    val n = EnergyBoot.allocate(
+      () => if !f.exists then 0L else String(java.nio.file.Files.readAllBytes(f.toPath), "UTF-8").trim.toLong,
+      () => AshidoriApp.db.energyMaxBoot(),
+      () => Option(LoggerWrites.Overflow.dir.listFiles()).toSeq.flatten
+        .filter(x => x.getName.contains(OverflowFiles.CompletedRecord))
+        .flatMap(x => scala.util.Try(String(java.nio.file.Files.readAllBytes(x.toPath), "UTF-8")).toOption),
+      n => Maintenance.write(f, n.toString))
+    if n.isEmpty then Log.w("no recorder number: a source could not be read or the counter not written")
     n
   }
 
