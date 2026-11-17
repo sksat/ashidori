@@ -537,7 +537,9 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       progress("端末内の行を読んでいます")
       Try {
         val idx = intent.files.map(t => CommitRepair.tableOf(t.path) -> RowBag()).toMap
-        forEachChunkRow(db, intent.delete)((table, row) => idx.get(table).foreach(_.add(row)))
+        // In each file's own layout (a commit written before an upgrade).
+        val width = widths(intent)
+        forEachChunkRow(db, intent.delete)((table, row) => idx.get(table).foreach(_.add(CommitRepair.fit(row, width(table)))))
         idx
       }.toEither.left.map {
         case e: RowBag.TooLarge => CommitRepair.TooLargeMark + e.getMessage
@@ -640,20 +642,31 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       case CommitIntent.Delete.Hot(table, from, to, max) =>
         Archive.All.find(_.name == table).foreach(t => db.hotRows(t, from, to, max).foreach(r => f(table, r.toIndexedSeq)))
       case CommitIntent.Delete.Files(paths) =>
+        // As stored; fitted to the month file's layout by the caller.
         for p <- paths if file(p).exists do
-          // In the table's current columns, as the month file has them.
-          val t = CommitRepair.tableOf(p)
-          Using.resource(Archive.All.find(_.name == t).fold(ParquetReader.open(file(p).getPath))(td => Archive.open(td, file(p).getPath)))(
-            _.rowIterator.foreach(f(t, _)))
+          Using.resource(ParquetReader.open(file(p).getPath))(_.rowIterator.foreach(f(CommitRepair.tableOf(p), _)))
 
   /** A record of 0.21.0 with what [[CommitRepair.verify]] needs, from the
     * chunk's rows (still all in SQLite, or in the day files of a month
     * merge). Its previous files stay unknown: such a record is repaired
     * only by hand.
     */
+  /** Per table of `i`, the column count of its file (the published one, or
+    * its tmp file): a commit written before an upgrade has an earlier layout,
+    * and its rows are checked in that layout ([[CommitRepair.fit]]).
+    */
+  private def widths(i: CommitIntent): Map[String, Int] =
+    i.files.map { t =>
+      val w = Seq(file(t.path), tmpOf(t.path)).filter(_.exists)
+        .flatMap(f => Try(ParquetReader.meta(f.getPath).columns.size).toOption).headOption
+        .orElse(Archive.All.find(_.name == CommitRepair.tableOf(t.path)).map(_.columns.size))
+      CommitRepair.tableOf(t.path) -> w.getOrElse(0)
+    }.toMap
+
   private def completeChecks(db: Db, i: CommitIntent): CommitIntent =
     val samplers = i.files.map(t => CommitRepair.tableOf(t.path) -> ChunkSampler()).toMap
-    forEachChunkRow(db, i.delete)((table, row) => samplers.get(table).foreach(_.add(row)))
+    val width = widths(i)
+    forEachChunkRow(db, i.delete)((table, row) => samplers.get(table).foreach(_.add(CommitRepair.fit(row, width(table)))))
     i.copy(files = i.files.map { t =>
       if t.check.isDefined then t
       else

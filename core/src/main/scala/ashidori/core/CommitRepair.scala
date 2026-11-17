@@ -38,6 +38,21 @@ import ashidori.core.CommitIntent.{Check, Delete, OnDisk, Prev, Recovery, Target
   * otherwise it waits for the user (「整理を修復」).
   */
 object CommitRepair:
+  /** A row in a file's own layout: its first `width` columns, or nulls after
+    * it. Archive layouts only add columns at the end ([[Archive.layouts]]),
+    * so a row of the current layout read from SQLite and the same row in a
+    * file of an earlier layout (a commit written before an upgrade) hash
+    * alike once fitted to the file's width, as the file's recorded sample
+    * hashes were made. A row with a value in a column the file does not
+    * have is left as it is, so it matches no row of the file: its rows are
+    * never deleted from SQLite as archived (that value is not in the file).
+    */
+  def fit(r: IndexedSeq[Any], width: Int): IndexedSeq[Any] =
+    if r.size == width then r
+    else if r.size > width then
+      if r.iterator.drop(width).forall(_ == null) then r.take(width) else r
+    else r ++ IndexedSeq.fill(width - r.size)(null)
+
   /** Where one table of the commit stands. */
   enum State:
     /** Its new version is in place (the recorded rows and size). */
