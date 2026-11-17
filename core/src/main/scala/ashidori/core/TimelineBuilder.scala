@@ -16,10 +16,16 @@ final case class TimelineParams(
     /** a vehicle run shorter than this between two GNSS outages is part of the underground ride */
     maxSurfacingMs: Long = 3 * 60_000L,
     /** faster than this between fixes is a position jump, not movement (~1080 km/h) */
-    maxPlausibleSpeedMps: Double = 300.0
+    maxPlausibleSpeedMps: Double = 300.0,
+    /** no position for this long while the place changed: 記録なし unless the
+      * leg's mode has evidence of its own ([[TimelineBuilder.isUnrecorded]])
+      */
+    unrecordedMinMs: Long = 15 * 60_000L
 )
 
-/** Turns raw fixes and motion windows into a sequence of visits and trips. */
+/** Turns raw fixes and motion windows into a sequence of visits, trips and
+  * stretches without a record ([[Unrecorded]]).
+  */
 object TimelineBuilder:
 
   def build(
@@ -60,7 +66,7 @@ object TimelineBuilder:
         // log it may just be jitter before the first fix settles.
         val minDist = if betweenStays then p.minTripDistanceM / 3 else p.minTripDistanceM
         if dist >= minDist || (dur >= p.minTripDurationMs && dist >= minDist / 2) then
-          out += Trip(path.head.time, path.last.time, path, legs(path, motionIndex, p))
+          out ++= splitUnrecorded(path, pieces(path, motionIndex, p))
 
     var cursor = 0
     for (s, k) <- stays.zipWithIndex do
@@ -69,6 +75,28 @@ object TimelineBuilder:
       cursor = s.to
     addTrip(cursor, fixes.size - 1, betweenStays = false)
     absorbEdgeStops(out.result())
+
+  /** A trip's legs, with the stretches without a record taken out as
+    * [[Unrecorded]] segments between the trips on either side.
+    */
+  private def splitUnrecorded(path: Vector[Fix], ps: Vector[(Leg, Boolean)]): Vector[Segment] =
+    if !ps.exists(_._2) then Vector(Trip(path.head.time, path.last.time, path, ps.map(_._1)))
+    else
+      def at(t: Long) = path.find(_.time >= t).getOrElse(path.last).latLng
+      val out = Vector.newBuilder[Segment]
+      var legs = Vector.empty[Leg]
+      def flush(): Unit =
+        if legs.nonEmpty then
+          val (a, b) = (legs.head.start, legs.last.end)
+          out += Trip(a, b, path.filter(f => f.time >= a && f.time <= b), legs)
+          legs = Vector.empty
+      for (l, unrecorded) <- ps do
+        if unrecorded then
+          flush()
+          out += Unrecorded(l.start, l.end, at(l.start), at(l.end))
+        else legs :+= l
+      flush()
+      out.result()
 
   /** With sparse sampling while stationary, the last fix of a visit may be
     * minutes before departure. A trip that starts (or ends) with a stop is
@@ -99,7 +127,10 @@ object TimelineBuilder:
     a.toVector
 
   /** Split a trip path into legs of homogeneous transport mode. */
-  def legs(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[Leg] =
+  def legs(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[Leg] = pieces(path, motion, p).map(_._1)
+
+  /** The legs of a trip path, each with whether it is a stretch without a record. */
+  private def pieces(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[(Leg, Boolean)] =
     if path.size < 2 then return Vector.empty
     val iv = intervals(path, motion, p)
     // Smooth the coarse class with a duration-weighted majority over neighbours.
@@ -168,7 +199,7 @@ object TimelineBuilder:
         runs(k - 1) = (runs(k - 1)._1, runs(k + 1)._2, Coarse.Gap)
         runs.remove(k, 2)
       else k += 1
-    runs.toVector.map { case (a, b, _) => makeLeg(iv.slice(a, b + 1), motion) }
+    runs.toVector.map { case (a, b, _) => makeLeg(iv.slice(a, b + 1), motion, p) }
 
   private final case class Interval(
       start: Long,
@@ -176,6 +207,8 @@ object TimelineBuilder:
       dist: Double,
       speed: Double,
       gap: Boolean,
+      /** no position for at least [[TimelineParams.unrecordedMinMs]] while the place changed */
+      silent: Boolean,
       /** either end has accuracy worse than 50 m */
       poor: Boolean,
       cadence: Double,
@@ -190,7 +223,10 @@ object TimelineBuilder:
       val b = path(k + 1)
       val dt = math.max(1L, b.time - a.time)
       val d = Geo.distance(a, b)
-      val gap = dt > p.gapMs && d / (dt / 1000.0) > 2.5
+      // A long silence where the place changed is a gap too, at any speed:
+      // otherwise a phone off for hours reads as a slow walk.
+      val silent = dt >= p.unrecordedMinMs && d >= p.stay.radiusM
+      val gap = (dt > p.gapMs && d / (dt / 1000.0) > 2.5) || silent
       // Doppler speed is far better than position differences for short intervals.
       val speed =
         if !gap && a.hasSpeed && b.hasSpeed && dt < 30_000 then (a.speed + b.speed) / 2.0
@@ -199,10 +235,10 @@ object TimelineBuilder:
       val dist = if !gap && a.hasSpeed && b.hasSpeed && dt < 30_000 then math.min(d, speed * dt / 1000.0) else d
       val m = motion.summary(a.time, b.time)
       val poor = (a.hasAccuracy && a.accuracy > 50) || (b.hasAccuracy && b.accuracy > 50)
-      Interval(a.time, b.time, dist, speed, gap, poor, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
+      Interval(a.time, b.time, dist, speed, gap, silent, poor, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
     }
 
-  private def makeLeg(iv: IndexedSeq[Interval], motion: MotionIndex): Leg =
+  private def makeLeg(iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): (Leg, Boolean) =
     val start = iv.head.start
     val end = iv.last.end
     val dur = end - start
@@ -231,7 +267,36 @@ object TimelineBuilder:
     )
     val (mode, conf) = ModeClassifier.classify(f)
     val roughTime = iv.filter(i => i.gap || i.poor).map(_.dt).sum
-    Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0)
+    val silentTime = iv.filter(_.silent).map(_.dt).sum
+    (Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0),
+      isUnrecorded(mode, silentTime, dur, f.hasMotion))
+
+  /** A leg that is mostly a long silence is 記録なし, unless something besides
+    * the two ends says how the user moved: the speed of an underground ride
+    * or a flight, or steps counted meanwhile. A low-confidence mode with
+    * such evidence stays a trip (shown as estimated).
+    */
+  def isUnrecorded(mode: TransportMode, silentMs: Long, durationMs: Long, hasMotion: Boolean): Boolean =
+    silentMs > 0 && silentMs * 2 >= durationMs && (mode match
+      case TransportMode.Unknown                      => true
+      case TransportMode.Subway | TransportMode.Flying => false
+      case _                                          => !hasMotion)
+
+  /** A user correction applies to a leg if they overlap by more than half;
+    * the leg is then marked [[Leg.corrected]].
+    */
+  def applyOverrides(segs: Vector[Segment], os: Seq[(Long, Long, TransportMode)]): Vector[Segment] =
+    if os.isEmpty then segs
+    else segs.map {
+      case t: Trip => t.copy(legs = t.legs.map(l => applyOverride(l, os)))
+      case s       => s
+    }
+
+  def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =
+    os.find { (s, e, _) =>
+      val ov = math.min(e, l.end) - math.max(s, l.start)
+      ov > (l.end - l.start) / 2
+    }.fold(l)((_, _, m) => l.copy(mode = m, confidence = 1.0, corrected = true))
 
   private def weightedQuantile(sorted: IndexedSeq[(Double, Long)], q: Double): Double =
     val total = sorted.map(_._2).sum.toDouble

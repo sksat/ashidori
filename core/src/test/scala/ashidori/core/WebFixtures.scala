@@ -137,10 +137,7 @@ object WebFixtures:
     // One correction, as in the overrides stream: the first vehicle leg.
     val firstVehicle = built.collect { case t: Trip => t.legs }.flatten.find(_.mode.isVehicle)
     val overrides = firstVehicle.toVector.map(l => (l.start, l.end, TransportMode.Car))
-    val corrected = built.map {
-      case t: Trip => t.copy(legs = t.legs.map(l => applyOverride(l, overrides)))
-      case s       => s
-    }
+    val corrected = TimelineBuilder.applyOverrides(built, overrides)
     val segs = Stats.splitByDay(corrected, Zone).getOrElse(Date, Vector.empty)
     val dayStart = Date.atStartOfDay(Zone).toInstant.toEpochMilli
     val dayEnd = Date.plusDays(1).atStartOfDay(Zone).toInstant.toEpochMilli
@@ -156,8 +153,34 @@ object WebFixtures:
         "distanceByMode" -> ujson.Obj.from(summary.distanceByMode.map((m, d) => m.key -> ujson.Num(d))),
         "durationByMode" -> ujson.Obj.from(summary.durationByMode.map((m, d) => m.key -> num(d))),
         "steps" -> summary.steps,
-        "visits" -> summary.visits
+        "visits" -> summary.visits,
+        "unrecordedMs" -> num(summary.unrecordedMs)
       )
+    ), indent = 1))
+
+    // --- Stretches without a record (GapDay): what the app builds ---------
+    val gap = GapDay.build()
+    val gapSegs = TimelineBuilder.build(gap.fixes, gap.motion)
+    val gapDay = Stats.splitByDay(gapSegs, GapDay.Zone).getOrElse(GapDay.Date, Vector.empty)
+    val gapSummary = Stats.day(GapDay.Date, gapDay, 0)
+    write(dir, "gaps-timeline.json", ujson.write(ujson.Obj(
+      "date" -> GapDay.Date.toString,
+      "fixes" -> ujson.Arr.from(gap.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble))),
+      "motion" -> ujson.Arr.from(gap.motion.map(m => ujson.Arr(num(m.start), num(m.end), m.accelStd.toDouble, m.accelMean.toDouble, m.steps))),
+      "segments" -> ujson.Arr.from(gapSegs.map(segJson)),
+      "summary" -> ujson.Obj(
+        "totalDistanceM" -> gapSummary.totalDistanceM,
+        "movingMs" -> num(gapSummary.movingMs),
+        "unrecordedMs" -> num(gapSummary.unrecordedMs)
+      )
+    )))
+
+    // --- One palette: the modes' labels and colours, and the other line colours
+    write(dir, "palette.json", ujson.write(ujson.Obj(
+      "modes" -> ujson.Arr.from(TransportMode.values.toSeq.map(m =>
+        ujson.Obj("key" -> m.key, "label" -> m.label, "emoji" -> m.emoji, "color" -> m.color, "vehicle" -> m.isVehicle))),
+      "unrecorded" -> Palette.Unrecorded,
+      "stay" -> Palette.Stay
     ), indent = 1))
 
     // --- A user's batches as the server lists and serves them -------------
@@ -259,12 +282,6 @@ object WebFixtures:
     o
 
   /** As the app applies a correction (TimelineRepo): overlap of more than half. */
-  private def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =
-    os.find { (s, e, _) =>
-      val ov = math.min(e, l.end) - math.max(s, l.start)
-      ov > (l.end - l.start) / 2
-    }.fold(l)((_, _, m) => l.copy(mode = m, confidence = 1.0))
-
   private def segJson(s: Segment): ujson.Value = s match
     case v: Visit =>
       ujson.Obj("type" -> "visit", "start" -> num(v.start), "end" -> num(v.end), "lat" -> v.lat, "lon" -> v.lon,
@@ -274,7 +291,9 @@ object WebFixtures:
         "legs" -> ujson.Arr.from(t.legs.map(l => ujson.Obj(
           "start" -> num(l.start), "end" -> num(l.end), "mode" -> l.mode.key, "distanceM" -> l.distanceM,
           "steps" -> l.steps, "uncertain" -> l.uncertain, "confidence" -> l.confidence))))
-    case other => ujson.Obj("type" -> other.getClass.getSimpleName)
+    case u: Unrecorded =>
+      ujson.Obj("type" -> "unrecorded", "start" -> num(u.start), "end" -> num(u.end),
+        "from" -> ujson.Obj("lat" -> u.from.lat, "lon" -> u.from.lon), "to" -> ujson.Obj("lat" -> u.to.lat, "lon" -> u.to.lon))
 
   private def num(l: Long): ujson.Num = ujson.Num(l.toDouble)
 

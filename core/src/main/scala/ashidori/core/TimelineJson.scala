@@ -49,6 +49,8 @@ object TimelineJson:
           ))
         )
         legs :+ path
+      // Google's format has nothing for a stretch without a record: left out.
+      case _: Unrecorded => Seq.empty
     }
     ujson.write(ujson.Obj("semanticSegments" -> ujson.Arr.from(segs)), indent = 1)
 

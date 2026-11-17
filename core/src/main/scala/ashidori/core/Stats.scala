@@ -9,8 +9,11 @@ final case class DaySummary(
     durationByMode: Map[TransportMode, Long],
     steps: Int,
     visits: Int,
-    distinctPlaces: Int
+    distinctPlaces: Int,
+    /** time without a record ([[Unrecorded]]), not part of the totals */
+    unrecordedMs: Long = 0
 ):
+  /** Distance travelled: trips only, never a stretch without a record. */
   def totalDistanceM: Double = distanceByMode.values.sum
   def movingMs: Long = durationByMode.values.sum
 
@@ -25,6 +28,10 @@ final case class MonthSummary(
 
 object Stats:
 
+  /** A day's totals. Stretches without a record ([[Unrecorded]]) add only
+    * to [[DaySummary.unrecordedMs]]: how the user got from one end to the
+    * other is unknown, so they count as neither distance nor travel time.
+    */
   def day(date: LocalDate, segments: Seq[Segment], steps: Int): DaySummary =
     val legs = segments.collect { case t: Trip => t.legs }.flatten.filter(_.mode != TransportMode.Still)
     val visits = segments.collect { case v: Visit => v }
@@ -34,8 +41,30 @@ object Stats:
       legs.groupMapReduce(_.mode)(_.durationMs)(_ + _),
       steps,
       visits.size,
-      visits.flatMap(_.placeId).distinct.size
+      visits.flatMap(_.placeId).distinct.size,
+      segments.collect { case u: Unrecorded => u.durationMs }.sum
     )
+
+  /** Time of `[from, to)` that no stay or trip covers: stretches without a
+    * record and the part of the day before the first or after the last one.
+    */
+  def missingMs(segments: Seq[Segment], from: Long, to: Long): Long =
+    val covered = segments.filterNot(_.isInstanceOf[Unrecorded])
+      .map(s => (math.max(s.start, from), math.min(s.end, to))).filter((a, b) => b > a).sortBy(_._1)
+    var total = 0L
+    var cursor = from
+    for (a, b) <- covered do
+      if b > cursor then
+        total += b - math.max(a, cursor)
+        cursor = b
+    math.max(0L, to - from) - total
+
+  /** A day recorded only in part (the calendar's grey dot): at least
+    * `minMissingMs` of it without a record. `to` is the end of the day, or
+    * now for today.
+    */
+  def partial(segments: Seq[Segment], from: Long, to: Long, minMissingMs: Long = 3_600_000L): Boolean =
+    segments.nonEmpty && missingMs(segments, from, to) >= minMissingMs
 
   def month(ym: YearMonth, days: Seq[DaySummary], placeIds: Seq[Long]): MonthSummary =
     val ds = days.filter(d => YearMonth.from(d.date) == ym)
@@ -83,6 +112,7 @@ object Stats:
     else
       s match
         case v: Visit => v.copy(start = a, end = b)
+        case u: Unrecorded => u.copy(start = a, end = b)
         case t: Trip =>
           val frac = (b - a).toDouble / math.max(1L, t.end - t.start)
           t.copy(

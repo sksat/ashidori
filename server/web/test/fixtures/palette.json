@@ -1,0 +1,83 @@
+{
+ "modes": [
+  {
+   "key": "STILL",
+   "label": "滞在",
+   "emoji": "📍",
+   "color": "#80868B",
+   "vehicle": false
+  },
+  {
+   "key": "WALKING",
+   "label": "徒歩",
+   "emoji": "🚶",
+   "color": "#2E9D57",
+   "vehicle": false
+  },
+  {
+   "key": "RUNNING",
+   "label": "ランニング",
+   "emoji": "🏃",
+   "color": "#E8710A",
+   "vehicle": false
+  },
+  {
+   "key": "CYCLING",
+   "label": "自転車",
+   "emoji": "🚲",
+   "color": "#00A3A3",
+   "vehicle": false
+  },
+  {
+   "key": "IN_PASSENGER_VEHICLE",
+   "label": "車",
+   "emoji": "🚗",
+   "color": "#5B6CD9",
+   "vehicle": true
+  },
+  {
+   "key": "IN_BUS",
+   "label": "バス",
+   "emoji": "🚌",
+   "color": "#D9822B",
+   "vehicle": true
+  },
+  {
+   "key": "IN_TRAIN",
+   "label": "電車",
+   "emoji": "🚆",
+   "color": "#1A73E8",
+   "vehicle": true
+  },
+  {
+   "key": "IN_SUBWAY",
+   "label": "地下鉄",
+   "emoji": "🚇",
+   "color": "#9334E6",
+   "vehicle": true
+  },
+  {
+   "key": "FLYING",
+   "label": "飛行機",
+   "emoji": "✈️",
+   "color": "#00838F",
+   "vehicle": true
+  },
+  {
+   "key": "IN_FERRY",
+   "label": "船",
+   "emoji": "⛴️",
+   "color": "#0277BD",
+   "vehicle": true
+  },
+  {
+   "key": "UNKNOWN_ACTIVITY_TYPE",
+   "label": "移動",
+   "emoji": "➡️",
+   "color": "#80868B",
+   "vehicle": false
+  }
+ ],
+ "unrecorded": "#9AA0A6",
+ "stay": "#006B5B"
+}

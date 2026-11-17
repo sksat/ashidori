@@ -166,7 +166,9 @@ final case class Leg(
     /** fraction of the leg's time without a good position (GNSS gap or
       * poor accuracy): the drawn path there is only an approximation
       */
-    uncertain: Double = 0
+    uncertain: Double = 0,
+    /** the user set the mode ([[TimelineBuilder.applyOverrides]]) */
+    corrected: Boolean = false
 ) extends Segment:
   def isUncertain: Boolean = uncertain >= 0.3
 
@@ -175,3 +177,21 @@ final case class Trip(start: Long, end: Long, path: Vector[Fix], legs: Vector[Le
   def mainMode: TransportMode =
     if legs.isEmpty then TransportMode.Unknown
     else legs.maxBy(_.distanceM).mode
+
+/** A stretch without positions (記録なし) where the user went from `from` to
+  * `to` but nothing says how: the phone was off, recording stopped, or the
+  * signal was lost for long. Neither a stay nor a trip; it is shown as such
+  * and never counted in distance or travel time.
+  */
+final case class Unrecorded(start: Long, end: Long, from: LatLng, to: LatLng) extends Segment:
+  /** Straight line between the last position before and the first after. */
+  def displacementM: Double = from.distanceTo(to)
+
+/** Display colours shared by the map lines, chips and legends (the web
+  * viewer's `MODES` has the same values; a test compares them).
+  */
+object Palette:
+  /** 記録なし: the dotted line and rail. */
+  val Unrecorded = "#9AA0A6"
+  /** Stays: the visit markers and the rail's dots. */
+  val Stay = "#006B5B"

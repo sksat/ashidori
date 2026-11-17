@@ -574,6 +574,7 @@
    "IN_SUBWAY": 1799000
   },
   "steps": 4991,
-  "visits": 6
+  "visits": 6,
+  "unrecordedMs": 0
  }
 }
