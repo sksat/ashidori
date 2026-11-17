@@ -9,9 +9,11 @@ import scala.collection.mutable
 /** The offline venue index (tools/venues/build_index.py, "AVEN" version 2):
   * venues from OpenStreetMap in a grid of ~1 km cells, stored in
   * deflate-compressed blocks of whole cells with an index in the header.
-  * Opening reads only the header; a query inflates the few blocks around
-  * it, and recently used blocks stay decoded (at most [[CacheBlocks]] and
-  * [[MaxCacheBytes]]). Searching sends nothing.
+  * Opening reads only the header; a query (around a point, by name, or in
+  * a rectangle for the map, [[within]]) inflates the few blocks it needs,
+  * and recently used blocks stay decoded (at most [[CacheBlocks]] and
+  * [[MaxCacheBytes]], the least recently used dropped first). Searching
+  * sends nothing.
   *
   * The file is checked against the pinned sha256 before it is installed,
   * but the reader does not rely on that: every count and length is bounded
@@ -25,7 +27,7 @@ import scala.collection.mutable
 final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
   import VenueIndex.*
 
-  private val (scale, cell, south, west, rows, cols, categories, dict, firstKeys, blockPoints, offsets, lengths) =
+  private val (scale, cell, south, west, rows, cols, categories, tags, dict, firstKeys, blockPoints, offsets, lengths) =
     val head = src.read(0, 10)
     if String(head, 0, 4, UTF_8) != "AVEN" then throw IOException("not a venue index")
     if head(4) != 2 then throw IOException(s"unsupported version ${head(4)}")
@@ -39,11 +41,13 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
     val rows = r.count(65535)
     val cols = r.count(65535)
     checkGrid(scale, cell, south, west, rows, cols)
-    val categories = Array.fill(r.count(MaxCategories)) {
+    // Each category's tag (key, value) and its label.
+    val tags = Array.fill(r.count(MaxCategories)) {
       val kv = r.str(r.count(1024))
       val i = kv.indexOf('=')
-      if i < 0 then kv else Overpass.label(kv.take(i), kv.drop(i + 1))
+      if i < 0 then (kv, "") else (kv.take(i), kv.drop(i + 1))
     }
+    val categories = tags.map((k, v) => if v.isEmpty then k else Overpass.label(k, v))
     val dict = r.bytes(r.count(MaxDictionary))
     val n = r.count(MaxBlocks)
     val firstKeys = new Array[Long](n)
@@ -61,7 +65,7 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
       off += lengths(i)
       if i > 0 && firstKeys(i) <= firstKeys(i - 1) then throw IOException("blocks out of order")
     if off != src.length then throw IOException("index does not match the file size")
-    (scale, cell, south.toInt, west.toInt, rows, cols, categories, dict, firstKeys, points, offsets, lengths)
+    (scale, cell, south.toInt, west.toInt, rows, cols, categories, tags, dict, firstKeys, points, offsets, lengths)
 
   /** Number of venues. */
   val size: Long = blockPoints.iterator.map(_.toLong).sum
@@ -126,6 +130,45 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
         if found.size >= limit || r >= maxM || spent >= budget then done = true
         else r = math.min(maxM, r * 4)
       found.values.toVector.sortBy(_._2).take(limit)
+  }
+
+  /** Venues in the rectangle `south` ≤ lat ≤ `north`, `west` ≤ lon ≤ `east`
+    * (degrees), with their tags, in the file's order. It inflates only the
+    * blocks holding the cells that meet the rectangle. A rectangle of more
+    * than `maxCells` cells, or one that crosses the antimeridian
+    * (`west` > `east`), finds nothing.
+    */
+  def within(south: Double, west: Double, north: Double, east: Double,
+             maxCells: Int = MaxQueryCells): Vector[Tagged] = synchronized {
+    val sane = south <= north && west <= east && south <= 90 && north >= -90 && west <= 180 && east >= -180
+    // Cell indices as doubles first: a far-away rectangle must not overflow.
+    val r0 = math.max(0.0, math.floor((south * scale - this.south) / cell))
+    val r1 = math.min(rows - 1.0, math.floor((north * scale - this.south) / cell))
+    val c0 = math.max(0.0, math.floor((west * scale - this.west) / cell))
+    val c1 = math.min(cols - 1.0, math.floor((east * scale - this.west) / cell))
+    if !sane || r0 > r1 || c0 > c1 || (r1 - r0 + 1) * (c1 - c0 + 1) > math.min(maxCells, MaxQueryCells) then Vector.empty
+    else
+      // In whole scale units, so that 36.0827 × 1e5 still takes 3608270.
+      val (s, n) = (math.ceil(south * scale - 1e-6), math.floor(north * scale + 1e-6))
+      val (w, e) = (math.ceil(west * scale - 1e-6), math.floor(east * scale + 1e-6))
+      // Morton order: the cells of a block come together.
+      val keys = (for r <- r0.toInt to r1.toInt; c <- c0.toInt to c1.toInt yield morton(r, c)).sorted
+      val out = Vector.newBuilder[Tagged]
+      for key <- keys do
+        val bi = blockOf(key)
+        if bi >= 0 then
+          val b = block(bi)
+          b.cellRange(key).foreach { (from, until) =>
+            var j = from
+            while j < until do
+              val la = b.lat(j).toDouble
+              val lo = b.lon(j).toDouble
+              if la >= s && la <= n && lo >= w && lo <= e then
+                val (k, v) = tags(b.cat(j))
+                out += Tagged(venue(b, j), k, v)
+              j += 1
+          }
+      out.result()
   }
 
   // ---- internals ----
@@ -278,6 +321,9 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
   def close(): Unit = src.close()
 
 object VenueIndex:
+  /** A venue with its OpenStreetMap tag `key`=`value` (e.g. shop=books). */
+  final case class Tagged(venue: Venue, key: String, value: String)
+
   /** Decoded blocks kept (about 2048 venues each), and their total size. */
   val CacheBlocks = 24
   val MaxCacheBytes: Long = 16L * 1024 * 1024

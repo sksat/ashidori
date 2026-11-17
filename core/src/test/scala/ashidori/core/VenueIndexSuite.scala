@@ -240,3 +240,109 @@ class VenueIndexSuite extends munit.FunSuite:
     for p <- Seq(tsukuba, tokyo, LatLng(43.0687, 141.3507)) do idx.nearby(p, 500)
     assert(idx.cacheBytes > 0 && idx.cacheBytes <= VenueIndex.MaxCacheBytes, idx.cacheBytes)
   }
+
+  // ---- the map's rectangle query ----
+
+  /** The rectangle (south, west, north, east) that holds the circle of `r` metres around `p`. */
+  private def square(p: LatLng, r: Double) =
+    val dLat = r / 111_320.0
+    val dLon = r / (111_320.0 * math.cos(math.toRadians(p.lat)))
+    (p.lat - dLat, p.lon - dLon, p.lat + dLat, p.lon + dLon)
+
+  /** `within` agrees with `nearby`: the circle's venues are those of the
+    * enclosing square within the radius, and a wider circle clipped to the
+    * square gives the square's venues. Returns the square's count.
+    */
+  private def checkConsistent(idx: VenueIndex, p: LatLng, r: Double): Int =
+    val (s, w, n, e) = square(p, r)
+    val box = idx.within(s, w, n, e)
+    assertEquals(box.map(_.venue.id).distinct.size, box.size)
+    assertEquals(
+      box.filter(t => Geo.distance(p.lat, p.lon, t.venue.lat, t.venue.lon) <= r).map(_.venue).toSet,
+      idx.nearby(p, r).map(_._1).toSet)
+    val inBox = (v: Venue) => v.lat >= s && v.lat <= n && v.lon >= w && v.lon <= e
+    assertEquals(idx.nearby(p, r * 1.5).map(_._1).filter(inBox).toSet, box.map(_.venue).toSet)
+    box.size
+
+  test("within: the venues of a rectangle with their tags, consistent with nearby") {
+    for (p, r) <- Seq((tsukuba, 100.0), (tsukuba, 1_200.0), (tokyo, 50.0), (tokyo, 400.0), (LatLng(36.0835, 140.1115), 30.0)) do
+      checkConsistent(index, p, r)
+    val (s, w, n, e) = square(tsukuba, 200)
+    val tagged = index.within(s, w, n, e).map(t => t.venue.id -> t).toMap
+    assertEquals(tagged.keySet, Set("node/1", "node/2", "node/3", "way/4"))
+    assertEquals((tagged("node/1").key, tagged("node/1").value), ("railway", "station"))
+    assertEquals((tagged("node/3").key, tagged("node/3").value), ("amenity", "cafe"))
+    assertEquals((tagged("way/4").key, tagged("way/4").value), ("leisure", "park"))
+    // Names and labels as nearby gives them.
+    assertEquals(tagged("node/3").venue.name, "スターバックス")
+    assertEquals(tagged("node/3").venue.category, "カフェ")
+  }
+
+  test("within: clipped to the rectangle, not to whole cells") {
+    // Tsukuba station (36.0827, 140.1112) and the convenience store
+    // (36.0830, 140.1115) share a cell; a rectangle around either takes one.
+    assertEquals(index.within(36.0826, 140.1111, 36.0828, 140.1113).map(_.venue.id), Vector("node/1"))
+    assertEquals(index.within(36.0829, 140.1114, 36.0831, 140.1116).map(_.venue.id), Vector("node/2"))
+    // Edges are inclusive.
+    assertEquals(index.within(36.0827, 140.1112, 36.0827, 140.1112).map(_.venue.id), Vector("node/1"))
+  }
+
+  test("within: empty rectangles, outside the grid, too many cells") {
+    assertEquals(index.within(36.09, 140.11, 36.08, 140.12), Vector.empty) // south > north
+    assertEquals(index.within(36.08, 140.12, 36.09, 140.11), Vector.empty) // west > east
+    assertEquals(index.within(10, 100, 11, 101), Vector.empty)
+    assertEquals(index.within(-95, -200, -91, -190), Vector.empty)
+    assertEquals(index.within(Double.NaN, 140.11, 36.09, 140.12), Vector.empty)
+    // Japan at once is beyond the cell cap: nothing, not a long query.
+    assertEquals(index.within(30, 128, 46, 146), Vector.empty)
+    val (s, w, n, e) = square(tsukuba, 200)
+    assertEquals(index.within(s, w, n, e, maxCells = 1), Vector.empty)
+  }
+
+  test("within: inflates only the blocks of the rectangle, and keeps them") {
+    val fresh = VenueIndex(bytes)
+    val (s, w, n, e) = square(tsukuba, 200)
+    fresh.within(s, w, n, e)
+    val first = fresh.inflated
+    assert(first >= 1 && first < fresh.blocks, (first, fresh.blocks))
+    fresh.within(s, w, n, e)
+    assertEquals(fresh.inflated, first)
+  }
+
+  /** The released index (venues-20261014), when ASHIDORI_VENUES names its
+    * venues.aven: consistency at random spots, and the time of the map's
+    * query around Tokyo Station (printed).
+    */
+  test("within on the released index (ASHIDORI_VENUES)") {
+    val path = sys.env.get("ASHIDORI_VENUES").map(java.io.File(_)).filter(_.isFile)
+    assume(path.nonEmpty, "ASHIDORI_VENUES not set")
+    val idx = VenueIndex.open(path.get)
+    try
+      val rnd = scala.util.Random(7)
+      val spots = Seq(tokyo, tsukuba, LatLng(34.7025, 135.4959), LatLng(35.1709, 136.8815)) ++
+        Seq.fill(12)(LatLng(33.5 + rnd.nextDouble() * 2.5, 130.5 + rnd.nextDouble() * 9))
+      val counts = spots.map(p => checkConsistent(idx, p, 150 + rnd.nextDouble() * 600))
+      assert(counts.take(4).forall(_ > 50), counts)
+      // A phone's view (412 × 915 dp) around Tokyo Station; 512 dp tiles.
+      def view(zoom: Int) =
+        val cos = math.cos(math.toRadians(tokyo.lat))
+        val mPerDp = 40_075_016.7 * cos / (512 * math.pow(2, zoom))
+        val dLat = 915 / 2.0 * mPerDp / 111_320.0
+        val dLon = 412 / 2.0 * mPerDp / (111_320.0 * cos)
+        (tokyo.lat - dLat, tokyo.lon - dLon, tokyo.lat + dLat, tokyo.lon + dLon)
+      for zoom <- Seq(15, 16, 17) do
+        val (s, w, n, e) = view(zoom)
+        val cold = VenueIndex.open(path.get)
+        try
+          val t0 = System.nanoTime()
+          val vs = cold.within(s, w, n, e)
+          val t1 = System.nanoTime()
+          cold.within(s, w, n, e)
+          val t2 = System.nanoTime()
+          val sel = VenueMapLayer.select(vs, zoom.toDouble, tokyo, cap = 1_500)
+          val t3 = System.nanoTime()
+          println(f"within Tokyo Station z$zoom: ${vs.size} venues, ${cold.inflated} blocks; " +
+            f"cold ${(t1 - t0) / 1e6}%.1f ms, cached ${(t2 - t1) / 1e6}%.1f ms; select ${sel.size} in ${(t3 - t2) / 1e6}%.1f ms")
+        finally cold.close()
+    finally idx.close()
+  }
