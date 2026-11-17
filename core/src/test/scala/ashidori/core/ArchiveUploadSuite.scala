@@ -89,6 +89,32 @@ class ArchiveUploadSuite extends munit.FunSuite:
     finally snap2.close()
   }
 
+  test("no range yet, a deletion recorded, the old file opened, the cut completes: the old file is held") {
+    val period = Some((0L, 86_400_000L))
+    var ranges = Vector.empty[(Long, Long, Long, Boolean)]
+    def seq = ranges.map(_._3).maxOption.getOrElse(0L)
+    // The uploader's gate: the check of pending ranges finds none, and right
+    // after it the deletion is recorded (before the file is opened).
+    val opened = ArchiveUpload.openGate(period, () => seq, () => {
+      val now = ranges
+      ranges = ranges :+ (1000L, 2000L, 1L, true)
+      now
+    })
+    assertEquals(opened, Some(0L))
+    // The file (the version before the cut) is opened; then the cut completes.
+    ranges = ranges.map(_.copy(_4 = false))
+    // The next part, and every part already sealed from it, is held.
+    assert(ArchiveUpload.heldByDeletion(period.get, opened.get, ranges))
+    // Had the sequence been read after the check (as before), it would be 1
+    // and the old file would have gone out.
+    assert(!ArchiveUpload.heldByDeletion(period.get, seq, ranges))
+    // A deletion recorded before the sequence is read is seen pending: the file waits.
+    ranges = Vector((1000L, 2000L, 1L, true))
+    assertEquals(ArchiveUpload.openGate(period, () => seq, () => ranges), None)
+    // Another period: opened as usual.
+    assertEquals(ArchiveUpload.openGate(Some((5000L, 6000L)), () => seq, () => ranges), Some(1L))
+  }
+
   test("a part sealed by an earlier version (no file recorded): its file is read from the batch") {
     val keys = BlobKeys.of(Array.fill[Byte](32)(7))
     val plain = Crypto.gzip(("""{"file":"fixes/2026-10-01.parquet","gen":"1","part":0,"parts":1,"data":""}""" + "\n").getBytes("UTF-8"))

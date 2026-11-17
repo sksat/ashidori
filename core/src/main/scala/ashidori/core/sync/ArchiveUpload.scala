@@ -72,6 +72,31 @@ object ArchiveUpload:
     val (a, b) = period
     ranges.exists((x, y, seq, pending) => x < b && y > a && (pending || seq > opened))
 
+  /** Before a file covering `period` is opened for upload: the deletion
+    * sequence, read first, then whether a range over it is not cut yet.
+    * None: it is not (the file waits for the cut). Some(seq): open the file
+    * and check its parts against `seq` ([[heldByDeletion]]). Read in this
+    * order, a range recorded after the sequence was read has a larger one,
+    * whether it is seen pending here or cut by the time a part is sealed.
+    */
+  def openGate(period: Option[(Long, Long)], seqNow: () => Long, ranges: () => Seq[(Long, Long, Long, Boolean)]): Option[Long] =
+    val seq = seqNow()
+    val pending = period.exists((a, b) => ranges().exists((x, y, _, p) => p && x < b && y > a))
+    Option.when(!pending)(seq)
+
+  /** Discarding a batch that must not be sent, and the upload marks that
+    * would skip what it held: one transaction, so a stop in between leaves
+    * both (the batch is found and discarded again), never the marks alone.
+    * `names`: the sync_state names now; `forget`: the files whose marks go.
+    * The statements, with their arguments, in order.
+    */
+  def discard(id: Long, names: Seq[String], forget: String => Boolean): Seq[(String, Seq[Any])] =
+    ("DELETE FROM sync_outbox WHERE id=?", Seq(id)) +:
+      names.filter(n => markFile(n).exists(forget)).map(n => ("DELETE FROM sync_state WHERE name=?", Seq(n)))
+
+  /** The sync_state names that can be upload marks. */
+  val MarkNames = "SELECT name FROM sync_state WHERE name LIKE '%|up%:%'"
+
   /** The archive file (`<table>/<name>`) a batch of stream `archive` is a
     * part of, from its plaintext (gzipped JSON Lines; see [[nextPart]]'s
     * caller), if it names one.

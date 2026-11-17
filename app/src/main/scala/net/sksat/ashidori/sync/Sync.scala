@@ -567,16 +567,18 @@ object Uploader:
       val mark = db.syncValue(up)
       // A day still being archived (rows left in SQLite) is sent once it is
       // complete; a file handed over is sent again only when it changed.
+      // The deletion sequence, read before the check of ranges not cut yet
+      // and before the file is opened: a range recorded after it is either
+      // seen pending here or, if cut from a newer version only, larger than
+      // it when a part is sealed or sent (ArchiveUpload.openGate).
+      val gate = ArchiveUpload.openGate(AshidoriApp.archive.periodOf(name), () => db.deletionSeq(), () => db.deletedRangesNow())
+      val openedSeq = gate.getOrElse(0L)
       val inProgress = !isMonth && scala.util.Try(java.time.LocalDate.parse(name.take(10))).toOption.exists(d =>
         !net.sksat.ashidori.Maintenance.Complete.is(d) &&
           AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1)))) ||
-        // A range the user deleted that is not cut out of this file yet
-        // (read fresh for each file): sent once it is (as a new
-        // generation), never with those rows.
-        heldByDeletion(s"${t.name}/$name", Long.MaxValue)
-      // Read before the file is opened: a deletion recorded after it may
-      // have been cut from a newer version only, not from the open one.
-      val openedSeq = db.deletionSeq()
+        // A range the user deleted that is not cut out of this file yet:
+        // sent once it is (as a new generation), never with those rows.
+        gate.isEmpty
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
         if inProgress then None
@@ -675,16 +677,14 @@ object Uploader:
         // not sent (it may hold a deleted range); the files of its tables
         // go out again from the current versions.
         Log.w(s"outbox ${e.stream}/${e.seq}: its file is unknown, not sent; its tables are sent again")
-        db.deleteOutbox(e.id)
-        db.forgetUploads(run.reg, (if cls == Raw then ashidori.core.Archive.RawTables else ashidori.core.Archive.UploadedSignalTables)
-          .map(_.name).toSet)
+        val tables = (if cls == Raw then ashidori.core.Archive.RawTables else ashidori.core.Archive.UploadedSignalTables).map(_.name).toSet
+        db.discardOutbox(e.id, Some(run.reg), f => tables(f.takeWhile(_ != '/')))
       else if e.file.exists(heldByDeletion(_, e.delSeq)) then
         // A part of an archive file sealed before a range of it was deleted
         // (or before it was cut): never sent. The cut file goes out as a new
         // generation; seqs may have gaps.
         Log.i(s"outbox ${e.stream}/${e.seq} (${e.file.get}) held by a deletion: not sent")
-        db.deleteOutbox(e.id)
-        db.forgetUpload(e.file.get)
+        db.discardOutbox(e.id, None, e.file.contains)
       else
         run.client.putBatch(e.stream, e.seq, db.outboxBlob(e.id))
         db.deleteOutbox(e.id)

@@ -1238,6 +1238,20 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
     deletedCache = None
 
+  /** Discards outbox row `id` and forgets the upload marks of the files
+    * `forget` holds (of registration `reg`, if given; else of every one), in
+    * one transaction ([[ashidori.core.sync.ArchiveUpload.discard]]).
+    */
+  def discardOutbox(id: Long, reg: Option[String], forget: String => Boolean): Unit = tx { db =>
+    val names = Using.resource(db.rawQuery(ashidori.core.sync.ArchiveUpload.MarkNames, null)) { c =>
+      val b = Vector.newBuilder[String]
+      while c.moveToNext() do b += c.getString(0)
+      b.result()
+    }.filter(n => reg.forall(r => n.startsWith(r + "|")))
+    for (sql, args) <- ashidori.core.sync.ArchiveUpload.discard(id, names, forget) do
+      db.execSQL(sql, args.map(_.asInstanceOf[AnyRef]).toArray)
+  }
+
   /** Forgets every archive upload mark of registration `reg` for the
     * tables `tables` (by name): their files are all sent again from part 0.
     */
