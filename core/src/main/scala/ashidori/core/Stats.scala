@@ -45,6 +45,14 @@ object Stats:
       segments.collect { case u: Unrecorded => u.durationMs }.sum
     )
 
+  /** A day's segments as shown: a day with nothing but stretches without a
+    * record (the phone off from the day before to the day after) is a day
+    * without a record, like a day with no data at all. The web viewer does
+    * the same (`daySegments`).
+    */
+  def shown(segments: Vector[Segment]): Vector[Segment] =
+    if segments.forall(_.isInstanceOf[Unrecorded]) then Vector.empty else segments
+
   /** Time of `[from, to)` that no stay or trip covers: stretches without a
     * record and the part of the day before the first or after the last one.
     */
@@ -123,7 +131,8 @@ object Stats:
               val la = math.max(l.start, a)
               val lb = math.min(l.end, b)
               val lf = (lb - la).toDouble / math.max(1L, l.end - l.start)
-              l.copy(start = la, end = lb, distanceM = l.distanceM * lf, steps = (l.steps * lf).toInt)
+              l.copy(start = la, end = lb, distanceM = l.distanceM * lf, steps = (l.steps * lf).toInt,
+                whole = Some((l.wholeStart, l.wholeEnd)))
             )
           )
         case other => other

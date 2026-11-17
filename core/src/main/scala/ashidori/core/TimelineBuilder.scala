@@ -269,21 +269,37 @@ object TimelineBuilder:
     val roughTime = iv.filter(i => i.gap || i.poor).map(_.dt).sum
     val silentTime = iv.filter(_.silent).map(_.dt).sum
     (Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0),
-      isUnrecorded(mode, silentTime, dur, f.hasMotion))
+      isUnrecorded(mode, silentTime, dur, phoneOn = f.hasMotion, walked = walked(m.steps, m.cadence)))
+
+  /** Steps that say the user walked: enough of them, at a walking rate
+    * while the accelerometer was recording. Motion rows alone (a phone on
+    * a table) are not travel.
+    */
+  def walked(steps: Int, cadence: Double): Boolean =
+    !cadence.isNaN && steps >= MinWalkSteps && cadence >= MinWalkCadence
+  val MinWalkSteps = 30
+  val MinWalkCadence = 10.0
 
   /** A leg that is mostly a long silence is 記録なし, unless something besides
-    * the two ends says how the user moved: the speed of an underground ride
-    * or a flight, or steps counted meanwhile. A low-confidence mode with
-    * such evidence stays a trip (shown as estimated).
+    * its two ends says how the user moved. The speed between the ends alone
+    * is not enough: a phone switched off in a car gives a subway's speed too.
+    *  - on foot: steps counted meanwhile ([[walked]]);
+    *  - in a vehicle (an underground ride, a tunnel): the accelerometer
+    *    recording meanwhile (`phoneOn`), so only positions were missing;
+    *  - a flight: its speed, which nothing else on the ground reaches.
+    * A low-confidence mode with such evidence stays a trip (shown as estimated).
     */
-  def isUnrecorded(mode: TransportMode, silentMs: Long, durationMs: Long, hasMotion: Boolean): Boolean =
+  def isUnrecorded(mode: TransportMode, silentMs: Long, durationMs: Long, phoneOn: Boolean, walked: Boolean): Boolean =
     silentMs > 0 && silentMs * 2 >= durationMs && (mode match
-      case TransportMode.Unknown                      => true
-      case TransportMode.Subway | TransportMode.Flying => false
-      case _                                          => !hasMotion)
+      case TransportMode.Unknown                         => true
+      case TransportMode.Flying                          => false
+      case TransportMode.Walking | TransportMode.Running => !walked
+      case _                                             => !phoneOn)
 
   /** A user correction applies to a leg if they overlap by more than half;
-    * the leg is then marked [[Leg.corrected]].
+    * the first match wins (callers list the newest first). A correction to
+    * the inferred mode itself (取り消し) leaves the leg as built, so it is not
+    * marked [[Leg.corrected]] and keeps its confidence.
     */
   def applyOverrides(segs: Vector[Segment], os: Seq[(Long, Long, TransportMode)]): Vector[Segment] =
     if os.isEmpty then segs
@@ -296,7 +312,7 @@ object TimelineBuilder:
     os.find { (s, e, _) =>
       val ov = math.min(e, l.end) - math.max(s, l.start)
       ov > (l.end - l.start) / 2
-    }.fold(l)((_, _, m) => l.copy(mode = m, confidence = 1.0, corrected = true))
+    }.fold(l)((_, _, m) => if m == l.mode then l else l.copy(mode = m, confidence = 1.0, inferred = Some(l.mode)))
 
   private def weightedQuantile(sorted: IndexedSeq[(Double, Long)], q: Double): Double =
     val total = sorted.map(_._2).sum.toDouble

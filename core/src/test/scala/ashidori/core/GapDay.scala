@@ -9,7 +9,10 @@ import java.time.{LocalDate, ZoneId}
   *  - 11:30 a walk, 20 min without positions but with steps counted (the
   *    user walked 1.5 km indoors): a trip, walking;
   *  - 12:30 a walk into an underground station, 8 min without positions,
-  *    5 km away: an underground ride (subway), a trip.
+  *    5 km away: an underground ride (subway), a trip;
+  *  - 20 min, 1 km, motion rows without steps (a phone on a table): 記録なし;
+  *  - 20 min, 10 km, no motion rows (the phone off, at a subway's speed): 記録なし;
+  *  - 20 min, 10 km, the accelerometer recording (a tunnel): a trip.
   * Stays of 30 min sit between them.
   */
 object GapDay:
@@ -41,24 +44,38 @@ object GapDay:
         motion += MotionWindow(t, t + 5_000, 1.8f, 0.3f, 9)
         t += 5_000
         north += 7.0
-    /** No position for `minutes` while moving `east` metres (with steps if `steps`). */
-    def silence(minutes: Int, eastM: Double, steps: Boolean): Unit =
-      if steps then
-        for k <- 0 until minutes * 6 do motion += MotionWindow(t + k * 10_000L, t + (k + 1) * 10_000L, 1.8f, 0.3f, 18)
+    /** No position for `minutes` while moving `east` metres; motion rows
+      * of (`steps` per 10 s, `std`), or none.
+      */
+    def silence(minutes: Int, eastM: Double, rows: Option[(Int, Float)]): Unit =
+      for (steps, std) <- rows; k <- 0 until minutes * 6 do
+        motion += MotionWindow(t + k * 10_000L, t + (k + 1) * 10_000L, std, 0.3f, steps)
       t += minutes * 60_000L
       east += eastM
 
     stay(30)
     walk(10)
-    silence(180, 20_000, steps = false)
+    silence(180, 20_000, None)
     walk(10)
     stay(30)
     walk(5)
-    silence(20, 1_500, steps = true)
+    silence(20, 1_500, Some((18, 1.8f)))
     walk(5)
     stay(30)
     walk(5)
-    silence(8, 5_000, steps = false)
+    silence(8, 5_000, None)
+    walk(5)
+    stay(30)
+    walk(5)
+    silence(20, 1_000, Some((0, 0.05f)))
+    walk(5)
+    stay(30)
+    walk(5)
+    silence(20, 10_000, None)
+    walk(5)
+    stay(30)
+    walk(5)
+    silence(20, 10_000, Some((0, 0.4f)))
     walk(5)
     stay(30)
     Out(fixes.result(), motion.result())

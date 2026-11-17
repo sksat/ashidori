@@ -167,10 +167,23 @@ final case class Leg(
       * poor accuracy): the drawn path there is only an approximation
       */
     uncertain: Double = 0,
-    /** the user set the mode ([[TimelineBuilder.applyOverrides]]) */
-    corrected: Boolean = false
+    /** the mode inferred from the record, when a correction set another one
+      * ([[TimelineBuilder.applyOverrides]])
+      */
+    inferred: Option[TransportMode] = None,
+    /** the leg as built, when this is the part of it on one day ([[Stats.splitByDay]]) */
+    whole: Option[(Long, Long)] = None
 ) extends Segment:
   def isUncertain: Boolean = uncertain >= 0.3
+  /** The user set a mode other than the inferred one (shown with ✎). */
+  def corrected: Boolean = inferred.exists(_ != mode)
+  /** The mode the record says, whatever the user set. */
+  def autoMode: TransportMode = inferred.getOrElse(mode)
+  /** Start and end of the whole leg, also across midnight: a correction is
+    * saved for these, so it applies from either day.
+    */
+  def wholeStart: Long = whole.fold(start)(_._1)
+  def wholeEnd: Long = whole.fold(end)(_._2)
 
 final case class Trip(start: Long, end: Long, path: Vector[Fix], legs: Vector[Leg]) extends Segment:
   def distanceM: Double = legs.map(_.distanceM).sum
