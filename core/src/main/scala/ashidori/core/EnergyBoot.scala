@@ -21,6 +21,24 @@ object EnergyBoot:
   def inSpills(texts: Iterable[String]): Long =
     texts.iterator.flatMap(t => InRecord.findAllMatchIn(t).flatMap(m => m.group(1).toLongOption)).maxOption.getOrElse(0L)
 
+  /** The texts of the spilled small records in `dir` (`.rec`, and `.rec.tmp`
+    * cut short). Throws if the directory cannot be listed or a file cannot be
+    * read: a number it holds would be missed, so no number may be allocated.
+    * Only a file gone between the listing and the read is skipped (imported
+    * meanwhile: its records are in the database, read after the spills).
+    * No directory (known not to exist): nothing spilled.
+    */
+  def spillTexts(dir: java.io.File, read: java.io.File => String = f =>
+      String(java.nio.file.Files.readAllBytes(f.toPath), java.nio.charset.StandardCharsets.UTF_8)): Seq[String] =
+    if java.nio.file.Files.notExists(dir.toPath) then Nil
+    else
+      val all = dir.listFiles()
+      if all == null then throw java.io.IOException(s"cannot list $dir")
+      all.toSeq.filter(_.getName.contains(OverflowFiles.CompletedRecord)).flatMap { f =>
+        try Some(read(f))
+        catch case _: java.nio.file.NoSuchFileException if !f.exists => None
+      }
+
   /** The next number, or None if any source cannot be read or the number
     * cannot be put on disk (then none is used: the caller tries again later).
     */

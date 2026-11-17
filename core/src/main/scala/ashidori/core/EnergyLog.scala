@@ -56,6 +56,17 @@ object EnergyLog:
   final case class Before(tail: Option[EnergyRow], checkpoint: Option[EnergyCheckpoint], newest: Boolean,
                           olderOpen: Seq[(EnergyRow, Option[Long])] = Nil)
 
+  /** An open row as a span read at `now`. The running recorder's (`live`)
+    * holds until now. Any other was left by a process that is gone (or this
+    * process has no recorder number, so it records no state): its state is
+    * known only up to its recorder's last confirmation, and its end is
+    * unknown. The time after it is covered by no span, so the estimates
+    * leave it out.
+    */
+  def openSpan(r: EnergyRow, live: Option[Long], confirmedAt: Option[Long], now: Long): EnergySpan =
+    if live.contains(r.boot) && r.boot != 0 then r.span.copy(end = math.max(r.start, now))
+    else r.span.copy(end = math.max(r.start, math.min(now, confirmedAt.getOrElse(r.start))), endKnown = false)
+
   /** One span per piece of a state change: the rows of the same origin
     * (`boot`, `seq`) and the same start can be there twice, an earlier and
     * a later version (the archive kept a row that was closed again after it

@@ -395,6 +395,10 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)),
       !c.isNull(at + 13) && c.getInt(at + 13) != 0, c.getLong(at + 14), c.getLong(at + 15))
 
+  /** When recorder `boot` last confirmed its state, if it did. */
+  private def confirmedAt(boot: Long): Option[Long] =
+    query("SELECT confirmed_at FROM energy_checkpoint WHERE boot=?", boot)(_.getLong(0)).headOption
+
   /** Rows not closed yet: normally the current one; more after the process was killed. */
   private def openEnergy(): Vector[(Long, EnergyRow)] =
     query(s"SELECT rowid,$energyCols FROM energy_state WHERE end IS NULL ORDER BY start") { c =>
@@ -408,7 +412,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         hotRows(Archive.Battery, from, Long.MaxValue).map(r => Archive.batteryOf(r.toIndexedSeq))
       val spans = AshidoriApp.archive.read(Archive.EnergyStates, from, Long.MaxValue).map(Archive.energyOf) ++
         hotRows(Archive.EnergyStates, from, Long.MaxValue).map(r => Archive.energyOf(r.toIndexedSeq)) ++
-        openEnergy().map(_._2).filter(_.start < now).map(_.span.copy(end = now))
+        openEnergy().map(_._2).filter(_.start < now).map(r =>
+          EnergyLog.openSpan(r, EnergyRecorder.live, confirmedAt(r.boot), now))
       // One version of each piece of a state change (EnergyLog.select), not one per start.
       (readings.distinctBy(_.time).sortBy(_.time), EnergyLog.select(spans))
     }

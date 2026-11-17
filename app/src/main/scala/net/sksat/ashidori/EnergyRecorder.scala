@@ -27,6 +27,7 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
   private var unrecorded = 0L
   private def tracker: Option[EnergyTracker] =
     if trackerNow.isEmpty then trackerNow = EnergyRecorder.nextBoot().map(EnergyTracker(_))
+    EnergyRecorder.live = trackerNow.map(_.boot)
     trackerNow
   /** Screen and charger as last broadcast. */
   var screenOn: Boolean = true
@@ -62,6 +63,7 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
       scala.util.Try(ctx.unregisterReceiver(receiver))
       registered = false
     tracker.foreach(t => if t.update(now, None) then submit(t, now))
+    EnergyRecorder.live = None
 
   /** Records a new span and a battery reading when the state changed. */
   def update(now: Long, st: EnergyState, plan: String): Unit =
@@ -114,6 +116,13 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
     )
 
 object EnergyRecorder:
+  /** The number of this process's running recorder, if it has one: only its
+    * open span holds until now. Another open span (a process that is gone,
+    * or this one while it has no number) is known only up to its last
+    * confirmation ([[EnergyLog.openSpan]]).
+    */
+  @volatile private[ashidori] var live: Option[Long] = None
+
   private def bootFile = java.io.File(AshidoriApp.app.getFilesDir, "energy-boot")
 
   /** This process's recorder number ([[EnergyBoot]]): above the counter
@@ -126,9 +135,8 @@ object EnergyRecorder:
     val n = EnergyBoot.allocate(
       () => if !f.exists then 0L else String(java.nio.file.Files.readAllBytes(f.toPath), "UTF-8").trim.toLong,
       () => AshidoriApp.db.energyMaxBoot(),
-      () => Option(LoggerWrites.Overflow.dir.listFiles()).toSeq.flatten
-        .filter(x => x.getName.contains(OverflowFiles.CompletedRecord))
-        .flatMap(x => scala.util.Try(String(java.nio.file.Files.readAllBytes(x.toPath), "UTF-8")).toOption),
+      // A spill directory or file that cannot be read aborts (EnergyBoot.spillTexts).
+      () => EnergyBoot.spillTexts(LoggerWrites.Overflow.dir),
       n => Maintenance.write(f, n.toString))
     if n.isEmpty then Log.w("no recorder number: a source could not be read or the counter not written")
     n
