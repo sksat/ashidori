@@ -96,6 +96,12 @@ object LoggerWrites:
       onSaved()
     }
 
+  /** Deletes [from, to) ([[Db.deleteRange]]) on the write thread, after
+    * every batch queued before it; `done` gets the outcome (on that thread).
+    */
+  def deleteRange(from: Long, to: Long)(done: scala.util.Try[Unit] => Unit): Unit =
+    exec.execute(() => done(Try(commit(_.deleteRange(from, to)))))
+
   private def importOverflow(): Unit =
     Overflow.importSome(() => backlog.synchronized(backlog.pending))
     SmallOverflow.importSome(() => backlog.synchronized(backlog.pending))

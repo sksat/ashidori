@@ -58,10 +58,16 @@ object DbSchema:
         "ALTER TABLE energy_state ADD COLUMN end_unknown INTEGER NOT NULL DEFAULT 0") ++
       Seq(CreateEnergyCheckpoint)
 
+  /** Version 8: ranges the user deleted ([[Deletion]]): nothing is written
+    * into them again. Not archived.
+    */
+  val CreateDeletedRange: String =
+    "CREATE TABLE IF NOT EXISTS deleted_range(start INTEGER NOT NULL, end INTEGER NOT NULL, deleted_at INTEGER NOT NULL)"
+
   /** From version 7 to 8. `fixes`: the columns `fixes` has now. */
   def toV8(fixes: Set[String]): Seq[String] =
     FixColumns.filterNot((n, _) => fixes(n)).map((n, t) => s"ALTER TABLE fixes ADD COLUMN $n $t") ++
-      Seq(CreatePressure, "CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)")
+      Seq(CreatePressure, "CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)", CreateDeletedRange)
 
   /** Which rows of an archived table archiving takes (an SQL condition):
     * all but the open span of `energy_state`, which stays in SQLite until

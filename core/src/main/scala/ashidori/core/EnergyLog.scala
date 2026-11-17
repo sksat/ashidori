@@ -64,7 +64,6 @@ object EnergyLog:
             if end <= b then None
             else if r.end.isEmpty then Option.when(b <= now)(r.copy(start = b))
             else Some(r.copy(start = b))
-          // A zero-length row marked unknown stays (it records the restart).
           before.toSeq ++ after.toSeq
       }
     }
