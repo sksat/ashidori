@@ -87,6 +87,26 @@ class LegMergeSuite extends munit.FunSuite:
     assertEquals(back, Vector(whole))
   }
 
+  test("取り消し after changing a leg whose parts were corrected shows the corrected mode again") {
+    val (a, b) = (parts12(0), parts12(1))
+    val parts = Seq(ModeOverride(a.start, a.end, Bus, 1), ModeOverride(b.start, b.end, Bus, 2))
+    val before = corrected(parts*)
+    assertEquals(before.map(l => (l.mode, l.inferred)), Vector((Bus, Some(Car))))
+    val l = before.head
+    // Changed to 電車 for the whole leg (as DayRows saves it), then taken back.
+    val edit = ModeOverride(l.wholeStart, l.wholeEnd, Train, 3)
+    assertEquals(corrected((parts :+ edit)*).map(_.mode), Vector(Train))
+    val back = ModeOverride(l.wholeStart, l.wholeEnd, TimelineBuilder.undoMode(l), 4)
+    assertEquals(corrected((parts ++ Seq(edit, back))*), before)
+    // Writing the inferred mode instead would have hidden both corrections.
+    assertEquals(corrected((parts ++ Seq(edit, ModeOverride(l.wholeStart, l.wholeEnd, l.autoMode, 4)))*).map(_.mode), Vector(Car))
+  }
+
+  test("取り消し without an earlier correction writes the inferred mode: the leg as built") {
+    val l = tripAt(segs, 12).head
+    assertEquals(TimelineBuilder.undoMode(l), Car)
+  }
+
   test("a correction back to the inferred mode on one part changes nothing") {
     val a = parts12(0)
     assertEquals(corrected(ModeOverride(a.start, a.end, Car)), tripAt(segs, 12))
@@ -139,4 +159,25 @@ class LegMergeSuite extends munit.FunSuite:
     val built = TimelineBuilder.build(f.result(), m.result())
     assertEquals(built.map(_.getClass.getSimpleName), Vector("Trip", "Unrecorded", "Trip"), show(built))
     assertEquals(legs(built).map(_.mode), Vector(Car, Car))
+  }
+
+  test("a long drive with many class switches merges in one pass, fast") {
+    // 2,000 runs of a minute each, alternating 5 m/s (Mid) and 12 m/s (Vehicle): about 33 h of 車.
+    val t0 = at(0, 0)
+    val f = Vector.newBuilder[Fix]
+    val m = Vector.newBuilder[MotionWindow]
+    var north = 0.0
+    var t = t0
+    for k <- 0 until 2000; _ <- 0 until 12 do
+      f += Fix(t, 36.0 + north / 111_320.0, 140.0, accuracy = 8f)
+      m += MotionWindow(t, t + 5_000, 0.4f, 0.1f, 0)
+      t += 5_000
+      north += (if k % 2 == 0 then 5.0 else 12.0) * 5
+    val (fixes, motion) = (f.result(), m.result())
+    assert(TimelineBuilder.unmerged(fixes, motion).collect { case t: Trip => t.legs.size }.sum >= 1000)
+    val started = System.nanoTime()
+    val built = TimelineBuilder.build(fixes, motion)
+    val ms = (System.nanoTime() - started) / 1_000_000
+    assertEquals(legs(built).map(_.mode), Vector(Car))
+    assert(ms < 3_000, s"$ms ms")
   }

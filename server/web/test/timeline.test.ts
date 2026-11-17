@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fixesOf, motionOf, readParquet } from "../src/data/archive";
-import { MODES, PALETTE, type Fix, type ModeKey, type Segment } from "../src/data/model";
+import { MODES, PALETTE, type Fix, type ModeKey, type MotionWindow, type Segment } from "../src/data/model";
 import { applyOverrides, buildTimeline, classify, dayKey, isUnrecorded, removeSpikes, shownSegments, splitByDay, summarizeDay, walked } from "../src/data/timeline";
 import { latestOverrides } from "../src/data/records";
 import { contentOf, legendModes } from "../src/map/content";
@@ -254,12 +254,37 @@ describe("adjacent legs of one mode merged, against the app on the same rows", (
     });
   }
 
+  it("merges a long drive with many class switches fast", () => {
+    // 2,000 runs of a minute each, alternating 5 m/s and 12 m/s, a car's vibration: about 33 h of 車.
+    const fs: Fix[] = [];
+    const ms: MotionWindow[] = [];
+    let north = 0;
+    let t = 1_800_000_000_000;
+    for (let k = 0; k < 2000; k++)
+      for (let i = 0; i < 12; i++) {
+        fs.push({ time: t, lat: 36 + north / 111_320, lon: 140, accuracy: 8, altitude: NaN, speed: NaN, bearing: NaN, provider: "gps" });
+        ms.push({ start: t, end: t + 5_000, accelStd: Math.fround(0.4), accelMean: Math.fround(0.1), steps: 0 });
+        t += 5_000;
+        north += (k % 2 === 0 ? 5 : 12) * 5;
+      }
+    const started = performance.now();
+    const segs = buildTimeline(fs, ms);
+    const took = performance.now() - started;
+    expect(segs.flatMap((s) => (s.type === "trip" ? s.legs.map((l) => l.mode) : []))).toEqual(["IN_PASSENGER_VEHICLE"]);
+    expect(took, `${took} ms`).toBeLessThan(3_000);
+  });
+
   it("merges a slow start, a drive around a short outage and a corrected walk into their neighbours", () => {
     const vehicleLegs = (name: string) =>
       exp.cases.find((c) => c.name === name)!.segments.flatMap((s) => (s.type === "trip" ? [s.legs.filter((l) => l.mode !== "STILL").map((l) => l.mode)] : []));
     expect(vehicleLegs("none")).toEqual([["IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"], ["WALKING", "IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"]]);
     expect(vehicleLegs("onePart")[3]).toEqual(["IN_BUS", "IN_PASSENGER_VEHICLE"]);
     expect(vehicleLegs("bothParts")[3]).toEqual(["IN_BUS"]);
+    // Changed to 電車 for the whole leg, then 取り消し (the app writes back the mode shown before): バス again.
+    expect(vehicleLegs("bothPartsChanged")[3]).toEqual(["IN_TRAIN"]);
+    const undone = exp.cases.find((c) => c.name === "bothPartsChangedUndone")!;
+    expect(undone.overrides[undone.overrides.length - 1]!.mode).toBe("IN_BUS");
+    expect(undone.segments).toEqual(exp.cases.find((c) => c.name === "bothParts")!.segments);
     expect(vehicleLegs("joinNeighbour")[2]).toEqual(["IN_PASSENGER_VEHICLE"]);
   });
 });

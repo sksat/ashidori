@@ -244,42 +244,40 @@ object TimelineBuilder:
 
   /** Adjacent legs that show the same mode are one leg: the coarse speed
     * classes cut a drive into a slow start and the rest, or around a short
-    * outage, though both parts end as 車. The merged leg is built again
-    * from all their intervals and kept only if it still shows that mode:
-    *  - without a correction on either part, if it is classified so itself;
-    *  - with one, always: the user said what both parts were. It shows the
+    * outage, though both parts end as 車. Each longest run of such legs is
+    * built again as one leg from all their intervals, kept if it still
+    * shows that mode:
+    *  - without a correction on any part, if it is classified so itself;
+    *  - with one, always: the user said what the parts were. It shows the
     *    corrected mode, with the mode the record says for the whole as
     *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
+    * If not, each half of the run (by legs) is tried in the same way, so a
+    * run is built at most once per halving: O(n log n), however many legs.
     * Corrections are applied to the parts first, so a correction saved for
     * one part keeps the span it was saved for: it neither drops off nor
     * spreads to its neighbour. One saved for a merged leg covers each of its
     * parts whole, so the parts merge again. Never across a stretch without
     * a record (the trip ends there) or a visit (another trip).
-    * Repeated until nothing changes.
     */
   private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): Vector[Piece] =
-    def merged(a: Piece, b: Piece): Option[Piece] =
-      if a.unrecorded || b.unrecorded || a.leg.mode != b.leg.mode then None
+    def joined(run: Vector[Piece]): Vector[Piece] =
+      if run.size < 2 then run
       else
-        val mode = a.leg.mode
-        val (l, unrecorded) = makeLeg(iv.slice(a.from, b.to + 1), motion, p)
-        if unrecorded then None
-        else if a.leg.corrected || b.leg.corrected then
-          Some(Piece(a.from, b.to, if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
-        else Option.when(l.mode == mode)(Piece(a.from, b.to, l, false))
-    var cur = ps
-    var changed = true
-    while changed do
-      changed = false
-      val out = ArrayBuffer.empty[Piece]
-      for x <- cur do
-        out.lastOption.flatMap(merged(_, x)) match
-          case Some(m) =>
-            out(out.size - 1) = m
-            changed = true
-          case None => out += x
-      cur = out.toVector
-    cur
+        val mode = run.head.leg.mode
+        val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p)
+        val ok = !unrecorded && (run.exists(_.leg.corrected) || l.mode == mode)
+        if !ok then joined(run.take(run.size / 2)) ++ joined(run.drop(run.size / 2))
+        else Vector(Piece(run.head.from, run.last.to,
+          if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
+    val out = Vector.newBuilder[Piece]
+    var i = 0
+    while i < ps.size do
+      var j = i + 1
+      if !ps(i).unrecorded then
+        while j < ps.size && !ps(j).unrecorded && ps(j).leg.mode == ps(i).leg.mode do j += 1
+      out ++= joined(ps.slice(i, j))
+      i = j
+    out.result()
 
   private final case class Interval(
       start: Long,
@@ -399,6 +397,15 @@ object TimelineBuilder:
       val ov = math.min(o.end, l.end) - math.max(o.start, l.start)
       ov > (l.end - l.start) / 2
     }.fold(l)(o => if o.mode == l.mode then l else l.copy(mode = o.mode, confidence = 1.0, inferred = Some(l.mode)))
+
+  /** The mode 取り消し writes back for a leg the user changes: the one shown
+    * before the change. A correction is written for the leg's whole span and
+    * wins over the older ones it covers, so writing the mode the record says
+    * would drop corrections that were shown (both parts of a merged leg
+    * corrected to バス, changed to 電車, taken back: バス, not 車). Back to the
+    * inferred mode, it leaves the leg as built.
+    */
+  def undoMode(shown: Leg): TransportMode = shown.mode
 
   private def weightedQuantile(sorted: IndexedSeq[(Double, Long)], q: Double): Double =
     val total = sorted.map(_._2).sum.toDouble

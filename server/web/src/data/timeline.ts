@@ -571,39 +571,37 @@ interface Piece {
 }
 
 /**
- * TimelineBuilder.mergeSameMode: adjacent legs that show the same mode are
- * one leg, built again from all their intervals and kept only if it still
- * shows that mode: without a correction on either part, if it is classified
- * so itself; with one, always (the mode the record says for the whole as
- * `inferred`). Corrections are applied to the parts first, so each keeps
- * the span it was saved for. Never across a stretch without a record.
- * Repeated until nothing changes.
+ * TimelineBuilder.mergeSameMode: each longest run of adjacent legs that show
+ * the same mode is built again as one leg from all their intervals, kept if
+ * it still shows that mode: without a correction on any part, if it is
+ * classified so itself; with one, always (the mode the record says for the
+ * whole as `inferred`). If not, each half of the run (by legs) is tried the
+ * same way: O(n log n). Corrections are applied to the parts first, so each
+ * keeps the span it was saved for. Never across a stretch without a record.
  */
 function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex): Piece[] {
-  const merged = (a: Piece, b: Piece): Piece | undefined => {
-    if (a.unrecorded || b.unrecorded || a.leg.mode !== b.leg.mode) return undefined;
-    const mode = a.leg.mode;
-    const [l, unrecorded] = makeLeg(iv.slice(a.from, b.to + 1), motion);
-    if (unrecorded) return undefined;
-    if (a.leg.corrected || b.leg.corrected)
-      return { from: a.from, to: b.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false };
-    return l.mode === mode ? { from: a.from, to: b.to, leg: l, unrecorded: false } : undefined;
-  };
-  let cur = ps;
-  let changed = true;
-  while (changed) {
-    changed = false;
-    const out: Piece[] = [];
-    for (const x of cur) {
-      const m = out.length > 0 ? merged(out[out.length - 1]!, x) : undefined;
-      if (m) {
-        out[out.length - 1] = m;
-        changed = true;
-      } else out.push(x);
+  const joined = (run: Piece[]): Piece[] => {
+    if (run.length < 2) return run;
+    const first = run[0]!;
+    const last = run[run.length - 1]!;
+    const mode = first.leg.mode;
+    const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion);
+    const ok = !unrecorded && (run.some((x) => x.leg.corrected === true) || l.mode === mode);
+    if (!ok) {
+      const h = Math.trunc(run.length / 2);
+      return [...joined(run.slice(0, h)), ...joined(run.slice(h))];
     }
-    cur = out;
+    return [{ from: first.from, to: last.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false }];
+  };
+  const out: Piece[] = [];
+  let i = 0;
+  while (i < ps.length) {
+    let j = i + 1;
+    if (!ps[i]!.unrecorded) while (j < ps.length && !ps[j]!.unrecorded && ps[j]!.leg.mode === ps[i]!.leg.mode) j++;
+    out.push(...joined(ps.slice(i, j)));
+    i = j;
   }
-  return cur;
+  return out;
 }
 
 function weightedQuantile(sorted: [number, number][], q: number): number {

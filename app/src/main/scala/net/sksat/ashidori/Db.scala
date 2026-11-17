@@ -654,10 +654,6 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     db.insert("mode_overrides", null, cv)
   }
 
-  /** The correction stored for exactly this leg, if any (for 取り消し). */
-  def modeOverride(start: Long, end: Long): Option[TransportMode] =
-    query("SELECT mode FROM mode_overrides WHERE start=? AND end=?", start, end)(c => TransportMode.fromKey(c.getString(0))).headOption
-
   def deleteCheckIn(id: Long): Unit =
     w.delete("checkins", "id=?", Array(id.toString))
 

@@ -184,10 +184,18 @@ object WebFixtures:
     val noon = tripAt(12)
     val merged = TimelineBuilder.build(md.fixes, md.motion).collect { case t: Trip => t.legs }.flatten
       .find(l => l.start == noon.head.start).get
+    val bothParts = Seq(ModeOverride(noon(0).start, noon(0).end, TransportMode.Bus, 1), ModeOverride(noon(1).start, noon(1).end, TransportMode.Bus, 2))
+    // Both parts corrected to バス (one leg), changed to 電車, then 取り消し: バス again.
+    val shownBus = TimelineBuilder.build(md.fixes, md.motion, overrides = bothParts).collect { case t: Trip => t.legs }.flatten
+      .find(l => l.start == noon.head.start).get
+    val toTrain = ModeOverride(shownBus.wholeStart, shownBus.wholeEnd, TransportMode.Train, 3)
+    val undoTrain = ModeOverride(shownBus.wholeStart, shownBus.wholeEnd, TimelineBuilder.undoMode(shownBus), 4)
     val cases = Seq(
       "none" -> Seq.empty,
       "onePart" -> Seq(ModeOverride(noon(0).start, noon(0).end, TransportMode.Bus, 1)),
-      "bothParts" -> Seq(ModeOverride(noon(0).start, noon(0).end, TransportMode.Bus, 1), ModeOverride(noon(1).start, noon(1).end, TransportMode.Bus, 2)),
+      "bothParts" -> bothParts,
+      "bothPartsChanged" -> (bothParts :+ toTrain),
+      "bothPartsChangedUndone" -> (bothParts ++ Seq(toTrain, undoTrain)),
       "wholeLeg" -> Seq(ModeOverride(merged.start, merged.end, TransportMode.Train, 3)),
       "undone" -> Seq(ModeOverride(merged.start, merged.end, TransportMode.Train, 3), ModeOverride(merged.start, merged.end, TransportMode.Car, 4)),
       "joinNeighbour" -> Seq(ModeOverride(tripAt(11).head.start, tripAt(11).head.end, TransportMode.Car, 5))

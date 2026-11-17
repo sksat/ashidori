@@ -287,14 +287,15 @@ object Edits:
       .show()
 
   /** Sets the leg's mode, for the whole leg (also across midnight).
-    * 取り消し writes the correction it replaced, or the inferred mode: a new
-    * row that sync carries like any other (a deleted row would not reach
-    * the web viewer), and that leaves the leg as built.
+    * 取り消し writes the mode shown before the change
+    * ([[TimelineBuilder.undoMode]]): a new row that sync carries like any
+    * other (a deleted row would not reach the web viewer); the inferred mode
+    * leaves the leg as built.
     */
   def changeMode(act: MainActivity, l: Leg, m: TransportMode, changed: () => Unit): Unit =
     val (s, e) = (l.wholeStart, l.wholeEnd)
     AshidoriApp.io.execute { () =>
-      val back = AshidoriApp.db.modeOverride(s, e).getOrElse(l.autoMode)
+      val back = TimelineBuilder.undoMode(l)
       AshidoriApp.db.setModeOverride(s, e, m)
       changed()
       act.runOnUiThread { () =>
