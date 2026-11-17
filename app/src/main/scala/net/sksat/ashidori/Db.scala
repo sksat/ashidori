@@ -1199,7 +1199,9 @@ object Db:
     if !f.exists then None
     else
       scala.util.Try {
-        val db = SQLiteDatabase.openDatabase(f.getPath, null, SQLiteDatabase.OPEN_READONLY)
+        // Never Android's default handler, which deletes a database it finds
+        // corrupt (also one opened read-only): the same one as every open.
+        val db = SQLiteDatabase.openDatabase(f.getPath, null, SQLiteDatabase.OPEN_READONLY, Db.KeepOnCorruption)
         try db.getVersion
         finally db.close()
       }.toOption
