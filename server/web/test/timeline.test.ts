@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fixesOf, motionOf, readParquet } from "../src/data/archive";
 import { MODES, PALETTE, type Fix, type ModeKey, type MotionWindow, type Segment } from "../src/data/model";
-import { applyOverrides, buildTimeline, classify, dayKey, isUnrecorded, removeSpikes, shownSegments, splitByDay, summarizeDay, walked } from "../src/data/timeline";
+import { applyOverrides, buildTimeline, classify, Coarse, dayKey, isUnrecorded, removeSpikes, shownSegments, smooth, splitByDay, summarizeDay, walked } from "../src/data/timeline";
 import { latestOverrides } from "../src/data/records";
 import { contentOf, legendModes } from "../src/map/content";
 import { fixture, fixtureJson } from "./helpers";
@@ -92,6 +92,14 @@ describe("timeline rules", () => {
     bearing: NaN,
     provider: "gps",
     ...x,
+  });
+
+  it("breaks ties in the smoothing as the app does: the own class, else the first in order", () => {
+    type Name = keyof typeof Coarse;
+    const cases = fixtureJson<{ classes: Name[]; dt: number[]; smoothed: Name[] }[]>("smoothing-ties.json");
+    for (const c of cases) expect(smooth(c.classes.map((n) => Coarse[n]), c.dt), c.classes.join(",")).toEqual(c.smoothed.map((n) => Coarse[n]));
+    expect(cases[0]!.smoothed).toEqual(["Mid", "Mid", "Vehicle", "Vehicle"]);
+    expect(cases[1]!.smoothed[2]).toBe("Mid");
   });
 
   it("drops single spikes but keeps fast straight motion", () => {

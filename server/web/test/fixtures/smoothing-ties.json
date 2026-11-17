@@ -1,0 +1,108 @@
+[
+ {
+  "classes": [
+   "Mid",
+   "Mid",
+   "Vehicle",
+   "Vehicle"
+  ],
+  "dt": [
+   5000,
+   5000,
+   5000,
+   5000
+  ],
+  "smoothed": [
+   "Mid",
+   "Mid",
+   "Vehicle",
+   "Vehicle"
+  ]
+ },
+ {
+  "classes": [
+   "Vehicle",
+   "Mid",
+   "Still",
+   "Vehicle",
+   "Mid"
+  ],
+  "dt": [
+   5000,
+   5000,
+   5000,
+   5000,
+   5000
+  ],
+  "smoothed": [
+   "Vehicle",
+   "Vehicle",
+   "Mid",
+   "Mid",
+   "Mid"
+  ]
+ },
+ {
+  "classes": [
+   "Foot",
+   "Vehicle",
+   "Still",
+   "Foot",
+   "Vehicle"
+  ],
+  "dt": [
+   5000,
+   5000,
+   5000,
+   5000,
+   5000
+  ],
+  "smoothed": [
+   "Foot",
+   "Foot",
+   "Foot",
+   "Vehicle",
+   "Vehicle"
+  ]
+ },
+ {
+  "classes": [
+   "Mid",
+   "Gap",
+   "Vehicle"
+  ],
+  "dt": [
+   10000,
+   100000,
+   10000
+  ],
+  "smoothed": [
+   "Mid",
+   "Gap",
+   "Vehicle"
+  ]
+ },
+ {
+  "classes": [
+   "Still",
+   "Vehicle",
+   "Vehicle",
+   "Foot",
+   "Mid"
+  ],
+  "dt": [
+   10000,
+   3000,
+   7000,
+   4000,
+   6000
+  ],
+  "smoothed": [
+   "Still",
+   "Vehicle",
+   "Vehicle",
+   "Vehicle",
+   "Vehicle"
+  ]
+ }
+]

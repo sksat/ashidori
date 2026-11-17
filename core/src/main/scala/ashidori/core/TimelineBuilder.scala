@@ -170,18 +170,7 @@ object TimelineBuilder:
     // The ground: the higher of the first and the last altitude of the trip.
     val ends = Seq(path.find(!_.altitude.isNaN), path.findLast(!_.altitude.isNaN)).flatten.map(_.altitude)
     val ground = ends.maxOption.getOrElse(Double.NaN)
-    // Smooth the coarse class with a duration-weighted majority over neighbours.
-    val smoothed = iv.indices.map { i =>
-      val lo = math.max(0, i - 2)
-      val hi = math.min(iv.size - 1, i + 2)
-      if iv(i).coarse == Coarse.Gap then Coarse.Gap
-      else
-        (lo to hi)
-          .filter(j => iv(j).coarse != Coarse.Gap)
-          .groupMapReduce(j => iv(j).coarse)(j => iv(j).dt.toDouble)(_ + _)
-          .maxBy(_._2)
-          ._1
-    }
+    val smoothed = smooth(iv.map(_.coarse), iv.map(_.dt))
     // Runs of equal class: (startInterval, endIntervalInclusive, class)
     var runs = ArrayBuffer.empty[(Int, Int, Coarse)]
     var s = 0
@@ -241,6 +230,22 @@ object TimelineBuilder:
       Piece(a, b, if unrecorded then l else applyOverride(l, ordered), unrecorded)
     }
     (if merge then mergeSameMode(built, iv, motion, p, ground) else built).map(x => (x.leg, x.unrecorded))
+
+  /** Each interval's coarse class by a duration-weighted majority over it
+    * and two neighbours on either side, gaps left out (and kept). On equal
+    * weight: the interval's own class, else the first in [[Coarse]]'s order
+    * (the web viewer breaks ties the same way).
+    */
+  private[core] def smooth(coarse: IndexedSeq[Coarse], dt: IndexedSeq[Long]): IndexedSeq[Coarse] =
+    coarse.indices.map { i =>
+      if coarse(i) == Coarse.Gap then Coarse.Gap
+      else
+        (math.max(0, i - 2) to math.min(coarse.size - 1, i + 2))
+          .filter(j => coarse(j) != Coarse.Gap)
+          .groupMapReduce(coarse(_))(dt(_))(_ + _)
+          .maxBy((c, w) => (w, c == coarse(i), -c.ordinal))
+          ._1
+    }
 
   /** A leg of intervals `from` to `to` (inclusive). */
   private final case class Piece(from: Int, to: Int, leg: Leg, unrecorded: Boolean)

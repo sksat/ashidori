@@ -216,6 +216,27 @@ object WebFixtures:
       })
     )))
 
+    // --- Ties in the smoothing of coarse classes --------------------------------
+    import ModeClassifier.Coarse
+    val tieCases = Seq(
+      // Two against two: each keeps its own class.
+      Seq(Coarse.Mid, Coarse.Mid, Coarse.Vehicle, Coarse.Vehicle) -> Seq(5_000L, 5_000L, 5_000L, 5_000L),
+      // The middle one's own class is not among the tied: the first in order (Mid before Vehicle).
+      Seq(Coarse.Vehicle, Coarse.Mid, Coarse.Still, Coarse.Vehicle, Coarse.Mid) -> Seq.fill(5)(5_000L),
+      Seq(Coarse.Foot, Coarse.Vehicle, Coarse.Still, Coarse.Foot, Coarse.Vehicle) -> Seq.fill(5)(5_000L),
+      // Gaps are left out: 10 s against 10 s.
+      Seq(Coarse.Mid, Coarse.Gap, Coarse.Vehicle) -> Seq(10_000L, 100_000L, 10_000L),
+      // Equal durations from different counts.
+      Seq(Coarse.Still, Coarse.Vehicle, Coarse.Vehicle, Coarse.Foot, Coarse.Mid) -> Seq(10_000L, 3_000L, 7_000L, 4_000L, 6_000L)
+    )
+    write(dir, "smoothing-ties.json", ujson.write(ujson.Arr.from(tieCases.map { (cs, dts) =>
+      ujson.Obj(
+        "classes" -> ujson.Arr.from(cs.map(c => ujson.Str(c.toString))),
+        "dt" -> ujson.Arr.from(dts.map(num)),
+        "smoothed" -> ujson.Arr.from(TimelineBuilder.smooth(cs.toIndexedSeq, dts.toIndexedSeq).map(c => ujson.Str(c.toString)))
+      )
+    }), indent = 1))
+
     // --- Fast trips (FastDay): 飛行機 only with evidence of a flight ----------
     def fastJson(d: FastDay.Out) = ujson.Obj(
       "fixes" -> ujson.Arr.from(d.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble, f.altitude))),

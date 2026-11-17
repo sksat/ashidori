@@ -7,8 +7,6 @@
 // Differences from the app, kept small on purpose:
 // - Scala's Float arithmetic is reproduced with Math.fround where the app
 //   computes in float32 (Doppler speed sums, accelStd weights).
-// - Ties in the per-interval smoothing are broken by the order of the
-//   classes here; the app's order comes from a hash map (and may differ).
 // - Unnamed places get no area name: the app's reverse geocoder index is
 //   not available in the browser.
 // - Day boundaries are those of the browser's time zone, not the device's.
@@ -281,8 +279,9 @@ function looksLikeCycling(f: LegFeatures, hasMotion: boolean): boolean {
   return f.stopRatio < 0.3;
 }
 
-const Coarse = { Still: 0, Foot: 1, Mid: 2, Vehicle: 3, Gap: 4 } as const;
-type Coarse = (typeof Coarse)[keyof typeof Coarse];
+/** ModeClassifier.Coarse, in its order. */
+export const Coarse = { Still: 0, Foot: 1, Mid: 2, Vehicle: 3, Gap: 4 } as const;
+export type Coarse = (typeof Coarse)[keyof typeof Coarse];
 
 function coarse(speed: number, cadence: number, gap: boolean): Coarse {
   if (gap) return Coarse.Gap;
@@ -473,6 +472,26 @@ function intervals(path: Fix[], motion: MotionIndex): Interval[] {
 
 type Run = [number, number, Coarse];
 
+/**
+ * TimelineBuilder.smooth: each interval's coarse class by a duration-weighted
+ * majority over it and two neighbours on either side, gaps left out (and
+ * kept). On equal weight: the interval's own class, else the first in the
+ * order of `Coarse`, as in the app.
+ */
+export function smooth(classes: readonly Coarse[], dt: readonly number[]): Coarse[] {
+  return classes.map((own, i) => {
+    if (own === Coarse.Gap) return Coarse.Gap;
+    const w = new Map<Coarse, number>();
+    for (let j = Math.max(0, i - 2); j <= Math.min(classes.length - 1, i + 2); j++)
+      if (classes[j] !== Coarse.Gap) w.set(classes[j]!, (w.get(classes[j]!) ?? 0) + dt[j]!);
+    let best: Coarse = own;
+    let bw = -1;
+    for (const [c, v] of w)
+      if (v > bw || (v === bw && c !== best && (c === own || (best !== own && c < best)))) [best, bw] = [c, v];
+    return best;
+  });
+}
+
 /** TimelineBuilder.legs: splits a trip path into legs of one mode. */
 export function legs(path: Fix[], motion: MotionIndex): Leg[] {
   return pieces(path, motion, []).map(([l]) => l);
@@ -486,20 +505,10 @@ function pieces(path: Fix[], motion: MotionIndex, newest: readonly ModeOverride[
   const first = path.find((f) => !Number.isNaN(f.altitude));
   const last = path.findLast((f) => !Number.isNaN(f.altitude));
   const ground = first && last ? Math.max(first.altitude, last.altitude) : NaN;
-  const smoothed = iv.map((x, i) => {
-    if (x.coarse === Coarse.Gap) return Coarse.Gap;
-    const lo = Math.max(0, i - 2);
-    const hi = Math.min(iv.length - 1, i + 2);
-    const w = new Map<Coarse, number>();
-    for (let j = lo; j <= hi; j++) {
-      const y = iv[j]!;
-      if (y.coarse !== Coarse.Gap) w.set(y.coarse, (w.get(y.coarse) ?? 0) + (y.end - y.start));
-    }
-    let best: Coarse = x.coarse;
-    let bw = -1;
-    for (const [c, v] of w) if (v > bw) [best, bw] = [c, v];
-    return best;
-  });
+  const smoothed = smooth(
+    iv.map((x) => x.coarse),
+    iv.map((x) => x.end - x.start),
+  );
   let runs: Run[] = [];
   let s = 0;
   for (let i = 1; i <= iv.length; i++) {
