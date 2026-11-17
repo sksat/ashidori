@@ -104,10 +104,10 @@ object Archive:
     * reading or span), merged into month files.
     */
   val SignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus, EnergyStates, Pressure)
-  /** Signal tables the sync uploads (small stream). `energy_state` and
-    * `pressure` stay on the device.
+  /** Signal tables the sync uploads (small stream, end-to-end encrypted
+    * like every archive file): all of them.
     */
-  val UploadedSignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus)
+  val UploadedSignalTables: Seq[TableDef] = SignalTables
   val All: Seq[TableDef] = SignalTables ++ RawTables
 
   /** Version of the archive layout. 1: up to app 0.21.0. 2 added the

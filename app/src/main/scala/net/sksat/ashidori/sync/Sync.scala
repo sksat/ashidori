@@ -491,7 +491,7 @@ object Uploader:
 
   /** Upload the small streams. Returns the number of batches sent.
     * Editable data (places, check-ins, corrections) plus the archived
-    * signal tables that are small (positions, motion, battery, GNSS status).
+    * signal tables that are small (positions, motion, battery, GNSS status, state spans, pressure).
     * Logged signals are sent as the day's encrypted Parquet files once the
     * day is archived, not row by row.
     */
@@ -544,6 +544,7 @@ object Uploader:
     var sent = 0
     def key(kind: String, t: ashidori.core.Archive.TableDef, name: String) = s"${run.reg}|$kind:${t.name}/$name"
     val files = for t <- tables; f <- AshidoriApp.archive.archivedFiles(t) yield (t, f)
+    val pendingDeletions = db.archiveDeletionsPending().map((_, a, b) => (a, b))
     val it = files.iterator
     var full = false
     while it.hasNext && !full do
@@ -558,7 +559,10 @@ object Uploader:
       // complete; a file handed over is sent again only when it changed.
       val inProgress = !isMonth && scala.util.Try(java.time.LocalDate.parse(name.take(10))).toOption.exists(d =>
         !net.sksat.ashidori.Maintenance.Complete.is(d) &&
-          AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1))))
+          AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1)))) ||
+        // A range the user deleted that is not cut out of this file yet:
+        // sent once it is (as a new generation), never with those rows.
+        AshidoriApp.archive.periodOf(name).exists((a, b) => pendingDeletions.exists((x, y) => x < b && y > a))
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
         if inProgress then None

@@ -93,7 +93,9 @@ describe("archive parts", () => {
     }
     expect(completed).toEqual(fixture("commute-fixes.parquet"));
     const files = asm.complete();
-    expect([...files.keys()].sort()).toEqual(["fixes/2026-10-05.parquet", "motion/2026-10-05.parquet"]);
+    // Tables the viewer does not use (state spans, pressure) assemble as well.
+    expect([...files.keys()].sort()).toEqual([
+      "energy_state/2026-10-05.parquet", "fixes/2026-10-05.parquet", "motion/2026-10-05.parquet", "pressure/2026-10-05.parquet"]);
     expect(files.get("fixes/2026-10-05.parquet")).toEqual(fixture("commute-fixes.parquet"));
     expect(files.get("motion/2026-10-05.parquet")).toEqual(fixture("commute-motion.parquet"));
     expect(asm.incomplete()).toEqual([]);

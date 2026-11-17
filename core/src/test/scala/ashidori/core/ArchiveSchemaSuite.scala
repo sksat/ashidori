@@ -155,10 +155,9 @@ class ArchiveSchemaSuite extends munit.FunSuite:
     }
     val p = PressureSample(t0, 1008.5f)
     assertEquals(Archive.pressureOf(Archive.pressureRow(p).toIndexedSeq), p)
-    // Every signal table is archived and merged by month; only the four of
-    // 0.21.0 are uploaded.
+    // Every signal table is archived, merged by month and uploaded.
     assertEquals(Archive.SignalTables.map(_.name).toSet,
       Set("fixes", "motion", "battery", "gnss_status", "energy_state", "pressure"))
-    assertEquals(Archive.UploadedSignalTables.map(_.name), Seq("fixes", "motion", "battery", "gnss_status"))
+    assertEquals(Archive.UploadedSignalTables, Archive.SignalTables)
     assert(Archive.SignalTables.forall(Archive.All.contains))
   }

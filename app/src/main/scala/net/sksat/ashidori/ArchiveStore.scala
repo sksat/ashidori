@@ -107,6 +107,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       case e: (Archive.LayoutError | ParquetReader.TypeMismatch) => throw e
       case scala.util.control.NonFatal(_)                         => empty
 
+  /** The time span [from, to) of an archive file's name (a day or a month). */
+  def periodOf(name: String): Option[(Long, Long)] =
+    val base = name.stripSuffix(".parquet")
+    Try(LocalDate.parse(base)).toOption.map(d => (startOf(d), startOf(d.plusDays(1))))
+      .orElse(Try(YearMonth.parse(base)).toOption.map(m => (startOf(m.atDay(1)), startOf(m.plusMonths(1).atDay(1)))))
+
   /** Days that have archived rows of `t` (from file names). */
   def archivedFiles(t: Archive.TableDef): Seq[File] =
     Option(File(root, t.name).listFiles()).toSeq.flatten.filter(_.getName.endsWith(".parquet")).filterNot(excludedFile).sortBy(_.getName)

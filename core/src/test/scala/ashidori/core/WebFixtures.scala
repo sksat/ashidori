@@ -95,9 +95,11 @@ object WebFixtures:
 
     // --- Parquet: the archive tables of a simulated day --------------------
     val sim = TrajectorySimulator.run(Scenarios.commute(Date))
-    val fixesPq = parquet(Archive.Fixes.columns, sim.fixes.map(Archive.fixRow))
+    // As the app writes archive files: the current layout, with the table
+    // and the archive schema in the footer.
+    val fixesPq = parquet(Archive.Fixes.columns, sim.fixes.map(Archive.fixRow), table = Some(Archive.Fixes))
     // Small row groups so that a reader must handle several of them.
-    val motionPq = parquet(Archive.Motion.columns, sim.motion.map(Archive.motionRow), rowGroupRows = 500)
+    val motionPq = parquet(Archive.Motion.columns, sim.motion.map(Archive.motionRow), rowGroupRows = 500, table = Some(Archive.Motion))
     write(dir, "commute-fixes.parquet", fixesPq)
     write(dir, "commute-motion.parquet", motionPq)
     write(dir, "commute-fixes.rows.json", rowsJson(fixesPq))
@@ -248,6 +250,17 @@ object WebFixtures:
     archiveParts(s"fixes/$Date.parquet", "1f00d", fixesPq.dropRight(17), 4 * 1024, only = Some(2))
     // The apps were updated to v1.1 here: ASHM from now on.
     legacy = false
+    // Tables the viewer does not use (state spans, pressure): sent like the
+    // others, skipped by the viewer without counting as a failure.
+    val dayStart = Date.atStartOfDay(Zone).toInstant.toEpochMilli
+    val st = EnergyState(true, 1000, "gps", false, false, false, false, "balanced", "balanced", "OnFoot", "Outdoor")
+    val spans = Seq(EnergySpan(dayStart + 7 * hour, dayStart + 8 * hour, st),
+      EnergySpan(dayStart + 8 * hour, dayStart + 9 * hour, st.copy(still = true), endKnown = false))
+    archiveParts(s"energy_state/$Date.parquet", "4e11a",
+      parquet(Archive.EnergyStates.columns, spans.map(Archive.energyRow), table = Some(Archive.EnergyStates)), 3 * 1024 * 1024)
+    archiveParts(s"pressure/$Date.parquet", "5a7c2", parquet(Archive.Pressure.columns,
+      (0 until 720).map(i => Archive.pressureRow(PressureSample(dayStart + 8 * hour + i * 5000L, 1008f + i * 0.001f))),
+      table = Some(Archive.Pressure)), 3 * 1024 * 1024)
     archiveParts(s"fixes/$Date.parquet", "2b7e1", fixesPq, 4 * 1024)
     archiveParts(s"motion/$Date.parquet", "3c9a4", motionPq, 3 * 1024 * 1024)
 
@@ -314,9 +327,10 @@ object WebFixtures:
 
   private def num(l: Long): ujson.Num = ujson.Num(l.toDouble)
 
-  private def parquet(cols: Seq[Column], rows: Seq[Seq[Any]], rowGroupRows: Int = 50_000): Array[Byte] =
+  private def parquet(cols: Seq[Column], rows: Seq[Seq[Any]], rowGroupRows: Int = 50_000,
+                      table: Option[Archive.TableDef] = None): Array[Byte] =
     val bo = ByteArrayOutputStream()
-    val w = ParquetWriter(bo, cols, rowGroupRows)
+    val w = table.fold(ParquetWriter(bo, cols, rowGroupRows))(t => Archive.writer(t, bo, rowGroupRows))
     rows.foreach(w.write)
     w.close()
     bo.toByteArray

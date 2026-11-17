@@ -48,6 +48,16 @@ describe("ViewerStore over the app's batches", () => {
     expect(st.failures(DEV_A)).toBe(0);
   });
 
+  it("skips the archive tables it does not use (state spans, pressure) without a failure", async () => {
+    const files = listing().items.filter((i) => i.deviceId === DEV_A && i.stream === "archive");
+    expect(files.length).toBeGreaterThan(0);
+    const { store: st } = await store();
+    await st.init();
+    await st.loadMore(DEV_A, 7);
+    expect(st.failures(DEV_A)).toBe(0);
+    expect(st.day(DEV_A, "2026-10-05")!.partial).toBe(false);
+  });
+
   it("keeps going when a batch cannot be read, and counts it", async () => {
     // The motion file is the last archive batch, after the parts of the fixes.
     const motion = Math.max(...listing().items.filter((i) => i.deviceId === DEV_A && i.stream === "archive").map((i) => i.seq));
