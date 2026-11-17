@@ -201,6 +201,35 @@ object WriteStall:
       }
       before = None
 
+  /** The alert with its side effects (the notification and its state on
+    * disk), one check at a time: a change and its rollback when an effect
+    * fails cannot interleave with another check. `raise(kinds)` and
+    * `clear()` return whether they took effect.
+    */
+  final class Alert(val monitor: Monitor, raise: Set[String] => Boolean, clear: () => Boolean):
+    /** Some(true): raised now; Some(false): cleared now (each only when its
+      * effect worked; otherwise it is tried again at the next check).
+      * `retry`: this change was tried before and failed.
+      */
+    def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Set[String])
+             (onChange: (Boolean, Boolean) => Unit = (_, _) => ()): Option[Boolean] = synchronized {
+      monitor.update(noCommit, unsavedTooLong, unsaved, saved) match
+        case Some(up) =>
+          val wasRetry = retrying
+          val ok = if up then raise(unsaved) else clear()
+          if ok then
+            retrying = false
+            onChange(up, wasRetry)
+            Some(up)
+          else
+            monitor.failed()
+            if !wasRetry then onChange(up, false)
+            retrying = true
+            None
+        case None => None
+    }
+    private var retrying = false
+
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)
 

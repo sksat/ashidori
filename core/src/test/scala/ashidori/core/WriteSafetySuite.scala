@@ -160,3 +160,27 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(WriteKind.label("unknown"), "unknown")
   }
 
+  test("stall alert: checks from several threads never interleave a change and its rollback") {
+    val active = java.util.concurrent.atomic.AtomicInteger(0)
+    val overlaps = java.util.concurrent.atomic.AtomicInteger(0)
+    val raises = java.util.concurrent.atomic.AtomicInteger(0)
+    def effect(ok: => Boolean): Boolean =
+      if active.incrementAndGet() > 1 then overlaps.incrementAndGet()
+      Thread.sleep(2)
+      try ok finally active.decrementAndGet()
+    // The first raise fails (its state not kept), the next ones work.
+    val alert = WriteStall.Alert(WriteStall.Monitor(), _ => effect(raises.incrementAndGet() > 1), () => effect(true))
+    val changes = java.util.concurrent.ConcurrentLinkedQueue[(Boolean, Boolean)]()
+    val threads = (1 to 8).map(i => Thread(() =>
+      for _ <- 1 to 20 do
+        alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)((up, logged) => changes.add((up, logged)))
+    ))
+    threads.foreach(_.start())
+    threads.foreach(_.join())
+    assertEquals(overlaps.get, 0)
+    // Raised once in effect: the failed try logged, the retry that worked not again.
+    assertEquals(changes.toArray.toSeq, Seq((true, false), (true, true)))
+    assert(alert.monitor.reported)
+    assertEquals(raises.get, 2)
+  }
+

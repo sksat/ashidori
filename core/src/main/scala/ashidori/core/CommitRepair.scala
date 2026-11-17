@@ -127,7 +127,7 @@ object CommitRepair:
     def tmpExists(path: String): Boolean
     def quarantined(path: String): Boolean
     /** [[verify]] of the published file, with every chunk row of its table
-      * still in SQLite ([[ChunkIndex]]).
+      * still in SQLite ([[RowBag]]).
       */
     def verify(t: Target): Either[String, Unit]
     /** [[verifyWhole]] of the file in place (the previous version), if any. */
@@ -234,9 +234,17 @@ object CommitRepair:
     * group (an error while decoding fails the check).
     *
     * The rows carried over from the previous file are checked by count
-    * only: once the new version is in place the previous one is gone.
+    * only: once the new version is in place the previous one is gone. That
+    * is the best check left for a file already published; a tmp file is
+    * checked against its previous file before it is published
+    * ([[verifyPublish]]).
+    *
+    * `expected`: when given, the file must hold exactly these rows as a
+    * multiset ([[RowBag]]): each one at least once (equal rows are kept
+    * once by archiving) and no more often than given, and no other row.
     */
-  def verify(t: Target, footerRows: Long, rows: => Iterator[Row], chunk: Option[ChunkIndex] = None): Either[String, Unit] =
+  def verify(t: Target, footerRows: Long, rows: => Iterator[Row], chunk: Option[RowBag] = None,
+             expected: Option[RowBag] = None): Either[String, Unit] =
     try
       if footerRows != t.rows then return Left(s"フッタの行数 $footerRows（記録は ${t.rows}）")
       t.check.foreach { c =>
@@ -257,6 +265,7 @@ object CommitRepair:
         n += 1
         val h = ArchiveMerge.hash(r)
         chunk.foreach(_.mark(h))
+        expected.foreach(_.mark(h))
         wanted.get(k).foreach { hs =>
           hs -= h
           if hs.isEmpty then wanted.remove(k)
@@ -268,10 +277,26 @@ object CommitRepair:
         for (a, b) <- c.addedRange do
           if range.forall((l, h) => l > a || h < b) then return Left("区切りの行の時刻の範囲が含まれない")
       if wanted.nonEmpty then return Left(s"区切りの行のうち ${wanted.values.map(_.size).sum} 行が見つからない")
-      chunk.map(_.missing).filter(_ > 0) match
-        case Some(m) => Left(s"端末内の $m 行がファイルにない")
-        case None    => Right(())
-    catch case e: Exception => Left(s"読めない: ${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("")}")
+      for c <- chunk if c.missing > 0 do return Left(s"端末内の ${c.missing} 行がファイルにない")
+      for e <- expected do
+        if e.foreign > 0 then return Left(s"以前の版にも端末内にもない行が ${e.foreign} 行ある")
+        if e.missing > 0 then return Left(s"以前の版か端末内の ${e.missing} 行がない")
+        if e.overfull > 0 then return Left(s"${e.overfull} 種類の行が多すぎる")
+      Right(())
+    catch
+      case e: RowBag.TooLarge => Left(TooLargeMark + Option(e.getMessage).getOrElse(""))
+      case e: Exception => Left(s"読めない: ${e.getClass.getSimpleName}: ${Option(e.getMessage).getOrElse("")}")
+
+  /** Prefix of a check that was not made: too many rows to compare. */
+  val TooLargeMark = "照合する行が多すぎる: "
+
+  /** Checks a tmp file before it is published over its previous file
+    * (finishing an interrupted commit): [[verify]], and as a multiset
+    * (`expected`) every row of the previous file (still in place) and every
+    * chunk row still in SQLite, and nothing else.
+    */
+  def verifyPublish(t: Target, footerRows: Long, rows: => Iterator[Row], expected: RowBag): Either[String, Unit] =
+    verify(t, footerRows, rows, None, Some(expected))
 
   /** Checks a file in place (the previous version of a table not
     * published): every row group decodes, in time order, to as many rows as
@@ -334,48 +359,67 @@ final class ChunkSampler(max: Int = 8):
   def check(prev: Prev, carried: Long, added: Long, range: Option[(Long, Long)]): Check =
     Check(prev, carried, added, range, this.range, samples)
 
-/** The rows of a commit's chunk still in SQLite, for checking that a
-  * published file holds every one of them: their [[ArchiveMerge.hash]]es
-  * (of all columns), sorted, and which were found. Eight bytes per row (a
-  * portion is at most [[ArchiveStore]]'s 2 million lines). A row repeated
-  * in the chunk is one entry: archiving keeps one of equal rows.
+/** A multiset of rows by their [[ArchiveMerge.hash]] (of all columns),
+  * for checking an archive file against the rows it must hold: the hashes
+  * sorted with how often each was added, and how often each is seen in the
+  * file. At most `cap` rows ([[RowBag.Cap]]): beyond that [[add]] throws
+  * [[RowBag.TooLarge]], and the caller takes the safe path (no automatic
+  * action). Eight bytes per row added, plus 8 per distinct row once sealed.
   */
-final class ChunkIndex:
+final class RowBag(cap: Int = RowBag.Cap):
   private var hashes = new Array[Long](1024)
   private var n = 0
-  private var sealedSize = -1
-  private var found: java.util.BitSet = null
-  /** Rows added (repeats included). */
-  var rows = 0L
+  // Once sealed: distinct hashes, how often each was added, how often seen.
+  private var distinct = 0
+  private var expected: Array[Int] = null
+  private var seen: Array[Int] = null
+  /** Rows marked that are not in the bag. */
+  var foreign = 0L
+
+  def rows: Long = n
 
   def add(r: Row): Unit = addHash(ArchiveMerge.hash(r))
 
   def addHash(h: Long): Unit =
-    require(sealedSize < 0, "sealed")
-    if n == hashes.length then hashes = java.util.Arrays.copyOf(hashes, n * 2)
+    require(expected == null, "sealed")
+    if n >= cap then throw RowBag.TooLarge(cap)
+    if n == hashes.length then hashes = java.util.Arrays.copyOf(hashes, math.min(cap, n * 2).max(n + 1))
     hashes(n) = h
     n += 1
-    rows += 1
 
   private def seal(): Unit =
-    if sealedSize < 0 then
+    if expected == null then
       java.util.Arrays.sort(hashes, 0, n)
+      val counts = new Array[Int](n.max(1))
       var u = 0
       for i <- 0 until n do
-        if u == 0 || hashes(u - 1) != hashes(i) then
+        if u > 0 && hashes(u - 1) == hashes(i) then counts(u - 1) += 1
+        else
           hashes(u) = hashes(i)
+          counts(u) = 1
           u += 1
-      sealedSize = u
-      found = java.util.BitSet(u)
+      distinct = u
+      expected = counts
+      seen = new Array[Int](u.max(1))
 
-  /** A row of the file with hash `h`: whether the chunk has it. */
+  /** A row of the file with hash `h`: whether the bag has it (counted). */
   def mark(h: Long): Boolean =
     seal()
-    val i = java.util.Arrays.binarySearch(hashes, 0, sealedSize, h)
-    if i >= 0 then found.set(i)
+    val i = java.util.Arrays.binarySearch(hashes, 0, distinct, h)
+    if i >= 0 then seen(i) += 1 else foreign += 1
     i >= 0
 
-  /** Distinct rows of the chunk not found (so far). */
+  /** Distinct rows of the bag not seen in the file. */
   def missing: Int =
     seal()
-    sealedSize - found.cardinality()
+    (0 until distinct).count(seen(_) == 0)
+
+  /** Distinct rows seen more often than the bag has them. */
+  def overfull: Int =
+    seal()
+    (0 until distinct).count(i => seen(i) > expected(i))
+
+object RowBag:
+  /** A portion is at most [[ArchiveStore]]'s 2 million lines. */
+  val Cap = 2_000_000
+  final class TooLarge(cap: Int) extends RuntimeException(s"more than $cap rows to compare")

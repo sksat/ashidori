@@ -111,6 +111,7 @@ class DebugMaintenanceService extends android.app.Service:
         try
           if repair then Maintenance.repair(manual = true)
           else while Maintenance.run(manual = true, () => false) do ()
+        catch case e: Throwable => Log.w("debug maintenance failed", e)
         finally stopSelf(id)
       , "ashidori-maintenance").start()
     android.app.Service.START_NOT_STICKY

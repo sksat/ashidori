@@ -107,8 +107,9 @@ object Maintenance:
           if manual then
             if archive.repairNow(db, l => Progress.set(l)) then "修復しました" else "未完了の整理はありません"
           else
-            archive.recover(db)
-            "未完了の整理はありません"
+            val had = archive.commitPending
+            archive.recover(db, progress = l => Progress.set(l))
+            if had then "中断された整理を解決しました" else "未完了の整理はありません"
         catch
           case _: ArchiveStore.CommitStuck => "自動では解決できません（「整理を修復」で解決）"
           case NonFatal(e) =>
@@ -244,8 +245,14 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
-      // A commit a crash interrupted is finished (or dropped) first.
-      archive.recover(db)
+      // A commit a crash interrupted is resolved first; one waiting for the
+      // user stops the run (said so in the progress line).
+      try archive.recover(db, progress = l => Progress.set(l))
+      catch
+        case _: ArchiveStore.CommitStuck =>
+          // Not a failure of this run: nothing to archive until it is resolved.
+          Progress.set("記録の整理が停止（要確認）", running = false)
+          return false
       val legacy = Option(ctx.getExternalFilesDir(null)).map(File(_, "gnss"))
       legacy.foreach(d => Try(archive.migrateLegacyLogs(db, d)).failed.foreach(e => Log.w("legacy log migration failed", e)))
       val now = System.currentTimeMillis()

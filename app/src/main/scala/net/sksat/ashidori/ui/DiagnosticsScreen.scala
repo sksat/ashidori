@@ -229,7 +229,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private def confirmRepair(): Unit =
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
       .setTitle("整理を修復")
-      .setMessage("途中で中断した整理を表ごとに解決します。置き換え済みで検証できた表は、端末内に重複して残る行を削除します。" +
+      .setMessage("途中で中断した整理を表ごとに解決します。置き換え済みの表は、端末内に重複して残る行がすべてファイルにあることを確かめてから、その行を削除します。" +
+        "以前から保存されていた行は、元のファイルが残っていないため行数だけを確かめます（残る中で最もよい確認）。" +
         "検証できないファイルは隔離し、削除しません。先に救出用バックアップを書き出すことを勧めます。")
       .setPositiveButton("修復する", (_, _) => {
         backupLine = None

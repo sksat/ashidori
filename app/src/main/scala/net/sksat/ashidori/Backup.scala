@@ -20,9 +20,10 @@ import ashidori.core.Archive
   * Consistency: with the archive's locks held shared (no commit moves rows
   * from SQLite to the archive meanwhile), SQLite writes a consistent copy of
   * the database to app storage (VACUUM INTO, on a read-only connection: the
-  * logger keeps writing), and every archive file is opened. Then the locks
-  * are released and the ZIP is written from the copy and the open files,
-  * outside any lock: a slow destination holds up nothing.
+  * logger keeps writing), and every archive file is hard-linked into a
+  * staging directory. Then the locks are released and the ZIP is written
+  * from the copy and the links, outside any lock: a slow destination holds
+  * up nothing.
   *
   * Files are streamed through a fixed buffer, never parsed: memory stays
   * flat whatever their size. The database and the text are deflated at the
@@ -34,14 +35,16 @@ import ashidori.core.Archive
   * commit, and stores every file as it is: the whole archive (with tmp
   * files and quarantined files), the commit record and the other state of
   * `files/maintenance/`, and all overflow files. It also holds the lock of
-  * tmp writes ([[ArchiveStore.holdingTmps]]) until the ZIP is written, so
-  * no tmp file is taken in the middle of being written.
+  * tmp writes ([[ArchiveStore.holdingTmps]]) while it hard-links the files
+  * into a staging directory, so no tmp file is taken in the middle of
+  * being written; the ZIP is then written from the links, with no lock
+  * held, and the links removed.
   *
   * 「隔離したファイルを書き出す」 ([[writeQuarantine]]): only the files a
   * repair quarantined, and the list of them.
   *
-  * Every ZIP ends with `manifest.txt`: SHA-256, size and name of each entry
-  * as written.
+  * Every ZIP ends with `manifest.txt`: SHA-256, size and name of every
+  * other entry as written.
   */
 object Backup:
   /** Free space kept for the logger while a backup runs (hours of 全力ログ). */
@@ -93,6 +96,26 @@ object Backup:
       if dir.getUsableSpace < LoggingMargin then
         throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB 未満のため中断（記録用の領域を確保）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
+    // The files to write, hard-linked here under the locks (copied if a link
+    // cannot be made): a file replaced or deleted afterwards (every writer
+    // makes a new file) leaves the link as it was, so the ZIP is written
+    // after the locks are released.
+    val staging = File(dir, "staging")
+    def clearStaging(): Unit =
+      def rm(f: File): Unit =
+        if f.isDirectory then Option(f.listFiles()).toSeq.flatten.foreach(rm)
+        f.delete()
+      rm(staging)
+    clearStaging()
+    def stage(name: String, f: File): File =
+      val to = File(staging, name)
+      to.getParentFile.mkdirs()
+      try android.system.Os.link(f.getPath, to.getPath)
+      catch case _: Exception => java.nio.file.Files.copy(f.toPath, to.toPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+      to
+    def add(name: String, f: File): Unit =
+      val st = stage(name, f)
+      opened += ((name, st, FileInputStream(st)))
     def walk(f: File): Seq[File] =
       if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)
       else if f.isFile then Seq(f)
@@ -100,9 +123,9 @@ object Backup:
     def under(dir: File, f: File) = dir.toPath.relativize(f.toPath).toString
     def collect(): Unit = mode match
       case Mode.Quarantine =>
-        for f <- walk(quarantine) do opened += (("files/archive/" + under(archive.root, f), f, FileInputStream(f)))
+        for f <- walk(quarantine) do add("files/archive/" + under(archive.root, f), f)
         val list = File(Maintenance.dir, "attention")
-        for in <- Try(FileInputStream(list)).toOption do opened += (("files/maintenance/attention", list, in))
+        if list.exists then Try(add("files/maintenance/attention", list))
       case _ =>
         // No overflow file is imported (and deleted) meanwhile: each one is
         // either in the copy with its import mark, or in the ZIP unimported.
@@ -115,27 +138,27 @@ object Backup:
           // is never made to wait for a backup).
           val now = System.currentTimeMillis()
           for f <- walk(overflow.dir)
-              if f.getName.endsWith(".txt") || rescue && f.getName.endsWith(".tmp") && now - f.lastModified() > 60_000L
-              in <- Try(FileInputStream(f)).toOption do
-            opened += (("files/overflow/" + under(overflow.dir, f), f, in))
+              if f.getName.endsWith(".txt") || rescue && f.getName.endsWith(".tmp") && now - f.lastModified() > 60_000L do
+            if f.getName.endsWith(".txt") then add("files/overflow/" + under(overflow.dir, f), f)
+            else Try(add("files/overflow/" + under(overflow.dir, f), f))
         finally overflow.lock.unlock()
         // Files a repair quarantined are kept whole (they may hold the only
         // copy of some rows); the rescue takes everything as it is.
         for f <- walk(archive.root) if rescue || f.getName.endsWith(".parquet") || f.toPath.startsWith(quarantine.toPath) do
-          if !f.getName.startsWith(".lock-") then
-            opened += (("files/archive/" + under(archive.root, f), f, FileInputStream(f)))
+          if !f.getName.startsWith(".lock-") then add("files/archive/" + under(archive.root, f), f)
         if rescue then
           // Small state files; the transient copies of their atomic writes
           // (`*.tmp`) are not state. One gone since the listing is skipped.
-          for f <- walk(Maintenance.dir) if !f.getName.endsWith(".tmp"); in <- Try(FileInputStream(f)).toOption do
-            opened += (("files/maintenance/" + under(Maintenance.dir, f), f, in))
+          for f <- walk(Maintenance.dir) if !f.getName.endsWith(".tmp") && !f.getName.startsWith(".lock-") do
+            Try(add("files/maintenance/" + under(Maintenance.dir, f), f))
     def body(): Long =
       mode match
         // The rescue holds the locks without finishing an unfinished commit
-        // (which may be what cannot be done).
-        case Mode.Rescue => archive.holding(Archive.All*)(collect())
+        // (which may be what cannot be done), and the lock of tmp writes: no
+        // tmp file is taken half written. Only while the files are linked.
+        case Mode.Rescue => archive.holdingTmps(archive.holding(Archive.All*)(collect()))
         case Mode.Normal => archive.reading(Archive.All*)(collect())
-        case Mode.Quarantine => collect()
+        case Mode.Quarantine => archive.holdingTmps(collect())
       val log = File(c.getFilesDir, "lifecycle.log")
       val withDb = mode != Mode.Quarantine
       val total = (if withDb then snapshot.length else 0L) + opened.map(_._2.length).sum + log.length
@@ -225,24 +248,28 @@ object Backup:
                |""".stripMargin) +
             s"""files/archive/quarantine/<commit>/<table>/<file>: files a repair moved aside (may hold the only copy of some rows; Parquet, or `.tmp`: a new version that was not published)
                |files/lifecycle.log: lifecycle log (no positions)
-               |manifest.txt: SHA-256, size and name of each entry above
+               |manifest.txt: SHA-256, size and name of every other entry
                |""".stripMargin + (if !rescue then "" else
             s"""files/archive/**/*.tmp: new versions written by an unfinished archive commit
                |files/maintenance/commit: the unfinished commit's record (files to replace, rows to delete)
                |files/maintenance/commit-stuck, attention: the repair's state
                |commit-status.txt: the state when this was written
                |""".stripMargin)
-        zip.putNextEntry(ZipEntry("ashidori-backup.txt"))
-        zip.write(about.getBytes(UTF_8))
-        zip.closeEntry()
+        def text(name: String, body: String): Unit =
+          val bytes = body.getBytes(UTF_8)
+          zip.putNextEntry(ZipEntry(name))
+          zip.write(bytes)
+          zip.closeEntry()
+          val sha = java.security.MessageDigest.getInstance("SHA-256")
+          sha.update(bytes)
+          note(name, bytes.length.toLong, sha)
+        text("ashidori-backup.txt", about)
         if mode != Mode.Normal then
           val status = CommitStatus.stuck().fold(
             if archive.commitPending then "unfinished commit recorded (not known to be stuck)\n" else "no unfinished commit\n")(
             ls => ("waiting for the user:" +: ls).mkString("", "\n", "\n")) +
             Attention.all().map(e => s"quarantined ${e.path} -> ${e.quarantined} onlyCopy=${e.onlyCopy} ${e.why}\n").mkString
-          zip.putNextEntry(ZipEntry("commit-status.txt"))
-          zip.write(status.getBytes(UTF_8))
-          zip.closeEntry()
+          text("commit-status.txt", status)
         zip.putNextEntry(ZipEntry("manifest.txt"))
         zip.write(manifest.toString.getBytes(UTF_8))
         zip.closeEntry()
@@ -251,11 +278,9 @@ object Backup:
       }
       progress(done, total)
       done
-    try
-      // The rescue and the quarantine export: no tmp file is being written
-      // while their files are collected and copied.
-      if mode == Mode.Normal then body() else archive.holdingTmps(body())
+    try body()
     finally
       opened.foreach(o => Try(o._3.close()))
+      Try(clearStaging())
       snapshot.delete()
   }
