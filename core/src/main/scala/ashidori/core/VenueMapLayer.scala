@@ -32,10 +32,14 @@ object VenueMapLayer:
   val MinZoom = 15
   /** From this zoom on, shops go before malls and department stores. */
   val CloseZoom = 17
-  /** Venues of the same (normalized) name closer than this are one. */
+  /** Venues of the same (normalized) name closer than this are one. A
+    * basemap POI of the same name is not checked: reading the rendered
+    * POIs took 8–70 ms on the main thread (emulator); the layer lies under
+    * the basemap's labels, so the collision hides the venue on the same spot.
+    */
   val SameNameM = 50.0
-  /** A venue this close to a basemap POI of the same name is left to the basemap. */
-  val BasemapSameNameM = 100.0
+  /** Stations of one name (a node per line or operator) closer than this are one. */
+  val SameStationM = 400.0
 
   private val Transit = Set(("railway", "station"), ("railway", "halt"), ("railway", "tram_stop"),
     ("public_transport", "station"), ("amenity", "bus_station"), ("amenity", "ferry_terminal"),
@@ -86,47 +90,40 @@ object VenueMapLayer:
   /** A venue to draw. */
   final case class Item(venue: Venue, style: Style)
 
-  /** A name drawn by the basemap at a spot (its own POIs). */
-  final case class Named(name: String, at: LatLng)
-
   /** Of `vs` (venues in view), those to draw at `zoom`: shown from `zoom`
     * or the next level (so that zooming in shows them before the next
-    * query), one per name within [[SameNameM]], none that the basemap
-    * already draws within [[BasemapSameNameM]], at most `cap`, by rank at
-    * `zoom` and then closest to `centre`. Nothing below [[MinZoom]] − 1.
+    * query), one per normalized name within [[SameNameM]], at most `cap`,
+    * by rank at `zoom` and then closest to `centre`. Nothing below
+    * [[MinZoom]] − 1. Runs off the main thread, a few thousand venues at a
+    * time: names come normalized from the index, styles once per tag.
     */
-  def select(vs: Seq[VenueIndex.Tagged], zoom: Double, centre: LatLng, cap: Int,
-             basemap: Seq[Named] = Nil): Vector[Item] =
+  def select(vs: Seq[VenueIndex.Tagged], zoom: Double, centre: LatLng, cap: Int): Vector[Item] =
     if zoom < MinZoom - 1 then Vector.empty
     else
       val upTo = math.floor(zoom).toInt + 1
       val cosLat = math.cos(math.toRadians(centre.lat))
-      // Squared distance in degrees of latitude (an order, not metres).
-      def d2(v: Venue) =
-        val dy = v.lat - centre.lat
-        val dx = (v.lon - centre.lon) * cosLat
-        dx * dx + dy * dy
-      val candidates = vs.iterator
-        .filter(t => t.venue.name.nonEmpty)
-        .map(t => Item(t.venue, style(t.key, t.value)))
-        .filter(_.style.minZoom <= upTo)
-        .toVector
-        .sortBy(i => (i.style.rankAt(zoom), d2(i.venue)))
-      val drawn = mutable.HashMap.empty[String, mutable.ArrayBuffer[LatLng]]
-      for b <- basemap do
-        val k = VenueIndex.normalize(b.name)
-        if k.nonEmpty then drawn.getOrElseUpdate(k, mutable.ArrayBuffer.empty) += b.at
-      val kept = mutable.HashMap.empty[String, mutable.ArrayBuffer[LatLng]]
+      val styles = mutable.HashMap.empty[(String, String), Style]
+      val cand = vs.iterator.filter(_.normalizedName.nonEmpty)
+        .map(t => (t, styles.getOrElseUpdate((t.key, t.value), style(t.key, t.value))))
+        .filter(_._2.minZoom <= upTo).toArray
+      // Rank, then squared distance in degrees of latitude (an order, not metres).
+      val order = cand.map { (t, st) =>
+        val dy = t.venue.lat - centre.lat
+        val dx = (t.venue.lon - centre.lon) * cosLat
+        (st.rankAt(zoom).toDouble * 1e6) + dx * dx + dy * dy
+      }
+      val idx = cand.indices.sortBy(order(_))
+      val kept = mutable.HashMap.empty[String, List[Venue]]
       val out = Vector.newBuilder[Item]
       var n = 0
-      val it = candidates.iterator
+      val it = idx.iterator
       while n < cap && it.hasNext do
-        val i = it.next()
-        val k = VenueIndex.normalize(i.venue.name)
-        def near(m: mutable.HashMap[String, mutable.ArrayBuffer[LatLng]], r: Double) =
-          m.get(k).exists(_.exists(p => Geo.distance(p.lat, p.lon, i.venue.lat, i.venue.lon) < r))
-        if !near(kept, SameNameM) && !near(drawn, BasemapSameNameM) then
-          kept.getOrElseUpdate(k, mutable.ArrayBuffer.empty) += i.venue.latLng
-          out += i
+        val (t, st) = cand(it.next())
+        val v = t.venue
+        val same = kept.getOrElse(t.normalizedName, Nil)
+        val r = if st.group == Group.Transit then SameStationM else SameNameM
+        if !same.exists(p => Geo.distance(p.lat, p.lon, v.lat, v.lon) < r) then
+          kept(t.normalizedName) = v :: same
+          out += Item(v, st)
           n += 1
       out.result()

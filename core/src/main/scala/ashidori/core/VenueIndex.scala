@@ -165,7 +165,8 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
               val lo = b.lon(j).toDouble
               if la >= s && la <= n && lo >= w && lo <= e then
                 val (k, v) = tags(b.cat(j))
-                out += Tagged(venue(b, j), k, v)
+                val shownName = if b.nameJa(j) > 0 then b.nameJa(j) - 1 else b.name(j)
+                out += Tagged(venue(b, j), k, v, b.normalized(shownName))
               j += 1
           }
       out.result()
@@ -321,8 +322,10 @@ final class VenueIndex private (src: VenueIndex.Source, maxCacheBytes: Long):
   def close(): Unit = src.close()
 
 object VenueIndex:
-  /** A venue with its OpenStreetMap tag `key`=`value` (e.g. shop=books). */
-  final case class Tagged(venue: Venue, key: String, value: String)
+  /** A venue with its OpenStreetMap tag `key`=`value` (e.g. shop=books) and
+    * its name as [[normalize]] gives it (decoded with the block, not per query).
+    */
+  final case class Tagged(venue: Venue, key: String, value: String, normalizedName: String)
 
   /** Decoded blocks kept (about 2048 venues each), and their total size. */
   val CacheBlocks = 24

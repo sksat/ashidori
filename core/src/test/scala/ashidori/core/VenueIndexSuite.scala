@@ -273,9 +273,12 @@ class VenueIndexSuite extends munit.FunSuite:
     assertEquals((tagged("node/1").key, tagged("node/1").value), ("railway", "station"))
     assertEquals((tagged("node/3").key, tagged("node/3").value), ("amenity", "cafe"))
     assertEquals((tagged("way/4").key, tagged("way/4").value), ("leisure", "park"))
-    // Names and labels as nearby gives them.
+    // Names and labels as nearby gives them; the shown name normalized.
     assertEquals(tagged("node/3").venue.name, "スターバックス")
     assertEquals(tagged("node/3").venue.category, "カフェ")
+    for t <- tagged.values do assertEquals(t.normalizedName, VenueIndex.normalize(t.venue.name))
+    val (ts, tw, tn, te) = square(tokyo, 300)
+    assertEquals(index.within(ts, tw, tn, te).find(_.venue.id == "node/12").map(_.normalizedName), Some("newdays"))
   }
 
   test("within: clipped to the rectangle, not to whole cells") {

@@ -1,6 +1,6 @@
 package ashidori.core
 
-import VenueMapLayer.{Group, Named}
+import VenueMapLayer.Group
 
 class VenueMapLayerSuite extends munit.FunSuite:
   private val c = LatLng(35.6812, 139.7671)
@@ -10,7 +10,7 @@ class VenueMapLayerSuite extends munit.FunSuite:
     seq += 1
     val lat = c.lat + dy / 111_320.0
     val lon = c.lon + dx / (111_320.0 * math.cos(math.toRadians(c.lat)))
-    VenueIndex.Tagged(Venue(s"node/$seq", name, Overpass.label(key, value), lat, lon), key, value)
+    VenueIndex.Tagged(Venue(s"node/$seq", name, Overpass.label(key, value), lat, lon), key, value, VenueIndex.normalize(name))
 
   test("visible range: 15 for stations and major places, 16 for most, 17 for offices") {
     def mz(k: String, v: String) = VenueMapLayer.style(k, v).minZoom
@@ -74,10 +74,12 @@ class VenueMapLayerSuite extends munit.FunSuite:
     assert(sel.exists(_.venue.id == vs.head.venue.id))
   }
 
-  test("select: the basemap's own POIs of the same name nearby are left to it") {
-    val vs = Seq(at("丸善", "shop", "books", 0, 0), at("丸善", "shop", "books", 500, 0), at("八重洲ブックセンター", "shop", "books", 50))
-    val sel = VenueMapLayer.select(vs, 16, c, 100, basemap = Seq(Named("丸善", c), Named("無関係", c)))
-    assertEquals(sel.map(_.venue.id).toSet, Set(vs(1).venue.id, vs(2).venue.id))
+  test("select: a station's nodes per line within 400 m are one; shops of a chain 100 m apart are two") {
+    val vs = Seq(at("東京", "railway", "station"), at("東京", "railway", "station", 250, 120),
+      at("東京", "railway", "station", 900), at("ローソン", "shop", "convenience", 100), at("ローソン", "shop", "convenience", 200))
+    val sel = VenueMapLayer.select(vs, 17, c, 100)
+    assertEquals(sel.count(_.venue.name == "東京"), 2)
+    assertEquals(sel.count(_.venue.name == "ローソン"), 2)
   }
 
   test("select: capped, by rank and then distance from the centre") {
