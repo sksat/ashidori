@@ -69,3 +69,32 @@ class OverflowImportSuite extends munit.FunSuite:
     assertEquals(BackupManifest.line("cd", 4, "files/overflow/raw-2.txt.tmp", partial = true),
       "cd  4  files/overflow/raw-2.txt.tmp  partial\n")
   }
+
+  test("a backup: a .tmp completed between the listing and its opening is taken as its .txt; none left out unnamed") {
+    val d = java.nio.file.Files.createTempDirectory("overflow")
+    OverflowFiles.write(d, "raw-1.txt", "1\ta\n".getBytes, _ => ())
+    intercept[Stop](OverflowFiles.write(d, "raw-2.txt", "2\tb\n".getBytes, _ => (), () => throw Stop()))
+    intercept[Stop](OverflowFiles.write(d, "raw-3.txt", "3\tc\n".getBytes, _ => (), () => throw Stop()))
+    // The writer of raw-2 completes it right after the listing, before it is opened.
+    var raced = false
+    def open(p: java.nio.file.Path): String =
+      if p.getFileName.toString == "raw-2.txt.tmp" && !raced then
+        raced = true
+        java.nio.file.Files.move(p, d.resolve("raw-2.txt"))
+      java.nio.file.Files.readString(p)
+    val (taken, missing) = OverflowFiles.forBackup(d, open)
+    assert(raced)
+    assertEquals(taken, Vector(("raw-1.txt", "1\ta\n", false), ("raw-2.txt", "2\tb\n", false), ("raw-3.txt.tmp", "3\tc\n", true)))
+    assertEquals(missing, Vector.empty[String])
+  }
+
+  test("a backup: a spill file that cannot be opened at all is named as missing") {
+    val d = java.nio.file.Files.createTempDirectory("overflow")
+    OverflowFiles.write(d, "raw-1.txt", "1\ta\n".getBytes, _ => ())
+    intercept[Stop](OverflowFiles.write(d, "raw-2.txt", "2\tb\n".getBytes, _ => (), () => throw Stop()))
+    val (taken, missing) = OverflowFiles.forBackup(d, p =>
+      if p.getFileName.toString.startsWith("raw-2") then throw java.io.IOException("cannot") else java.nio.file.Files.readString(p))
+    assertEquals(taken.map(_._1), Vector("raw-1.txt"))
+    assertEquals(missing, Vector("raw-2.txt.tmp"))
+    assertEquals(BackupManifest.missing("files/overflow/raw-2.txt.tmp"), "-  -  files/overflow/raw-2.txt.tmp  missing\n")
+  }

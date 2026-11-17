@@ -72,7 +72,7 @@ class DebugReceiver extends BroadcastReceiver:
         Thread(() =>
           try
             val n = Backup.write(c, android.net.Uri.fromFile(f), (d, t) => Log.i(s"backup $d / $t"))
-            Log.i(s"backup done: $n bytes to $f")
+            Log.i(s"backup done: ${n.bytes} bytes to $f, missing ${n.missing.size}")
           catch case e: Throwable => Log.e("backup failed", e)
         , "ashidori-backup").start()
       case "ashidori.debug.RESCUE" =>
@@ -80,7 +80,7 @@ class DebugReceiver extends BroadcastReceiver:
         Thread(() =>
           try
             val n = Backup.writeRescue(c, android.net.Uri.fromFile(f), (d, t) => Log.i(s"rescue $d / $t"))
-            Log.i(s"rescue done: $n bytes to $f")
+            Log.i(s"rescue done: ${n.bytes} bytes to $f, missing ${n.missing.size}")
           catch case e: Throwable => Log.e("rescue failed", e)
         , "ashidori-rescue").start()
       case "ashidori.debug.QUARANTINE_EXPORT" =>
@@ -88,7 +88,7 @@ class DebugReceiver extends BroadcastReceiver:
         Thread(() =>
           try
             val n = Backup.writeQuarantine(c, android.net.Uri.fromFile(f), (d, t) => ())
-            Log.i(s"quarantine export done: $n bytes to $f")
+            Log.i(s"quarantine export done: ${n.bytes} bytes to $f")
           catch case e: Throwable => Log.e("quarantine export failed", e)
         , "ashidori-quarantine-export").start()
       case "ashidori.debug.READ" =>

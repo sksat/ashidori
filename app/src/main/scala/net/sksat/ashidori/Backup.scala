@@ -6,7 +6,7 @@ import java.io.{BufferedOutputStream, File, FileInputStream}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.zip.{CRC32, Deflater, ZipEntry, ZipOutputStream}
 import scala.util.{Try, Using}
-import ashidori.core.{Archive, BackupManifest, OverflowFiles}
+import ashidori.core.{Archive, BackupManifest, LifeKind, OverflowFiles}
 
 /** 「バックアップを書き出す」: the recorded data in one ZIP file the user
   * picks (release builds are not debuggable and `adb backup` skips apps for
@@ -60,19 +60,24 @@ object Backup:
     val t = java.time.Instant.ofEpochMilli(now).atZone(AshidoriApp.zone)
     s"ashidori-$kind-${t.format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmm"))}.zip"
 
-  /** Writes the backup to `uri`; `progress(done, total)` in bytes now and
-    * then. Returns the bytes read. Call off the main thread.
+  /** What a backup wrote: the bytes read, and the files that should be in
+    * it and could not be taken (named in its manifest as `missing`).
     */
-  def write(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long = writeZip(c, uri, progress, Mode.Normal)
+  final case class Written(bytes: Long, missing: Seq[String])
+
+  /** Writes the backup to `uri`; `progress(done, total)` in bytes now and
+    * then. Call off the main thread.
+    */
+  def write(c: Context, uri: Uri, progress: (Long, Long) => Unit): Written = writeZip(c, uri, progress, Mode.Normal)
 
   /** 「救出用バックアップ」: as [[write]], with every file as it is (see above). */
-  def writeRescue(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long = writeZip(c, uri, progress, Mode.Rescue)
+  def writeRescue(c: Context, uri: Uri, progress: (Long, Long) => Unit): Written = writeZip(c, uri, progress, Mode.Rescue)
 
   /** 「隔離したファイルを書き出す」 (see above). */
-  def writeQuarantine(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long = writeZip(c, uri, progress, Mode.Quarantine)
+  def writeQuarantine(c: Context, uri: Uri, progress: (Long, Long) => Unit): Written = writeZip(c, uri, progress, Mode.Quarantine)
 
   // One at a time: they share the copy of the database.
-  private def writeZip(c: Context, uri: Uri, progress: (Long, Long) => Unit, mode: Mode): Long = synchronized {
+  private def writeZip(c: Context, uri: Uri, progress: (Long, Long) => Unit, mode: Mode): Written = synchronized {
     val rescue = mode == Mode.Rescue
     val archive = AshidoriApp.archive
     val db = AshidoriApp.db
@@ -115,6 +120,8 @@ object Backup:
     // Entries taken as they were while they may be being written: marked
     // `partial` in the manifest, never presented as consistent.
     val partial = scala.collection.mutable.Set.empty[String]
+    // Spill files that could not be taken: named in the manifest and reported.
+    val missing = scala.collection.mutable.ArrayBuffer.empty[String]
     def walk(f: File): Seq[File] =
       if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)
       else if f.isFile then Seq(f)
@@ -135,11 +142,14 @@ object Backup:
           // Completed spill files never change (OverflowFiles): consistent
           // copies. A `.tmp` may be being written (the logger never waits
           // for a backup) or left by a process that died: taken as it is,
-          // marked partial. One gone since the listing is skipped.
-          for f <- walk(overflow.dir); p <- OverflowFiles.inBackup(f.getName) do
-            val name = "files/overflow/" + under(overflow.dir, f)
-            if p then Try { add(name, f); partial += name }
-            else add(name, f)
+          // marked partial. One completed between the listing and its
+          // opening is taken as the completed file; none is left out unnamed.
+          val (spills, lost) = OverflowFiles.forBackup(overflow.dir.toPath, p => (p.toFile, FileInputStream(p.toFile)))
+          for (n, (f, in), p) <- spills do
+            val name = "files/overflow/" + n
+            opened += ((name, f, in))
+            if p then partial += name
+          missing ++= lost.map("files/overflow/" + _)
         finally overflow.lock.unlock()
         // Files a repair quarantined are kept whole (they may hold the only
         // copy of some rows); the rescue takes everything as it is.
@@ -150,7 +160,7 @@ object Backup:
           // (`*.tmp`) are not state. One gone since the listing is skipped.
           for f <- walk(Maintenance.dir) if !f.getName.endsWith(".tmp") && !f.getName.startsWith(".lock-") do
             Try(add("files/maintenance/" + under(Maintenance.dir, f), f))
-    def body(): Long =
+    def body(): Written =
       mode match
         // The rescue holds the locks without finishing an unfinished commit
         // (which may be what cannot be done), and the lock of tmp writes: no
@@ -254,7 +264,7 @@ object Backup:
                |""".stripMargin) +
             s"""files/archive/quarantine/<commit>/<table>/<file>: files a repair moved aside (may hold the only copy of some rows; Parquet, or `.tmp`: a new version that was not published)
                |files/lifecycle.log: lifecycle log (no positions)
-               |manifest.txt: SHA-256, size and name of every other entry; `partial` after the name: taken as it was while it may have been being written, not a consistent copy
+               |manifest.txt: SHA-256, size and name of every other entry; `partial` after the name: taken as it was while it may have been being written, not a consistent copy; `-  -  name  missing`: a spill file that could not be taken
                |""".stripMargin + (if !rescue then "" else
             s"""files/archive/**/*.tmp: new versions written by an unfinished archive commit
                |files/maintenance/commit: the unfinished commit's record (files to replace, rows to delete)
@@ -276,6 +286,7 @@ object Backup:
             ls => ("waiting for the user:" +: ls).mkString("", "\n", "\n")) +
             Attention.all().map(e => s"quarantined ${e.path} -> ${e.quarantined} onlyCopy=${e.onlyCopy} ${e.why}\n").mkString
           text("commit-status.txt", status)
+        for name <- missing do manifest.append(BackupManifest.missing(name))
         zip.putNextEntry(ZipEntry("manifest.txt"))
         zip.write(manifest.toString.getBytes(UTF_8))
         zip.closeEntry()
@@ -283,7 +294,9 @@ object Backup:
         zip.flush()
       }
       progress(done, total)
-      done
+      if missing.nonEmpty then
+        LifeLog.add(LifeKind.Note, s"バックアップ: 退避ファイル ${missing.size} 件を含められず（${missing.mkString("、")}）")
+      Written(done, missing.toSeq)
     try body()
     finally
       opened.foreach(o => Try(o._3.close()))

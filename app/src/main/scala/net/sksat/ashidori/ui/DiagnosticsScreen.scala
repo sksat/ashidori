@@ -271,11 +271,12 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
                 backupLine = Some(s"書き出し中… ${mb(done)} / ${mb(total)}")
                 showDataStatus()
               }
-            val n = mode match
+            val w = mode match
               case Backup.Mode.Normal     => Backup.write(act, uri, report)
               case Backup.Mode.Rescue     => Backup.writeRescue(act, uri, report)
               case Backup.Mode.Quarantine => Backup.writeQuarantine(act, uri, report)
-            s"${label}書き出しました（${mb(n)}）"
+            s"${label}書き出しました（${mb(w.bytes)}）" +
+              (if w.missing.isEmpty then "" else s"。ただし退避ファイル ${w.missing.size} 件を含められませんでした（要確認）")
           catch
             case _: ArchiveStore.Pending =>
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
