@@ -97,6 +97,7 @@ object Maintenance:
     * process, off the main thread.
     */
   def repair(manual: Boolean): Unit =
+    if AshidoriApp.newerDatabase.isDefined then return
     if !running.compareAndSet(false, true) then return
     try
       val db = AshidoriApp.db

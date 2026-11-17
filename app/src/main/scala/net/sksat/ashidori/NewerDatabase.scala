@@ -9,6 +9,8 @@ import android.content.{Context, Intent}
   * tap) until an app that can open the database clears it at its start.
   */
 object NewerDatabase:
+  /** Thrown instead of opening a database of a newer version. */
+  final class Refused(version: Int) extends IllegalStateException(s"database version $version is newer than ${Db.Version}")
   private val Id = 2003
   private def prefs(c: Context) = c.getSharedPreferences("lifelog", Context.MODE_PRIVATE)
 

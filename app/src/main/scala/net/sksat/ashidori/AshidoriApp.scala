@@ -64,7 +64,12 @@ object AshidoriApp:
   @volatile private var instance: AshidoriApp = null
 
   def app: AshidoriApp = instance
-  lazy val db: Db = Db(instance)
+  /** The database. Never opened when it is of a newer app version (the
+    * entry points check [[newerDatabase]] first; this is the last guard).
+    */
+  lazy val db: Db =
+    newerDatabase.foreach(v => throw NewerDatabase.Refused(v))
+    Db(instance)
   lazy val archive: ArchiveStore = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
 
   /** The version of the database on disk when it is newer than this app's. */

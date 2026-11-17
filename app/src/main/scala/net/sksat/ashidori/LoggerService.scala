@@ -105,7 +105,9 @@ class LoggerService extends Service:
     thread = HandlerThread("ashidori-logger")
     thread.start()
     handler = Handler(thread.getLooper)
-    LoggerWrites.markStart()
+    // Imports overflow files: not with a database of a newer version (the
+    // start command then stops the service at once).
+    if AshidoriApp.newerDatabase.isEmpty then LoggerWrites.markStart()
 
   override def onStartCommand(intent: Intent, flags: Int, startId: Int): Int =
     // A null intent is a restart by the OS after the process was killed (START_STICKY).
@@ -194,7 +196,8 @@ class LoggerService extends Service:
     handler.post { () =>
       handler.removeCallbacksAndMessages(null)
       stopRecorder()
-      energy.stop(System.currentTimeMillis())
+      // Never started with a database of a newer version: nothing to close.
+      if AshidoriApp.newerDatabase.isEmpty then energy.stop(System.currentTimeMillis())
       lm.removeUpdates(locationListener)
       if statusRegistered then lm.unregisterGnssStatusCallback(statusCallback)
       sm.unregisterListener(sensorListener)

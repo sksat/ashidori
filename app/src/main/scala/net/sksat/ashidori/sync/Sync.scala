@@ -644,6 +644,8 @@ private val LockWaitMs = 3 * 60_000L
 
 class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
+    // A database of a newer version is not opened: nothing to send.
+    if AshidoriApp.newerDatabase.isDefined then return ListenableWorker.Result.success()
     // After repeated crashes only a sync the user asked for runs.
     if net.sksat.ashidori.Maintenance.SafeMode.syncStopped && !getTags.contains(SyncScheduler.ManualTag) then
       return ListenableWorker.Result.success()
@@ -676,6 +678,7 @@ class SmallSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx
 
 class RawLogSyncWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
+    if AshidoriApp.newerDatabase.isDefined then return ListenableWorker.Result.success()
     if net.sksat.ashidori.Maintenance.SafeMode.syncStopped then return ListenableWorker.Result.success()
     SyncLock.tryRun(LockWaitMs) {
       SyncRun.current(() => isStopped).fold(ListenableWorker.Result.success()) { run =>
