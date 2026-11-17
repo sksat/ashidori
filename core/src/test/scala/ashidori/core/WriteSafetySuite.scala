@@ -155,6 +155,15 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(m.update(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 5L)), Some(false))
   }
 
+  test("stall alert: a kind is named once unsaved for a minute, not for a batch merely in the queue") {
+    val b = WriteBacklog()
+    val f = b.offer(5, raw = false, "fixes", now = 0L).get
+    b.done(f, 5, raw = false, now = 10L, lost = true)
+    b.offer(1, raw = false, "battery", now = 59_000L)
+    assertEquals(WriteStall.stalledKinds(b.unsavedSince, 60_000L), Set("fixes"))
+    assertEquals(WriteStall.stalledKinds(b.unsavedSince, 119_000L), Set("fixes", "battery"))
+  }
+
   test("stall alert found only by its notification (0.21.0): cleared after a save, while nothing is stalled") {
     val m = WriteStall.Monitor(restored = Some(Set.empty))
     assertEquals(m.update(noCommit = false, unsavedTooLong = false), None)

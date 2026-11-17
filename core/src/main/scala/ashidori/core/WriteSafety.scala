@@ -267,6 +267,17 @@ object WriteStall:
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)
 
+  /** A kind unsaved for at least this long is named by the alert (one
+    * check apart): a batch merely in the queue at a check is not.
+    */
+  val KindMs: Long = 60_000L
+
+  /** The kinds the alert names: unsaved (waiting or failed) for at least
+    * [[KindMs]].
+    */
+  def stalledKinds(unsavedSince: Map[String, Long], nowUptime: Long): Set[String] =
+    unsavedSince.collect { case (k, since) if nowUptime - since >= KindMs => k }.toSet
+
   def thresholdMs(intervalMs: Long, maxBatchDelayMs: Long): Long =
     math.max(MinMs, 2 * math.max(intervalMs, maxBatchDelayMs) + MarginMs)
 
