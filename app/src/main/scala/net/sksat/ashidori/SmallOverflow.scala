@@ -7,9 +7,11 @@ import ashidori.core.*
 
 /** The logger's small rows ([[SmallRecord]]) that could not be saved now:
   * the write queue was full, or SQLite refused the batch after its retries.
-  * Each batch goes to a file of its own (fsynced, renamed into place) in
-  * the raw-line overflow directory, so backups take it along, and is
-  * imported once SQLite takes writes again: the batch and a mark naming the
+  * Each batch goes to a file of its own in the raw-line overflow directory,
+  * completed the same way (written to `.tmp`, synced, renamed without
+  * replacing to `.rec`, the directory synced: [[OverflowFiles]]), so both
+  * backups take it along under the same rules and manifest. It is imported
+  * once SQLite takes writes again: the batch and a mark naming the
   * file in one transaction, then the file is deleted, then the mark
   * ([[OverflowImport]]). A crash at any point neither loses nor repeats it.
   */
@@ -22,15 +24,9 @@ object SmallOverflow:
   def spill(r: SmallRecord): Unit = synchronized {
     ArchiveStore.ensureDir(dir)
     seq += 1
-    val f = File(dir, f"small-${System.currentTimeMillis()}%013d-$seq%06d.rec")
-    val tmp = File(f.getPath + ".tmp")
-    val out = FileOutputStream(tmp)
-    try
-      out.write((SmallRecord.encode(r) + "\n").getBytes(UTF_8))
-      out.getFD.sync()
-    finally out.close()
-    if !tmp.renameTo(f) then throw java.io.IOException(s"rename to $f failed")
-    ArchiveStore.syncDir(dir)
+    // Completed only by the rename (never written again): see OverflowFiles.
+    OverflowFiles.write(dir.toPath, f"small-${System.currentTimeMillis()}%013d-$seq%06d${OverflowFiles.CompletedRecord}",
+      (SmallRecord.encode(r) + "\n").getBytes(UTF_8), d => ArchiveStore.syncDir(d.toFile))
   }
 
   /** Saves `r` in SQLite (the write thread's path and the import's). */
@@ -45,14 +41,14 @@ object SmallOverflow:
     case SmallRecord.FixMsl(vs)                    => db.updateFixMsl(vs)
 
   /** Files waiting to be imported. */
-  def waiting: Int = Option(dir.listFiles()).toSeq.flatten.count(_.getName.endsWith(".rec"))
+  def waiting: Int = Option(dir.listFiles()).toSeq.flatten.count(_.getName.endsWith(OverflowFiles.CompletedRecord))
 
   /** Imports spilled batches, oldest first, while the queue is short (on
     * the write thread, as the raw-line overflow).
     */
   def importSome(pending: () => Long): Unit =
     val lock = LoggerWrites.Overflow.lock
-    val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".rec")).filterNot(f => undecodable(f.getName))
+    val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(OverflowFiles.CompletedRecord)).filterNot(f => undecodable(f.getName))
       .sortBy(_.getName)
     for f <- files.take(50) if pending() < WriteBacklog.MaxOtherRows / 2 && lock.tryLock() do
       try

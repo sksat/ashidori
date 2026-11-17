@@ -64,6 +64,9 @@ class OverflowImportSuite extends munit.FunSuite:
     assertEquals(names, Seq("raw-1.txt", "raw-2.txt.tmp"))
     assertEquals(names.map(OverflowFiles.inBackup), Seq(Some(false), Some(true)))
     assertEquals(OverflowFiles.inBackup("notes"), None)
+    // Small-row batches: the same rules.
+    assertEquals(Seq("small-1.rec", "small-1.rec.tmp").map(OverflowFiles.inBackup), Seq(Some(false), Some(true)))
+    assertEquals(OverflowFiles.inBackup("small-1.json"), None)
     // In the manifest: only the .tmp is marked partial.
     assertEquals(BackupManifest.line("ab", 4, "files/overflow/raw-1.txt"), "ab  4  files/overflow/raw-1.txt\n")
     assertEquals(BackupManifest.line("cd", 4, "files/overflow/raw-2.txt.tmp", partial = true),
@@ -85,6 +88,17 @@ class OverflowImportSuite extends munit.FunSuite:
     val (taken, missing) = OverflowFiles.forBackup(d, open)
     assert(raced)
     assertEquals(taken, Vector(("raw-1.txt", "1\ta\n", false), ("raw-2.txt", "2\tb\n", false), ("raw-3.txt.tmp", "3\tc\n", true)))
+    assertEquals(missing, Vector.empty[String])
+  }
+
+  test("small-row batches (.rec) are written, listed and taken by a backup like raw-line spills") {
+    val d = java.nio.file.Files.createTempDirectory("overflow")
+    OverflowFiles.write(d, "raw-1.txt", "1\ta\n".getBytes, _ => ())
+    OverflowFiles.write(d, "small-1.rec", "{\"t\":\"pressure\"}\n".getBytes, _ => ())
+    intercept[Stop](OverflowFiles.write(d, "small-2.rec", "{}\n".getBytes, _ => (), () => throw Stop()))
+    intercept[IllegalArgumentException](OverflowFiles.write(d, "small-3.json", "{}".getBytes, _ => ()))
+    val (taken, missing) = OverflowFiles.forBackup(d, java.nio.file.Files.readString(_))
+    assertEquals(taken.map(t => (t._1, t._3)), Vector(("raw-1.txt", false), ("small-1.rec", false), ("small-2.rec.tmp", true)))
     assertEquals(missing, Vector.empty[String])
   }
 

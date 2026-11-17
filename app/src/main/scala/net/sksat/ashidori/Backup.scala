@@ -261,6 +261,8 @@ object Backup:
                |files/archive/<table>/<YYYY-MM[-DD]>.parquet: archived days and months
                |files/overflow/raw-*.txt: raw lines not in the database yet (time TAB line)
                |files/overflow/raw-*.txt.tmp: such a file not completed (being written, or its writer died): partial
+               |files/overflow/small-*.rec: positions, motion, battery, pressure and other small rows not in the database yet (one JSON line)
+               |files/overflow/small-*.rec.tmp: such a file not completed: partial
                |""".stripMargin) +
             s"""files/archive/quarantine/<commit>/<table>/<file>: files a repair moved aside (may hold the only copy of some rows; Parquet, or `.tmp`: a new version that was not published)
                |files/lifecycle.log: lifecycle log (no positions)

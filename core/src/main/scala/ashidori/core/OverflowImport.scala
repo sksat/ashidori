@@ -32,7 +32,8 @@ object OverflowImport:
       ops.unmark()
       if had then Result.AlreadyImported else Result.Imported
 
-/** Overflow files (raw lines the queue had no room for): each written whole
+/** Overflow files (raw lines the queue had no room for, `.txt`; small-row
+  * batches it had no room for or SQLite refused, `.rec`): each written whole
   * to `<name>.tmp`, synced, then renamed to `<name>` (never over a file) and
   * its directory synced. A completed file is never written again (only
   * imported and deleted), so a copy of it is consistent; a `.tmp` may be
@@ -42,14 +43,17 @@ object OverflowFiles:
   import java.nio.file.{Files, Path, StandardOpenOption}
 
   val Completed = ".txt"
+  /** A small-row batch ([[SmallRecord]]): completed the same way. */
+  val CompletedRecord = ".rec"
   val Partial = ".tmp"
+  private val completed = Seq(Completed, CompletedRecord)
 
   /** Writes `bytes` as the completed file `dir/name` (ending in
     * [[Completed]]): to its `.tmp`, synced, renamed, the directory synced.
     * `crash` marks the point before the rename (for tests).
     */
   def write(dir: Path, name: String, bytes: Array[Byte], syncDir: Path => Unit, crash: () => Unit = () => ()): Path =
-    require(name.endsWith(Completed), name)
+    require(completed.exists(name.endsWith), name)
     val f = dir.resolve(name)
     val tmp = dir.resolve(name + Partial)
     val ch = java.nio.channels.FileChannel.open(tmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
@@ -69,8 +73,8 @@ object OverflowFiles:
     * marked partial: never presented as consistent), None not a spill file.
     */
   def inBackup(name: String): Option[Boolean] =
-    if name.endsWith(Completed) then Some(false)
-    else if name.endsWith(Completed + Partial) then Some(true)
+    if completed.exists(name.endsWith) then Some(false)
+    else if completed.exists(c => name.endsWith(c + Partial)) then Some(true)
     else None
 
   /** The spill files of `dir` for a backup, each opened by `open`: (file
