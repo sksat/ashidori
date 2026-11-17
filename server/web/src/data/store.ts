@@ -206,6 +206,8 @@ export class ViewerStore extends EventTarget {
     const places: Place[] = [];
     const checkIns: CheckIn[] = [];
     const overrides: ModeOverride[] = [];
+    // Upload order (cursor, then line): each device's change-counter order.
+    let seq = 0;
     for (const { ref, records } of opened) {
       for (const r of records) {
         if (ref.stream === "places") {
@@ -216,7 +218,7 @@ export class ViewerStore extends EventTarget {
           if (c) checkIns.push(c);
         } else {
           const o = overrideOf(r);
-          if (o) overrides.push(o);
+          if (o) overrides.push({ ...o, deviceId: ref.deviceId, seq: seq++ });
         }
       }
     }

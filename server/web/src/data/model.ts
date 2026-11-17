@@ -204,6 +204,23 @@ export interface ModeOverride {
   end: number;
   mode: ModeKey;
   updatedAt: number;
+  /** The device that made it ("" when unknown). */
+  deviceId?: string;
+  /** Its place in that device's upload order (the app's change counter). */
+  seq?: number;
+}
+
+/**
+ * The order in which corrections win, newest first: updatedAt, then the
+ * device id, then the device's upload order, all descending (core
+ * ModeOverride.newestFirst). Last writer wins by the devices' clocks.
+ */
+export function compareOverrides(a: ModeOverride, b: ModeOverride): number {
+  if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+  const da = a.deviceId ?? "";
+  const db = b.deviceId ?? "";
+  if (da !== db) return da < db ? 1 : -1;
+  return (b.seq ?? 0) - (a.seq ?? 0);
 }
 
 /** The latest record of the `status` stream of a device. */

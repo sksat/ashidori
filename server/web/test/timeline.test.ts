@@ -149,8 +149,8 @@ describe("stretches without a record (記録なし), against the app on the same
       if (g.type === "unrecorded" && w.type === "unrecorded") expect(close(g.from.lat, w.from.lat) && close(g.to.lon, w.to.lon)).toBe(true);
       if (g.type === "trip" && w.type === "trip") expect(g.legs.map((l) => l.mode)).toEqual(w.legs.map((l) => l.mode));
     });
-    // The phone off for 3 hours, motion rows without steps, the phone off at a subway's speed.
-    expect(segs.filter((s) => s.type === "unrecorded")).toHaveLength(3);
+    // The phone off for 3 hours, motion rows without steps, the phone off at a subway's speed, the phone still in a car.
+    expect(segs.filter((s) => s.type === "unrecorded")).toHaveLength(4);
   });
 
   it("leaves them out of the day's distance and travel time", () => {
@@ -163,14 +163,13 @@ describe("stretches without a record (記録なし), against the app on the same
 
   it("keeps a trip when the mode has evidence of its own", () => {
     const h = 3_600_000;
-    expect(isUnrecorded("UNKNOWN_ACTIVITY_TYPE", 3 * h, 3 * h, true, true)).toBe(true);
-    expect(isUnrecorded("WALKING", h, h, false, false)).toBe(true);
-    expect(isUnrecorded("WALKING", h, h, true, false)).toBe(true);
-    expect(isUnrecorded("WALKING", h, h, true, true)).toBe(false);
-    expect(isUnrecorded("IN_SUBWAY", h, h, false, false)).toBe(true);
-    expect(isUnrecorded("IN_SUBWAY", h, h, true, false)).toBe(false);
-    expect(isUnrecorded("FLYING", 3 * h, 3 * h, false, false)).toBe(false);
-    expect(isUnrecorded("IN_BUS", h / 4, h, false, false)).toBe(false);
+    expect(isUnrecorded("UNKNOWN_ACTIVITY_TYPE", 3 * h, 3 * h, true)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, false)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, true)).toBe(false);
+    expect(isUnrecorded("IN_SUBWAY", h, h, false)).toBe(true);
+    expect(isUnrecorded("IN_TRAIN", h, h, true)).toBe(true);
+    expect(isUnrecorded("FLYING", 3 * h, 3 * h, false)).toBe(false);
+    expect(isUnrecorded("IN_BUS", h / 4, h, false)).toBe(false);
     expect(walked(0, 0)).toBe(false);
     expect(walked(500, NaN)).toBe(false);
     expect(walked(1200, 90)).toBe(true);
@@ -193,6 +192,23 @@ describe("stretches without a record (記録なし), against the app on the same
     expect([changed.mode, changed.corrected, changed.inferred]).toEqual(["IN_TRAIN", true, "IN_SUBWAY"]);
   });
 
+  it("picks the same correction as the app for equal timestamps (updatedAt, device, upload order)", () => {
+    interface OrderExp {
+      rows: { s: number; e: number; mode: ModeKey; updatedAt: number; device: string; seq: number }[];
+      expected: { start: number; mode: ModeKey }[];
+    }
+    const o = fixtureJson<OrderExp>("override-order.json");
+    const rows = o.rows.map((r) => ({ start: r.s, end: r.e, mode: r.mode, updatedAt: r.updatedAt, deviceId: r.device, seq: r.seq }));
+    const legsOf = (ss: Segment[]) => ss.flatMap((s) => (s.type === "trip" ? s.legs : []));
+    for (const order of [rows, rows.slice().reverse()]) {
+      const got = legsOf(applyOverrides(segs, order));
+      for (const e of o.expected) expect(got.find((l) => l.start === e.start)?.mode).toBe(e.mode);
+    }
+    // latestOverrides keeps the same row per leg.
+    const kept = legsOf(applyOverrides(segs, latestOverrides(rows.slice().reverse())));
+    for (const e of o.expected) expect(kept.find((l) => l.start === e.start)?.mode).toBe(e.mode);
+  });
+
   it("shows a day with nothing but stretches without a record as a day without a record, as the app does", () => {
     const u = segs.find((s) => s.type === "unrecorded")!;
     expect(shownSegments([u])).toEqual([]);
@@ -202,7 +218,7 @@ describe("stretches without a record (記録なし), against the app on the same
   it("draws them as a dotted grey line, not as a mode", () => {
     const c = contentOf([{ date: exp.date, segments: day } as never]);
     const gaps = c.routes.filter((r) => r.gap);
-    expect(gaps).toHaveLength(3);
+    expect(gaps).toHaveLength(4);
     expect(gaps[0]!.color).toBe(PALETTE.unrecorded);
     expect(legendModes(c)).not.toContain("UNKNOWN_ACTIVITY_TYPE");
   });

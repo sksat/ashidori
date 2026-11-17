@@ -2,7 +2,7 @@
 // records"). Readers ignore unknown fields and tolerate missing ones.
 
 import type { CheckIn, DeviceStatus, ModeOverride, Place, PlaceKind } from "./model";
-import { modeFromKey } from "./model";
+import { compareOverrides, modeFromKey } from "./model";
 
 type Obj = Record<string, unknown>;
 const obj = (x: unknown): Obj | null => (typeof x === "object" && x !== null && !Array.isArray(x) ? (x as Obj) : null);
@@ -82,13 +82,13 @@ export function latestByKey<T extends { key: string; updatedAt: number }>(rows: 
   return out;
 }
 
-/** Overrides have no id: the app replaces one by its (start, end). */
+/** Overrides have no id: the app replaces one by its (start, end). The one first in compareOverrides wins. */
 export function latestOverrides(rows: Iterable<ModeOverride>): ModeOverride[] {
   const m = new Map<string, ModeOverride>();
   for (const o of rows) {
     const k = `${o.start}-${o.end}`;
     const prev = m.get(k);
-    if (!prev || o.updatedAt >= prev.updatedAt) m.set(k, o);
+    if (!prev || compareOverrides(o, prev) <= 0) m.set(k, o);
   }
   return [...m.values()];
 }

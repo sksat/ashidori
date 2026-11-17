@@ -14,7 +14,7 @@
 // - Day boundaries are those of the browser's time zone, not the device's.
 
 import type { CheckIn, Fix, Leg, ModeKey, ModeOverride, MotionWindow, Place, Segment, Trip, Unrecorded, Visit } from "./model";
-import { modeInfo } from "./model";
+import { compareOverrides, modeInfo } from "./model";
 
 // ---------------------------------------------------------------- params
 
@@ -596,7 +596,7 @@ function makeLeg(iv: Interval[], motion: MotionIndex): [Leg, boolean] {
   const silent = iv.filter((x) => x.silent).reduce((a, x) => a + (x.end - x.start), 0);
   return [
     { start, end, mode, distanceM: dist, steps: m.steps, confidence: conf, maxSpeed: mx, medianSpeed: med, uncertain: dur > 0 ? rough / dur : 0.0 },
-    isUnrecorded(mode, silent, dur, !Number.isNaN(m.cadence), walked(m.steps, m.cadence)),
+    isUnrecorded(mode, silent, dur, walked(m.steps, m.cadence)),
   ];
 }
 
@@ -606,23 +606,20 @@ export function walked(steps: number, cadence: number): boolean {
 }
 
 /**
- * TimelineBuilder.isUnrecorded: mostly a long silence, and nothing besides
- * its two ends says how the user moved: steps (on foot), the accelerometer
- * recording meanwhile (a vehicle underground or in a tunnel), or a flight's
- * speed. The speed between the ends alone is not enough.
+ * TimelineBuilder.isUnrecorded: mostly a long silence, unless there is strong
+ * evidence of how the user moved: steps (on foot) or a flight's speed. The
+ * speed between the ends and the mere presence of motion rows are not.
  */
-export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, phoneOn: boolean, walkedMeanwhile: boolean): boolean {
+export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, walkedMeanwhile: boolean): boolean {
   if (silentMs <= 0 || silentMs * 2 < durationMs) return false;
   switch (mode) {
-    case "UNKNOWN_ACTIVITY_TYPE":
-      return true;
     case "FLYING":
       return false;
     case "WALKING":
     case "RUNNING":
       return !walkedMeanwhile;
     default:
-      return !phoneOn;
+      return true;
   }
 }
 
@@ -635,7 +632,7 @@ export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number
  */
 export function applyOverrides(segs: Segment[], overrides: readonly ModeOverride[]): Segment[] {
   if (overrides.length === 0) return segs;
-  const newest = overrides.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+  const newest = overrides.slice().sort(compareOverrides);
   return segs.map((s) => {
     if (s.type !== "trip") return s;
     return {
