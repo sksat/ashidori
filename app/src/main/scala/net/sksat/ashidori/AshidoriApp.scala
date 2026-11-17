@@ -19,6 +19,12 @@ class AshidoriApp extends Application:
 
   private def startMain(): Unit =
     LifeLog.add(LifeKind.ProcessStart, s"記録=${if Settings.loggingEnabled then "オン" else "オフ"}")
+    // A database of a newer version (the app was downgraded): nothing that
+    // opens it starts; the screen and the logger say so (Db.NewerMessage).
+    AshidoriApp.newerDatabase.foreach { v =>
+      LifeLog.add(LifeKind.Note, s"データベースが新しい版（$v、この版は ${Db.Version}）のため開かない")
+      return
+    }
     val nm = getSystemService(classOf[NotificationManager])
     nm.createNotificationChannel(
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)
@@ -58,6 +64,9 @@ object AshidoriApp:
   def app: AshidoriApp = instance
   lazy val db: Db = Db(instance)
   lazy val archive: ArchiveStore = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
+
+  /** The version of the database on disk when it is newer than this app's. */
+  lazy val newerDatabase: Option[Int] = Db.versionOnDisk(instance).filter(_ > Db.Version)
 
   /** The `:maintenance` process (archive maintenance), not the app's main one. */
   lazy val isMaintenanceProcess: Boolean = Application.getProcessName.endsWith(":maintenance")

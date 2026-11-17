@@ -116,6 +116,11 @@ class LoggerService extends Service:
         stopReason = "user"
         Settings.loggingEnabled = false
         stopSelf()
+      case _ if AshidoriApp.newerDatabase.isDefined =>
+        LifeLog.notifyStopped(this, Db.NewerMessage)
+        stopReason = "newer-database"
+        stopSelf()
+        return Service.START_NOT_STICKY
       // Sticky restarts arrive here without a permission check.
       case _ if !LoggerService.hasLocationPermission(this) =>
         LifeLog.add(LifeKind.ForegroundFailed, s"${if sticky then "自動再起動" else action.split('.').last}: 位置情報の権限なし")

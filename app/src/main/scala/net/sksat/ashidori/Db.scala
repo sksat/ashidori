@@ -180,6 +180,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if oldV < 7 then addEnergy(db)
     if oldV < 8 then addElevation(db)
 
+  /** A database of a newer app version: not opened (Android's default
+    * would fail the same way). The data stays as it is; the way back is a
+    * newer app, never a reset or a lowered version number. The app checks
+    * [[Db.versionOnDisk]] first and says so instead of crashing.
+    */
+  override def onDowngrade(db: SQLiteDatabase, oldV: Int, newV: Int): Unit =
+    throw android.database.sqlite.SQLiteException(s"database version $oldV is newer than this app's $newV")
+
   private def w = getWritableDatabase
   private def r = getReadableDatabase
 
@@ -1128,6 +1136,22 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
 object Db:
   val Version = 8
+
+  /** The schema version of the database on disk, without opening it for
+    * this app (None if there is none or it cannot be read).
+    */
+  def versionOnDisk(ctx: Context, name: String = "ashidori.db"): Option[Int] =
+    val f = ctx.getDatabasePath(name)
+    if !f.exists then None
+    else
+      scala.util.Try {
+        val db = SQLiteDatabase.openDatabase(f.getPath, null, SQLiteDatabase.OPEN_READONLY)
+        try db.getVersion
+        finally db.close()
+      }.toOption
+
+  /** The message shown when the database is of a newer app version. */
+  val NewerMessage = "記録は新しい版の ashidori で作成されているため、この版では開けません。記録は端末内に残っています。新しい版に更新してください。"
 
 
   /** On corruption, keep the files (and say so): Android's default handler

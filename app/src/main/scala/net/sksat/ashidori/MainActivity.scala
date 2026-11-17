@@ -105,6 +105,14 @@ class MainActivity extends AppCompatActivity:
       locales.setApplicationLocales(android.os.LocaleList.forLanguageTags("ja-JP"))
     // Brand colors (themes.xml) rather than wallpaper-derived dynamic color.
     super.onCreate(savedInstanceState)
+    // A database of a newer version: say so, open nothing else.
+    if AshidoriApp.newerDatabase.isDefined then
+      val t = android.widget.TextView(this)
+      t.setText(Db.NewerMessage)
+      t.setTextSize(16f)
+      t.setPadding(48, 96, 48, 48)
+      setContentView(t)
+      return
     // Recreated (process killed in the background, configuration change):
     // the day the map showed. The camera is restored by the map tab.
     Option(savedInstanceState).flatMap(b => Option(b.getString(MainActivity.StateDate)))
@@ -256,6 +264,7 @@ class MainActivity extends AppCompatActivity:
 
   override def onNewIntent(intent: Intent): Unit =
     super.onNewIntent(intent)
+    if AshidoriApp.newerDatabase.isDefined then return
     if BasemapDownload.debuggable then debugDownloads(intent)
     handleIntent(intent)
 
@@ -443,6 +452,7 @@ class MainActivity extends AppCompatActivity:
     maps.foreach(_.onStart())
   override def onResume(): Unit =
     super.onResume()
+    if AshidoriApp.newerDatabase.isDefined then return
     // Resume logging after an app update, a force stop, or a stop the
     // background could not recover from (the "記録停止"
     // notification leads here). On every resume, not only in onCreate: the

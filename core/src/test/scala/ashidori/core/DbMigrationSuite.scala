@@ -64,6 +64,78 @@ class DbMigrationSuite extends munit.FunSuite:
     run(db, DbSchema.toV7(columns(db, "battery"), columns(db, "energy_state")).map(_ + ";").mkString("\n"))
     run(db, DbSchema.toV8(columns(db, "fixes")).map(_ + ";").mkString("\n"))
 
+  /** Runs `script`; the shell's exit code (with -bail: not 0 after an error). */
+  private def runCode(db: File, script: String): Int =
+    assume(shell, "sqlite3 not installed")
+    val io = BasicIO.standard(in => { in.write(script.getBytes("UTF-8")); in.close() })
+      .withOutput(_.readAllBytes()).withError(_.readAllBytes())
+    Process(Seq("sqlite3", "-bail", db.getPath)).run(io).exitValue()
+
+  /** The upgrade as SQLiteOpenHelper runs it (getDatabaseLocked): on a WAL
+    * connection (Db.onConfigure), one transaction holding onUpgrade(6, 8)
+    * and setVersion(8). `inject` goes between the two steps.
+    */
+  private def helperUpgrade(db: File, inject: String = ""): String =
+    val v7 = DbSchema.toV7(columns(db, "battery"), columns(db, "energy_state"))
+    val v8 = DbSchema.toV8(columns(db, "fixes"))
+    (Seq("PRAGMA journal_mode=WAL", "BEGIN IMMEDIATE") ++ v7 ++ Seq(inject).filter(_.nonEmpty) ++ v8 ++
+      Seq("PRAGMA user_version=8", "COMMIT")).map(_ + ";").mkString("\n") + "\n"
+
+  /** A 0.21.0 database (user_version 6) with a few rows, in WAL mode. */
+  private def v6Db(): File =
+    val db = tempDb()
+    run(db, "PRAGMA journal_mode=WAL;\n" + v6 + "PRAGMA user_version=6;\n" +
+      insert("fixes", "time, lat, lon, acc, alt, speed, bearing, provider, sats", "1000, 35.5, 139.5, 4.5, 40.25, NULL, NULL, 'gps', 12") +
+      insert("battery", "time, pct, charging, screen_on, mode, plan", "1500, 80, 0, 1, 'balanced', 'GNSS 10秒間隔'"))
+    db
+
+  private def schemaOf(db: File): Vector[String] =
+    run(db, "SELECT type, name, sql FROM sqlite_master ORDER BY type, name;")
+
+  test("the helper's upgrade: user_version 8 with the tables, in one transaction") {
+    val db = v6Db()
+    val before = schemaOf(db)
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("6"))
+    run(db, helperUpgrade(db))
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("8"))
+    assertNotEquals(schemaOf(db), before)
+    assertEquals(run(db, "SELECT time, pct FROM battery;"), Vector("1500|80"))
+  }
+
+  test("an upgrade cut short (the process killed between the steps) leaves version 6 as it was, and runs again") {
+    assume(shell, "sqlite3 not installed")
+    val db = v6Db()
+    val before = schemaOf(db)
+    val script = helperUpgrade(db)
+    // Up to the end of step 7 (inside the transaction), then killed.
+    val cut = script.linesIterator.takeWhile(!_.startsWith("ALTER TABLE fixes")).mkString("\n") + "\nSELECT 'reached';\n"
+    val p = java.lang.ProcessBuilder("sqlite3", "-bail", db.getPath).redirectErrorStream(true).start()
+    p.getOutputStream.write(cut.getBytes("UTF-8"))
+    p.getOutputStream.flush()
+    val out = java.io.BufferedReader(java.io.InputStreamReader(p.getInputStream))
+    var line = out.readLine()
+    while line != null && line != "reached" do line = out.readLine()
+    assertEquals(line, "reached")
+    p.destroyForcibly()
+    p.waitFor()
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("6"))
+    assertEquals(schemaOf(db), before)
+    run(db, helperUpgrade(db))
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("8"))
+    assertEquals(run(db, "SELECT COUNT(*) FROM fixes WHERE msl IS NULL;"), Vector("1"))
+  }
+
+  test("a failed upgrade leaves version 6 as it was; the next open upgrades") {
+    val db = v6Db()
+    val before = schemaOf(db)
+    assertNotEquals(runCode(db, helperUpgrade(db, inject = "INSERT INTO no_such_table VALUES(1)")), 0)
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("6"))
+    assertEquals(schemaOf(db), before)
+    assertEquals(run(db, "SELECT time FROM fixes;"), Vector("1000"))
+    run(db, helperUpgrade(db))
+    assertEquals(run(db, "PRAGMA user_version;"), Vector("8"))
+  }
+
   test("a 0.21.0 database migrates to version 8 with every row kept, and matches a new one") {
     val db = tempDb()
     run(db, v6 + Seq(raiseFloor("fixes"), raiseFloor("battery")).map(_ + ";").mkString("\n"))
