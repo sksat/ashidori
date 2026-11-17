@@ -203,20 +203,11 @@
     },
     {
      "start": 1791192952000,
-     "end": 1791193082000,
-     "mode": "WALKING",
-     "distanceM": 165.99785506930675,
-     "steps": 215,
-     "uncertain": 0,
-     "confidence": 0.85
-    },
-    {
-     "start": 1791193082000,
      "end": 1791193387000,
      "mode": "WALKING",
-     "distanceM": 1112.5181005409495,
-     "steps": 0,
-     "uncertain": 0.9836065573770492,
+     "distanceM": 1278.5159556102562,
+     "steps": 215,
+     "uncertain": 0.6896551724137931,
      "confidence": 0.6
     },
     {
@@ -479,20 +470,11 @@
     },
     {
      "start": 1791192952000,
-     "end": 1791193082000,
-     "mode": "WALKING",
-     "distanceM": 165.99785506930675,
-     "steps": 215,
-     "uncertain": 0,
-     "confidence": 0.85
-    },
-    {
-     "start": 1791193082000,
      "end": 1791193387000,
      "mode": "WALKING",
-     "distanceM": 1112.5181005409495,
-     "steps": 0,
-     "uncertain": 0.9836065573770492,
+     "distanceM": 1278.5159556102562,
+     "steps": 215,
+     "uncertain": 0.6896551724137931,
      "confidence": 0.6
     },
     {

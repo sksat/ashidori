@@ -316,13 +316,18 @@ export class MotionIndex {
 
 // ------------------------------------------------------ timeline builder
 
-/** TimelineBuilder.build */
-export function buildTimeline(rawFixes: readonly Fix[], motion: readonly MotionWindow[] = []): Segment[] {
+/**
+ * TimelineBuilder.build: with the user's corrections applied to the legs as
+ * built, then adjacent legs of a trip that show the same mode made one
+ * (mergeSameMode).
+ */
+export function buildTimeline(rawFixes: readonly Fix[], motion: readonly MotionWindow[] = [], overrides: readonly ModeOverride[] = []): Segment[] {
   if (rawFixes.length === 0) return [];
   const sorted = rawFixes.slice().sort((a, b) => a.time - b.time);
   const fixes = removeSpikes(sorted);
   const index = new MotionIndex(motion);
-  return splitAtJumps(fixes, PARAMS.maxPlausibleSpeedMps).flatMap((run) => buildRun(run, index));
+  const newest = overrides.slice().sort(compareOverrides);
+  return splitAtJumps(fixes, PARAMS.maxPlausibleSpeedMps).flatMap((run) => buildRun(run, index, newest));
 }
 
 export function splitAtJumps(fixes: readonly Fix[], maxSpeed: number): Fix[][] {
@@ -340,7 +345,7 @@ export function splitAtJumps(fixes: readonly Fix[], maxSpeed: number): Fix[][] {
   return out;
 }
 
-function buildRun(fixes: Fix[], motion: MotionIndex): Segment[] {
+function buildRun(fixes: Fix[], motion: MotionIndex, newest: readonly ModeOverride[]): Segment[] {
   const stays = detectStays(fixes);
   const out: Segment[] = [];
   const addTrip = (from: number, to: number, betweenStays: boolean) => {
@@ -349,7 +354,7 @@ function buildRun(fixes: Fix[], motion: MotionIndex): Segment[] {
     const dist = Math.max(fdist(path[0]!, path[path.length - 1]!), pathLength(path) * 0.5);
     const dur = path[path.length - 1]!.time - path[0]!.time;
     const minDist = betweenStays ? PARAMS.minTripDistanceM / 3 : PARAMS.minTripDistanceM;
-    if (dist >= minDist || (dur >= PARAMS.minTripDurationMs && dist >= minDist / 2)) out.push(...splitUnrecorded(path, pieces(path, motion)));
+    if (dist >= minDist || (dur >= PARAMS.minTripDurationMs && dist >= minDist / 2)) out.push(...splitUnrecorded(path, pieces(path, motion, newest)));
   };
   let cursor = 0;
   stays.forEach((s, k) => {
@@ -387,6 +392,9 @@ function splitUnrecorded(path: Fix[], ps: [Leg, boolean][]): Segment[] {
   return out;
 }
 
+/** A stop as built (the inferred mode): a correction does not change this. */
+const builtStill = (l: Leg) => (l.inferred ?? l.mode) === "STILL";
+
 function absorbEdgeStops(segs: Segment[]): Segment[] {
   const a = segs.slice();
   for (let i = 0; i < a.length; i++) {
@@ -394,13 +402,13 @@ function absorbEdgeStops(segs: Segment[]): Segment[] {
     if (s.type !== "trip" || s.legs.length <= 1) continue;
     let trip: Trip = s;
     const prev = a[i - 1];
-    if (i > 0 && trip.legs[0]!.mode === "STILL" && prev?.type === "visit") {
+    if (i > 0 && builtStill(trip.legs[0]!) && prev?.type === "visit") {
       const cut = trip.legs[0]!.end;
       a[i - 1] = { ...prev, end: cut };
       trip = { ...trip, start: cut, legs: trip.legs.slice(1), path: trip.path.filter((f) => f.time >= cut) };
     }
     const next = a[i + 1];
-    if (i + 1 < a.length && trip.legs.length > 1 && trip.legs[trip.legs.length - 1]!.mode === "STILL" && next?.type === "visit") {
+    if (i + 1 < a.length && trip.legs.length > 1 && builtStill(trip.legs[trip.legs.length - 1]!) && next?.type === "visit") {
       const cut = trip.legs[trip.legs.length - 1]!.start;
       a[i + 1] = { ...next, start: cut };
       trip = { ...trip, end: cut, legs: trip.legs.slice(0, -1), path: trip.path.filter((f) => f.time <= cut) };
@@ -448,11 +456,11 @@ type Run = [number, number, Coarse];
 
 /** TimelineBuilder.legs: splits a trip path into legs of one mode. */
 export function legs(path: Fix[], motion: MotionIndex): Leg[] {
-  return pieces(path, motion).map(([l]) => l);
+  return pieces(path, motion, []).map(([l]) => l);
 }
 
-/** The legs, each with whether it is a stretch without a record. */
-function pieces(path: Fix[], motion: MotionIndex): [Leg, boolean][] {
+/** The legs, each with whether it is a stretch without a record; corrected by `newest`, and merged. */
+function pieces(path: Fix[], motion: MotionIndex, newest: readonly ModeOverride[]): [Leg, boolean][] {
   if (path.length < 2) return [];
   const iv = intervals(path, motion);
   const smoothed = iv.map((x, i) => {
@@ -547,7 +555,55 @@ function pieces(path: Fix[], motion: MotionIndex): [Leg, boolean][] {
       runs.splice(k, 2);
     } else k++;
   }
-  return runs.map(([a, b]) => makeLeg(iv.slice(a, b + 1), motion));
+  const built = runs.map(([a, b]): Piece => {
+    const [l, unrecorded] = makeLeg(iv.slice(a, b + 1), motion);
+    return { from: a, to: b, leg: unrecorded ? l : applyOverride(l, newest), unrecorded };
+  });
+  return mergeSameMode(built, iv, motion).map((x) => [x.leg, x.unrecorded]);
+}
+
+/** A leg of intervals `from` to `to` (inclusive). */
+interface Piece {
+  from: number;
+  to: number;
+  leg: Leg;
+  unrecorded: boolean;
+}
+
+/**
+ * TimelineBuilder.mergeSameMode: adjacent legs that show the same mode are
+ * one leg, built again from all their intervals and kept only if it still
+ * shows that mode: without a correction on either part, if it is classified
+ * so itself; with one, always (the mode the record says for the whole as
+ * `inferred`). Corrections are applied to the parts first, so each keeps
+ * the span it was saved for. Never across a stretch without a record.
+ * Repeated until nothing changes.
+ */
+function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex): Piece[] {
+  const merged = (a: Piece, b: Piece): Piece | undefined => {
+    if (a.unrecorded || b.unrecorded || a.leg.mode !== b.leg.mode) return undefined;
+    const mode = a.leg.mode;
+    const [l, unrecorded] = makeLeg(iv.slice(a.from, b.to + 1), motion);
+    if (unrecorded) return undefined;
+    if (a.leg.corrected || b.leg.corrected)
+      return { from: a.from, to: b.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false };
+    return l.mode === mode ? { from: a.from, to: b.to, leg: l, unrecorded: false } : undefined;
+  };
+  let cur = ps;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const out: Piece[] = [];
+    for (const x of cur) {
+      const m = out.length > 0 ? merged(out[out.length - 1]!, x) : undefined;
+      if (m) {
+        out[out.length - 1] = m;
+        changed = true;
+      } else out.push(x);
+    }
+    cur = out;
+  }
+  return cur;
 }
 
 function weightedQuantile(sorted: [number, number][], q: number): number {
@@ -628,21 +684,20 @@ export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number
 /**
  * TimelineBuilder.applyOverrides: a correction applies to a leg if they
  * overlap by more than half, the newest first. A correction to the inferred
- * mode itself (the app's 取り消し) leaves the leg as built.
+ * mode itself (the app's 取り消し) leaves the leg as built. buildTimeline
+ * does this to the legs before it merges them; this applies corrections to
+ * legs already built, without merging.
  */
 export function applyOverrides(segs: Segment[], overrides: readonly ModeOverride[]): Segment[] {
   if (overrides.length === 0) return segs;
   const newest = overrides.slice().sort(compareOverrides);
-  return segs.map((s) => {
-    if (s.type !== "trip") return s;
-    return {
-      ...s,
-      legs: s.legs.map((l) => {
-        const o = newest.find((o) => Math.min(o.end, l.end) - Math.max(o.start, l.start) > Math.trunc((l.end - l.start) / 2));
-        return !o || o.mode === l.mode ? l : { ...l, mode: o.mode, confidence: 1.0, corrected: true, inferred: l.mode };
-      }),
-    };
-  });
+  return segs.map((s) => (s.type === "trip" ? { ...s, legs: s.legs.map((l) => applyOverride(l, newest)) } : s));
+}
+
+/** `newest`: sorted by compareOverrides. */
+function applyOverride(l: Leg, newest: readonly ModeOverride[]): Leg {
+  const o = newest.find((o) => Math.min(o.end, l.end) - Math.max(o.start, l.start) > Math.trunc((l.end - l.start) / 2));
+  return !o || o.mode === l.mode ? l : { ...l, mode: o.mode, confidence: 1.0, corrected: true, inferred: l.mode };
 }
 
 /** Stats.shown: a day with nothing but stretches without a record is a day without a record. */

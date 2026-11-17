@@ -52,7 +52,9 @@ object TimelineRepo:
         stored ++ LoggerState.recentFixes.filter(f => f.time > lastStored && f.time < dayEnd + Margin)
       else stored
     val motion = db.motion(dayStart - Margin, dayEnd + Margin)
-    val built = TimelineBuilder.build(fixes, motion)
+    // Corrections are applied while building: before adjacent legs of the
+    // same mode are merged, so each keeps the span it was saved for.
+    val built = TimelineBuilder.build(fixes, motion, overrides = db.modeOverrides(dayStart - Margin, dayEnd + Margin))
 
     // Link visits to places, persisting newly discovered ones.
     val known = db.places()
@@ -67,9 +69,8 @@ object TimelineRepo:
       case s        => s
     }
 
-    val corrected = TimelineBuilder.applyOverrides(linked, db.modeOverrides(dayStart - Margin, dayEnd + Margin))
     // A day that is all 記録なし (the phone off from the day before to the day after) is a day without a record.
-    val ofDay = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
+    val ofDay = Stats.splitByDay(linked, zone).getOrElse(date, Vector.empty)
     val segs = Stats.shown(ofDay)
     val steps = db.steps(dayStart, dayEnd)
     DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places),

@@ -28,17 +28,35 @@ final case class TimelineParams(
   */
 object TimelineBuilder:
 
+  /** The timeline, with the user's corrections (`overrides`) applied to the
+    * legs as built ([[applyOverrides]]) and then adjacent legs of a trip
+    * that show the same mode made one ([[mergeSameMode]]).
+    */
   def build(
       rawFixes: IndexedSeq[Fix],
       motion: IndexedSeq[MotionWindow] = IndexedSeq.empty,
-      p: TimelineParams = TimelineParams()
+      p: TimelineParams = TimelineParams(),
+      overrides: Seq[ModeOverride] = Seq.empty
+  ): Vector[Segment] = buildWith(rawFixes, motion, p, overrides, merge = true)
+
+  /** As [[build]] without corrections, the legs as cut by speed (for tests). */
+  private[core] def unmerged(rawFixes: IndexedSeq[Fix], motion: IndexedSeq[MotionWindow]): Vector[Segment] =
+    buildWith(rawFixes, motion, TimelineParams(), Seq.empty, merge = false)
+
+  private def buildWith(
+      rawFixes: IndexedSeq[Fix],
+      motion: IndexedSeq[MotionWindow],
+      p: TimelineParams,
+      overrides: Seq[ModeOverride],
+      merge: Boolean
   ): Vector[Segment] =
     if rawFixes.isEmpty then return Vector.empty
     val fixes = Geo.removeSpikes(rawFixes.sortBy(_.time))
+    val ordered = overrides.sorted(using ModeOverride.newestFirst)
     // A jump faster than any airliner is not travel (a bad fix, a mock or
     // imported location, a device reset): build each continuous run on its
     // own so the jump never counts as distance.
-    splitAtJumps(fixes, p.maxPlausibleSpeedMps).flatMap(run => buildRun(run, motion, p))
+    splitAtJumps(fixes, p.maxPlausibleSpeedMps).flatMap(run => buildRun(run, motion, p, ordered, merge))
 
   /** Splits where consecutive fixes imply an impossible speed. */
   def splitAtJumps(fixes: IndexedSeq[Fix], maxSpeed: Double): Vector[IndexedSeq[Fix]] =
@@ -52,7 +70,13 @@ object TimelineBuilder:
       }
       ((0 +: cuts) :+ fixes.size).sliding(2).collect { case Seq(a, b) => fixes.slice(a, b) }.toVector
 
-  private def buildRun(fixes: IndexedSeq[Fix], motion: IndexedSeq[MotionWindow], p: TimelineParams): Vector[Segment] =
+  private def buildRun(
+      fixes: IndexedSeq[Fix],
+      motion: IndexedSeq[MotionWindow],
+      p: TimelineParams,
+      ordered: Seq[ModeOverride],
+      merge: Boolean
+  ): Vector[Segment] =
     val stays = StayPointDetector.detect(fixes, p.stay)
     val out = Vector.newBuilder[Segment]
     val motionIndex = MotionIndex(motion)
@@ -66,7 +90,7 @@ object TimelineBuilder:
         // log it may just be jitter before the first fix settles.
         val minDist = if betweenStays then p.minTripDistanceM / 3 else p.minTripDistanceM
         if dist >= minDist || (dur >= p.minTripDurationMs && dist >= minDist / 2) then
-          out ++= splitUnrecorded(path, pieces(path, motionIndex, p))
+          out ++= splitUnrecorded(path, pieces(path, motionIndex, p, ordered, merge))
 
     var cursor = 0
     for (s, k) <- stays.zipWithIndex do
@@ -101,6 +125,7 @@ object TimelineBuilder:
   /** With sparse sampling while stationary, the last fix of a visit may be
     * minutes before departure. A trip that starts (or ends) with a stop is
     * really the visit lasting until departure, so move that time to the visit.
+    * A stop as built: a correction does not change this.
     */
   private def absorbEdgeStops(segs: Vector[Segment]): Vector[Segment] =
     val a = segs.toArray
@@ -108,14 +133,14 @@ object TimelineBuilder:
       a(i) match
         case t: Trip if t.legs.size > 1 =>
           var trip = t
-          if i > 0 && trip.legs.head.mode == TransportMode.Still then
+          if i > 0 && trip.legs.head.autoMode == TransportMode.Still then
             a(i - 1) match
               case v: Visit =>
                 val cut = trip.legs.head.end
                 a(i - 1) = v.copy(end = cut)
                 trip = trip.copy(start = cut, legs = trip.legs.tail, path = trip.path.filter(_.time >= cut))
               case _ =>
-          if i + 1 < a.length && trip.legs.size > 1 && trip.legs.last.mode == TransportMode.Still then
+          if i + 1 < a.length && trip.legs.size > 1 && trip.legs.last.autoMode == TransportMode.Still then
             a(i + 1) match
               case v: Visit =>
                 val cut = trip.legs.last.start
@@ -127,10 +152,19 @@ object TimelineBuilder:
     a.toVector
 
   /** Split a trip path into legs of homogeneous transport mode. */
-  def legs(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[Leg] = pieces(path, motion, p).map(_._1)
+  def legs(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[Leg] =
+    pieces(path, motion, p, Seq.empty, merge = true).map(_._1)
 
-  /** The legs of a trip path, each with whether it is a stretch without a record. */
-  private def pieces(path: Vector[Fix], motion: MotionIndex, p: TimelineParams): Vector[(Leg, Boolean)] =
+  /** The legs of a trip path, each with whether it is a stretch without a
+    * record; corrected by `ordered` (newest first), and merged if `merge`.
+    */
+  private def pieces(
+      path: Vector[Fix],
+      motion: MotionIndex,
+      p: TimelineParams,
+      ordered: Seq[ModeOverride],
+      merge: Boolean
+  ): Vector[(Leg, Boolean)] =
     if path.size < 2 then return Vector.empty
     val iv = intervals(path, motion, p)
     // Smooth the coarse class with a duration-weighted majority over neighbours.
@@ -199,7 +233,53 @@ object TimelineBuilder:
         runs(k - 1) = (runs(k - 1)._1, runs(k + 1)._2, Coarse.Gap)
         runs.remove(k, 2)
       else k += 1
-    runs.toVector.map { case (a, b, _) => makeLeg(iv.slice(a, b + 1), motion, p) }
+    val built = runs.toVector.map { case (a, b, _) =>
+      val (l, unrecorded) = makeLeg(iv.slice(a, b + 1), motion, p)
+      Piece(a, b, if unrecorded then l else applyOverride(l, ordered), unrecorded)
+    }
+    (if merge then mergeSameMode(built, iv, motion, p) else built).map(x => (x.leg, x.unrecorded))
+
+  /** A leg of intervals `from` to `to` (inclusive). */
+  private final case class Piece(from: Int, to: Int, leg: Leg, unrecorded: Boolean)
+
+  /** Adjacent legs that show the same mode are one leg: the coarse speed
+    * classes cut a drive into a slow start and the rest, or around a short
+    * outage, though both parts end as 車. The merged leg is built again
+    * from all their intervals and kept only if it still shows that mode:
+    *  - without a correction on either part, if it is classified so itself;
+    *  - with one, always: the user said what both parts were. It shows the
+    *    corrected mode, with the mode the record says for the whole as
+    *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
+    * Corrections are applied to the parts first, so a correction saved for
+    * one part keeps the span it was saved for: it neither drops off nor
+    * spreads to its neighbour. One saved for a merged leg covers each of its
+    * parts whole, so the parts merge again. Never across a stretch without
+    * a record (the trip ends there) or a visit (another trip).
+    * Repeated until nothing changes.
+    */
+  private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): Vector[Piece] =
+    def merged(a: Piece, b: Piece): Option[Piece] =
+      if a.unrecorded || b.unrecorded || a.leg.mode != b.leg.mode then None
+      else
+        val mode = a.leg.mode
+        val (l, unrecorded) = makeLeg(iv.slice(a.from, b.to + 1), motion, p)
+        if unrecorded then None
+        else if a.leg.corrected || b.leg.corrected then
+          Some(Piece(a.from, b.to, if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
+        else Option.when(l.mode == mode)(Piece(a.from, b.to, l, false))
+    var cur = ps
+    var changed = true
+    while changed do
+      changed = false
+      val out = ArrayBuffer.empty[Piece]
+      for x <- cur do
+        out.lastOption.flatMap(merged(_, x)) match
+          case Some(m) =>
+            out(out.size - 1) = m
+            changed = true
+          case None => out += x
+      cur = out.toVector
+    cur
 
   private final case class Interval(
       start: Long,
@@ -301,6 +381,8 @@ object TimelineBuilder:
     * several, the one first in [[ModeOverride.newestFirst]] wins. A
     * correction to the inferred mode itself (取り消し) leaves the leg as
     * built, so it is not marked [[Leg.corrected]] and keeps its confidence.
+    * [[build]] does this to the legs before it merges them; this applies
+    * corrections to legs already built, without merging.
     */
   def applyOverrides(segs: Vector[Segment], os: Seq[ModeOverride]): Vector[Segment] =
     if os.isEmpty then segs

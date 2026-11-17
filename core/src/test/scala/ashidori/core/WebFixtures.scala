@@ -139,7 +139,7 @@ object WebFixtures:
     // One correction, as in the overrides stream: the first vehicle leg.
     val firstVehicle = built.collect { case t: Trip => t.legs }.flatten.find(_.mode.isVehicle)
     val overrides = firstVehicle.toVector.map(l => (l.start, l.end, TransportMode.Car))
-    val corrected = TimelineBuilder.applyOverrides(built, overrides.map((s, e, m) => ModeOverride(s, e, m)))
+    val corrected = TimelineBuilder.build(fixes, motion, overrides = overrides.map((s, e, m) => ModeOverride(s, e, m)))
     val segs = Stats.splitByDay(corrected, Zone).getOrElse(Date, Vector.empty)
     val dayStart = Date.atStartOfDay(Zone).toInstant.toEpochMilli
     val dayEnd = Date.plusDays(1).atStartOfDay(Zone).toInstant.toEpochMilli
@@ -149,8 +149,8 @@ object WebFixtures:
       "date" -> Date.toString,
       "zone" -> Zone.getId,
       "overrides" -> ujson.Arr.from(overrides.map((s, e, m) => ujson.Obj("s" -> num(s), "e" -> num(e), "mode" -> m.key))),
-      "raw" -> ujson.Arr.from(built.map(segJson)),
-      "segments" -> ujson.Arr.from(segs.map(segJson)),
+      "raw" -> ujson.Arr.from(built.map(segJson(_))),
+      "segments" -> ujson.Arr.from(segs.map(segJson(_))),
       "summary" -> ujson.Obj(
         "distanceByMode" -> ujson.Obj.from(summary.distanceByMode.map((m, d) => m.key -> ujson.Num(d))),
         "durationByMode" -> ujson.Obj.from(summary.durationByMode.map((m, d) => m.key -> num(d))),
@@ -169,12 +169,43 @@ object WebFixtures:
       "date" -> GapDay.Date.toString,
       "fixes" -> ujson.Arr.from(gap.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble))),
       "motion" -> ujson.Arr.from(gap.motion.map(m => ujson.Arr(num(m.start), num(m.end), m.accelStd.toDouble, m.accelMean.toDouble, m.steps))),
-      "segments" -> ujson.Arr.from(gapSegs.map(segJson)),
+      "segments" -> ujson.Arr.from(gapSegs.map(segJson(_))),
       "summary" -> ujson.Obj(
         "totalDistanceM" -> gapSummary.totalDistanceM,
         "movingMs" -> num(gapSummary.movingMs),
         "unrecordedMs" -> num(gapSummary.unrecordedMs)
       )
+    )))
+
+    // --- Adjacent legs of one mode merged (MergeDay), with corrections --------
+    val md = MergeDay.build()
+    val split = TimelineBuilder.unmerged(md.fixes, md.motion).collect { case t: Trip => t.legs.filter(_.mode != TransportMode.Still) }
+    def tripAt(h: Int) = split.find(_.head.start >= MergeDay.at(h, 0)).get
+    val noon = tripAt(12)
+    val merged = TimelineBuilder.build(md.fixes, md.motion).collect { case t: Trip => t.legs }.flatten
+      .find(l => l.start == noon.head.start).get
+    val cases = Seq(
+      "none" -> Seq.empty,
+      "onePart" -> Seq(ModeOverride(noon(0).start, noon(0).end, TransportMode.Bus, 1)),
+      "bothParts" -> Seq(ModeOverride(noon(0).start, noon(0).end, TransportMode.Bus, 1), ModeOverride(noon(1).start, noon(1).end, TransportMode.Bus, 2)),
+      "wholeLeg" -> Seq(ModeOverride(merged.start, merged.end, TransportMode.Train, 3)),
+      "undone" -> Seq(ModeOverride(merged.start, merged.end, TransportMode.Train, 3), ModeOverride(merged.start, merged.end, TransportMode.Car, 4)),
+      "joinNeighbour" -> Seq(ModeOverride(tripAt(11).head.start, tripAt(11).head.end, TransportMode.Car, 5))
+    )
+    write(dir, "merge-timeline.json", ujson.write(ujson.Obj(
+      "date" -> MergeDay.Date.toString,
+      "fixes" -> ujson.Arr.from(md.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble))),
+      "motion" -> ujson.Arr.from(md.motion.map(m => ujson.Arr(num(m.start), num(m.end), m.accelStd.toDouble, m.accelMean.toDouble, m.steps))),
+      "cases" -> ujson.Arr.from(cases.map { (name, os) =>
+        val segs = TimelineBuilder.build(md.fixes, md.motion, overrides = os)
+        val sum = Stats.day(MergeDay.Date, Stats.splitByDay(segs, MergeDay.Zone).getOrElse(MergeDay.Date, Vector.empty), 0)
+        ujson.Obj(
+          "name" -> name,
+          "overrides" -> ujson.Arr.from(os.map(o => ujson.Obj("s" -> num(o.start), "e" -> num(o.end), "mode" -> o.mode.key, "updatedAt" -> num(o.updatedAt)))),
+          "segments" -> ujson.Arr.from(segs.map(segJson(_, inferred = true))),
+          "durationByMode" -> ujson.Obj.from(sum.durationByMode.map((m, d) => m.key -> num(d)))
+        )
+      })
     )))
 
     // --- One palette: the modes' labels and colours, and the other line colours
@@ -312,7 +343,7 @@ object WebFixtures:
     o
 
   /** As the app applies a correction (TimelineRepo): overlap of more than half. */
-  private def segJson(s: Segment): ujson.Value = s match
+  private def segJson(s: Segment, inferred: Boolean = false): ujson.Value = s match
     case v: Visit =>
       ujson.Obj("type" -> "visit", "start" -> num(v.start), "end" -> num(v.end), "lat" -> v.lat, "lon" -> v.lon,
         "radius" -> v.radius, "fixCount" -> v.fixCount)
@@ -320,7 +351,8 @@ object WebFixtures:
       ujson.Obj("type" -> "trip", "start" -> num(t.start), "end" -> num(t.end), "pathSize" -> t.path.size,
         "legs" -> ujson.Arr.from(t.legs.map(l => ujson.Obj(
           "start" -> num(l.start), "end" -> num(l.end), "mode" -> l.mode.key, "distanceM" -> l.distanceM,
-          "steps" -> l.steps, "uncertain" -> l.uncertain, "confidence" -> l.confidence))))
+          "steps" -> l.steps, "uncertain" -> l.uncertain, "confidence" -> l.confidence)
+          .tap(o => if inferred then o("inferred") = l.inferred.fold(ujson.Null)(m => ujson.Str(m.key))))))
     case u: Unrecorded =>
       ujson.Obj("type" -> "unrecorded", "start" -> num(u.start), "end" -> num(u.end),
         "from" -> ujson.Obj("lat" -> u.from.lat, "lon" -> u.from.lon), "to" -> ujson.Obj("lat" -> u.to.lat, "lon" -> u.to.lon))

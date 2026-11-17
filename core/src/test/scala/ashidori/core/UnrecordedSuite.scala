@@ -30,7 +30,8 @@ class UnrecordedSuite extends munit.FunSuite:
   }
 
   test("a silence with steps counted stays a trip (walking)") {
-    val silentWalk = legs(segs).find(l => l.durationMs >= 19 * 60_000L && l.durationMs <= 21 * 60_000L)
+    // One walk with the walks before and after it (5 + 20 + 5 min).
+    val silentWalk = legs(segs).find(l => l.durationMs >= 24 * 60_000L && l.durationMs <= 31 * 60_000L && l.uncertain > 0.5)
     assertEquals(silentWalk.map(_.mode), Some(TransportMode.Walking), legs(segs).mkString("\n"))
   }
 

@@ -26,7 +26,7 @@ import { BlobError, STATUS_CAPS, openBlob } from "./crypto";
 import type { CheckIn, DeviceStatus, Fix, ModeOverride, MotionWindow, Place, Segment } from "./model";
 import { checkInOf, latestByKey, latestOverrides, overrideOf, placeOf, statusOf } from "./records";
 import type { DaySummary } from "./timeline";
-import { addDays, applyOverrides, buildTimeline, dayKey, dayStart, linkPlaces, shownSegments, splitByDay, summarizeDay } from "./timeline";
+import { addDays, buildTimeline, dayKey, dayStart, linkPlaces, shownSegments, splitByDay, summarizeDay } from "./timeline";
 
 const NEEDED = new Set(["fixes", "motion"]);
 const SMALL = 1024 * 1024;
@@ -401,9 +401,10 @@ export class ViewerStore extends EventTarget {
     const de = dayStart(addDays(date, 1));
     const fixes = near.flatMap((d) => a.fixes.get(d) ?? []).filter((f) => f.time >= ds - MARGIN && f.time < de + MARGIN);
     const motion = near.flatMap((d) => a.motion.get(d) ?? []).filter((m) => m.start >= ds - MARGIN && m.start < de + MARGIN);
-    const built = linkPlaces(buildTimeline(fixes, motion), this.placesFor(deviceId));
-    const corrected = applyOverrides(built, this.overrides.filter((o) => o.end > ds - MARGIN && o.start < de + MARGIN));
-    const segments = shownSegments(splitByDay(corrected).get(date) ?? []);
+    // Corrections are applied while building, before adjacent legs of one mode are merged.
+    const overrides = this.overrides.filter((o) => o.end > ds - MARGIN && o.start < de + MARGIN);
+    const built = linkPlaces(buildTimeline(fixes, motion, overrides), this.placesFor(deviceId));
+    const segments = shownSegments(splitByDay(built).get(date) ?? []);
     const steps = (a.motion.get(date) ?? []).filter((m) => m.start >= ds && m.start < de).reduce((s, m) => s + m.steps, 0);
     const data: DayData = {
       date,

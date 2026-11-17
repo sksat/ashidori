@@ -64,7 +64,7 @@ describe("timeline, against the app's TimelineBuilder on the same rows", async (
 
   it("applies overrides, splits by day and summarises as the app does", () => {
     const overrides = exp.overrides.map((o) => ({ start: o.s, end: o.e, mode: o.mode, updatedAt: 0 }));
-    const segs = splitByDay(applyOverrides(buildTimeline(fixes, motion), overrides)).get(exp.date) ?? [];
+    const segs = splitByDay(buildTimeline(fixes, motion, overrides)).get(exp.date) ?? [];
     expectSame(segs, exp.segments);
     const ds = new Date(2026, 9, 5).getTime();
     const steps = motion.filter((m) => m.start >= ds && m.start < ds + 86_400_000).reduce((a, m) => a + m.steps, 0);
@@ -221,6 +221,46 @@ describe("stretches without a record (記録なし), against the app on the same
     expect(gaps).toHaveLength(4);
     expect(gaps[0]!.color).toBe(PALETTE.unrecorded);
     expect(legendModes(c)).not.toContain("UNKNOWN_ACTIVITY_TYPE");
+  });
+});
+
+describe("adjacent legs of one mode merged, against the app on the same rows", () => {
+  type ExpLeg = ExpTrip["legs"][number] & { inferred: ModeKey | null };
+  interface MergeExp {
+    date: string;
+    fixes: [number, number, number, number][];
+    motion: [number, number, number, number, number][];
+    cases: {
+      name: string;
+      overrides: { s: number; e: number; mode: ModeKey; updatedAt: number }[];
+      segments: (ExpVisit | (Omit<ExpTrip, "legs"> & { legs: ExpLeg[] }))[];
+      durationByMode: Record<string, number>;
+    }[];
+  }
+  const exp = fixtureJson<MergeExp>("merge-timeline.json");
+  const fixes: Fix[] = exp.fixes.map(([time, lat, lon, accuracy]) => ({ time, lat, lon, accuracy, altitude: NaN, speed: NaN, bearing: NaN, provider: "gps" }));
+  const motion = exp.motion.map(([start, end, accelStd, accelMean, steps]) => ({ start, end, accelStd, accelMean, steps }));
+
+  for (const c of exp.cases) {
+    it(`builds the same legs (${c.name})`, () => {
+      const overrides = c.overrides.map((o) => ({ start: o.s, end: o.e, mode: o.mode, updatedAt: o.updatedAt }));
+      const segs = buildTimeline(fixes, motion, overrides);
+      expectSame(segs, c.segments);
+      const legsOf = (ss: typeof segs) => ss.flatMap((s) => (s.type === "trip" ? s.legs : []));
+      const wantLegs = c.segments.flatMap((s) => (s.type === "trip" ? s.legs : []));
+      expect(legsOf(segs).map((l) => [l.inferred ?? null, l.corrected === true])).toEqual(wantLegs.map((l) => [l.inferred, l.inferred !== null]));
+      const sum = summarizeDay(exp.date, splitByDay(segs).get(exp.date) ?? [], 0);
+      expect(Object.fromEntries(sum.durationByMode)).toEqual(c.durationByMode);
+    });
+  }
+
+  it("merges a slow start, a drive around a short outage and a corrected walk into their neighbours", () => {
+    const vehicleLegs = (name: string) =>
+      exp.cases.find((c) => c.name === name)!.segments.flatMap((s) => (s.type === "trip" ? [s.legs.filter((l) => l.mode !== "STILL").map((l) => l.mode)] : []));
+    expect(vehicleLegs("none")).toEqual([["IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"], ["WALKING", "IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"]]);
+    expect(vehicleLegs("onePart")[3]).toEqual(["IN_BUS", "IN_PASSENGER_VEHICLE"]);
+    expect(vehicleLegs("bothParts")[3]).toEqual(["IN_BUS"]);
+    expect(vehicleLegs("joinNeighbour")[2]).toEqual(["IN_PASSENGER_VEHICLE"]);
   });
 });
 
