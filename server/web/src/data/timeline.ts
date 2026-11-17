@@ -238,6 +238,8 @@ interface LegFeatures {
   accelStd: number;
   stopRatio: number;
   gapRatio: number;
+  /** Time-weighted median GNSS altitude above the higher of the trip's ends, metres; NaN (or absent) when unknown. */
+  climbM?: number;
 }
 
 /** ModeClassifier.classify */
@@ -245,7 +247,7 @@ export function classify(f: LegFeatures): [ModeKey, number] {
   const avg = f.durationMs > 0 ? f.distanceM / (f.durationMs / 1000.0) : 0.0;
   const hasMotion = !Number.isNaN(f.cadence);
   if (f.durationMs <= 0) return ["UNKNOWN_ACTIVITY_TYPE", 0.0];
-  if (f.medianSpeed > 45 || (f.p90Speed > 70 && avg > 30)) return ["FLYING", 0.85];
+  if (flying(f)) return ["FLYING", 0.85];
   if (f.gapRatio > 0.5 && (f.durationMs > 2 * 3_600_000 || f.distanceM > 80_000)) return ["UNKNOWN_ACTIVITY_TYPE", 0.2];
   if (f.gapRatio > 0.5 && avg >= 4 && avg <= 35) return ["IN_SUBWAY", 0.55];
   if (f.medianSpeed < 0.4 && f.stopRatio > 0.8 && (!hasMotion || f.cadence < 10)) return ["STILL", 0.6];
@@ -258,6 +260,20 @@ export function classify(f: LegFeatures): [ModeKey, number] {
   if (!Number.isNaN(f.accelStd) && f.accelStd < 0.25 && f.medianSpeed > 8) return ["IN_TRAIN", 0.5];
   if (f.stopRatio > 0.3 && f.p90Speed < 15) return ["IN_BUS", 0.35];
   return ["IN_PASSENGER_VEHICLE", 0.5];
+}
+
+export const FLYING = { speed: 100.0, climbM: 2_000.0, minMs: 10 * 60_000 } as const;
+
+/**
+ * ModeClassifier.flying: faster than any train for long, or fast and high
+ * above both ends of the trip, for at least 10 min. 45 to 100 m/s alone is a
+ * Shinkansen as well; a short fast leg is never a flight.
+ */
+export function flying(f: LegFeatures): boolean {
+  const avg = f.durationMs > 0 ? f.distanceM / (f.durationMs / 1000.0) : 0.0;
+  const fast = f.medianSpeed > 45 || (f.p90Speed > 70 && avg > 30);
+  const climb = f.climbM ?? NaN;
+  return f.durationMs >= FLYING.minMs && (f.medianSpeed > FLYING.speed || (fast && climb > FLYING.climbM));
 }
 
 function looksLikeCycling(f: LegFeatures, hasMotion: boolean): boolean {
@@ -426,6 +442,8 @@ interface Interval {
   gap: boolean;
   silent: boolean;
   poor: boolean;
+  /** The higher of the two ends' altitudes; NaN when neither has one. */
+  alt: number;
   cadence: number;
   accelStd: number;
   coarse: Coarse;
@@ -447,7 +465,8 @@ function intervals(path: Fix[], motion: MotionIndex): Interval[] {
     const dist = doppler ? Math.min(d, (speed * dt) / 1000.0) : d;
     const m = motion.summary(a.time, b.time);
     const poor = (hasAccuracy(a) && a.accuracy > 50) || (hasAccuracy(b) && b.accuracy > 50);
-    out.push({ start: a.time, end: b.time, dist, speed, gap, silent, poor, cadence: m.cadence, accelStd: m.accelStd, coarse: coarse(speed, m.cadence, gap) });
+    const alt = Number.isNaN(a.altitude) ? b.altitude : Number.isNaN(b.altitude) ? a.altitude : Math.max(a.altitude, b.altitude);
+    out.push({ start: a.time, end: b.time, dist, speed, gap, silent, poor, alt, cadence: m.cadence, accelStd: m.accelStd, coarse: coarse(speed, m.cadence, gap) });
   }
   return out;
 }
@@ -463,6 +482,10 @@ export function legs(path: Fix[], motion: MotionIndex): Leg[] {
 function pieces(path: Fix[], motion: MotionIndex, newest: readonly ModeOverride[]): [Leg, boolean][] {
   if (path.length < 2) return [];
   const iv = intervals(path, motion);
+  // The ground: the higher of the first and the last altitude of the trip.
+  const first = path.find((f) => !Number.isNaN(f.altitude));
+  const last = path.findLast((f) => !Number.isNaN(f.altitude));
+  const ground = first && last ? Math.max(first.altitude, last.altitude) : NaN;
   const smoothed = iv.map((x, i) => {
     if (x.coarse === Coarse.Gap) return Coarse.Gap;
     const lo = Math.max(0, i - 2);
@@ -556,10 +579,10 @@ function pieces(path: Fix[], motion: MotionIndex, newest: readonly ModeOverride[
     } else k++;
   }
   const built = runs.map(([a, b]): Piece => {
-    const [l, unrecorded] = makeLeg(iv.slice(a, b + 1), motion);
+    const [l, unrecorded] = makeLeg(iv.slice(a, b + 1), motion, ground);
     return { from: a, to: b, leg: unrecorded ? l : applyOverride(l, newest), unrecorded };
   });
-  return mergeSameMode(built, iv, motion).map((x) => [x.leg, x.unrecorded]);
+  return mergeSameMode(built, iv, motion, ground).map((x) => [x.leg, x.unrecorded]);
 }
 
 /** A leg of intervals `from` to `to` (inclusive). */
@@ -579,13 +602,13 @@ interface Piece {
  * same way, then the two legs at the cut once as a pair: O(n log n). Corrections are applied to the parts first, so each
  * keeps the span it was saved for. Never across a stretch without a record.
  */
-function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex): Piece[] {
+function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex, ground: number): Piece[] {
   // `run` as one leg, if it still shows its mode.
   const asOne = (run: Piece[]): Piece | undefined => {
     const first = run[0]!;
     const last = run[run.length - 1]!;
     const mode = first.leg.mode;
-    const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion);
+    const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion, ground);
     if (unrecorded || !(run.some((x) => x.leg.corrected === true) || l.mode === mode)) return undefined;
     return { from: first.from, to: last.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false };
   };
@@ -621,7 +644,14 @@ function weightedQuantile(sorted: [number, number][], q: number): number {
   return sorted[sorted.length - 1]![0];
 }
 
-function makeLeg(iv: Interval[], motion: MotionIndex): [Leg, boolean] {
+/** The time-weighted median altitude of the intervals above `ground`. */
+function climbM(iv: Interval[], ground: number): number {
+  const known = iv.filter((x) => !Number.isNaN(x.alt));
+  if (Number.isNaN(ground) || known.length === 0) return NaN;
+  return weightedQuantile(known.map((x): [number, number] => [x.alt, x.end - x.start]).sort((a, b) => a[0] - b[0]), 0.5) - ground;
+}
+
+function makeLeg(iv: Interval[], motion: MotionIndex, ground: number): [Leg, boolean] {
   const start = iv[0]!.start;
   const end = iv[iv.length - 1]!.end;
   const dur = end - start;
@@ -652,6 +682,7 @@ function makeLeg(iv: Interval[], motion: MotionIndex): [Leg, boolean] {
     accelStd: m.accelStd,
     stopRatio: dur > 0 ? stopTime / dur : 0.0,
     gapRatio: dur > 0 ? gapTime / dur : 0.0,
+    climbM: climbM(iv, ground),
   });
   const rough = iv.filter((x) => x.gap || x.poor).reduce((a, x) => a + (x.end - x.start), 0);
   const silent = iv.filter((x) => x.silent).reduce((a, x) => a + (x.end - x.start), 0);
@@ -668,7 +699,7 @@ export function walked(steps: number, cadence: number): boolean {
 
 /**
  * TimelineBuilder.isUnrecorded: mostly a long silence, unless there is strong
- * evidence of how the user moved: steps (on foot) or a flight's speed. The
+ * evidence of how the user moved: steps (on foot) or a flight (`flying`). The
  * speed between the ends and the mere presence of motion rows are not.
  */
 export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, walkedMeanwhile: boolean): boolean {

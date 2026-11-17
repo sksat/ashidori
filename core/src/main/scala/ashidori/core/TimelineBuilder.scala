@@ -167,6 +167,9 @@ object TimelineBuilder:
   ): Vector[(Leg, Boolean)] =
     if path.size < 2 then return Vector.empty
     val iv = intervals(path, motion, p)
+    // The ground: the higher of the first and the last altitude of the trip.
+    val ends = Seq(path.find(!_.altitude.isNaN), path.findLast(!_.altitude.isNaN)).flatten.map(_.altitude)
+    val ground = ends.maxOption.getOrElse(Double.NaN)
     // Smooth the coarse class with a duration-weighted majority over neighbours.
     val smoothed = iv.indices.map { i =>
       val lo = math.max(0, i - 2)
@@ -234,10 +237,10 @@ object TimelineBuilder:
         runs.remove(k, 2)
       else k += 1
     val built = runs.toVector.map { case (a, b, _) =>
-      val (l, unrecorded) = makeLeg(iv.slice(a, b + 1), motion, p)
+      val (l, unrecorded) = makeLeg(iv.slice(a, b + 1), motion, p, ground)
       Piece(a, b, if unrecorded then l else applyOverride(l, ordered), unrecorded)
     }
-    (if merge then mergeSameMode(built, iv, motion, p) else built).map(x => (x.leg, x.unrecorded))
+    (if merge then mergeSameMode(built, iv, motion, p, ground) else built).map(x => (x.leg, x.unrecorded))
 
   /** A leg of intervals `from` to `to` (inclusive). */
   private final case class Piece(from: Int, to: Int, leg: Leg, unrecorded: Boolean)
@@ -262,11 +265,11 @@ object TimelineBuilder:
     * parts whole, so the parts merge again. Never across a stretch without
     * a record (the trip ends there) or a visit (another trip).
     */
-  private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): Vector[Piece] =
+  private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams, ground: Double): Vector[Piece] =
     /** `run` as one leg, if it still shows its mode. */
     def asOne(run: Seq[Piece]): Option[Piece] =
       val mode = run.head.leg.mode
-      val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p)
+      val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p, ground)
       Option.when(!unrecorded && (run.exists(_.leg.corrected) || l.mode == mode))(Piece(run.head.from, run.last.to,
         if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
     def joined(run: Vector[Piece]): Vector[Piece] =
@@ -297,6 +300,8 @@ object TimelineBuilder:
       silent: Boolean,
       /** either end has accuracy worse than 50 m */
       poor: Boolean,
+      /** the higher of the two ends' GNSS altitudes; NaN when neither has one */
+      alt: Double,
       cadence: Double,
       accelStd: Double,
       coarse: Coarse
@@ -321,10 +326,12 @@ object TimelineBuilder:
       val dist = if !gap && a.hasSpeed && b.hasSpeed && dt < 30_000 then math.min(d, speed * dt / 1000.0) else d
       val m = motion.summary(a.time, b.time)
       val poor = (a.hasAccuracy && a.accuracy > 50) || (b.hasAccuracy && b.accuracy > 50)
-      Interval(a.time, b.time, dist, speed, gap, silent, poor, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
+      val alt = if a.altitude.isNaN then b.altitude else if b.altitude.isNaN then a.altitude else math.max(a.altitude, b.altitude)
+      Interval(a.time, b.time, dist, speed, gap, silent, poor, alt, m.cadence, m.accelStd, ModeClassifier.coarse(speed, m.cadence, gap))
     }
 
-  private def makeLeg(iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): (Leg, Boolean) =
+  /** `ground`: the altitude of the trip's ends ([[LegFeatures.climbM]]). */
+  private def makeLeg(iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams, ground: Double): (Leg, Boolean) =
     val start = iv.head.start
     val end = iv.last.end
     val dur = end - start
@@ -349,13 +356,20 @@ object TimelineBuilder:
       m.cadence,
       m.accelStd,
       if dur > 0 then stopTime.toDouble / dur else 0.0,
-      if dur > 0 then gapTime.toDouble / dur else 0.0
+      if dur > 0 then gapTime.toDouble / dur else 0.0,
+      climbM(iv, ground)
     )
     val (mode, conf) = ModeClassifier.classify(f)
     val roughTime = iv.filter(i => i.gap || i.poor).map(_.dt).sum
     val silentTime = iv.filter(_.silent).map(_.dt).sum
     (Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0),
       isUnrecorded(mode, silentTime, dur, walked = walked(m.steps, m.cadence)))
+
+  /** The time-weighted median altitude of the intervals above `ground`. */
+  private def climbM(iv: IndexedSeq[Interval], ground: Double): Double =
+    val known = iv.filterNot(_.alt.isNaN)
+    if ground.isNaN || known.isEmpty then Double.NaN
+    else weightedQuantile(known.map(i => (i.alt, i.dt)).sortBy(_._1), 0.5) - ground
 
   /** Steps that say the user walked: enough of them, at a walking rate
     * while the accelerometer was recording. Motion rows alone (a phone on
@@ -370,7 +384,8 @@ object TimelineBuilder:
     * position while the place changed) is 記録なし unless there is strong
     * evidence of how the user moved:
     *  - on foot: steps counted meanwhile ([[walked]]);
-    *  - a flight: its speed, which nothing else reaches.
+    *  - a flight: [[ModeClassifier.flying]], a speed no train reaches or
+    *    height above the trip's ends, for long.
     * The speed between the two ends is no evidence for anything else (a
     * phone switched off in a car gives a subway's speed), and neither are
     * motion rows (a phone lying still in a car records them too). A long

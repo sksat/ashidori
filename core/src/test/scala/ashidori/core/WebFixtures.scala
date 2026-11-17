@@ -216,6 +216,17 @@ object WebFixtures:
       })
     )))
 
+    // --- Fast trips (FastDay): 飛行機 only with evidence of a flight ----------
+    def fastJson(d: FastDay.Out) = ujson.Obj(
+      "fixes" -> ujson.Arr.from(d.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble, f.altitude))),
+      "motion" -> ujson.Arr.from(d.motion.map(m => ujson.Arr(num(m.start), num(m.end), m.accelStd.toDouble, m.accelMean.toDouble, m.steps))),
+      "segments" -> ujson.Arr.from(TimelineBuilder.build(d.fixes, d.motion).map(segJson(_)))
+    )
+    write(dir, "fast-timeline.json", ujson.write(ujson.Obj(
+      "day" -> fastJson(FastDay.day()),
+      "hongKongHaneda" -> fastJson(FastDay.hongKongHaneda())
+    )))
+
     // --- One palette: the modes' labels and colours, and the other line colours
     // --- Which correction wins: equal timestamps, two devices ----------------
     val gapLegs = gapSegs.collect { case t: Trip => t.legs }.flatten.filter(_.mode != TransportMode.Still)

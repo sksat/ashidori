@@ -105,7 +105,11 @@ describe("timeline rules", () => {
     const base = { durationMs: 600_000, distanceM: 1000, medianSpeed: 1.4, p90Speed: 1.8, maxSpeed: 2, cadence: 100, accelStd: 1.5, stopRatio: 0, gapRatio: 0 };
     expect(classify(base)[0]).toBe("WALKING");
     expect(classify({ ...base, cadence: 150, medianSpeed: 2.8 })[0]).toBe("RUNNING");
-    expect(classify({ ...base, medianSpeed: 50 })[0]).toBe("FLYING");
+    // 飛行機: faster than any train, or fast and high above the trip's ends, for at least 10 min.
+    expect(classify({ ...base, medianSpeed: 120, p90Speed: 120 })[0]).toBe("FLYING");
+    expect(classify({ ...base, medianSpeed: 85, p90Speed: 85, cadence: NaN })[0]).toBe("IN_TRAIN");
+    expect(classify({ ...base, medianSpeed: 85, p90Speed: 85, cadence: NaN, climbM: 3000 })[0]).toBe("FLYING");
+    expect(classify({ ...base, durationMs: 200_000, medianSpeed: 150, p90Speed: 150, cadence: NaN })[0]).toBe("IN_TRAIN");
     expect(classify({ ...base, gapRatio: 0.8, distanceM: 6000 })[0]).toBe("IN_SUBWAY");
     expect(classify({ ...base, cadence: NaN, medianSpeed: 15, p90Speed: 33 })[0]).toBe("IN_TRAIN");
     expect(classify({ ...base, cadence: NaN, medianSpeed: 6, p90Speed: 13, stopRatio: 0.4 })[0]).toBe("IN_BUS");
@@ -288,6 +292,31 @@ describe("adjacent legs of one mode merged, against the app on the same rows", (
     expect(undone.overrides[undone.overrides.length - 1]!.mode).toBe("IN_BUS");
     expect(undone.segments).toEqual(exp.cases.find((c) => c.name === "bothParts")!.segments);
     expect(vehicleLegs("joinNeighbour")[2]).toEqual(["IN_PASSENGER_VEHICLE"]);
+  });
+});
+
+describe("fast trips, against the app on the same rows", () => {
+  interface FastExp {
+    fixes: [number, number, number, number, number][];
+    motion: [number, number, number, number, number][];
+    segments: (ExpVisit | ExpTrip)[];
+  }
+  const exp = fixtureJson<{ day: FastExp; hongKongHaneda: FastExp }>("fast-timeline.json");
+  const build = (e: FastExp) =>
+    buildTimeline(
+      e.fixes.map(([time, lat, lon, accuracy, altitude]) => ({ time, lat, lon, accuracy, altitude, speed: NaN, bearing: NaN, provider: "gps" })),
+      e.motion.map(([start, end, accelStd, accelMean, steps]) => ({ start, end, accelStd, accelMean, steps })),
+    );
+  const modes = (ss: (ExpVisit | ExpTrip)[]) => ss.flatMap((s) => (s.type === "trip" ? [s.legs.map((l) => l.mode).filter((m) => m !== "STILL")] : []));
+
+  it("builds the same legs: a Shinkansen is a train, a flight one flight, a jump no flight", () => {
+    expectSame(build(exp.day), exp.day.segments);
+    expect(modes(exp.day.segments)).toEqual([["IN_TRAIN"], ["FLYING"], ["IN_TRAIN"], ["IN_TRAIN"]]);
+  });
+
+  it("keeps Hong Kong to Haneda (long, high, fast, few fixes) a flight", () => {
+    expectSame(build(exp.hongKongHaneda), exp.hongKongHaneda.segments);
+    expect(modes(exp.hongKongHaneda.segments)).toEqual([["FLYING"]]);
   });
 });
 

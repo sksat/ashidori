@@ -14,7 +14,11 @@ final case class LegFeatures(
     /** fraction of time spent below 1 m/s */
     stopRatio: Double,
     /** fraction of time that falls in GNSS gaps (e.g. underground) */
-    gapRatio: Double
+    gapRatio: Double,
+    /** how far the leg's (time-weighted median) GNSS altitude is above the
+      * higher of its trip's two ends, metres; NaN when unknown
+      */
+    climbM: Double = Double.NaN
 ):
   def avgSpeed: Double = if durationMs > 0 then distanceM / (durationMs / 1000.0) else 0.0
   def hasMotion: Boolean = !cadence.isNaN
@@ -29,7 +33,7 @@ object ModeClassifier:
 
   def classify(f: LegFeatures): (TransportMode, Double) =
     if f.durationMs <= 0 then (Unknown, 0.0)
-    else if f.medianSpeed > 45 || (f.p90Speed > 70 && f.avgSpeed > 30) then (Flying, 0.85)
+    else if flying(f) then (Flying, 0.85)
     // Mostly without GNSS: a subway ride is short; a long gap (phone off,
     // no signal for hours) says nothing about how we moved.
     else if f.gapRatio > 0.5 && (f.durationMs > 2 * 3_600_000L || f.distanceM > 80_000) then (Unknown, 0.2)
@@ -42,6 +46,26 @@ object ModeClassifier:
     else if f.medianSpeed < 8.5 && f.p90Speed < 12.5 && looksLikeCycling(f) then (Cycling, 0.6)
     else if f.medianSpeed < 3.0 then (Walking, 0.4)
     else vehicle(f)
+
+  /** Faster than any train for long ([[FlyingSpeed]]), or fast and high
+    * above both ends of the trip ([[FlyingClimbM]]), for at least
+    * [[FlyingMinMs]]. Speed between 45 and 100 m/s alone is no evidence of
+    * a flight: a Shinkansen reaches 89 m/s (320 km/h). A short fast leg is a
+    * fast stretch of a train (or a GNSS jump), never a flight. The same
+    * evidence keeps a flight without positions from being 記録なし
+    * ([[TimelineBuilder.isUnrecorded]]).
+    */
+  def flying(f: LegFeatures): Boolean =
+    val fast = f.medianSpeed > 45 || (f.p90Speed > 70 && f.avgSpeed > 30)
+    f.durationMs >= FlyingMinMs && (f.medianSpeed > FlyingSpeed || (fast && f.climbM > FlyingClimbM))
+
+  /** m/s (360 km/h): above what trains in service reach. */
+  val FlyingSpeed = 100.0
+  /** m: above any railway's climb between two of its stations (Karuizawa is
+    * 900 m above Tokyo), below any airliner's cruise.
+    */
+  val FlyingClimbM = 2_000.0
+  val FlyingMinMs: Long = 10 * 60_000L
 
   private def looksLikeCycling(f: LegFeatures): Boolean =
     if f.hasMotion then f.cadence < 30 && (f.accelStd.isNaN || f.accelStd >= 0.8)
