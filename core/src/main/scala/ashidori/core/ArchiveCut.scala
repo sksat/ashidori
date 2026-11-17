@@ -31,19 +31,26 @@ object ArchiveCut:
   private def step(h: Long, r: IndexedSeq[Any]): Long = h * 31 + ArchiveMerge.hash(r)
 
   /** Writes the file at `path` without [from, to) to `out` (in the current
-    * layout, with its footer). Does not close `out`.
+    * layout, with its footer), in time order. Does not close `out`.
+    *
+    * Only state spans change their start when cut (to the range's end), so
+    * that two spans of the same start, `[0,100)` and `[0,200)` minus
+    * `[40,80)`, would come out as 0, 80, 0, 80: their rows (a file of them
+    * is small) are sorted again, by start then as they were. Every other
+    * table only loses rows, which keeps its order.
     */
   def write(t: Archive.TableDef, path: String, out: java.io.OutputStream, groupRows: Int, from: Long, to: Long): Written =
     var kept = 0L
     var hash = 17L
     val w = Archive.writer(t, out, groupRows)
+    def put(k: IndexedSeq[Any]): Unit =
+      w.write(k)
+      kept += 1
+      hash = step(hash, k)
     Using.resource(Archive.open(t, path, whole = true)) { r =>
-      r.rowIterator.foreach { row =>
-        for k <- cutRow(t, row, from, to) do
-          w.write(k)
-          kept += 1
-          hash = step(hash, k)
-      }
+      if t == Archive.EnergyStates then
+        r.rowIterator.flatMap(cutRow(t, _, from, to)).toVector.sortBy(ArchiveMerge.key).foreach(put)
+      else r.rowIterator.foreach(row => cutRow(t, row, from, to).foreach(put))
     }
     w.close()
     Written(kept, hash)
@@ -58,14 +65,21 @@ object ArchiveCut:
     var back = 17L
     var n = 0L
     var left = false
+    var last = Long.MinValue
+    var unordered = false
     Using.resource(Archive.open(t, path)) { r =>
       r.rowIterator.foreach { row =>
         if cutRow(t, row, from, to) != Seq(row) then left = true
+        val k = ArchiveMerge.key(row)
+        if k < last then unordered = true
+        last = k
         back = step(back, row)
         n += 1
       }
     }
-    if left then Left("a row of the range is left")
+    // A repair checks a published file's order: it must hold before publishing.
+    if unordered then Left("rows not in time order")
+    else if left then Left("a row of the range is left")
     else if n != written.rows || back != written.hash then Left("does not read back as written")
     else Right(())
 

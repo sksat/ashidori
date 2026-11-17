@@ -66,6 +66,25 @@ class ArchiveCutSuite extends munit.FunSuite:
       Vector(EnergySpan(t0, t0 + 40 * Min, s), EnergySpan(t0 + 80 * Min, t0 + 90 * Min, s, endKnown = false)))
   }
 
+  test("two spans of the same start, [0,100) and [0,200) minus [40,80): the result is in time order") {
+    val s = EnergyState(true, 1000, "gps", false, false, true, false, "balanced", "balanced", "Walking", "Outdoor")
+    val spans = Seq(EnergySpan(t0, t0 + 100 * Min, s, endKnown = false), EnergySpan(t0, t0 + 200 * Min, s))
+    val src = file(Archive.EnergyStates.columns, spans.map(Archive.energyRow))
+    val (out, w) = cutTo(Archive.EnergyStates, src, t0 + 40 * Min, t0 + 80 * Min)
+    assertEquals(ArchiveCut.check(Archive.EnergyStates, out.getPath, w, t0 + 40 * Min, t0 + 80 * Min), Right(()))
+    val back = rows(Archive.EnergyStates, out).map(Archive.energyOf).map(x => ((x.start - t0) / Min, (x.end - t0) / Min))
+    assertEquals(back, Vector((0L, 40L), (0L, 40L), (80L, 100L), (80L, 200L)))
+    // The repair's check of the published file (time order among others) holds.
+    val target = ArchiveCut.target("energy_state/x.parquet", CommitIntent.Prev.File(2, src.length), w, out.length, out.getPath)
+    assertEquals(CommitRepair.verify(target, 4, rows(Archive.EnergyStates, out).iterator), Right(()))
+    // Written unsorted, the check would refuse to publish it.
+    val unsorted = file(Archive.EnergyStates.columns, spans.flatMap(sp => ArchiveCut.cutRow(Archive.EnergyStates,
+      Archive.energyRow(sp).toIndexedSeq, t0 + 40 * Min, t0 + 80 * Min)), Seq(Archive.TableKey -> "energy_state", Archive.SchemaKey -> "3"))
+    val u = rows(Archive.EnergyStates, unsorted)
+    val wu = ArchiveCut.Written(4, u.foldLeft(17L)((h, r) => h * 31 + ArchiveMerge.hash(r)))
+    assertEquals(ArchiveCut.check(Archive.EnergyStates, unsorted.getPath, wu, t0 + 40 * Min, t0 + 80 * Min), Left("rows not in time order"))
+  }
+
   test("a range covering the whole file leaves an empty file, not none; a damaged new version fails its check") {
     val ps = (0 until 10).map(i => Archive.pressureRow(PressureSample(t0 + i * 5000L, 1000f)))
     val src = file(Archive.Pressure.columns, ps)
