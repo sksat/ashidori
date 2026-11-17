@@ -596,37 +596,61 @@ function makeLeg(iv: Interval[], motion: MotionIndex): [Leg, boolean] {
   const silent = iv.filter((x) => x.silent).reduce((a, x) => a + (x.end - x.start), 0);
   return [
     { start, end, mode, distanceM: dist, steps: m.steps, confidence: conf, maxSpeed: mx, medianSpeed: med, uncertain: dur > 0 ? rough / dur : 0.0 },
-    isUnrecorded(mode, silent, dur, !Number.isNaN(m.cadence)),
+    isUnrecorded(mode, silent, dur, !Number.isNaN(m.cadence), walked(m.steps, m.cadence)),
   ];
+}
+
+/** TimelineBuilder.walked: enough steps at a walking rate; motion rows alone are not travel. */
+export function walked(steps: number, cadence: number): boolean {
+  return !Number.isNaN(cadence) && steps >= 30 && cadence >= 10.0;
 }
 
 /**
  * TimelineBuilder.isUnrecorded: mostly a long silence, and nothing besides
- * the two ends says how the user moved (an underground ride's or a flight's
- * speed, steps counted meanwhile).
+ * its two ends says how the user moved: steps (on foot), the accelerometer
+ * recording meanwhile (a vehicle underground or in a tunnel), or a flight's
+ * speed. The speed between the ends alone is not enough.
  */
-export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, hasMotion: boolean): boolean {
+export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, phoneOn: boolean, walkedMeanwhile: boolean): boolean {
   if (silentMs <= 0 || silentMs * 2 < durationMs) return false;
-  if (mode === "UNKNOWN_ACTIVITY_TYPE") return true;
-  if (mode === "IN_SUBWAY" || mode === "FLYING") return false;
-  return !hasMotion;
+  switch (mode) {
+    case "UNKNOWN_ACTIVITY_TYPE":
+      return true;
+    case "FLYING":
+      return false;
+    case "WALKING":
+    case "RUNNING":
+      return !walkedMeanwhile;
+    default:
+      return !phoneOn;
+  }
 }
 
 // ------------------------------------------------- corrections, places
 
-/** A user correction applies to a leg if they overlap by more than half (TimelineRepo). */
+/**
+ * TimelineBuilder.applyOverrides: a correction applies to a leg if they
+ * overlap by more than half, the newest first. A correction to the inferred
+ * mode itself (the app's 取り消し) leaves the leg as built.
+ */
 export function applyOverrides(segs: Segment[], overrides: readonly ModeOverride[]): Segment[] {
   if (overrides.length === 0) return segs;
+  const newest = overrides.slice().sort((a, b) => b.updatedAt - a.updatedAt);
   return segs.map((s) => {
     if (s.type !== "trip") return s;
     return {
       ...s,
       legs: s.legs.map((l) => {
-        const o = overrides.find((o) => Math.min(o.end, l.end) - Math.max(o.start, l.start) > Math.trunc((l.end - l.start) / 2));
-        return o ? { ...l, mode: o.mode, confidence: 1.0, corrected: true } : l;
+        const o = newest.find((o) => Math.min(o.end, l.end) - Math.max(o.start, l.start) > Math.trunc((l.end - l.start) / 2));
+        return !o || o.mode === l.mode ? l : { ...l, mode: o.mode, confidence: 1.0, corrected: true, inferred: l.mode };
       }),
     };
   });
+}
+
+/** Stats.shown: a day with nothing but stretches without a record is a day without a record. */
+export function shownSegments(segs: Segment[]): Segment[] {
+  return segs.every((s) => s.type === "unrecorded") ? [] : segs;
 }
 
 /** Places.matchRadius / nearest */

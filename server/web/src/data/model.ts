@@ -117,8 +117,10 @@ export interface Leg {
   medianSpeed: number;
   /** Fraction of the leg's time without a good position. */
   uncertain: number;
-  /** The user set the mode (an override applied). */
+  /** The user set a mode other than the inferred one (shown with ✎). */
   corrected?: boolean;
+  /** The inferred mode, when a correction set another one. */
+  inferred?: ModeKey;
 }
 
 export interface Trip {

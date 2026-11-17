@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { fixesOf, motionOf, readParquet } from "../src/data/archive";
 import { MODES, PALETTE, type Fix, type ModeKey, type Segment } from "../src/data/model";
-import { applyOverrides, buildTimeline, classify, dayKey, isUnrecorded, removeSpikes, splitByDay, summarizeDay } from "../src/data/timeline";
+import { applyOverrides, buildTimeline, classify, dayKey, isUnrecorded, removeSpikes, shownSegments, splitByDay, summarizeDay, walked } from "../src/data/timeline";
+import { latestOverrides } from "../src/data/records";
 import { contentOf, legendModes } from "../src/map/content";
 import { fixture, fixtureJson } from "./helpers";
 
@@ -148,7 +149,8 @@ describe("stretches without a record (記録なし), against the app on the same
       if (g.type === "unrecorded" && w.type === "unrecorded") expect(close(g.from.lat, w.from.lat) && close(g.to.lon, w.to.lon)).toBe(true);
       if (g.type === "trip" && w.type === "trip") expect(g.legs.map((l) => l.mode)).toEqual(w.legs.map((l) => l.mode));
     });
-    expect(segs.filter((s) => s.type === "unrecorded")).toHaveLength(1);
+    // The phone off for 3 hours, motion rows without steps, the phone off at a subway's speed.
+    expect(segs.filter((s) => s.type === "unrecorded")).toHaveLength(3);
   });
 
   it("leaves them out of the day's distance and travel time", () => {
@@ -161,17 +163,46 @@ describe("stretches without a record (記録なし), against the app on the same
 
   it("keeps a trip when the mode has evidence of its own", () => {
     const h = 3_600_000;
-    expect(isUnrecorded("UNKNOWN_ACTIVITY_TYPE", 3 * h, 3 * h, false)).toBe(true);
-    expect(isUnrecorded("WALKING", h, h, false)).toBe(true);
-    expect(isUnrecorded("WALKING", h, h, true)).toBe(false);
-    expect(isUnrecorded("IN_SUBWAY", h, h, false)).toBe(false);
-    expect(isUnrecorded("IN_BUS", h / 4, h, false)).toBe(false);
+    expect(isUnrecorded("UNKNOWN_ACTIVITY_TYPE", 3 * h, 3 * h, true, true)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, false, false)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, true, false)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, true, true)).toBe(false);
+    expect(isUnrecorded("IN_SUBWAY", h, h, false, false)).toBe(true);
+    expect(isUnrecorded("IN_SUBWAY", h, h, true, false)).toBe(false);
+    expect(isUnrecorded("FLYING", 3 * h, 3 * h, false, false)).toBe(false);
+    expect(isUnrecorded("IN_BUS", h / 4, h, false, false)).toBe(false);
+    expect(walked(0, 0)).toBe(false);
+    expect(walked(500, NaN)).toBe(false);
+    expect(walked(1200, 90)).toBe(true);
+  });
+
+  it("converges after 取り消し: the newer correction to the inferred mode wins and is not marked", () => {
+    const leg = segs.flatMap((s) => (s.type === "trip" ? s.legs : [])).find((l) => l.mode === "IN_SUBWAY")!;
+    // Both rows synced: the change to train, then the app's 取り消し (the inferred mode, newer).
+    const rows = [
+      { start: leg.start, end: leg.end, mode: "IN_TRAIN" as const, updatedAt: 1 },
+      { start: leg.start, end: leg.end, mode: "IN_SUBWAY" as const, updatedAt: 2 },
+    ];
+    for (const os of [latestOverrides(rows), rows, rows.slice().reverse()]) {
+      const got = applyOverrides(segs, os).flatMap((s) => (s.type === "trip" ? s.legs : [])).find((l) => l.start === leg.start)!;
+      expect(got).toEqual(leg);
+      expect(got.corrected).toBeUndefined();
+    }
+    // Before the 取り消し arrived: the correction, marked.
+    const changed = applyOverrides(segs, [rows[0]!]).flatMap((s) => (s.type === "trip" ? s.legs : [])).find((l) => l.start === leg.start)!;
+    expect([changed.mode, changed.corrected, changed.inferred]).toEqual(["IN_TRAIN", true, "IN_SUBWAY"]);
+  });
+
+  it("shows a day with nothing but stretches without a record as a day without a record, as the app does", () => {
+    const u = segs.find((s) => s.type === "unrecorded")!;
+    expect(shownSegments([u])).toEqual([]);
+    expect(shownSegments(day)).toEqual(day);
   });
 
   it("draws them as a dotted grey line, not as a mode", () => {
     const c = contentOf([{ date: exp.date, segments: day } as never]);
     const gaps = c.routes.filter((r) => r.gap);
-    expect(gaps).toHaveLength(1);
+    expect(gaps).toHaveLength(3);
     expect(gaps[0]!.color).toBe(PALETTE.unrecorded);
     expect(legendModes(c)).not.toContain("UNKNOWN_ACTIVITY_TYPE");
   });
