@@ -778,11 +778,21 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * written to, so archiving, which may have read the fix already, is not
     * affected: an altitude that comes after its day was read is simply not
     * in the archive (null there, shown as 「—」).
+    *
+    * An altitude of a fix whose day ended [[Db.MslLateMs]] ago or more is
+    * not added (a batch that waited in an overflow file): archiving reads a
+    * day only once it has been over [[ArchiveStore.SettleMs]], so what it
+    * reads of the join (also when a repair checks the day's rows against
+    * the archive) no longer changes.
     */
   def updateFixMsl(vs: Seq[(Long, Double, Float)]): Unit = tx { db =>
     val st = db.compileStatement("INSERT INTO fix_msl(time, msl, msl_acc) VALUES(?, ?, ?)")
+    val zone = AshidoriApp.zone
+    val now = System.currentTimeMillis()
+    def dayOver(t: Long) =
+      java.time.Instant.ofEpochMilli(t).atZone(zone).toLocalDate.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
     try
-      for (t, m, a) <- vs if !m.isNaN && kept(t) do
+      for (t, m, a) <- vs if !m.isNaN && kept(t) && now < dayOver(t) + Db.MslLateMs do
         st.bindLong(1, t)
         st.bindDouble(2, m)
         if a.isNaN then st.bindNull(3) else st.bindDouble(3, a.toDouble)
@@ -1175,6 +1185,11 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
 object Db:
   val Version = 8
+
+  /** How long after its day ended a fix's MSL altitude is still added (half
+    * of [[ArchiveStore.SettleMs]]).
+    */
+  val MslLateMs: Long = 30 * 60_000L
 
   /** The schema version of the database on disk, without opening it for
     * this app (None if there is none or it cannot be read).
