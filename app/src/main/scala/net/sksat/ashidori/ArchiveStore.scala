@@ -449,29 +449,43 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   private def quarantineDir(intent: CommitIntent) =
     File(root, s"$QuarantineDir/${CommitRepair.id(intent)}-${intent.repairTag}")
 
-  /** `from` to `to`, never replacing a file, durably ([[SafeMove]]): also a
-    * move a crash cut short (`from` gone, `to` there) is made durable.
-    * Whether there was anything to move.
+  /** `from` to `to` (or `to.N` beside a file there: none is replaced),
+    * durably and written ahead ([[SafeMove]]): the name chosen is recorded
+    * in the commit record, and the file's entry in the list of quarantined
+    * files ([[Attention]], made by `entry` from where it went) is made,
+    * before the rename. Repeated after a crash, the recorded name is used:
+    * a move cut short is made durable and the list points at the file.
+    * Whether `from` was there to move now.
     */
-  private def moveDurably(from: File, to: File): Boolean =
+  private def moveDurably(from: File, to: File)(entry: String => Attention.Entry): Boolean =
+    def rel(p: java.nio.file.Path) = root.toPath.relativize(p).toString
+    val src = rel(from.toPath)
+    def recordNow = intentText.flatMap(CommitIntent.decode).getOrElse(throw IllegalStateException("未完了の整理の記録がない"))
+    def listed(dest: String) =
+      val e = entry(dest)
+      Attention.add(if dest == rel(to.toPath) then e else e.copy(why = e.why + "（隔離先に同じ名前のファイルがあったため別の名前）"))
     val there = from.exists
-    val moved = SafeMove.move(from.toPath, to.toPath, p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile),
+    val moved = SafeMove.move(from.toPath, to.toPath, recordNow.moves.get(src).map(File(root, _).toPath),
+      t =>
+        val now = recordNow
+        Maintenance.write(intentFile, CommitIntent.encode(now.copy(moves = now.moves + (src -> rel(t)))))
+        debugCrashPoint("crash-move-recorded")
+        listed(rel(t)),
+      p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile),
       at => debugCrashPoint(s"crash-move-$at"))
-    // A file was where it was to go (never replaced): the mark names where it went.
-    for m <- moved if there && m != to.toPath do
-      Attention.add(Attention.Entry(System.currentTimeMillis(), root.toPath.relativize(from.toPath).toString,
-        root.toPath.relativize(m).toString, true, "隔離先に同じ名前のファイルがあったため別の名前で隔離"))
+    // Made again (it is kept once): the list points at the moved file
+    // even if a crash came between the record and the list.
+    moved.foreach(m => listed(rel(m)))
     there
 
-  /** Moves the tmp file of `t` to quarantine (its attention mark first;
-    * shown to the user if `alert`).
+  /** Moves the tmp file of `t` to quarantine, listed (shown to the user if
+    * `alert`).
     */
   private def setAside(qdir: File, t: CommitIntent.Target, why: String, alert: Boolean): Unit =
     val q = File(File(qdir, t.path).getPath + ".tmp")
-    if tmpOf(t.path).exists then
-      Attention.add(Attention.Entry(System.currentTimeMillis(), t.path + ".tmp", root.toPath.relativize(q.toPath).toString,
-        alert, why, seen = !alert))
-    if moveDurably(tmpOf(t.path), q) then debugCrashPoint("crash-after-first-move")
+    val moved = moveDurably(tmpOf(t.path), q)(d =>
+      Attention.Entry(System.currentTimeMillis(), t.path + ".tmp", d, alert, why, seen = !alert))
+    if moved then debugCrashPoint("crash-after-first-move")
 
   private def whole(path: String)(check: ParquetReader.FileReader => Either[String, Unit]): Either[String, Unit] =
     Try(ParquetReader.open(file(path).getPath)).fold(
@@ -497,7 +511,6 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         LifeLog.add(LifeKind.ArchiveRepair, "未完了の整理の記録（0.21.0 の形式）を端末内の行から補完し、修復を開始")
         full
     val qdir = quarantineDir(intent)
-    def move(from: File, to: File): Unit = moveDurably(from, to)
     // The chunk's rows still in SQLite (or day files of a month merge), per
     // table, read once for every published file; at most RowBag.Cap each.
     lazy val chunks: Either[String, Map[String, RowBag]] =
@@ -513,7 +526,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     CommitRepair.run(intent, new CommitRepair.Ops:
       def dest(path: String) = state(file(path))
       def tmpExists(path: String) = tmpOf(path).exists
-      def quarantined(path: String) = File(qdir, path).exists
+      // Moved by this repair (where its record says, or the name it was moved to).
+      def quarantined(path: String) =
+        intentText.flatMap(CommitIntent.decode).flatMap(_.moves.get(path)).exists(File(root, _).exists) ||
+          File(qdir, path).exists
       def verify(t: CommitIntent.Target) =
         chunks.flatMap { idx =>
           progress(s"検証中: ${t.path}")
@@ -526,12 +542,11 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           val expected = t.check.map(_.prev).collect { case CommitIntent.Prev.File(rows, _) => rows }
           whole(t.path)(r => CommitRepair.verifyWhole(r.rows, r.rowIterator, expected))
       def quarantine(t: CommitIntent.Target, why: String, onlyCopy: Boolean) =
-        val q = File(qdir, t.path)
         // A tmp file still there (it was moved first) goes too.
         setAside(qdir, t, why, alert = true)
-        if file(t.path).exists then
-          Attention.add(Attention.Entry(System.currentTimeMillis(), t.path, root.toPath.relativize(q.toPath).toString, onlyCopy, why))
-        if moveDurably(file(t.path), q) then debugCrashPoint("crash-after-first-move")
+        val moved = moveDurably(file(t.path), File(qdir, t.path))(d =>
+          Attention.Entry(System.currentTimeMillis(), t.path, d, onlyCopy, why))
+        if moved then debugCrashPoint("crash-after-first-move")
       def setAsideTmp(t: CommitIntent.Target, why: String, alert: Boolean) = setAside(qdir, t, why, alert)
       def begin() =
         // Rule B: durable before the first change (the record written whole,
@@ -585,13 +600,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     case CommitIntent.Delete.Files(paths) =>
       // Rule A: no data file is deleted by a repair; the day files the
       // verified month file holds go to quarantine.
-      val gone = paths.filter(p => tables(CommitRepair.tableOf(p)) && file(p).exists)
-      for p <- gone do
-        Attention.add(Attention.Entry(System.currentTimeMillis(), p, root.toPath.relativize(File(qdir, p).toPath).toString,
-          false, "月の整理に含まれた日のファイル", seen = true))
       // Every path (one moved before a crash too: its move made durable).
-      for p <- paths if tables(CommitRepair.tableOf(p)) do moveDurably(file(p), File(qdir, p))
-      gone.size.toLong
+      paths.filter(p => tables(CommitRepair.tableOf(p))).count(p =>
+        moveDurably(file(p), File(qdir, p))(d =>
+          Attention.Entry(System.currentTimeMillis(), p, d, false, "月の整理に含まれた日のファイル", seen = true))).toLong
 
   /** Every row of a commit's chunk still in SQLite (or in the day files of
     * a month merge), with its table: the rows a normal commit deletes

@@ -33,10 +33,15 @@ package ashidori.core
   * of one repair can meet a file of another (written with the marker).
   * `verified`: published files that passed the full check of the repair
   * ([[CommitRepair.verify]]); only for these do readers leave the chunk's
-  * rows in SQLite out. Both are lines after the deletion too.
+  * rows in SQLite out. `moves`: where the repair moves each file it sets
+  * aside (source -> destination, relative to the archive root), recorded
+  * before the rename ([[SafeMove]]), so a repair cut short finds the
+  * file it moved whatever name was chosen. All are lines after the
+  * deletion too.
   */
 final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete, repairing: Boolean = false,
-                              repairTag: String = "", verified: Set[String] = Set.empty)
+                              repairTag: String = "", verified: Set[String] = Set.empty,
+                              moves: Map[String, String] = Map.empty)
 
 object CommitIntent:
   /** The guard's pseudo table (see above). */
@@ -45,6 +50,8 @@ object CommitIntent:
   val RepairingLine = "repairing"
   /** A line naming a published file that passed the repair's full check. */
   val VerifiedLine = "verified"
+  /** A line naming a file the repair moves and where (recorded before the move). */
+  val MovedLine = "moved"
 
   /** Whether a record being repaired gets the guard: a commit of raw lines. */
   def guarded(i: CommitIntent): Boolean = i.delete match
@@ -148,7 +155,8 @@ object CommitIntent:
     // not a file line as the deletion, and nothing after it.
     val marker = Option.when(i.repairing)(if i.repairTag.isEmpty then RepairingLine else s"$RepairingLine\t${i.repairTag}").toSeq
     val verified = i.verified.toSeq.sorted.map(p => s"$VerifiedLine\t$p")
-    (((guard ++ files) :+ delete) ++ marker ++ verified :+ "end").mkString("\n") + "\n"
+    val moves = i.moves.toSeq.sorted.map((a, b) => s"$MovedLine\t$a\t$b")
+    (((guard ++ files) :+ delete) ++ marker ++ verified ++ moves :+ "end").mkString("\n") + "\n"
 
   /** None for a record cut short (no `end`) or unknown. */
   def decode(s: String): Option[CommitIntent] =
@@ -160,7 +168,8 @@ object CommitIntent:
         val files = fileLines.map(_.split("\t", -1)).map { a =>
           Target(a(1), a(2).toLong, a(3).toLong, Option.when(a.length > 4 && a(4) == "v2")(decodeCheck(a.toSeq.drop(5))))
         }
-        def extra(l: String) = l == RepairingLine || l.startsWith(RepairingLine + "\t") || l.startsWith(VerifiedLine + "\t")
+        def extra(l: String) = l == RepairingLine || l.startsWith(RepairingLine + "\t") || l.startsWith(VerifiedLine + "\t") ||
+          l.startsWith(MovedLine + "\t")
         val d = lines.filterNot(l => l.startsWith("file\t") || l == "end" || extra(l)).head.split("\t", -1)
         val delete = d(0) match
           case "hot"   => Delete.Hot(d(1), d(2).toLong, d(3).toLong, d(4).toLong)
@@ -170,5 +179,6 @@ object CommitIntent:
         val marker = lines.find(l => l == RepairingLine || l.startsWith(RepairingLine + "\t"))
         CommitIntent(files, delete, repairing = guards.nonEmpty || marker.isDefined,
           repairTag = marker.map(_.drop(RepairingLine.length).trim).getOrElse(""),
-          verified = lines.filter(_.startsWith(VerifiedLine + "\t")).map(_.drop(VerifiedLine.length + 1)).toSet)
+          verified = lines.filter(_.startsWith(VerifiedLine + "\t")).map(_.drop(VerifiedLine.length + 1)).toSet,
+          moves = lines.filter(_.startsWith(MovedLine + "\t")).map(_.split("\t", -1)).map(a => a(1) -> a(2)).toMap)
       }.toOption

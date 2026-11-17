@@ -569,17 +569,24 @@ class CommitRepairSuite extends munit.FunSuite:
     java.nio.file.Files.createDirectories(p.getParent)
     java.nio.file.Files.writeString(p, text)
 
-  final case class Synced(files: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty, dirs: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty)
+  /** What a move synced, and the record of where it moved (as in the
+    * commit record: kept across a crash).
+    */
+  final case class Synced(files: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty,
+                          dirs: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty,
+                          record: mutable.Map[String, String] = mutable.Map.empty):
+    def fresh = Synced(record = record)
   private def moveWith(from: java.nio.file.Path, to: java.nio.file.Path, s: Synced, crash: String => Unit = _ => ()) =
-    SafeMove.move(from, to, p => java.nio.file.Files.createDirectories(p), p => s.files += p.toString, p => s.dirs += p.toString, crash)
+    SafeMove.move(from, to, s.record.get(from.toString).map(java.nio.file.Path.of(_)), t => s.record(from.toString) = t.toString,
+      p => java.nio.file.Files.createDirectories(p), p => s.files += p.toString, p => s.dirs += p.toString, crash)
 
-  test("safe move: the file and both directories synced; never over another file") {
+  test("safe move: the name recorded before the rename; synced after; never over another file") {
     val d = tmpDir()
     val a = d.resolve("imu/x.parquet.tmp")
     val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
     writeFile(a, "tmp")
     val s = Synced()
-    assertEquals(moveWith(a, q, s), Some(q))
+    assertEquals(moveWith(a, q, s, at => assertEquals(s.record.get(a.toString), Some(q.toString), at)), Some(q))
     assert(!java.nio.file.Files.exists(a))
     assertEquals(java.nio.file.Files.readString(q), "tmp")
     assertEquals(s.files.toSeq, Seq(q.toString))
@@ -590,24 +597,42 @@ class CommitRepairSuite extends munit.FunSuite:
     assertEquals(moveWith(a, q, Synced()), Some(q1))
     assertEquals(java.nio.file.Files.readString(q), "tmp")
     assertEquals(java.nio.file.Files.readString(q1), "another")
-    // Nothing to move.
+    // Nothing to move, nothing recorded.
     assertEquals(moveWith(d.resolve("none"), d.resolve("q/none"), Synced()), None)
   }
 
-  test("safe move: cut short after the rename, the retry syncs the moved file and both directories") {
+  test("safe move: cut short right after a rename to `.1`, the retry finds that file by the record and syncs it") {
     val d = tmpDir()
     val a = d.resolve("imu/x.parquet.tmp")
     val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
+    val q1 = q.resolveSibling("x.parquet.tmp.1")
+    writeFile(q, "an earlier file")
     writeFile(a, "tmp")
     val first = Synced()
     intercept[Crash](moveWith(a, q, first, at => if at == "moved" then throw Crash()))
     assertEquals(first.files.toSeq, Nil)
-    val s = Synced()
-    assertEquals(moveWith(a, q, s), Some(q))
-    assert(!java.nio.file.Files.exists(a))
-    assertEquals(java.nio.file.Files.readString(q), "tmp")
-    assertEquals(s.files.toSeq, Seq(q.toString))
+    assertEquals(first.record.toMap, Map(a.toString -> q1.toString))
+    // The retry: the source gone, the recorded `.1` there (not `to`).
+    val s = first.fresh
+    assertEquals(moveWith(a, q, s), Some(q1))
+    assertEquals(java.nio.file.Files.readString(q1), "tmp")
+    assertEquals(java.nio.file.Files.readString(q), "an earlier file")
+    assertEquals(s.files.toSeq, Seq(q1.toString))
     assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString))
+  }
+
+  test("safe move: cut short after the name was recorded, before the rename: the retry moves to the recorded name") {
+    val d = tmpDir()
+    val a = d.resolve("imu/x.parquet.tmp")
+    val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
+    writeFile(a, "tmp")
+    val s = Synced()
+    s.record(a.toString) = q.resolveSibling("x.parquet.tmp.3").toString
+    assertEquals(moveWith(a, q, s), Some(q.resolveSibling("x.parquet.tmp.3")))
+    // A file took the recorded name meanwhile: another name, recorded again.
+    writeFile(a, "again")
+    assertEquals(moveWith(a, q, s), Some(q))
+    assertEquals(s.record(a.toString), q.toString)
   }
 
   test("a chunk archived again and cut short again: each repair moves to its own directory, the earlier copy kept") {
@@ -624,7 +649,9 @@ class CommitRepairSuite extends munit.FunSuite:
     assertEquals(java.nio.file.Files.readString(dir(first).resolve("imu/x.parquet.tmp")), "first")
     assertEquals(java.nio.file.Files.readString(dir(second).resolve("imu/x.parquet.tmp")), "second")
     // The tag and the files checked are kept with the record (0.21.0 reads past them).
-    val kept = second.copy(repairing = true, verified = Set("imu/x.parquet"))
+    val kept = second.copy(repairing = true, verified = Set("imu/x.parquet"),
+      moves = Map("imu/x.parquet.tmp" -> s"quarantine/${id(second)}-bbbb2222/imu/x.parquet.tmp.1"))
+    assertEquals(id(kept), id(i))
     assertEquals(CommitIntent.decode(CommitIntent.encode(kept)), Some(kept))
     assertEquals(OldDecoder.decode(CommitIntent.encode(kept)).map(_._2), Some("ids"))
   }

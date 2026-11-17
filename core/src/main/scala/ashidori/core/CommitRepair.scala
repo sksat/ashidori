@@ -172,7 +172,8 @@ object CommitRepair:
     */
   def id(i: CommitIntent): String =
     val crc = java.util.zip.CRC32()
-    val bare = i.copy(files = i.files.map(_.copy(check = None)), repairing = false, repairTag = "", verified = Set.empty)
+    val bare = i.copy(files = i.files.map(_.copy(check = None)), repairing = false, repairTag = "", verified = Set.empty,
+      moves = Map.empty)
     crc.update(CommitIntent.encode(bare).getBytes(java.nio.charset.StandardCharsets.UTF_8))
     f"${crc.getValue}%08x"
 
@@ -464,14 +465,19 @@ object RowBag:
   val Cap = 2_000_000
   final class TooLarge(cap: Int) extends RuntimeException(s"more than $cap rows to compare")
 
-/** A move that never replaces a file (rule A of [[CommitRepair]]): `from`
-  * is renamed to `to`, or to `to.1`, `to.2`, ... if a file is there (none
-  * is ever replaced), then the moved file, its directory and the source's
-  * directory are synced. Repeated after it was cut short (the rename done,
-  * not yet synced), it syncs the moved file and both directories again.
+/** A move that never replaces a file (rule A of [[CommitRepair]]), written
+  * ahead: `from` goes to `to`, or to `to.1`, `to.2`, ... if a file is
+  * there (none is ever replaced). The name chosen is recorded durably
+  * (`record`, in the commit record) before the rename; the moved file, its
+  * directory and the source's directory are synced after it.
+  *
+  * Repeated with what was recorded (`recorded`): the source gone and the
+  * recorded file there (cut short after the rename), the file and both
+  * directories are synced again; the source still there, it goes to the
+  * recorded name (or a new one, recorded, if a file took that name).
   * Hard links are not used: an app may not make them on Android.
   * `crash` marks the point after the rename (for tests). The file moved
-  * to, if there was anything.
+  * to, if there is one.
   */
 object SafeMove:
   import java.nio.file.{Files, LinkOption, Path}
@@ -482,23 +488,25 @@ object SafeMove:
   private def names(to: Path): Iterator[Path] =
     Iterator(to) ++ Iterator.from(1).map(n => to.resolveSibling(s"${to.getFileName}.$n"))
 
-  def move(from: Path, to: Path, ensureDir: Path => Unit, syncFile: Path => Unit, syncDir: Path => Unit,
-           crash: String => Unit = _ => ()): Option[Path] =
-    if exists(from) then
-      ensureDir(to.getParent)
-      val target = names(to).find(p => !exists(p)).get
-      // Without REPLACE_EXISTING: refused if a file appeared there meanwhile.
-      Files.move(from, target)
-      crash("moved")
+  def move(from: Path, to: Path, recorded: Option[Path], record: Path => Unit, ensureDir: Path => Unit,
+           syncFile: Path => Unit, syncDir: Path => Unit, crash: String => Unit = _ => ()): Option[Path] =
+    def synced(target: Path) =
       syncFile(target)
       syncDir(target.getParent)
       syncDir(from.getParent)
       Some(target)
-    else
-      // Moved before (perhaps not synced): sync what is there.
-      val moved = names(to).takeWhile(exists).toVector
-      moved.foreach(syncFile)
-      if moved.nonEmpty then
-        syncDir(to.getParent)
-        syncDir(from.getParent)
-      moved.lastOption
+    if exists(from) then
+      ensureDir(to.getParent)
+      val target = recorded.filterNot(exists).getOrElse {
+        val t = names(to).find(p => !exists(p)).get
+        record(t)
+        t
+      }
+      // Without REPLACE_EXISTING: refused if a file appeared there meanwhile.
+      Files.move(from, target)
+      crash("moved")
+      synced(target)
+    else recorded.filter(exists) match
+      // Moved before (perhaps not synced): sync it.
+      case Some(target) => synced(target)
+      case None         => None
