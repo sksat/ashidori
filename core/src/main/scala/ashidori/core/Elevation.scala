@@ -284,18 +284,28 @@ object Elevation:
       // Bridge variance of the random walk between two smoothed points.
       (a.x + (b.x - a.x) * f, a.p + (b.p - a.p) * f + q * (t - a.t) * (b.t - t) / (b.t - a.t) / 1000.0)
 
-/** Total and range of the elevation over a span. */
-final case class ElevationStats(ascentM: Double, descentM: Double, minM: Double, maxM: Double, startM: Double, endM: Double)
+/** Total and range of the elevation over a span. `gapMs`: time in it with
+  * no data (gaps over [[ElevationProfile.maxGapMs]]); ascent and descent
+  * do not count changes across them.
+  */
+final case class ElevationStats(ascentM: Double, descentM: Double, minM: Double, maxM: Double, startM: Double, endM: Double,
+                                gapMs: Long = 0L)
 
-/** The estimated elevation series of a day and what the timeline needs from it. */
-final case class ElevationProfile(points: Vector[Elevation.Point], source: Elevation.Source, hysteresisM: Double):
+/** The estimated elevation series of a day and what the timeline needs from
+  * it. Points further apart than `maxGapMs` have a gap between them: no
+  * data (the barometer's readings were not delivered, or there was no
+  * fix). Nothing is interpolated across a gap: [[at]] has no value in it,
+  * and a change across it is not ascent or descent.
+  */
+final case class ElevationProfile(points: Vector[Elevation.Point], source: Elevation.Source, hysteresisM: Double,
+                                  maxGapMs: Long = ElevationProfile.MaxGapMs):
   def isEmpty: Boolean = points.isEmpty
   /** The level is MSL (not only the changes). */
   def absolute: Boolean = source == Elevation.Source.Fused || source == Elevation.Source.Gnss
 
   private lazy val times: Array[Long] = points.map(_.time).toArray
 
-  /** Elevation at `t`, interpolated; None outside the series. */
+  /** Elevation at `t`, interpolated; None outside the series or in a gap. */
   def at(t: Long): Option[Double] =
     if points.isEmpty || t < points.head.time || t > points.last.time then None
     else
@@ -304,20 +314,45 @@ final case class ElevationProfile(points: Vector[Elevation.Point], source: Eleva
         case k =>
           val i = -k - 1
           val (a, b) = (points(i - 1), points(i))
-          Some(a.m + (b.m - a.m) * (t - a.time).toDouble / (b.time - a.time))
+          if b.time - a.time > maxGapMs then None
+          else Some(a.m + (b.m - a.m) * (t - a.time).toDouble / (b.time - a.time))
 
-  /** Values over [from, to], with the ends interpolated. */
-  private def span(from: Long, to: Long): Vector[Double] =
-    val inside = points.filter(p => p.time > from && p.time < to).map(_.m)
-    at(from).toVector ++ inside ++ at(to).toVector
+  /** Runs of values over [from, to] without a gap, with the ends
+    * interpolated where they are not in a gap; and the time in gaps.
+    */
+  private def runs(from: Long, to: Long): (Vector[Vector[Double]], Long) =
+    val inside = points.filter(p => p.time > from && p.time < to)
+    val withEnds = at(from).map(v => Elevation.Point(from, v, Double.NaN)).toVector ++ inside ++
+      at(to).map(v => Elevation.Point(to, v, Double.NaN)).toVector
+    val out = Vector.newBuilder[Vector[Double]]
+    var cur = Vector.newBuilder[Double]
+    var gap = 0L
+    var prev: Option[Long] = None
+    for p <- withEnds do
+      prev.foreach { t =>
+        if p.time - t > maxGapMs then
+          out += cur.result()
+          cur = Vector.newBuilder[Double]
+          gap += p.time - t
+      }
+      cur += p.m
+      prev = Some(p.time)
+    out += cur.result()
+    // Before the first point and after the last one in [from, to], when the ends are in a gap.
+    val lead = withEnds.headOption.fold(to - from)(p => p.time - from)
+    val tail = withEnds.lastOption.fold(0L)(p => to - p.time)
+    (out.result().filter(_.nonEmpty), gap + (if withEnds.isEmpty then lead else lead + tail))
 
-  /** Ascent and descent (changes under the hysteresis ignored), min and max over [from, to]. */
+  /** Ascent and descent (changes under the hysteresis ignored, none across
+    * a gap), min and max over [from, to].
+    */
   def stats(from: Long, to: Long): Option[ElevationStats] =
-    val vs = span(from, to)
-    if vs.isEmpty then None
+    val (rs, gap) = runs(from, to)
+    if rs.isEmpty then None
     else
-      val (up, down) = ElevationProfile.climb(vs, hysteresisM)
-      Some(ElevationStats(up, down, vs.min, vs.max, vs.head, vs.last))
+      val climbs = rs.map(ElevationProfile.climb(_, hysteresisM))
+      val vs = rs.flatten
+      Some(ElevationStats(climbs.map(_._1).sum, climbs.map(_._2).sum, vs.min, vs.max, rs.head.head, rs.last.last, gap))
 
   /** The whole series. */
   def total: Option[ElevationStats] =
@@ -337,6 +372,19 @@ final case class ElevationProfile(points: Vector[Elevation.Point], source: Eleva
     )
 
 object ElevationProfile:
+  /** Points further apart than this have a gap between them. Still, the
+    * stored pressure is at most 10 minutes apart (plus its 1-minute bucket).
+    */
+  val MaxGapMs: Long = 15 * 60_000L
+
+  /** Gaps in a series of sample times while the logger ran (`on`): the
+    * stretches over `minGapMs` with no sample, as (start, end).
+    */
+  def gaps(times: Seq[Long], on: Seq[(Long, Long)], minGapMs: Long = MaxGapMs): Seq[(Long, Long)] =
+    on.filter((a, b) => b > a).sortBy(_._1).flatMap { (a, b) =>
+      val ts = times.filter(t => t >= a && t < b).sorted
+      ((a +: ts) :+ b).sliding(2).collect { case Seq(x, y) if y - x > minGapMs => (x, y) }.toSeq
+    }
   final case class Day(total: Option[ElevationStats], legs: Vector[(Leg, Option[ElevationStats])], visits: Vector[(Visit, Option[Double])])
 
   /** Ascent and descent with a dead band: a change counts once the value has

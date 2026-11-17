@@ -185,14 +185,14 @@ class LoggerService extends Service:
       handler.removeCallbacksAndMessages(null)
       stopRecorder()
       energy.stop(System.currentTimeMillis())
-      pressure.stop()
       lm.removeUpdates(locationListener)
       if statusRegistered then lm.unregisterGnssStatusCallback(statusCallback)
       sm.unregisterListener(sensorListener)
       disarmSigMotion()
       accumulator.flush().foreach(pendingMotion += _)
       flush(force = true)
-      thread.quitSafely()
+      // The barometer's FIFO is flushed and kept before the thread ends.
+      pressure.stop(() => thread.quitSafely())
     }
     LoggerState.onMain {
       LoggerState.running = false

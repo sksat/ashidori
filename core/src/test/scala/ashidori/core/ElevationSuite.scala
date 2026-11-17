@@ -177,6 +177,29 @@ class ElevationSuite extends munit.FunSuite:
     assertEquals(ElevationProfile.climb(Seq(10.0, 5, 6, 4), 3), (0.0, 5.0))
   }
 
+  test("no interpolation across a gap: no value in it, no ascent from it") {
+    import Elevation.Point
+    val min = 60_000L
+    // Climbing 30 m in 5 minutes, a 40-minute gap, then 100 m higher and flat.
+    val before = (0 to 5).map(i => Point(T0 + i * min, 100.0 + 6 * i, 3))
+    val after = (45 to 50).map(i => Point(T0 + i * min, 230.0, 3))
+    val prof = ElevationProfile((before ++ after).toVector, Source.Fused, 3.0)
+    assertEquals(prof.at(T0 + 20 * min), None)
+    assertEquals(prof.at(T0 + 2 * min + 30_000L).map(_.round), Some(115L))
+    val s = prof.total.get
+    // The 30 m before the gap count; the 100 m jump across it does not.
+    assertEquals(s.ascentM, 30.0)
+    assertEquals(s.descentM, 0.0)
+    assertEquals(s.gapMs, 40 * min)
+    assertEquals((s.minM, s.maxM, s.startM, s.endM), (100.0, 230.0, 100.0, 230.0))
+    // A leg inside the gap has no statistics.
+    assertEquals(prof.stats(T0 + 10 * min, T0 + 30 * min), None)
+    // Gaps of the stored pressure while the logger ran: not the time it was off.
+    val ts = Seq(0L, 5L, 10L, 40L, 45L).map(T0 + _ * min)
+    assertEquals(ElevationProfile.gaps(ts, Seq((T0, T0 + 50 * min))), Seq((T0 + 10 * min, T0 + 40 * min)))
+    assertEquals(ElevationProfile.gaps(ts, Seq((T0, T0 + 12 * min), (T0 + 39 * min, T0 + 46 * min))), Nil)
+  }
+
   test("decimator: medians while moving, rare rows while still") {
     val d = PressureDecimator()
     val moving = (0 until 20).flatMap(i => d.add(i * 1000L, 1000f + (if i == 3 then 5f else 0f), moving = true)).toVector

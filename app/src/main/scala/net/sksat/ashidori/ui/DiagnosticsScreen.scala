@@ -47,6 +47,10 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val crashRow = row("異常終了（直近24時間）", "", "…")()
   private val pendingRow = row("保存待ち", "", "…")()
   private val kindRow = row("種類ごとの最後の保存", "", "")()
+  /** The barometer: what was received is saved (value); what was not
+    * received is missing (subtitle). Two facts, kept apart.
+    */
+  private val pressureRow = row("気圧", "", "…")()
   private val archiveRow = row("記録の整理", "", "…")()
   private val syncRow = row("自動同期", "", "…")(Some(() => resumeSync()))
   /** One line for the backup and maintenance below: progress, result or error. */
@@ -82,7 +86,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     scroll(
       vbox(
         sectionHeader("記録の保存"),
-        listGroup(savedRow, crashRow, pendingRow, kindRow, archiveRow, syncRow),
+        listGroup(savedRow, crashRow, pendingRow, kindRow, pressureRow, archiveRow, syncRow),
         repairCard,
         card(
           text("記録データ", 16f, bold = true),
@@ -164,7 +168,20 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val stuck = CommitStatus.stuck()
       val attention = Attention.all()
       val quarantined = Attention.quarantineBytes()
+      // Gaps of the stored pressure in the last day, while the logger ran.
+      val day = now - 86_400_000L
+      val gaps = Try {
+        val on = AshidoriApp.db.energyData(day, now)._2.map(s => (s.start, s.end))
+        ElevationProfile.gaps(AshidoriApp.db.pressure(day, now).map(_.time), on)
+      }.toOption
       act.runOnUiThread { () =>
+        val (_, saved, unsaved) = LoggerWrites.progress(Seq(WriteKind.Pressure)).head
+        pressureRow.setValue(unsaved.map(u => s"${fmtDuration(u)}前から未保存")
+          .orElse(saved.map(a => s"保存 ${fmtDuration(a)}前")).getOrElse("—"))
+        pressureRow.setSubtitle(gaps.fold("未受信: —") { g =>
+          if g.isEmpty then "未受信なし（直近24時間）"
+          else s"未受信 ${g.size} 回・計 ${fmtDuration(g.map((a, b) => b - a).sum)}（直近24時間）"
+        })
         savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
         val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
         savedRow.value.setTextColor(color(if stale then attr.error else attr.onSurfaceVariant))
