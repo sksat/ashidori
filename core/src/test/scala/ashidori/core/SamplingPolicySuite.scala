@@ -89,6 +89,27 @@ class SamplingPolicySuite extends munit.FunSuite:
     assertEquals(SamplingPolicy.plan(base.copy(motion = MotionState.Vehicle, now = 99_000_000L + 60_000)).source, LocationSource.Gnss)
   }
 
+  test("indoor state is a reason code, separate from its display label") {
+    val base = in(motion = MotionState.OnFoot).copy(environment = Environment.Indoor)
+    val indoor = SamplingPolicy.plan(base.copy(power = PowerState(80, charging = true, powerSave = false)))
+    assert(indoor.indoorProbing)
+    assert(indoor.reasons.contains(PlanReason.Indoor))
+    // The mode note leaves the indoor state out but keeps the other reasons.
+    assertEquals(indoor.modeReasons, List(PlanReason.Charging))
+    assertEquals(PlanReason.Indoor.label, "屋内")
+    // Outdoors, in 最高精度 or during a manual burst there is no indoor state.
+    assert(!SamplingPolicy.plan(in(motion = MotionState.OnFoot)).indoorProbing)
+    assert(!SamplingPolicy.plan(base.copy(mode = LoggingMode.Max)).indoorProbing)
+    val burst = SamplingPolicy.plan(base.copy(burstUntil = base.now + 60_000))
+    assert(!burst.indoorProbing)
+    assertEquals(burst.modeReasons, List(PlanReason.ManualBurst))
+    // Labels are display text only: each reason has its own.
+    val labels = List(PlanReason.Charging, PlanReason.BatteryCritical, PlanReason.PowerSave, PlanReason.BatteryLow15,
+      PlanReason.BatteryLow30, PlanReason.MaxCapped, PlanReason.ManualBurst, PlanReason.Indoor,
+      PlanReason.DrainOverBudget(3.0, 2.0)).map(_.label)
+    assertEquals(labels.distinct.size, labels.size)
+  }
+
   test("indoor detector needs sustained weak signals and recovers outdoors") {
     val d = IndoorDetector(enterIndoorMs = 30_000, exitIndoorMs = 10_000)
     def weak(t: Long) = GnssSnapshot(t, 8, 2, 18, 0)

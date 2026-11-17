@@ -116,8 +116,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     b.setMinHeight(dp(56))
     b.setTextSize(16f)
     b
-  private val stop =
-    val b = button("■  停止") {
+  /** The one way to stop recording: from the stop button here, or the
+    * notification's 停止 (which opens this screen), always with this
+    * confirmation, so a stray tap cannot end it.
+    */
+  def confirmStop(): Unit =
+    if LoggerState.running then
       com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
         .setTitle("記録を停止しますか")
         .setMessage("停止中の移動と滞在は記録されません。")
@@ -128,7 +132,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
           LoggerService.send(act, LoggerService.ActionStop)
         })
         .show()
-    }
+  private val stop =
+    val b = button("■  停止")(confirmStop())
     // A clear recorder red, same as the REC lamp.
     tint(b, 0xffe53935.toInt, android.graphics.Color.WHITE)
     b
@@ -238,7 +243,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     * longest mode's schedule.
     */
   private val detailSchedule = tabular(stableCaption(modes.map(schedule)))
-  private val burst = button("5分間 記録", tonal = true) {
+  private val burst = button(PositioningPanel.BurstLabel, tonal = true) {
     act.ensurePermissions { () =>
       Settings.burstUntil = System.currentTimeMillis() + LoggerService.BurstMs
       LoggerService.send(act, LoggerService.ActionBurst)

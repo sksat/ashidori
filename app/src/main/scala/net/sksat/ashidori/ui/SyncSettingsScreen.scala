@@ -169,8 +169,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     actions.clear()
     body.addView(
       card(
-        text("エンドツーエンド暗号化", 16f, bold = true),
-        caption("記録は端末で暗号化してから送ります。鍵はあなたの端末だけが持ち、サーバ（Cloudflare）からは中身を読めません。鍵をなくすとサーバ上のデータは復元できないため、復旧コードを必ず控えてください。")
+        text("🔒 記録を読める人", 16f, bold = true),
+        caption("記録を読めるのは自分の端末だけで、サーバの管理者は読めません。復旧コードをなくすと復元できません。")
       )
     )
     if !SyncConfig.paired then

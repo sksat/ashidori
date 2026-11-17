@@ -607,23 +607,28 @@ class LoggerService extends Service:
       .setContentIntent(open)
       .setOngoing(true)
       .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
-      .addAction(Notification.Action.Builder(null, "詳細ログ5分", pi(ActionBurst, 1)).build())
-      // No stop button here: recording is meant to run until stopped on
-      // purpose in the app (with a confirmation), so a stray tap can't end it.
-      .addAction(Notification.Action.Builder(null, "記録の設定", openLogger).build())
+      .addAction(Notification.Action.Builder(null, ui.PositioningPanel.BurstLabel, pi(ActionBurst, 1)).build())
+      .addAction(Notification.Action.Builder(null, "ステータス", openLogger(confirmStop = false)).build())
+      // 停止 opens the app's stop confirmation rather than stopping at once:
+      // recording is meant to run until stopped on purpose, so a stray tap
+      // on the notification can't end it.
+      .addAction(Notification.Action.Builder(null, "停止", openLogger(confirmStop = true)).build())
       .build()
 
-  private def openLogger: PendingIntent =
+  private def openLogger(confirmStop: Boolean): PendingIntent =
     PendingIntent.getActivity(
       this,
-      3,
-      Intent(this, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+      if confirmStop then 4 else 3,
+      Intent(this, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true)
+        .putExtra(MainActivity.ExtraConfirmStop, confirmStop).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
       PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
     )
 
   private def updateNotification(p: SamplingPlan): Unit =
     val nm = getSystemService(classOf[android.app.NotificationManager])
-    nm.notify(NotificationId, notification(s"${p.effectiveMode.label}・${estimator.current.label}・${p.describe}"))
+    // A status for people (「バランス・歩行・衛星・10 秒間隔」), not the log format of describe.
+    nm.notify(NotificationId,
+      notification(s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"))
 
 object LoggerService:
   val ActionStart = "net.sksat.ashidori.START"

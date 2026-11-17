@@ -275,6 +275,10 @@ class MainActivity extends AppCompatActivity:
     if intent.getBooleanExtra(MainActivity.ExtraOpenLogger, false) && Settings.onboarded then
       stack.clear()
       nav.setSelectedItemId(MainActivity.TabLogger)
+      // The notification's 停止: the same confirmation as the stop button.
+      if intent.getBooleanExtra(MainActivity.ExtraConfirmStop, false) then
+        intent.removeExtra(MainActivity.ExtraConfirmStop)
+        tabs.get(MainActivity.TabLogger).collect { case l: LoggerScreen => l }.foreach(_.confirmStop())
     if intent.getAction == Intent.ACTION_VIEW then
       Option(intent.getDataString).foreach { data =>
         if Settings.onboarded then openPairLink(data) else pendingLink = Some(data)
@@ -425,7 +429,7 @@ class MainActivity extends AppCompatActivity:
   override def onResume(): Unit =
     super.onResume()
     // Resume logging after an app update, a force stop, or a stop the
-    // background could not recover from (the "記録が止まっています"
+    // background could not recover from (the "記録停止"
     // notification leads here). On every resume, not only in onCreate: the
     // activity may have outlived the service.
     if Settings.onboarded && Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
@@ -473,6 +477,8 @@ class MainActivity extends AppCompatActivity:
 object MainActivity:
   /** Intent extra: open the recording screen (from the notification). */
   val ExtraOpenLogger = "ashidori.openLogger"
+  /** With [[ExtraOpenLogger]]: ask to stop recording (the notification's 停止). */
+  val ExtraConfirmStop = "ashidori.confirmStop"
   /** From an alert notification: 設定 › 端末診断. */
   val ExtraOpenDiagnostics = "ashidori.openDiagnostics"
   val TabTimeline = 1

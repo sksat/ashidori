@@ -150,10 +150,11 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     showMode(mode)
     add(sectionHeader("記録"), listGroup(mode))
 
+    // A positive switch, inverted over the stored setting (whose meaning stays: true = do not send).
     add(sectionHeader("プライバシー"), listGroup(
-      switchRow("位置情報を外部サービスに送らない", Settings.blockExternalLocation,
-        "地図・地名", onInfo = Some(() => showPrivacyInfo())) { b =>
-        Settings.blockExternalLocation = b
+      switchRow(PrivacySwitch, ashidori.core.SendGate.switchOn(Settings.blockExternalLocation),
+        "表示範囲・位置を配信元に送信", onInfo = Some(() => showPrivacyInfo())) { on =>
+        Settings.blockExternalLocation = ashidori.core.SendGate.blockFor(on)
         TrackMap.privacyChanged(act)
       }))
 

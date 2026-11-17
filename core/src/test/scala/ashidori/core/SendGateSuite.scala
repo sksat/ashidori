@@ -206,3 +206,20 @@ class SendGateSuite extends munit.FunSuite:
     assertEquals(ok, Right("mirror1"))
     assert(SendGate.firstSuccess(Seq("main"), () => true)(_ => throw RuntimeException("x")).left.exists(_.isInstanceOf[SendGate.Failed]))
   }
+
+  test("the positive settings switch is the stored block setting inverted, with the same behaviour") {
+    // The default (stored block = true: nothing sent) shows the switch off.
+    assert(!SendGate.switchOn(block = true))
+    assert(SendGate.switchOn(block = false))
+    for b <- Seq(true, false) do assertEquals(SendGate.blockFor(SendGate.switchOn(b)), b)
+    // Turning the switch on stores block = false: automatic work may send.
+    val stored = scala.collection.mutable.ArrayBuffer.empty[Boolean]
+    val g = SendGate(initialBlock = true, persist = (b, _) => stored += b)
+    assert(!g.automatic(g.ticket()))
+    g.setBlock(SendGate.blockFor(switchOn = true))
+    assert(!g.block && g.automatic(g.ticket()))
+    // Off again stores block = true: nothing automatic is sent.
+    g.setBlock(SendGate.blockFor(switchOn = false))
+    assert(g.block && !g.automatic(g.ticket()))
+    assertEquals(stored.toSeq, Seq(false, true))
+  }

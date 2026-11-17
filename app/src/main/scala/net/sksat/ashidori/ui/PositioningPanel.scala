@@ -68,7 +68,7 @@ final class PositioningPanel(act: MainActivity):
   private val constellations = vbox(constellationChips.grouped(2).map(cs => hbox(cs*)).toSeq*)
   private val sky = SkyPlotView(act)
   private val bars = Cn0BarsView(act)
-  private val wake = button("5分間 衛星で測位", tonal = true) {
+  private val wake = button(PositioningPanel.BurstLabel, tonal = true) {
     act.ensurePermissions { () =>
       Settings.burstUntil = System.currentTimeMillis() + LoggerService.BurstMs
       LoggerService.send(act, LoggerService.ActionBurst)
@@ -267,6 +267,9 @@ object PositioningPanel:
   /** History range: false = 1時間, true = 24時間. Kept while the app runs. */
   var day = false
 
+  /** The one label of the 5-minute burst (1 Hz satellites + raw data), wherever it starts. */
+  val BurstLabel = "5分間 生データを記録"
+
   private def every(ms: Long): String =
     if ms < 60_000 then s"${(ms / 1000.0).toString.stripSuffix(".0")} 秒間隔" else s"${ms / 60_000} 分間隔"
 
@@ -283,13 +286,13 @@ object PositioningPanel:
     * new plan arrives).
     */
   def modeNote(p: SamplingPlan, chosen: LoggingMode): Option[String] =
-    val other = p.reasons.filterNot(_ == "屋内")
+    val other = p.modeReasons.map(_.label)
     if other.isEmpty then None
     else if p.effectiveMode != chosen then Some(s"「${p.effectiveMode.label}」で動作中: ${other.mkString("・")}")
     else Some(other.mkString("・"))
 
   /** A typical mode note, for the height its line keeps when empty. */
-  val ModeNoteSample: String = "「バランス」で動作中: 充電中のため1段階上げ"
+  val ModeNoteSample: String = s"「バランス」で動作中: ${PlanReason.Charging.label}"
 
   private def indoorText(gnss: Boolean): String =
     if gnss then "屋外判定のため衛星で測位中"
@@ -302,7 +305,7 @@ object PositioningPanel:
 
   /** Second part: how positions are checked while indoors. */
   def indoorNote(p: SamplingPlan): Option[String] =
-    if p.reasons.contains("屋内") then Some(indoorText(p.source == LocationSource.Gnss)) else None
+    if p.indoorProbing then Some(indoorText(p.source == LocationSource.Gnss)) else None
 
   /** Every form the indoor note takes, for the room it keeps. */
   def indoorNoteVariants: Seq[String] = Seq(indoorText(true), indoorText(false))

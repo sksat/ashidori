@@ -224,6 +224,15 @@ object MapConsents:
       case _ => (true, Map.empty)
 
 object SendGate:
+  /** The settings switch is the positive 「オンライン地図と地名検索」 (on = use
+    * them), shown inverted over the stored `block` (key
+    * "blockExternalLocation", true = do not send), whose meaning and default
+    * stay as they were. Only the switch maps on/off.
+    */
+  def switchOn(block: Boolean): Boolean = !block
+  /** The `block` value a position of the switch stores. */
+  def blockFor(switchOn: Boolean): Boolean = !switchOn
+
   /** Tries `attempt` on each of `targets` in order until one succeeds.
     * `allowed` is checked right before each try: once it is false, nothing
     * more is tried and the result is [[Blocked]].

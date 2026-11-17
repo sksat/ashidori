@@ -51,6 +51,25 @@ final case class PolicyInput(
     motionSince: Long = 0L
 )
 
+/** Why a plan differs from the user's mode as chosen. The logic matches on
+  * the case; `label` is only for display.
+  */
+enum PlanReason:
+  case Charging, BatteryCritical, PowerSave, BatteryLow15, BatteryLow30, MaxCapped, ManualBurst, Indoor
+  /** measured screen-off drain over the mode's budget, both %/h */
+  case DrainOverBudget(drainPctPerHour: Double, budgetPctPerHour: Double)
+
+  def label: String = this match
+    case Charging        => "充電中のため精度を1段階向上"
+    case BatteryCritical => "電池残量わずか"
+    case PowerSave       => "省電力モード"
+    case BatteryLow15    => "電池残量15%以下"
+    case BatteryLow30    => "電池残量30%以下"
+    case MaxCapped       => "電池残量15%以下のため高精度に変更"
+    case ManualBurst     => "生データを手動で記録中"
+    case Indoor          => "屋内"
+    case DrainOverBudget(d, b) => f"電池消費 $d%.1f%%/時が目安（$b%.1f%%/時）を超過"
+
 final case class SamplingPlan(
     effectiveMode: LoggingMode,
     source: LocationSource,
@@ -64,10 +83,19 @@ final case class SamplingPlan(
     accelHz: Int,
     /** sensor FIFO batching latency */
     accelBatchMs: Long,
-    reasons: List[String],
+    reasons: List[PlanReason],
     /** re-plan after this many ms (a GNSS probe starts or ends); 0 = no deadline */
     replanInMs: Long = 0L
 ):
+  /** Indoors: Wi-Fi/cell positioning with short GNSS probes. */
+  def indoorProbing: Boolean = reasons.contains(PlanReason.Indoor)
+
+  /** Why the effective mode or interval differs from the chosen mode, for
+    * display; the indoor state is shown separately.
+    */
+  def modeReasons: List[PlanReason] = reasons.filterNot(_ == PlanReason.Indoor)
+
+  /** Log format (developer-facing, also stored with battery samples). */
   def describe: String =
     val src = source match
       case LocationSource.Passive => "GNSS停止"
@@ -114,7 +142,7 @@ object SamplingPolicy:
   )
 
   def plan(in: PolicyInput): SamplingPlan =
-    val reasons = List.newBuilder[String]
+    val reasons = List.newBuilder[PlanReason]
     val p = in.power
 
     // 1. Adjust the user's mode for the power situation.
@@ -122,20 +150,20 @@ object SamplingPolicy:
     if p.charging then
       if level < LoggingMode.Precise.level then
         level += 1
-        reasons += "充電中のため1段階上げ"
+        reasons += PlanReason.Charging
     else if p.batteryPct <= 5 then
       level = 0
-      reasons += "電池残量わずか"
+      reasons += PlanReason.BatteryCritical
     else if in.mode != LoggingMode.Max then
       if p.batteryPct <= 15 || p.powerSave then
         level = 0
-        reasons += (if p.powerSave then "省電力モード" else "電池残量15%以下")
+        reasons += (if p.powerSave then PlanReason.PowerSave else PlanReason.BatteryLow15)
       else if p.batteryPct <= 30 && level > 0 then
         level -= 1
-        reasons += "電池残量30%以下"
+        reasons += PlanReason.BatteryLow30
     else if p.batteryPct <= 15 then
       level = LoggingMode.Precise.level
-      reasons += "全力ログ中だが電池残量15%以下のため高精度に"
+      reasons += PlanReason.MaxCapped
     val mode = LoggingMode.ofLevel(level)
     val prof = profiles(mode)
 
@@ -144,11 +172,11 @@ object SamplingPolicy:
     val throttle =
       if p.charging || drain.isNaN || drain <= prof.drainBudget * 1.25 then 1.0
       else
-        reasons += f"消費 $drain%.1f%%/h が目安 ${prof.drainBudget}%.1f%%/h 超"
+        reasons += PlanReason.DrainOverBudget(drain, prof.drainBudget)
         math.min(4.0, drain / prof.drainBudget)
 
     val burst = in.now < in.burstUntil
-    if burst then reasons += "手動の詳細ログ中"
+    if burst then reasons += PlanReason.ManualBurst
 
     // 3. Location source and interval from the motion state.
     // Indoors (and not riding something) GNSS mostly burns power for no fix:
@@ -162,7 +190,7 @@ object SamplingPolicy:
     val phase = math.floorMod(in.now - in.motionSince, probeEvery)
     val probing = phase < IndoorProbeMs
     val probeApplies = (indoorWalk || indoorStill) && mode != LoggingMode.Max && !burst
-    if probeApplies then reasons += "屋内"
+    if probeApplies then reasons += PlanReason.Indoor
     val (source, baseInterval) =
       if mode == LoggingMode.Max || burst then (LocationSource.Gnss, 1_000L)
       else if indoorStill && probing then (LocationSource.Gnss, 1_000L)
