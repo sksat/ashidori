@@ -1,44 +1,30 @@
 package net.sksat.ashidori.ui
 
-import android.content.Context
-import android.graphics.{Canvas, Paint}
 import android.os.Bundle
 import android.view.{GestureDetector, Gravity, MotionEvent, View, ViewGroup}
-import android.widget.{FrameLayout, LinearLayout}
+import android.widget.LinearLayout
+import com.google.android.material.bottomsheet.{BottomSheetBehavior, BottomSheetDragHandleView}
 import com.google.android.material.datepicker.{CalendarConstraints, DateValidatorPointBackward, MaterialDatePicker}
 import java.time.{Instant, LocalDate, ZoneOffset}
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 import net.sksat.ashidori.*
 import ashidori.core.*
 import Ui.*
 
-/** Vertical rail connecting timeline entries: a dot for visits, a line for trips. */
-final class RailView(c: Context, val visit: Boolean, col: Int, top: Boolean, bottom: Boolean) extends View(c):
-  private given Context = c
-  private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-  setLayoutParams(LinearLayout.LayoutParams(Ui.dp(28), ViewGroup.LayoutParams.MATCH_PARENT))
-  override def onDraw(canvas: Canvas): Unit =
-    val cx = getWidth / 2f
-    p.setColor(col)
-    p.setStrokeWidth(Ui.dp(if visit then 2 else 4).toFloat)
-    val cy = Ui.dp(22).toFloat
-    if top then canvas.drawLine(cx, 0, cx, cy, p)
-    if bottom then canvas.drawLine(cx, cy, cx, getHeight.toFloat, p)
-    if visit then
-      p.setStyle(Paint.Style.FILL)
-      canvas.drawCircle(cx, cy, Ui.dp(7).toFloat, p)
-      p.setColor(Ui.color(Ui.attr.surface))
-      canvas.drawCircle(cx, cy, Ui.dp(3).toFloat, p)
-
-/** Day view: map of the day on top, the day's visits and trips below.
-  * Swipe left/right or use the arrows to change day; tap the date for a calendar.
+/** The map with a bottom sheet over it, like Google Maps.
+  *
+  * The map tab (day): the sheet has three heights. Lowered, it shows the date
+  * (「‹ 11月17日（月） ▾ ›」: the arrows move a day, the date opens a calendar)
+  * and one line of totals per mode; half and full, the day's stays and trips
+  * on a rail ([[DayRows]]), the map kept above. Tapping an item draws it
+  * thicker on the map and fits the camera to it. A small link at the end
+  * opens the day on the タイムライン tab.
+  *
+  * Week / month / year (pushed from the feed): the period's map and its
+  * summary ([[PeriodView]]).
   */
 final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = Seq(Span.Day)) extends Screen:
   private given Ctx = act
   override def title: String = s"${span.period}の記録"
-  private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
-  private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
 
   /** The map tab (day) and the period view are separate map surfaces: an
@@ -55,13 +41,15 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private def anchor: LocalDate = if spans.size > 1 then ownAnchor else act.selectedDate
   private def anchor_=(d: LocalDate): Unit = if spans.size > 1 then ownAnchor = d else act.selectedDate = d
 
+  // --- the period sheet (week / month / year) -------------------------------------------
+
   private val dateLabel = oneLine(text("", 18f, bold = true))
   private val summary = hbox()
   private val list = vbox()
-  // Until the day has loaded, the totals' room is already taken ("—").
+  // Until the period has loaded, the totals' room is already taken ("—").
   summary.addView(stat("—", "移動距離"))
   summary.addView(stat("—", "歩数"))
-  summary.addView(stat("—", "滞在"))
+  summary.addView(stat("—", "場所"))
   padded(summary, 8, 8)
 
   private def arrow(label: String)(f: => Unit) =
@@ -71,7 +59,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     b
 
   private val chipsId = View.generateViewId()
-  private val header =
+  private lazy val periodHeader =
     val prev = arrow("◀")(shift(-1))
     val next = arrow("▶")(shift(1))
     prev.setContentDescription("前へ")
@@ -80,7 +68,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     dateLabel.setLayoutParams(weighted())
     dateLabel.setMinHeight(dp(48))
     dateLabel.setContentDescription("日付を選択")
-    dateLabel.setOnClickListener(_ => pickDate())
+    dateLabel.setOnClickListener(_ => pickPeriodDate())
     val chips = com.google.android.material.chip.ChipGroup(act)
     chips.setId(chipsId)
     chips.setSingleSelection(true)
@@ -92,63 +80,84 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       c.setChecked(sp == span)
       c.setOnCheckedChangeListener((_, on) => if on && span != sp then { span = sp; act.updateTitle(); load() })
       chips.addView(c)
-    if spans.size > 1 then vbox(padded(chips, 16, 0), padded(hbox(prev, dateLabel, next), 12, 0))
-    else padded(hbox(prev, dateLabel, next), 12, 0)
+    vbox(padded(chips, 16, 0), padded(hbox(prev, dateLabel, next), 12, 0))
 
-  /** The day's list lives in a bottom sheet over a full-height map, like
-    * Google Maps: drag it down to see more map, up to read the list.
-    */
+  // --- the day sheet (map tab) --------------------------------------------------------------
+
+  private lazy val dateHeader = DayParts.DateHeader(act, shift, () => pickDay())
+  private lazy val daySummary = DayParts.SummaryRow(act)
+  private val dayList = vbox()
+  /** To the same day on the タイムライン tab: small, at the end of the list. */
+  private lazy val openLink =
+    val t = text("タイムラインで開く ›", 14f, colorAttr = attr.primary)
+    t.setGravity(Gravity.CENTER_VERTICAL | Gravity.END)
+    t.setMinHeight(dp(48))
+    t.setPadding(dp(16), 0, dp(20), 0)
+    ripple(t)
+    a11yRole(t, classOf[android.widget.Button])
+    t.setOnClickListener(_ => current.foreach(tl => act.openTimeline(tl.date)))
+    t
+
   private val scroller =
     val s = androidx.core.widget.NestedScrollView(act)
-    s.addView(vbox(summary, list, spacer(if spans == Seq(Span.Day) then 12 else 96)))
+    if dayOnly then s.addView(vbox(dayList, openLink, spacer(24)))
+    else s.addView(vbox(summary, list, spacer(96)))
+    s.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
     s
+
+  private val handle =
+    if dayOnly then BottomSheetDragHandleView(act)
+    else
+      val h = View(act)
+      val d = android.graphics.drawable.GradientDrawable()
+      d.setCornerRadius(dp(2).toFloat)
+      d.setColor(color(attr.outlineVariant))
+      h.setBackground(d)
+      val hlp = LinearLayout.LayoutParams(dp(32), dp(4))
+      hlp.gravity = Gravity.CENTER_HORIZONTAL
+      hlp.setMargins(0, dp(10), 0, dp(6))
+      h.setLayoutParams(hlp)
+      h
+
   private val sheet =
-    val handle = View(act)
-    val d = android.graphics.drawable.GradientDrawable()
-    d.setCornerRadius(dp(2).toFloat)
-    d.setColor(color(attr.outlineVariant))
-    handle.setBackground(d)
-    val hlp = LinearLayout.LayoutParams(dp(32), dp(4))
-    hlp.gravity = Gravity.CENTER_HORIZONTAL
-    hlp.setMargins(0, dp(10), 0, dp(6))
-    handle.setLayoutParams(hlp)
     val bg = android.graphics.drawable.GradientDrawable()
     bg.setCornerRadii(Array(dp(24), dp(24), dp(24), dp(24), 0, 0, 0, 0).map(_.toFloat))
     bg.setColor(color(attr.surface))
-    val v = vbox(handle, header, scroller)
+    val v = if dayOnly then vbox(handle, dateHeader, daySummary, scroller) else vbox(handle, periodHeader, scroller)
     v.setBackground(bg)
     v.setElevation(dp(6).toFloat)
-    scroller.setLayoutParams(
-      if spans == Seq(Span.Day) then matchWrap
-      else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
     v
-  private val behavior = com.google.android.material.bottomsheet.BottomSheetBehavior[LinearLayout]()
+  private val behavior = BottomSheetBehavior[LinearLayout]()
 
   val view: View =
     val coord = androidx.coordinatorlayout.widget.CoordinatorLayout(act)
     coord.addView(map.view, androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-    val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-      if dayOnly then ViewGroup.LayoutParams.WRAP_CONTENT else ViewGroup.LayoutParams.MATCH_PARENT)
+    val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
     slp.setBehavior(behavior)
     coord.addView(sheet, slp)
     behavior.setHideable(false)
+    behavior.setFitToContents(false)
+    behavior.setHalfExpandedRatio(0.5f)
+    behavior.setPeekHeight(dp(150))
     if dayOnly then
-      // Day: a short sheet (date, totals, link to the timeline) under a full map.
-      behavior.setFitToContents(true)
-      behavior.setPeekHeight(dp(150))
-      behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED)
+      // Three heights: the totals, half, and nearly all (a strip of the map
+      // stays above). Lowered at first: the map leads.
+      behavior.setExpandedOffset(dp(72))
+      behavior.setState(BottomSheetBehavior.STATE_COLLAPSED)
+      // Lowered, the sheet shows the date and the totals, and a sliver of
+      // the list below them says there is more.
+      sheet.addOnLayoutChangeListener((_, _, _, _, _, _, _, _, _) =>
+        val peek = handle.getHeight + dateHeader.getHeight + daySummary.getHeight + dp(20)
+        if handle.getHeight > 0 && peek != behavior.getPeekHeight then behavior.setPeekHeight(peek))
     else
-      behavior.setFitToContents(false)
-      behavior.setHalfExpandedRatio(0.5f)
       // Lowered sheet still shows the span chips and the date row.
-      behavior.setPeekHeight(dp(150))
-      behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_HALF_EXPANDED)
+      behavior.setState(BottomSheetBehavior.STATE_HALF_EXPANDED)
     coord.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-    // Fit the day's route into the part of the map the sheet does not cover.
+    // Fit the route into the part of the map the sheet does not cover.
     coord.addOnLayoutChangeListener((_, _, top, _, bottom, _, _, _, _) =>
-      map.bottomInset = if dayOnly then math.max(0, bottom - top - sheet.getTop) else ((bottom - top) * 0.5).toInt
+      map.bottomInset = math.max(0, bottom - top - sheet.getTop)
       liftFab())
-    behavior.addBottomSheetCallback(new com.google.android.material.bottomsheet.BottomSheetBehavior.BottomSheetCallback:
+    behavior.addBottomSheetCallback(new BottomSheetBehavior.BottomSheetCallback:
       override def onStateChanged(v: View, state: Int): Unit =
         map.bottomInset = math.max(0, coord.getHeight - v.getTop)
         liftFab()
@@ -157,25 +166,43 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     installSwipe()
     coord
 
-  /** Lower the sheet so the map shows what was just tapped. */
-  private def revealMap(): Unit =
-    behavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_COLLAPSED)
+  /** The selected item of the day, on the map: its line thicker, or a ring at
+    * the stay, with the camera fitted to it. A sheet raised to full height
+    * comes down to half so the map shows it.
+    */
+  private def showOnMap(item: Option[DayItem]): Unit = item match
+    case None => map.clearHighlight()
+    case Some(it) =>
+      if behavior.getState == BottomSheetBehavior.STATE_EXPANDED then
+        behavior.setState(BottomSheetBehavior.STATE_HALF_EXPANDED)
+        map.bottomInset = (view.getHeight * 0.5).toInt
+        // Keep the tapped item (and its actions) in the lowered sheet's sight.
+        rows.viewOf(it.key).foreach(v => scroller.postDelayed(() => scroller.smoothScrollTo(0, math.max(0, v.getTop - dp(8))), 300))
+      it match
+        case DayItem.Stay(v) => map.highlightPlace(v.latLng)
+        case other           => other.path.filter(_.points.size >= 2).foreach(p => map.highlight(p))
 
-  private lazy val rows = DayRows(act, _ => load())
+  private lazy val rows = DayRows(act, _ => load(), showOnMap)
   private val dayMarkerClick: (String, String) => Unit = (layer, key) =>
     if layer == "visit" then
       current.foreach { tl =>
-        tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).foreach(rows.openVisit(_, tl))
+        tl.segments.collect { case v: Visit => v }.find(_.start.toString == key).flatMap(v => v.placeId.flatMap(tl.places.get).map(v -> _))
+          .foreach((v, p) => PlaceSheet(act, p, Some(v), () => { TimelineRepo.invalidate(); load() }, Some(d => act.openDay(d))).show())
       }
   map.onMarkerClick = dayMarkerClick
 
   private var unobserve: () => Unit = () => ()
   private var lastLive = 0L
 
-  /** While today's day view is open, redraw as new fixes arrive (≤ every 20 s). */
-  /** The check-in button rides on the top edge of the sheet, over the map. */
+  /** The check-in button rides on the top edge of the sheet, over the map;
+    * with the sheet raised past half it steps aside for the list.
+    */
   private def liftFab(): Unit =
-    if dayOnly && view.getHeight > 0 then act.setFabLift(math.max(0, view.getHeight - sheet.getTop))
+    if dayOnly && view.getHeight > 0 && sheet.getTop > 0 then
+      val covered = view.getHeight - sheet.getTop
+      val half = (view.getHeight * 0.5).toInt
+      act.setFabLift(math.max(0, math.min(covered, half)))
+      act.setCheckInVisible(span == Span.Day && covered <= half + dp(8))
 
   override def onShow(): Unit =
     map.onScreen()
@@ -190,6 +217,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
           }
     load()
     unobserve()
+    // While today's day view is open, redraw as new fixes arrive (≤ every 20 s).
     unobserve = LoggerState.observe { () =>
       updateLiveTail()
       val now = System.currentTimeMillis()
@@ -237,7 +265,19 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       anchor = if d.isAfter(today) then today else d
       load()
 
-  private def pickDate(): Unit =
+  /** The calendar: dots on days with a record, grey where only part of the day was. */
+  private def pickDay(): Unit =
+    val zone = AshidoriApp.zone
+    def status(d: LocalDate): DayParts.Recorded =
+      val tl = TimelineRepo.day(d)
+      if tl.segments.isEmpty then DayParts.Recorded.None
+      else
+        val from = d.atStartOfDay(zone).toInstant.toEpochMilli
+        val to = math.min(d.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli, System.currentTimeMillis())
+        if Stats.partial(tl.segments, from, to) then DayParts.Recorded.Partial else DayParts.Recorded.Full
+    DayParts.Calendar(act, anchor, AshidoriApp.db.firstDataDateCached, status, d => { anchor = d; load() }).show()
+
+  private def pickPeriodDate(): Unit =
     val picker = MaterialDatePicker.Builder.datePicker()
       .setTitleText("日付を選択")
       .setSelection(anchor.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
@@ -265,27 +305,32 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     load()
 
   private def syncChips(): Unit =
-    val g = header.findViewById[com.google.android.material.chip.ChipGroup](chipsId)
-    for i <- 0 until g.getChildCount do
-      val c = g.getChildAt(i).asInstanceOf[com.google.android.material.chip.Chip]
-      c.setChecked(c.getText.toString == span.label)
+    if !dayOnly then
+      val g = periodHeader.findViewById[com.google.android.material.chip.ChipGroup](chipsId)
+      for i <- 0 until g.getChildCount do
+        val c = g.getChildAt(i).asInstanceOf[com.google.android.material.chip.Chip]
+        c.setChecked(c.getText.toString == span.label)
 
   def load(): Unit =
     val date = anchor
     val today = LocalDate.now(AshidoriApp.zone)
-    dateLabel.setText(span.title(date, today))
-    act.setCheckInVisible(span == Span.Day)
+    if span == Span.Day then { act.setCheckInVisible(true); liftFab() } else act.setCheckInVisible(false)
     if span != Span.Day then
+      dateLabel.setText(span.title(date, today))
       current = None
       period.load(span, date)
       return
+    dateHeader.show(date, today)
+    if !current.exists(_.date == date) then
+      // Another day: its own totals and list, nothing selected.
+      rows.clearSelection()
+      map.clearHighlight()
+      daySummary.clear()
     map.onMarkerClick = dayMarkerClick
     AshidoriApp.io.execute { () =>
       val tl = TimelineRepo.day(date)
       act.runOnUiThread(() => if anchor == date then render(tl))
     }
-
-  private def time(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
 
   private def stat(value: String, label: String): View =
     val v = vbox(tabular(oneLine(text(value, 20f, bold = true))), caption(label))
@@ -304,46 +349,34 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     updateLiveTail()
     fittedDate = Some(tl.date)
     current = Some(tl)
-    summary.removeAllViews()
-    summary.addView(stat(fmtDistance(tl.summary.totalDistanceM), "移動距離"))
-    summary.addView(stat(f"${tl.summary.steps}%,d", "歩数"))
-    summary.addView(stat(tl.summary.visits.toString, "滞在"))
-    padded(summary, 8, 8)
+    daySummary.show(tl.summary)
 
-    val trips = tl.segments.collect { case t: Trip => t }
+    val items = DayItem.of(tl)
     map.setData(
-      // One line per leg, colored by transport mode.
-      trips.flatMap(t => t.legs.filter(_.mode != TransportMode.Still).map { l =>
-        MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), 4), l.mode.color, l.isUncertain)
-      }),
+      // One line per leg, colored by transport mode; grey dots where there is no record.
+      items.flatMap(_.path).filter(_.points.size >= 2),
       tl.segments.collect { case v: Visit => MapMarker(v.latLng, v.start.toString) },
       tl.checkIns.map(c => MapMarker(LatLng(c.lat, c.lon), c.id.toString, c.venueName)),
       fit
     )
+    // The selection survives a refresh (today, after an edit) while its item is there.
+    rows.selection.flatMap(k => items.find(_.key == k)) match
+      case Some(it) => if !fit then showSelected(it)
+      case None     => rows.clearSelection()
 
-    // The day's stays and trips are read on the timeline; here the map leads.
-    // One row of one height for every day, with or without records, so the
-    // sheet (and the map's free area) keeps its size while paging days.
-    list.removeAllViews()
-    val slot =
-      if tl.segments.isEmpty then emptyState(tl.date)
-      else outlined("この日のタイムライン")(act.openTimeline(tl.date))
-    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
-    lp.setMargins(dp(16), 0, dp(16), dp(4))
-    slot.setLayoutParams(lp)
-    list.addView(slot)
+    dayList.removeAllViews()
+    if items.isEmpty then
+      dayList.addView(DayParts.emptyDay(act, tl.date))
+      openLink.setVisibility(View.GONE)
+    else
+      rows.rows(tl).foreach(dayList.addView)
+      openLink.setVisibility(View.VISIBLE)
 
-  private def emptyState(date: LocalDate): View =
-    // Today tells the recorder's state; a past day only that nothing was recorded.
-    val today = date == LocalDate.now(AshidoriApp.zone)
-    val label = oneLine(text(
-      if !today then "記録なし"
-      else if LoggerState.running then "記録中・データなし"
-      else "記録停止中", 16f, bold = true))
-    label.setLayoutParams(weighted())
-    val row = hbox(label)
-    if today && !LoggerState.running then row.addView(button("▶  記録を開始")(act.startLogging()))
-    row
+  /** Redraws the selected item's highlight (the day's data was replaced). */
+  private def showSelected(it: DayItem): Unit = it match
+    // Keep the camera: only the highlight is drawn again.
+    case DayItem.Stay(v) => map.highlightPlace(v.latLng, fit = false)
+    case other           => other.path.filter(_.points.size >= 2).foreach(map.highlight(_, fit = false))
 
   /** Camera and shown day, for a recreated activity (the day tab only). */
   def saveState(out: Bundle): Unit =

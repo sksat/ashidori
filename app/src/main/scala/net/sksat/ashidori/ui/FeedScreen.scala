@@ -18,7 +18,8 @@ import Ui.*
   * and works offline. With [[grid]] it is drawn on a faint square grid:
   * the picture stands for a map that is missing, not one still loading.
   */
-final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Seq[LatLng]) extends View(c):
+final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Seq[LatLng],
+                            gaps: Seq[(LatLng, LatLng)] = Nil) extends View(c):
   private var gridOn = false
   def grid: Boolean = gridOn
   def grid_=(on: Boolean): Unit =
@@ -33,6 +34,13 @@ final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Se
   line.setStrokeCap(Paint.Cap.ROUND)
   line.setStrokeJoin(Paint.Join.ROUND)
   private val dot = Paint(Paint.ANTI_ALIAS_FLAG)
+  /** 記録なし: grey dots between where the record stopped and resumed. */
+  private val gapLine = Paint(Paint.ANTI_ALIAS_FLAG)
+  gapLine.setStyle(Paint.Style.STROKE)
+  gapLine.setStrokeWidth(Ui.dp(3).toFloat)
+  gapLine.setStrokeCap(Paint.Cap.ROUND)
+  gapLine.setColor(android.graphics.Color.parseColor(Palette.Unrecorded))
+  gapLine.setPathEffect(android.graphics.DashPathEffect(Array(0.1f, Ui.dp(7).toFloat), 0))
   private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
   bg.setColor(Ui.color(Ui.attr.surfaceContainerHigh))
 
@@ -42,7 +50,7 @@ final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Se
     val r = Ui.dp(12).toFloat
     canvas.drawRoundRect(RectF(0, 0, w, h), r, r, bg)
     if gridOn then MapGrid.draw(canvas, w, h, gridPaint)
-    val pts = legs.flatMap(_._1) ++ stays
+    val pts = legs.flatMap(_._1) ++ stays ++ gaps.flatMap((a, b) => Seq(a, b))
     if pts.isEmpty then return
     // Equirectangular projection around the day's mean latitude.
     val k = math.cos(math.toRadians(pts.map(_.lat).sum / pts.size))
@@ -66,6 +74,10 @@ final class RouteSketchView(c: Context, legs: Seq[(Seq[LatLng], Int)], stays: Se
       }
       line.setColor(col)
       canvas.drawPath(path, line)
+    for (a, b) <- gaps do
+      val (ax, ay) = px(a)
+      val (bx, by) = px(b)
+      canvas.drawLine(ax, ay, bx, by, gapLine)
     for s <- stays do
       val (x, y) = px(s)
       dot.setColor(Ui.color(Ui.attr.primary))
@@ -316,7 +328,7 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
       box.addView(m)
     }
     // Newest first, like the rest of the feed.
-    val rs = rows.rows(tl)
+    val rs = rows.rows(tl, newestFirst = true)
     rs.foreach(box.addView)
     if rs.isEmpty then
       // Today tells the recorder's state; a past day only that nothing was recorded.

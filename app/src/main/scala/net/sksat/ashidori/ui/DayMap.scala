@@ -100,15 +100,18 @@ object DayMap:
     val paths = trips.flatMap(t => t.legs.filter(_.mode != TransportMode.Still).map { l =>
       MapPath(Geo.simplify(t.path.filter(f => f.time >= l.start && f.time <= l.end), toleranceM), l.mode.color, l.isUncertain)
     }).filter(_.points.size >= 2)
+    // A single day also shows its stretches without a record (grey dots).
+    val gaps = if tls.size == 1 then tls.head.segments.collect { case u: Unrecorded => MapPath.unrecorded(u) } else Nil
     // Repeated stays at one place draw one dot.
     val stays = visits.map(v => v.placeId.map(Left(_)).getOrElse(Right(v.latLng)) -> v.latLng).distinctBy(_._1).map(_._2)
-    val pts = paths.flatMap(_.points).map(_.latLng) ++ stays
+    val pts = (paths ++ gaps).flatMap(_.points).map(_.latLng) ++ stays
     if pts.isEmpty then return None
 
     val dm = act.getResources.getDisplayMetrics
     val wPx = dm.widthPixels - dp(insetDp)
     val hPx = dp(heightDp)
-    val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays)
+    val sketch = RouteSketchView(act, paths.map(p => (p.points.map(_.latLng), android.graphics.Color.parseColor(p.color))), stays,
+      gaps.map(g => (g.points.head.latLng, g.points.last.latLng)))
     val img = ImageView(act)
     img.setScaleType(ImageView.ScaleType.CENTER_CROP)
     val frame = MapCard(act)
@@ -127,7 +130,7 @@ object DayMap:
 
     // Same route, same picture: edits (mode changes) change the key.
     def key(style: MapStyle) =
-      s"${style.cacheKey}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${stays.hashCode}/$wPx"
+      s"${style.cacheKey}/$id/${paths.map(p => (p.color, p.points.size, p.dashed)).hashCode}/${gaps.size}/${stays.hashCode}/$wPx"
     // The snapshot draws the base map's attribution itself.
     def show(b: Bitmap): Unit =
       img.setImageBitmap(b)
@@ -156,7 +159,7 @@ object DayMap:
         .include(MLatLng(lat1 + padLat, lon1 + padLon))
         .build()
       val builder = style.snapshotBuilder
-        .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths)))
+        .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths ++ gaps)))
         .withSource(GeoJsonSource("day-stays", FeatureCollection.fromFeatures(
           stays.map(s => Feature.fromGeometry(Point.fromLngLat(s.lon, s.lat))).asJava)))
         .withLayer(LineLayer("day-route-line", "day-route").withProperties(
@@ -165,7 +168,13 @@ object DayMap:
           PropertyFactory.lineOpacity(Expression.switchCase(Expression.get("dashed"), Expression.literal(0.45f), Expression.literal(0.95f))),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
           PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-        ))
+        ).withFilter(Expression.eq(Expression.get("gap"), Expression.literal(false))))
+        .withLayer(LineLayer("day-route-gap", "day-route").withProperties(
+          PropertyFactory.lineColor(Palette.Unrecorded),
+          PropertyFactory.lineWidth(3.5f),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+          PropertyFactory.lineDasharray(Array[java.lang.Float](0.1f, 2.2f))
+        ).withFilter(Expression.eq(Expression.get("gap"), Expression.literal(true))))
         .withLayer(CircleLayer("day-stays-circle", "day-stays").withProperties(
           PropertyFactory.circleColor(TrackMap.DefaultLine),
           PropertyFactory.circleRadius(5f),
