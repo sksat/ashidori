@@ -212,8 +212,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     // being written ([[holdingTmps]]).
     private val fos =
       tmpLock.lock()
-      // A new file, never one truncated in place: a hard link to an old one
-      // (the rescue backup's staging) keeps what it had.
+      // A new file, never one truncated in place: an old one still open
+      // (a rescue backup writing its ZIP) keeps what it had.
       try
         if tmp.exists && !tmp.delete() then throw java.io.IOException(s"cannot replace $tmp")
         FileOutputStream(tmp)
@@ -454,8 +454,14 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * Whether there was anything to move.
     */
   private def moveDurably(from: File, to: File): Boolean =
-    SafeMove.move(from.toPath, to.toPath, p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile),
+    val there = from.exists
+    val moved = SafeMove.move(from.toPath, to.toPath, p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile),
       at => debugCrashPoint(s"crash-move-$at"))
+    // A file was where it was to go (never replaced): the mark names where it went.
+    for m <- moved if there && m != to.toPath do
+      Attention.add(Attention.Entry(System.currentTimeMillis(), root.toPath.relativize(from.toPath).toString,
+        root.toPath.relativize(m).toString, true, "隔離先に同じ名前のファイルがあったため別の名前で隔離"))
+    there
 
   /** Moves the tmp file of `t` to quarantine (its attention mark first;
     * shown to the user if `alert`).

@@ -20,10 +20,10 @@ import ashidori.core.Archive
   * Consistency: with the archive's locks held shared (no commit moves rows
   * from SQLite to the archive meanwhile), SQLite writes a consistent copy of
   * the database to app storage (VACUUM INTO, on a read-only connection: the
-  * logger keeps writing), and every archive file is hard-linked into a
-  * staging directory. Then the locks are released and the ZIP is written
-  * from the copy and the links, outside any lock: a slow destination holds
-  * up nothing.
+  * logger keeps writing), and every archive file is opened (every writer
+  * of them makes a new file, so an opened one keeps its content). Then the
+  * locks are released and the ZIP is written from the copy and the open
+  * files, outside any lock: a slow destination holds up nothing.
   *
   * Files are streamed through a fixed buffer, never parsed: memory stays
   * flat whatever their size. The database and the text are deflated at the
@@ -35,10 +35,9 @@ import ashidori.core.Archive
   * commit, and stores every file as it is: the whole archive (with tmp
   * files and quarantined files), the commit record and the other state of
   * `files/maintenance/`, and all overflow files. It also holds the lock of
-  * tmp writes ([[ArchiveStore.holdingTmps]]) while it hard-links the files
-  * into a staging directory, so no tmp file is taken in the middle of
-  * being written; the ZIP is then written from the links, with no lock
-  * held, and the links removed.
+  * tmp writes ([[ArchiveStore.holdingTmps]]) while it opens the files, so
+  * no tmp file is taken in the middle of being written; the ZIP is then
+  * written from the open files, with no lock held.
   *
   * 「隔離したファイルを書き出す」 ([[writeQuarantine]]): only the files a
   * repair quarantined, and the list of them.
@@ -103,26 +102,14 @@ object Backup:
       if dir.getUsableSpace < floor then
         throw java.io.IOException(s"空き容量が ${floor >> 20} MB 未満のため中断（記録用の領域を確保）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
-    // The files to write, hard-linked here under the locks (copied if a link
-    // cannot be made): a file replaced or deleted afterwards (every writer
-    // makes a new file) leaves the link as it was, so the ZIP is written
-    // after the locks are released.
-    val staging = File(dir, "staging")
-    def clearStaging(): Unit =
-      def rm(f: File): Unit =
-        if f.isDirectory then Option(f.listFiles()).toSeq.flatten.foreach(rm)
-        f.delete()
-      rm(staging)
-    clearStaging()
-    def stage(name: String, f: File): File =
-      val to = File(staging, name)
-      to.getParentFile.mkdirs()
-      try android.system.Os.link(f.getPath, to.getPath)
-      catch case _: Exception => java.nio.file.Files.copy(f.toPath, to.toPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-      to
-    def add(name: String, f: File): Unit =
-      val st = stage(name, f)
-      opened += ((name, st, FileInputStream(st)))
+    // The files to write, opened under the locks. Every writer of them
+    // makes a new file (a tmp file is deleted before it is written again,
+    // records and state are written to a tmp file and renamed, archive files
+    // are replaced by rename), so an opened file keeps its content after the
+    // locks are released, however it is replaced or deleted meanwhile; and
+    // no copy takes room. (Hard links would do as well, but an app may not
+    // make them on Android.)
+    def add(name: String, f: File): Unit = opened += ((name, f, FileInputStream(f)))
     def walk(f: File): Seq[File] =
       if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)
       else if f.isFile then Seq(f)
@@ -294,6 +281,5 @@ object Backup:
     try body()
     finally
       opened.foreach(o => Try(o._3.close()))
-      Try(clearStaging())
       snapshot.delete()
   }

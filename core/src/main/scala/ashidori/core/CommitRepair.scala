@@ -464,33 +464,41 @@ object RowBag:
   val Cap = 2_000_000
   final class TooLarge(cap: Int) extends RuntimeException(s"more than $cap rows to compare")
 
-/** A move that never replaces a file (rule A of [[CommitRepair]]): `to` is
-  * made a hard link of `from` (refused if `to` is another file), the file
-  * and its directory synced, then `from` removed and its directory synced.
-  * Repeated after it was cut short anywhere, it completes the same move:
-  * with `from` gone and `to` there, `to` and both directories are synced
-  * again. `crash` marks the points between steps (for tests).
+/** A move that never replaces a file (rule A of [[CommitRepair]]): `from`
+  * is renamed to `to`, or to `to.1`, `to.2`, ... if a file is there (none
+  * is ever replaced), then the moved file, its directory and the source's
+  * directory are synced. Repeated after it was cut short (the rename done,
+  * not yet synced), it syncs the moved file and both directories again.
+  * Hard links are not used: an app may not make them on Android.
+  * `crash` marks the point after the rename (for tests). The file moved
+  * to, if there was anything.
   */
 object SafeMove:
-  import java.nio.file.{Files, FileAlreadyExistsException, LinkOption, Path}
+  import java.nio.file.{Files, LinkOption, Path}
+
+  private def exists(p: Path) = Files.exists(p, LinkOption.NOFOLLOW_LINKS)
+
+  /** `to`, then `to.1`, `to.2`, ... */
+  private def names(to: Path): Iterator[Path] =
+    Iterator(to) ++ Iterator.from(1).map(n => to.resolveSibling(s"${to.getFileName}.$n"))
 
   def move(from: Path, to: Path, ensureDir: Path => Unit, syncFile: Path => Unit, syncDir: Path => Unit,
-           crash: String => Unit = _ => ()): Boolean =
-    val there = Files.exists(from, LinkOption.NOFOLLOW_LINKS)
-    val moved = Files.exists(to, LinkOption.NOFOLLOW_LINKS)
-    if !there && !moved then false
-    else
+           crash: String => Unit = _ => ()): Option[Path] =
+    if exists(from) then
       ensureDir(to.getParent)
-      if there then
-        if moved then
-          if !Files.isSameFile(from, to) then throw FileAlreadyExistsException(to.toString)
-        else Files.createLink(to, from)
-        crash("linked")
-      syncFile(to)
-      syncDir(to.getParent)
-      if there then
-        Files.delete(from)
-        crash("unlinked")
+      val target = names(to).find(p => !exists(p)).get
+      // Without REPLACE_EXISTING: refused if a file appeared there meanwhile.
+      Files.move(from, target)
+      crash("moved")
+      syncFile(target)
+      syncDir(target.getParent)
       syncDir(from.getParent)
-      true
-
+      Some(target)
+    else
+      // Moved before (perhaps not synced): sync what is there.
+      val moved = names(to).takeWhile(exists).toVector
+      moved.foreach(syncFile)
+      if moved.nonEmpty then
+        syncDir(to.getParent)
+        syncDir(from.getParent)
+      moved.lastOption

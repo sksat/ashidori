@@ -579,34 +579,35 @@ class CommitRepairSuite extends munit.FunSuite:
     val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
     writeFile(a, "tmp")
     val s = Synced()
-    assert(moveWith(a, q, s))
+    assertEquals(moveWith(a, q, s), Some(q))
     assert(!java.nio.file.Files.exists(a))
     assertEquals(java.nio.file.Files.readString(q), "tmp")
     assertEquals(s.files.toSeq, Seq(q.toString))
     assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString))
-    // Another file where it would go: refused, both kept.
+    // Another file where it would go: kept, the new one goes beside it.
     writeFile(a, "another")
-    intercept[java.nio.file.FileAlreadyExistsException](moveWith(a, q, Synced()))
+    val q1 = q.resolveSibling("x.parquet.tmp.1")
+    assertEquals(moveWith(a, q, Synced()), Some(q1))
     assertEquals(java.nio.file.Files.readString(q), "tmp")
-    assertEquals(java.nio.file.Files.readString(a), "another")
+    assertEquals(java.nio.file.Files.readString(q1), "another")
     // Nothing to move.
-    assert(!moveWith(d.resolve("none"), d.resolve("q/none"), Synced()))
+    assertEquals(moveWith(d.resolve("none"), d.resolve("q/none"), Synced()), None)
   }
 
-  test("safe move: cut short after the link or after the removal, the retry completes it and syncs the copy") {
-    for point <- Seq("linked", "unlinked") do
-      val d = tmpDir()
-      val a = d.resolve("imu/x.parquet.tmp")
-      val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
-      writeFile(a, "tmp")
-      intercept[Crash](moveWith(a, q, Synced(), at => if at == point then throw Crash()))
-      val s = Synced()
-      assert(moveWith(a, q, s), point)
-      assert(!java.nio.file.Files.exists(a), point)
-      assertEquals(java.nio.file.Files.readString(q), "tmp")
-      // The retry syncs the moved file and both directories, whatever was left.
-      assertEquals(s.files.toSeq, Seq(q.toString), point)
-      assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString), point)
+  test("safe move: cut short after the rename, the retry syncs the moved file and both directories") {
+    val d = tmpDir()
+    val a = d.resolve("imu/x.parquet.tmp")
+    val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
+    writeFile(a, "tmp")
+    val first = Synced()
+    intercept[Crash](moveWith(a, q, first, at => if at == "moved" then throw Crash()))
+    assertEquals(first.files.toSeq, Nil)
+    val s = Synced()
+    assertEquals(moveWith(a, q, s), Some(q))
+    assert(!java.nio.file.Files.exists(a))
+    assertEquals(java.nio.file.Files.readString(q), "tmp")
+    assertEquals(s.files.toSeq, Seq(q.toString))
+    assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString))
   }
 
   test("a chunk archived again and cut short again: each repair moves to its own directory, the earlier copy kept") {
