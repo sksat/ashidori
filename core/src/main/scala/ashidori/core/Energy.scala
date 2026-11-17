@@ -54,7 +54,12 @@ final case class EnergyState(
     env: String
 )
 
-final case class EnergySpan(start: Long, end: Long, state: EnergyState):
+/** The logger in `state` from `start` to `end`. `endKnown` false: the
+  * state was last confirmed at `end` and then the process ended without
+  * closing it; it may have lasted longer (up to the next span), but that
+  * time is not counted.
+  */
+final case class EnergySpan(start: Long, end: Long, state: EnergyState, endKnown: Boolean = true):
   def ms: Long = end - start
 
 object EnergySpan:

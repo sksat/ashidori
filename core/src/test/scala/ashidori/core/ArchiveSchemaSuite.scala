@@ -76,22 +76,54 @@ class ArchiveSchemaSuite extends munit.FunSuite:
     assertEquals(Archive.batteryOf(rows.last), late)
   }
 
-  test("a file with a column this version does not know is not rewritten") {
+  test("a file of an unknown layout or a newer version is an error, never nulls") {
+    // A column this version does not know: neither read nor rewritten.
     val newer = Archive.Pressure.columns :+ Column("hpa_raw", ColType.Float32)
     val f = file(newer, Seq(Seq(t0, 1013.2f, 1013.25f)))
-    // Read: the known columns.
-    Using.resource(Archive.open(Archive.Pressure, f.getPath)) { r =>
-      assertEquals(r.dropped.map(_.name), Seq("hpa_raw"))
-      assertEquals(r.rowIterator.toVector, Vector(IndexedSeq[Any](t0, 1013.2f)))
-    }
-    // Rewrite (merge or month merge): refused, the file stays as it is.
-    intercept[IllegalStateException](Archive.open(Archive.Pressure, f.getPath, whole = true))
-    // A column of the same name but another type is not the same column.
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, f.getPath))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, f.getPath, whole = true))
+    // A column of the same name but another type.
     val retyped = file(Seq(Column("time", ColType.Int64), Column("hpa", ColType.Float64)), Seq(Seq(t0, 1013.2)))
-    intercept[IllegalStateException](Archive.open(Archive.Pressure, retyped.getPath, whole = true))
-    Using.resource(Archive.open(Archive.Pressure, retyped.getPath)) { r =>
-      assertEquals(Archive.pressureOf(r.rowIterator.next()).hPa.isNaN, true)
+    intercept[ParquetReader.TypeMismatch](Archive.open(Archive.Pressure, retyped.getPath))
+    // A column left out that no version of the table lacked.
+    val partial = file(Seq(Column("time", ColType.Int64)), Seq(Seq(t0)))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, partial.getPath))
+    // The footer names the table and its version.
+    def tagged(t: Archive.TableDef, cols: Seq[Column], kv: Seq[(String, String)]): File =
+      val g = File.createTempFile("tagged", ".parquet")
+      g.deleteOnExit()
+      Using.resource(BufferedOutputStream(FileOutputStream(g))) { o =>
+        val w = ParquetWriter(o, cols, 100, kv)
+        w.close()
+      }
+      g
+    val v4 = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "pressure", Archive.SchemaKey -> "4"))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, v4.getPath))
+    val other = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "motion", Archive.SchemaKey -> "3"))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, other.getPath))
+    // Battery of schema 1 named as schema 2: its columns are not schema 2's.
+    val mislabeled = tagged(Archive.Battery, BatteryV1, Seq(Archive.TableKey -> "battery", Archive.SchemaKey -> "2"))
+    intercept[Archive.LayoutError](Archive.open(Archive.Battery, mislabeled.getPath))
+    val halfTagged = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "pressure"))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, halfTagged.getPath))
+  }
+
+  test("the writer puts the table and version in the footer, and refuses a value of another type") {
+    val g = File.createTempFile("written", ".parquet")
+    g.deleteOnExit()
+    Using.resource(BufferedOutputStream(FileOutputStream(g))) { o =>
+      val w = Archive.writer(Archive.Pressure, o, 100)
+      w.write(Archive.pressureRow(PressureSample(t0, 1001f)))
+      w.close()
     }
+    assertEquals(ParquetReader.meta(g.getPath).keyValues,
+      Map(Archive.TableKey -> "pressure", Archive.SchemaKey -> Archive.SchemaVersion.toString))
+    Using.resource(Archive.open(Archive.Pressure, g.getPath))(r => assertEquals(r.rowIterator.size, 1))
+    val w = ParquetWriter(java.io.ByteArrayOutputStream(), Archive.Battery.columns)
+    // A row of the earlier layout padded wrongly: a string where a number goes.
+    intercept[IllegalArgumentException](w.write(Seq(t0, 80, 0, 1, "balanced", "none", null, null, null, null, null)))
+    intercept[IllegalArgumentException](w.write(Seq(t0, 80L, 0, 1, "balanced", null, null, null, null, null, null)))
+    intercept[IllegalArgumentException](w.write(Seq(t0, 80, 0, 1, "balanced")))
   }
 
   test("a file of the current layout is still copied as stored") {

@@ -22,7 +22,7 @@ object ParquetReader:
   /** Footer of a file: the schema, the total row count and where each row
     * group's column chunks lie (absolute byte offsets).
     */
-  final case class Meta(columns: Seq[Column], rows: Long, groups: Seq[Group])
+  final case class Meta(columns: Seq[Column], rows: Long, groups: Seq[Group], keyValues: Map[String, String] = Map.empty)
 
   /** One row group: its row count, and per column the chunk's codec, start
     * and length.
@@ -65,7 +65,10 @@ object ParquetReader:
       }.flatten
       Group(rg(3).asInstanceOf[Long].toInt, chunks, time)
     }
-    Meta(columns, meta(3).asInstanceOf[Long], groups)
+    val kv = meta.getOrElse(5, Nil).asInstanceOf[Seq[Map[Int, Any]]].flatMap { e =>
+      e.get(1).map(k => k.toString -> e.get(2).fold("")(_.toString))
+    }.toMap
+    Meta(columns, meta(3).asInstanceOf[Long], groups, kv)
 
   private def footerLength(tail: Array[Byte]): Int =
     require(String(tail, tail.length - 4, 4, UTF_8) == "PAR1", "not parquet")
@@ -119,8 +122,9 @@ object ParquetReader:
     *
     * Rows come in [[columns]]: the columns asked for when it was opened, or
     * else the file's own. A column asked for that the file does not have
-    * (by name and type) reads as null; a column of the file not asked for
-    * is left out ([[dropped]]).
+    * reads as null; a column of the file not asked for is left out
+    * ([[dropped]]). A column of the file with the name of one asked for but
+    * another type fails the open ([[TypeMismatch]]), never reads as null.
     */
   final class FileReader private[ParquetReader] (raf: RandomAccessFile, val meta: Meta, as: Seq[Column]) extends AutoCloseable:
     val columns: Seq[Column] = if as.isEmpty then meta.columns else as
@@ -163,10 +167,17 @@ object ParquetReader:
 
     def close(): Unit = raf.close()
 
-  /** Opens a file; its rows in `as` (matched by name and type) if given. */
+  /** A column of the file has the name of one asked for, but another type. */
+  final class TypeMismatch(msg: String) extends IllegalStateException(msg)
+
+  /** Opens a file; its rows in `as` (matched by name) if given. */
   def open(path: String, as: Seq[Column] = Nil): FileReader =
     val raf = RandomAccessFile(path, "r")
-    try FileReader(raf, readMeta(raf), as)
+    try
+      val m = readMeta(raf)
+      for c <- as; f <- m.columns.find(_.name == c.name) if f.tpe != c.tpe do
+        throw TypeMismatch(s"$path: column ${c.name} is ${f.tpe}, expected ${c.tpe}")
+      FileReader(raf, m, as)
     catch
       case e: Throwable =>
         raf.close()

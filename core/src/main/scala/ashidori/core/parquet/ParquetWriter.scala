@@ -20,10 +20,15 @@ final case class Column(name: String, tpe: ColType)
   * column per row group. Enough for pandas / DuckDB / Polars / Arrow to read,
   * without the Hadoop-based parquet-java (too heavy for Android).
   *
-  * Values: Int / Long / Float / Double / String, or null (also NaN for
-  * floating columns) for missing.
+  * Values: Int (Int32, Int64), Long (Int64), Float (Float32, Float64),
+  * Double (Float64) or String (Str), or null (also NaN for floating
+  * columns) for missing. A value of another type is an error, not converted:
+  * a row of another layout (a column left out or shifted) does not write.
+  *
+  * `meta` goes into the footer's key-value metadata.
   */
-final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: Int = 50_000):
+final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: Int = 50_000,
+                          meta: Seq[(String, String)] = Nil):
   import ParquetWriter.*
 
   private val sink = CountingStream(out)
@@ -47,6 +52,16 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
 
   def write(row: Seq[Any]): Unit =
     require(row.size == schema.size, s"row has ${row.size} values, schema ${schema.size}")
+    // The whole row is checked before any of it is taken.
+    for (v, c) <- row.zip(schema) if v != null do
+      val ok = (c.tpe, v) match
+        case (ColType.Int32, _: Int)                 => true
+        case (ColType.Int64, _: Long | _: Int)       => true
+        case (ColType.Float32, _: Float)             => true
+        case (ColType.Float64, _: Double | _: Float) => true
+        case (ColType.Str, _: String)                => true
+        case _                                       => false
+      if !ok then throw IllegalArgumentException(s"column ${c.name} (${c.tpe}): ${v.getClass.getSimpleName} $v")
     for ((v, c), i) <- row.zip(schema).zipWithIndex do
       val present = v match
         case null                  => false
@@ -221,6 +236,14 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
             t.i64(3, g.rows)
           }
       }
+      if meta.nonEmpty then
+        t.listField(5, Thrift.Struct, meta.size) {
+          for (k, v) <- meta do
+            t.struct {
+              t.string(1, k)
+              t.string(2, v)
+            }
+        }
       t.string(6, "ashidori")
     }
     val footer = t.bytes

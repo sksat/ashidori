@@ -62,7 +62,7 @@ object Exporter:
           dayRows(t, d) { row =>
             val writer = w.getOrElse {
               zip.putNextEntry(ZipEntry(s"${t.name}.parquet"))
-              val nw = ParquetWriter(KeepOpen(zip), t.columns, ArchiveStore.groupRows(t))
+              val nw = Archive.writer(t, KeepOpen(zip), ArchiveStore.groupRows(t))
               w = Some(nw)
               nw
             }

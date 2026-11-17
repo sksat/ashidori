@@ -67,8 +67,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def read(t: Archive.TableDef, from: Long, to: Long): Vector[IndexedSeq[Any]] =
     filesFor(t, from, to).flatMap { f =>
-      Try(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
-        .getOrElse(Vector.empty)
+      orEmpty(Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
     }.toVector.sortBy(ArchiveMerge.key)
 
   private def inWindow(from: Long, to: Long)(r: IndexedSeq[Any]): Boolean =
@@ -80,7 +79,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * files with `close`. Call within [[reading]].
     */
   def stream(t: Archive.TableDef, from: Long, to: Long): (Iterator[IndexedSeq[Any]], () => Unit) =
-    val readers = filesFor(t, from, to).flatMap(f => Try(Archive.open(t, f.getPath)).toOption)
+    val readers = filesFor(t, from, to).flatMap(f => orEmpty(None)(Some(Archive.open(t, f.getPath))))
     val sorted = readers.map(_.rowsBetween(from, to).filter(inWindow(from, to)))
       .foldLeft(Iterator.empty[IndexedSeq[Any]])((a, b) => mergeSorted(a, b))
     (sorted, () => readers.foreach(r => Try(r.close())))
@@ -88,10 +87,19 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   /** Most recent archived row of `t`, if any. */
   def lastRow(t: Archive.TableDef): Option[IndexedSeq[Any]] =
     archivedFiles(t).lastOption.flatMap { f =>
-      Try(Using.resource(Archive.open(t, f.getPath)) { r =>
+      orEmpty(None)(Using.resource(Archive.open(t, f.getPath)) { r =>
         if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.toSeq.lastOption
-      }).toOption.flatten
+      })
     }
+
+  /** `f` on a file: one of an unknown layout is an error; one that cannot
+    * be read otherwise (cut short) reads as `empty`, as before.
+    */
+  private def orEmpty[A](empty: => A)(f: => A): A =
+    try f
+    catch
+      case e: (Archive.LayoutError | ParquetReader.TypeMismatch) => throw e
+      case scala.util.control.NonFatal(_)                         => empty
 
   /** Days that have archived rows of `t` (from file names). */
   def archivedFiles(t: Archive.TableDef): Seq[File] =
@@ -223,7 +231,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           existing.foreach(x => Try(x.close()))
           throw e
     private val out = BufferedOutputStream(fos, 1 << 16)
-    private val writer = ParquetWriter(out, t.columns, groupRows(t))
+    private val writer = Archive.writer(t, out, groupRows(t))
     // Archived groups wholly before the new rows are copied as stored.
     val merge = ArchiveMerge.FileMerge(existing, writer)
     // New rows come in the order of their stored time, which for some raw

@@ -13,10 +13,13 @@ object Archive:
   final case class TableDef(name: String, columns: Seq[Column]):
     def colNames: Seq[String] = columns.map(_.name)
 
-  /** Positions. `alt` is the WGS84 ellipsoidal height. The columns after
-    * `provider` were added in schema 3: `alt_acc` is the accuracy of `alt`,
-    * `msl` the altitude above mean sea level and `msl_acc` its accuracy
-    * (Android 14+; null before and on older devices).
+  /** Positions: `time` ms since the epoch (UTC), `lat`/`lon` WGS84 degrees,
+    * `acc` horizontal accuracy (m, 68 %), `alt` the WGS84 ellipsoidal height
+    * (m), `speed` m/s, `bearing` degrees from north. The columns after
+    * `provider` were added in schema 3: `alt_acc` is the accuracy of `alt`
+    * (m), `msl` the altitude above mean sea level from Android's geoid model
+    * (`AltitudeConverter`, m) and `msl_acc` its accuracy (Android 14+; null
+    * before and on older devices).
     */
   val Fixes = TableDef("fixes", Seq(
     Column("time", Int64), Column("lat", Float64), Column("lon", Float64), Column("acc", Float32),
@@ -38,13 +41,16 @@ object Archive:
     Column("time", Int64), Column("pct", Int32), Column("charging", Int32), Column("screen_on", Int32), Column("mode", Str),
     Column("charge_uah", Int64), Column("current_avg_ua", Int32), Column("current_now_ua", Int32),
     Column("voltage_mv", Int32), Column("temp_c", Float32), Column("plug", Str)))
-  /** What the logger was doing from `start` to `end` (schema 2): one row per
-    * stretch of unchanged state, split at local midnight. See [[EnergyState]].
+  /** What the logger was doing from `start` to `end` (ms, schema 2): one row
+    * per stretch of unchanged state, split at local midnight. `end_unknown`
+    * 1: the state was last confirmed at `end`, and when it really ended is
+    * not known (the process was killed). See [[EnergyState]].
     */
   val EnergyStates = TableDef("energy_state", Seq(
     Column("start", Int64), Column("end", Int64), Column("gnss", Int32), Column("gnss_interval_ms", Int64),
     Column("provider", Str), Column("detail", Int32), Column("still", Int32), Column("screen_on", Int32),
-    Column("charging", Int32), Column("mode", Str), Column("eff_mode", Str), Column("motion", Str), Column("env", Str)))
+    Column("charging", Int32), Column("mode", Str), Column("eff_mode", Str), Column("motion", Str), Column("env", Str),
+    Column("end_unknown", Int32)))
   val GnssStatus = TableDef("gnss_status", Seq(
     Column("time", Int64), Column("visible", Int32), Column("used", Int32), Column("top4", Float64), Column("l5", Int32),
     Column("env", Str), Column("acc", Float32)))
@@ -106,27 +112,79 @@ object Archive:
 
   /** Version of the archive layout. 1: up to app 0.21.0. 2 added the
     * battery columns after `mode` and the `energy_state` table; 3 the
-    * elevation columns of `fixes` and the `pressure` table. Columns are
-    * only ever added, at the end, and files do not record the version: a
-    * file's columns tell its layout, and [[open]] reads them by name.
+    * elevation columns of `fixes` and the `pressure` table.
+    *
+    * The version is a contract on each column's name, type, unit, sign and
+    * reference (datum, epoch), as documented on the tables here: a change
+    * to any of them is a new version (and a new column name), never a
+    * silent change of an existing column. Columns are only ever added, at
+    * the end of a table.
+    *
+    * Files written since schema 3 name their table and version in the
+    * footer ([[TableKey]], [[SchemaKey]]). Files without them (up to app
+    * 0.21.0) are taken for the layout their columns match exactly, of
+    * those the table had ([[layouts]]); any other file is an error.
     */
   val SchemaVersion = 3
 
-  /** An archive file of `t` with its rows in `t`'s columns, matched by name
-    * and type: a column the file lacks (written before the column was
-    * added) reads as null.
+  val TableKey = "ashidori.table"
+  val SchemaKey = "ashidori.schema"
+
+  /** An archive file that is not a known layout of the table it is read as. */
+  final class LayoutError(msg: String) extends IllegalStateException(msg)
+
+  /** The columns of `t` in each archive version that changed it, oldest first. */
+  def layouts(t: TableDef): Seq[(Int, Seq[Column])] = t match
+    case Battery      => Seq(1 -> Battery.columns.take(5), 2 -> Battery.columns)
+    case Fixes        => Seq(1 -> Fixes.columns.take(8), 3 -> Fixes.columns)
+    case EnergyStates => Seq(2 -> EnergyStates.columns)
+    case Pressure     => Seq(3 -> Pressure.columns)
+    case _            => Seq(1 -> t.columns)
+
+  /** The columns of `t` in archive version `v`, if it had the table then. */
+  def layoutAt(t: TableDef, v: Int): Option[Seq[Column]] = layouts(t).filter(_._1 <= v).lastOption.map(_._2)
+
+  /** A writer of an archive file of `t`: the current layout, with the table
+    * and the version in the footer.
+    */
+  def writer(t: TableDef, out: java.io.OutputStream, groupRows: Int): ParquetWriter =
+    ParquetWriter(out, t.columns, groupRows, Seq(TableKey -> t.name, SchemaKey -> SchemaVersion.toString))
+
+  /** An archive file of `t` with its rows in `t`'s current columns: a
+    * column the file lacks (written before the column was added) reads as
+    * null.
     *
-    * `whole`: the file is to be rewritten (merged with new rows), so every
-    * column it has must be one of `t`'s; a file with a column this version
-    * does not know (written by a newer version) is refused, as rewriting it
-    * would drop that column's values.
+    * The file must be a known layout of `t` ([[layouts]]): by its footer
+    * (table, and a version no newer than this one) or, without one, by its
+    * columns. Anything else, a column of another type among them, is a
+    * [[LayoutError]] (or [[ParquetReader.TypeMismatch]]), never rows with
+    * nulls: a newer version's file is neither read nor rewritten here.
+    * `whole`: the file is to be rewritten, so it must not have a column `t`
+    * lacks (implied by the above; checked again).
     */
   def open(t: TableDef, path: String, whole: Boolean = false): ParquetReader.FileReader =
     val r = ParquetReader.open(path, t.columns)
-    if whole && r.dropped.nonEmpty then
-      r.close()
-      throw IllegalStateException(s"$path has columns ${r.dropped.map(_.name).mkString(", ")} that ${t.name} does not have")
-    r
+    try
+      val cols = r.meta.columns
+      val kv = r.meta.keyValues
+      (kv.get(TableKey), kv.get(SchemaKey)) match
+        case (Some(name), Some(v)) =>
+          if name != t.name then throw LayoutError(s"$path: a file of $name, read as ${t.name}")
+          val ver = v.toIntOption.getOrElse(throw LayoutError(s"$path: schema '$v'"))
+          if ver > SchemaVersion then throw LayoutError(s"$path: schema $ver, newer than $SchemaVersion")
+          if !layoutAt(t, ver).contains(cols) then
+            throw LayoutError(s"$path: columns ${cols.map(_.name).mkString(",")} are not ${t.name} of schema $ver")
+        case (None, None) =>
+          if !layouts(t).exists(_._2 == cols) then
+            throw LayoutError(s"$path: columns ${cols.map(_.name).mkString(",")} are no known layout of ${t.name}")
+        case _ => throw LayoutError(s"$path: table or schema missing in the footer")
+      if whole && r.dropped.nonEmpty then
+        throw LayoutError(s"$path has columns ${r.dropped.map(_.name).mkString(", ")} that ${t.name} does not have")
+      r
+    catch
+      case e: Throwable =>
+        r.close()
+        throw e
 
   /** Which raw table a line belongs to. */
   def tableFor(kind: String): Option[TableDef] = kind match
@@ -273,12 +331,12 @@ object Archive:
     val e = s.state
     def b(x: Boolean) = if x then 1 else 0
     Seq(s.start, s.end, b(e.gnss), e.gnssIntervalMs, e.provider, b(e.detail), b(e.still), b(e.screenOn), b(e.charging),
-      e.mode, e.effMode, e.motion, e.env)
+      e.mode, e.effMode, e.motion, e.env, b(!s.endKnown))
   def energyOf(r: IndexedSeq[Any]): EnergySpan =
     def s(i: Int) = Option(r(i)).map(_.toString).getOrElse("")
     EnergySpan(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]),
       EnergyState(r(2) == 1, opt[Long](r(3)).getOrElse(0L), s(4), r(5) == 1, r(6) == 1, r(7) == 1, r(8) == 1,
-        s(9), s(10), s(11), s(12)))
+        s(9), s(10), s(11), s(12)), endKnown = !(r.size > 13 && r(13) == 1))
 
   /** Archive file names. */
   def dayFile(t: TableDef, day: java.time.LocalDate): String = s"${t.name}/$day.parquet"
