@@ -60,8 +60,10 @@ object EnergyUi:
       case None    => "実測: 算出中"
       case Some(r) => r.modePerDay(m).fold(why => s"実測: —（$why）", d => s"実測: 記録による消費 1日 約${pct(d)}%")
 
-/** 「電池の消費」: what the battery went to over the last week. The rows are
-  * always there; values fill in when the analysis is done.
+/** What the battery went to over the last week: what recording adds
+  * (「記録による消費」) and what the whole phone uses (「端末全体の消費」), in
+  * two groups so neither needs a caption. The rows are always there;
+  * values fill in when the analysis is done.
   */
 final class EnergyPanel(using c: Ctx):
   import EnergyUi.pct
@@ -73,18 +75,19 @@ final class EnergyPanel(using c: Ctx):
     r.setValue("—")
     r.setSubtitle("算出中")
     r
-  private val standby = mk("待機")
+  private val recording = mk("合計")
   private val gnss = mk("GNSS")
-  private val detail = mk("詳細ログ")
+  private val detail = mk("生データ記録")
   private val active = mk("移動の検出")
-  private val screen = mk("画面点灯中")
-  private val recording = mk("記録による消費（推定）")
+  private val standby = mk("画面オフ・静止中")
+  private val screen = mk("画面オン")
   private val data = mk("データ")
 
   val view: View = vbox(
-    sectionHeader(s"電池の消費（直近${EnergyStats.Days}日の実測）"),
-    listGroup(standby, gnss, detail, active, recording, screen, data),
-    supportingText("待機は端末全体の消費。GNSS・詳細ログ・移動の検出は記録による上乗せ。")
+    sectionHeader(s"記録による消費（直近${EnergyStats.Days}日の実測）"),
+    listGroup(recording, gnss, detail, active),
+    sectionHeader(s"端末全体の消費（直近${EnergyStats.Days}日の実測）"),
+    listGroup(standby, screen, data)
   )
 
   private def set(r: ListRow, value: String, sub: String): Unit =
@@ -106,7 +109,7 @@ final class EnergyPanel(using c: Ctx):
         set(recording, "—", ne.reason)
         set(data, if u.days > 0 then f"${u.days}%.1f日分" else "—", ne.reason)
       case Right(f) =>
-        coef(standby, f.baseline, v => s"${pct(v)}%/時", "画面オフ・静止中（端末全体）", "静止 ")
+        coef(standby, f.baseline, v => s"${pct(v)}%/時", hours(f.baseline.hours), "静止 ")
         val okClasses = GnssClass.values.toSeq.filter(c => f.gnss(c).ok)
         if okClasses.isEmpty then
           val h = f.gnss.values.map(_.hours).sum
@@ -120,11 +123,11 @@ final class EnergyPanel(using c: Ctx):
           val m = u.detailMinutes
           coef(detail, f.detail, v => s"+${pct(v * m / 60)}%/回", s"1回 平均${if m < 10 then f"$m%.1f" else f"$m%.0f"}分", "")
         coef(active, f.active, v => s"+${pct(v)}%/時", "加速度センサー・省電力測位", "移動 ")
-        if f.screen.ok && f.baseline.ok then set(screen, s"${pct(f.baseline.perHour + f.screen.perHour)}%/時", "ashidori 以外の消費を含む")
-        else if f.screen.ok then set(screen, "—", "待機が未算出")
+        if f.screen.ok && f.baseline.ok then set(screen, s"${pct(f.baseline.perHour + f.screen.perHour)}%/時", hours(f.screen.hours))
+        else if f.screen.ok then set(screen, "—", "画面オフ・静止中が未算出")
         else coef(screen, f.screen, _ => "—", "", "画面点灯 ")
         rep.recordingPerDay match
-          case Right(d) => set(recording, s"1日 ${pct(d)}%", "GNSS・詳細ログ・移動の検出の合計")
+          case Right(d) => set(recording, s"${pct(d)}%/日", "推定")
           case Left(why) => set(recording, "—", why)
         set(data, f"${u.days}%.1f日分",
           if f.source == EnergyModel.Source.Counter then f"電池残量計（${f.capacityMah}%.0f mAh）から算出"
@@ -145,8 +148,7 @@ final class FixQualityPanel(using c: Ctx):
 
   val view: View = vbox(
     sectionHeader(s"画面オフ時の測位（直近${EnergyStats.Days}日の中央値）"),
-    listGroup(FixQuality.Source.values.toSeq.map(rows)*),
-    supportingText("充電中を除く。10分以上の停止は間隔に含めない。")
+    listGroup(FixQuality.Source.values.toSeq.map(rows)*)
   )
 
   private def line(cell: Option[FixQuality.Cell]): String =

@@ -421,7 +421,7 @@ object EnergyModel:
 
   def termLabel(k: Int): String = k match
     case Active => "移動の検出"
-    case Detail => "詳細ログ"
+    case Detail => "生データ記録"
     case g if g >= Gnss0 => s"GNSS ${GnssClass.fromOrdinal(g - Gnss0).label}"
     case _ => ""
 
