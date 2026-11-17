@@ -13,7 +13,7 @@
 //   not available in the browser.
 // - Day boundaries are those of the browser's time zone, not the device's.
 
-import type { CheckIn, Fix, Leg, ModeKey, ModeOverride, MotionWindow, Place, Segment, Trip, Visit } from "./model";
+import type { CheckIn, Fix, Leg, ModeKey, ModeOverride, MotionWindow, Place, Segment, Trip, Unrecorded, Visit } from "./model";
 import { modeInfo } from "./model";
 
 // ---------------------------------------------------------------- params
@@ -36,6 +36,7 @@ export const PARAMS = {
   minLegDistanceM: 250.0,
   maxSurfacingMs: 3 * 60_000,
   maxPlausibleSpeedMps: 300.0,
+  unrecordedMinMs: 15 * 60_000,
 } as const;
 
 // ------------------------------------------------------------------- geo
@@ -348,8 +349,7 @@ function buildRun(fixes: Fix[], motion: MotionIndex): Segment[] {
     const dist = Math.max(fdist(path[0]!, path[path.length - 1]!), pathLength(path) * 0.5);
     const dur = path[path.length - 1]!.time - path[0]!.time;
     const minDist = betweenStays ? PARAMS.minTripDistanceM / 3 : PARAMS.minTripDistanceM;
-    if (dist >= minDist || (dur >= PARAMS.minTripDurationMs && dist >= minDist / 2))
-      out.push({ type: "trip", start: path[0]!.time, end: path[path.length - 1]!.time, path, legs: legs(path, motion) });
+    if (dist >= minDist || (dur >= PARAMS.minTripDurationMs && dist >= minDist / 2)) out.push(...splitUnrecorded(path, pieces(path, motion)));
   };
   let cursor = 0;
   stays.forEach((s, k) => {
@@ -359,6 +359,32 @@ function buildRun(fixes: Fix[], motion: MotionIndex): Segment[] {
   });
   addTrip(cursor, fixes.length - 1, false);
   return absorbEdgeStops(out);
+}
+
+/** TimelineBuilder.splitUnrecorded: stretches without a record between the trips around them. */
+function splitUnrecorded(path: Fix[], ps: [Leg, boolean][]): Segment[] {
+  if (!ps.some(([, u]) => u)) return [{ type: "trip", start: path[0]!.time, end: path[path.length - 1]!.time, path, legs: ps.map(([l]) => l) }];
+  const at = (t: number) => {
+    const f = path.find((x) => x.time >= t) ?? path[path.length - 1]!;
+    return { lat: f.lat, lon: f.lon };
+  };
+  const out: Segment[] = [];
+  let ls: Leg[] = [];
+  const flush = () => {
+    if (ls.length === 0) return;
+    const a = ls[0]!.start;
+    const b = ls[ls.length - 1]!.end;
+    out.push({ type: "trip", start: a, end: b, path: path.filter((f) => f.time >= a && f.time <= b), legs: ls });
+    ls = [];
+  };
+  for (const [l, unrecorded] of ps) {
+    if (unrecorded) {
+      flush();
+      out.push({ type: "unrecorded", start: l.start, end: l.end, from: at(l.start), to: at(l.end) } satisfies Unrecorded);
+    } else ls.push(l);
+  }
+  flush();
+  return out;
 }
 
 function absorbEdgeStops(segs: Segment[]): Segment[] {
@@ -390,6 +416,7 @@ interface Interval {
   dist: number;
   speed: number;
   gap: boolean;
+  silent: boolean;
   poor: boolean;
   cadence: number;
   accelStd: number;
@@ -403,14 +430,16 @@ function intervals(path: Fix[], motion: MotionIndex): Interval[] {
     const b = path[k + 1]!;
     const dt = Math.max(1, b.time - a.time);
     const d = fdist(a, b);
-    const gap = dt > PARAMS.gapMs && d / (dt / 1000.0) > 2.5;
+    // A long silence where the place changed is a gap too, at any speed.
+    const silent = dt >= PARAMS.unrecordedMinMs && d >= STAY.radiusM;
+    const gap = (dt > PARAMS.gapMs && d / (dt / 1000.0) > 2.5) || silent;
     const doppler = !gap && hasSpeed(a) && hasSpeed(b) && dt < 30_000;
     // Float + Float in the app, then / 2.0 as a double.
     const speed = doppler ? Math.fround(a.speed + b.speed) / 2.0 : d / (dt / 1000.0);
     const dist = doppler ? Math.min(d, (speed * dt) / 1000.0) : d;
     const m = motion.summary(a.time, b.time);
     const poor = (hasAccuracy(a) && a.accuracy > 50) || (hasAccuracy(b) && b.accuracy > 50);
-    out.push({ start: a.time, end: b.time, dist, speed, gap, poor, cadence: m.cadence, accelStd: m.accelStd, coarse: coarse(speed, m.cadence, gap) });
+    out.push({ start: a.time, end: b.time, dist, speed, gap, silent, poor, cadence: m.cadence, accelStd: m.accelStd, coarse: coarse(speed, m.cadence, gap) });
   }
   return out;
 }
@@ -419,6 +448,11 @@ type Run = [number, number, Coarse];
 
 /** TimelineBuilder.legs: splits a trip path into legs of one mode. */
 export function legs(path: Fix[], motion: MotionIndex): Leg[] {
+  return pieces(path, motion).map(([l]) => l);
+}
+
+/** The legs, each with whether it is a stretch without a record. */
+function pieces(path: Fix[], motion: MotionIndex): [Leg, boolean][] {
   if (path.length < 2) return [];
   const iv = intervals(path, motion);
   const smoothed = iv.map((x, i) => {
@@ -526,7 +560,7 @@ function weightedQuantile(sorted: [number, number][], q: number): number {
   return sorted[sorted.length - 1]![0];
 }
 
-function makeLeg(iv: Interval[], motion: MotionIndex): Leg {
+function makeLeg(iv: Interval[], motion: MotionIndex): [Leg, boolean] {
   const start = iv[0]!.start;
   const end = iv[iv.length - 1]!.end;
   const dur = end - start;
@@ -559,7 +593,23 @@ function makeLeg(iv: Interval[], motion: MotionIndex): Leg {
     gapRatio: dur > 0 ? gapTime / dur : 0.0,
   });
   const rough = iv.filter((x) => x.gap || x.poor).reduce((a, x) => a + (x.end - x.start), 0);
-  return { start, end, mode, distanceM: dist, steps: m.steps, confidence: conf, maxSpeed: mx, medianSpeed: med, uncertain: dur > 0 ? rough / dur : 0.0 };
+  const silent = iv.filter((x) => x.silent).reduce((a, x) => a + (x.end - x.start), 0);
+  return [
+    { start, end, mode, distanceM: dist, steps: m.steps, confidence: conf, maxSpeed: mx, medianSpeed: med, uncertain: dur > 0 ? rough / dur : 0.0 },
+    isUnrecorded(mode, silent, dur, !Number.isNaN(m.cadence)),
+  ];
+}
+
+/**
+ * TimelineBuilder.isUnrecorded: mostly a long silence, and nothing besides
+ * the two ends says how the user moved (an underground ride's or a flight's
+ * speed, steps counted meanwhile).
+ */
+export function isUnrecorded(mode: ModeKey, silentMs: number, durationMs: number, hasMotion: boolean): boolean {
+  if (silentMs <= 0 || silentMs * 2 < durationMs) return false;
+  if (mode === "UNKNOWN_ACTIVITY_TYPE") return true;
+  if (mode === "IN_SUBWAY" || mode === "FLYING") return false;
+  return !hasMotion;
 }
 
 // ------------------------------------------------- corrections, places
@@ -573,7 +623,7 @@ export function applyOverrides(segs: Segment[], overrides: readonly ModeOverride
       ...s,
       legs: s.legs.map((l) => {
         const o = overrides.find((o) => Math.min(o.end, l.end) - Math.max(o.start, l.start) > Math.trunc((l.end - l.start) / 2));
-        return o ? { ...l, mode: o.mode, confidence: 1.0 } : l;
+        return o ? { ...l, mode: o.mode, confidence: 1.0, corrected: true } : l;
       }),
     };
   });
@@ -633,7 +683,7 @@ function clip(s: Segment, from: number, to: number): Segment {
   const a = Math.max(s.start, from);
   const b = Math.min(s.end, to);
   if (a === s.start && b === s.end) return s;
-  if (s.type === "visit") return { ...s, start: a, end: b };
+  if (s.type === "visit" || s.type === "unrecorded") return { ...s, start: a, end: b };
   return {
     ...s,
     start: a,
@@ -677,7 +727,10 @@ export interface DaySummary {
   visits: number;
   /** Distinct synced places among the visits (unmatched visits each count once). */
   places: number;
+  /** Trips only: stretches without a record are never travel. */
   totalDistanceM: number;
+  /** Time without a record (not in the totals). */
+  unrecordedMs: number;
 }
 
 /** Stats.day */
@@ -686,7 +739,12 @@ export function summarizeDay(date: string, segs: readonly Segment[], steps: numb
   const dur = new Map<ModeKey, number>();
   let visits = 0;
   const places = new Set<string>();
+  let unrecorded = 0;
   for (const s of segs) {
+    if (s.type === "unrecorded") {
+      unrecorded += s.end - s.start;
+      continue;
+    }
     if (s.type === "visit") {
       visits++;
       places.add(s.placeKey ?? `${s.lat.toFixed(3)},${s.lon.toFixed(3)}`);
@@ -700,7 +758,7 @@ export function summarizeDay(date: string, segs: readonly Segment[], steps: numb
   }
   let total = 0;
   for (const v of dist.values()) total += v;
-  return { date, distanceByMode: dist, durationByMode: dur, steps, visits, places: places.size, totalDistanceM: total };
+  return { date, distanceByMode: dist, durationByMode: dur, steps, visits, places: places.size, totalDistanceM: total, unrecordedMs: unrecorded };
 }
 
 /** Distance per mode of several days, longest first. */

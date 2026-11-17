@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { fixesOf, motionOf, readParquet } from "../src/data/archive";
-import type { Fix, ModeKey, Segment } from "../src/data/model";
-import { applyOverrides, buildTimeline, classify, dayKey, removeSpikes, splitByDay, summarizeDay } from "../src/data/timeline";
+import { MODES, PALETTE, type Fix, type ModeKey, type Segment } from "../src/data/model";
+import { applyOverrides, buildTimeline, classify, dayKey, isUnrecorded, removeSpikes, splitByDay, summarizeDay } from "../src/data/timeline";
+import { contentOf, legendModes } from "../src/map/content";
 import { fixture, fixtureJson } from "./helpers";
 
 interface ExpVisit {
@@ -121,5 +122,70 @@ describe("timeline rules", () => {
     const days = splitByDay(buildTimeline(fixes));
     expect([...days.keys()]).toEqual(["2026-10-04", "2026-10-05"]);
     expect(days.get("2026-10-05")![0]!.start).toBe(ds);
+  });
+});
+
+describe("stretches without a record (記録なし), against the app on the same rows", () => {
+  type ExpUnrecorded = { type: "unrecorded"; start: number; end: number; from: { lat: number; lon: number }; to: { lat: number; lon: number } };
+  interface GapExp {
+    date: string;
+    fixes: [number, number, number, number][];
+    motion: [number, number, number, number, number][];
+    segments: (ExpVisit | ExpTrip | ExpUnrecorded)[];
+    summary: { totalDistanceM: number; movingMs: number; unrecordedMs: number };
+  }
+  const exp = fixtureJson<GapExp>("gaps-timeline.json");
+  const fixes: Fix[] = exp.fixes.map(([time, lat, lon, accuracy]) => ({ time, lat, lon, accuracy, altitude: NaN, speed: NaN, bearing: NaN, provider: "gps" }));
+  const motion = exp.motion.map(([start, end, accelStd, accelMean, steps]) => ({ start, end, accelStd, accelMean, steps }));
+  const segs = buildTimeline(fixes, motion);
+  const day = splitByDay(segs).get(exp.date) ?? [];
+
+  it("builds the same visits, trips and unrecorded stretches", () => {
+    expect(segs.map((s) => s.type)).toEqual(exp.segments.map((s) => s.type));
+    segs.forEach((g, i) => {
+      const w = exp.segments[i]!;
+      expect([g.start, g.end], `segment ${i}`).toEqual([w.start, w.end]);
+      if (g.type === "unrecorded" && w.type === "unrecorded") expect(close(g.from.lat, w.from.lat) && close(g.to.lon, w.to.lon)).toBe(true);
+      if (g.type === "trip" && w.type === "trip") expect(g.legs.map((l) => l.mode)).toEqual(w.legs.map((l) => l.mode));
+    });
+    expect(segs.filter((s) => s.type === "unrecorded")).toHaveLength(1);
+  });
+
+  it("leaves them out of the day's distance and travel time", () => {
+    const sum = summarizeDay(exp.date, day, 0);
+    expect(close(sum.totalDistanceM, exp.summary.totalDistanceM)).toBe(true);
+    expect([...sum.durationByMode.values()].reduce((a, b) => a + b, 0)).toBe(exp.summary.movingMs);
+    expect(sum.unrecordedMs).toBe(exp.summary.unrecordedMs);
+    expect(sum.distanceByMode.has("UNKNOWN_ACTIVITY_TYPE")).toBe(false);
+  });
+
+  it("keeps a trip when the mode has evidence of its own", () => {
+    const h = 3_600_000;
+    expect(isUnrecorded("UNKNOWN_ACTIVITY_TYPE", 3 * h, 3 * h, false)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, false)).toBe(true);
+    expect(isUnrecorded("WALKING", h, h, true)).toBe(false);
+    expect(isUnrecorded("IN_SUBWAY", h, h, false)).toBe(false);
+    expect(isUnrecorded("IN_BUS", h / 4, h, false)).toBe(false);
+  });
+
+  it("draws them as a dotted grey line, not as a mode", () => {
+    const c = contentOf([{ date: exp.date, segments: day } as never]);
+    const gaps = c.routes.filter((r) => r.gap);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]!.color).toBe(PALETTE.unrecorded);
+    expect(legendModes(c)).not.toContain("UNKNOWN_ACTIVITY_TYPE");
+  });
+});
+
+describe("one palette", () => {
+  interface PaletteExp {
+    modes: { key: ModeKey; label: string; emoji: string; color: string; vehicle: boolean }[];
+    unrecorded: string;
+    stay: string;
+  }
+  it("has the app's mode labels and colours, in its order", () => {
+    const p = fixtureJson<PaletteExp>("palette.json");
+    expect(MODES.map((m) => ({ ...m }))).toEqual(p.modes);
+    expect({ ...PALETTE }).toEqual({ unrecorded: p.unrecorded, stay: p.stay });
   });
 });

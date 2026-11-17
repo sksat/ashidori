@@ -2,7 +2,7 @@
 // with a large map that follows the selection on wide screens and a small
 // map per card on narrow ones (docs/web-ui.md, "タイムライン").
 
-import { mainMode, modeInfo, placeName, PLACE_KIND_LABEL, type Segment, type Trip, type Visit } from "../data/model";
+import { mainMode, modeInfo, placeName, PLACE_KIND_LABEL, type Segment, type Trip, type Unrecorded, type Visit } from "../data/model";
 import type { DayData } from "../data/store";
 import { addDays, checkInsOf, dayStart, modeTotals } from "../data/timeline";
 import { drawStatic } from "../map/canvas";
@@ -120,7 +120,13 @@ function tripRow(ctx: Ctx, d: DayData, t: Trip, i: number): HTMLElement {
         return h(
           "span",
           { class: "leg" },
-          h("span", { class: "lm" }, emoji(m.emoji), ` ${m.label}${l.confidence < 0.5 ? "（推定）" : ""}`),
+          h(
+            "span",
+            { class: "lm" },
+            emoji(m.emoji),
+            ` ${m.label}${l.confidence < 0.5 ? "（推定）" : ""}`,
+            l.corrected ? h("span", { class: "edited", "aria-label": "編集済み" }, "✎") : null,
+          ),
           h("span", { class: "ld num" }, `${l.uncertain >= 0.3 ? "約" : ""}${fmtDist(l.distanceM)}・${fmtDur(l.end - l.start)}${l.steps > 0 ? `・${nf(l.steps)}歩` : ""}`),
         );
       }),
@@ -128,12 +134,34 @@ function tripRow(ctx: Ctx, d: DayData, t: Trip, i: number): HTMLElement {
   );
 }
 
-function rows(ctx: Ctx, d: DayData): HTMLElement[] {
+/** 記録なし: how the user got from one place to the next is unknown. */
+function unrecordedRow(ctx: Ctx, d: DayData, u: Unrecorded, i: number): HTMLElement {
+  const sel = ctx.state.sel?.key === d.date && ctx.state.sel.index === i;
+  return h(
+    "li",
+    { class: "row u" },
+    h("span", { class: "rail", "aria-hidden": "true" }),
+    h(
+      "button",
+      { class: "rowbtn", type: "button", "aria-pressed": String(sel), onclick: () => select(ctx, d.date, i) },
+      h("span", { class: "pn" }, "記録なし"),
+      h("span", { class: "cap num" }, `${hm(u.start)} – ${hm(u.end)}・${fmtDur(u.end - u.start)}`),
+    ),
+  );
+}
+
+/** The segments shown as rows, newest first, with their index in the day. */
+function shown(d: DayData): [Segment, number][] {
   return d.segments
     .map((s, i): [Segment, number] => [s, i])
     .reverse()
-    .filter(([s]) => s.type === "visit" || s.legs.some((l) => l.mode !== "STILL"))
-    .map(([s, i]) => (s.type === "visit" ? visitRow(ctx, d, s, i) : tripRow(ctx, d, s, i)));
+    .filter(([s]) => s.type !== "trip" || s.legs.some((l) => l.mode !== "STILL"));
+}
+
+function rows(ctx: Ctx, d: DayData): HTMLElement[] {
+  return shown(d).map(([s, i]) =>
+    s.type === "visit" ? visitRow(ctx, d, s, i) : s.type === "unrecorded" ? unrecordedRow(ctx, d, s, i) : tripRow(ctx, d, s, i),
+  );
 }
 
 function mini(content: MapContent, key: string): HTMLElement {
@@ -416,7 +444,7 @@ function select(ctx: Ctx, key: string, index: number | null): void {
     card.querySelectorAll<HTMLButtonElement>(".dayhead").forEach((b) => b.setAttribute("aria-pressed", String(k === key && index === null)));
     const rowBtns = card.querySelectorAll<HTMLButtonElement>(".rowbtn");
     const d = k.includes(":") ? null : ctx.store?.day(ctx.state.device ?? "", k);
-    const order = d ? d.segments.map((s, i): [Segment, number] => [s, i]).reverse().filter(([s]) => s.type === "visit" || s.legs.some((l) => l.mode !== "STILL")).map(([, i]) => i) : [];
+    const order = d ? shown(d).map(([, i]) => i) : [];
     rowBtns.forEach((b, j) => b.setAttribute("aria-pressed", String(k === key && order[j] === index)));
     const m = card.querySelector<HTMLCanvasElement>(".mini canvas");
     if (m && d && (k === key || card.dataset.hl)) {

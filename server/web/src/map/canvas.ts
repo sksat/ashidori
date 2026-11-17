@@ -81,7 +81,8 @@ export function draw(canvas: HTMLCanvasElement, c: MapContent, v: View): void {
     g.globalAlpha = (r.dim ? 0.3 : 1) * (r.faint ? 0.45 : 1);
     g.strokeStyle = r.dashed ? today : r.color;
     g.lineWidth = r.highlight ? 7 : 4.5;
-    g.setLineDash(r.dashed ? [9, 6] : []);
+    // 記録なし: dots (round caps on near-zero dashes).
+    g.setLineDash(r.dashed ? [9, 6] : r.gap ? [0.1, 9] : []);
     line(r.coords);
   }
   g.setLineDash([]);

@@ -325,6 +325,7 @@ export class MapPanel {
       .map(modeInfo)
       .map((m) => h("li", null, h("i", { class: "sw", css: { "--c": m.color } }), m.label));
     if (this.content.routes.some((r) => r.dashed)) items.push(h("li", null, h("i", { class: "sw dash" }), "今日"));
+    if (this.content.routes.some((r) => r.gap)) items.push(h("li", null, h("i", { class: "sw gap" }), "記録なし"));
     if (this.content.stays.length) items.push(h("li", null, h("i", { class: "sw dot" }), "滞在"));
     if (this.content.fixes.length) items.push(h("li", null, h("i", { class: "sw dot fix" }), "最終測位"));
     replace(this.legend, items.length ? h("details", { class: "legend", open: !narrow() }, h("summary", null, "凡例"), h("ul", null, items)) : null);

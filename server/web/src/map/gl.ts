@@ -49,6 +49,7 @@ function geojson(c: MapContent, primary: string) {
         properties: {
           color: r.color,
           dashed: r.dashed,
+          gap: r.gap,
           opacity: (r.dim ? 0.3 : 1) * (r.faint ? 0.45 : 1),
           halo: r.dim ? 0.4 : 1,
           width: r.highlight ? 7 : 4.5,
@@ -169,9 +170,18 @@ export class GlMap {
       id: "route",
       type: "line",
       source: "routes",
-      filter: ["!", ["get", "dashed"]],
+      filter: ["all", ["!", ["get", "dashed"]], ["!", ["get", "gap"]]],
       layout: { "line-cap": "round", "line-join": "round" },
       paint: { "line-color": ["get", "color"], "line-width": ["get", "width"], "line-opacity": ["get", "opacity"] },
+    });
+    // 記録なし: grey dots from where the record stopped to where it resumed.
+    map.addLayer({
+      id: "route-gap",
+      type: "line",
+      source: "routes",
+      filter: ["get", "gap"],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": ["get", "color"], "line-width": ["get", "width"], "line-opacity": ["get", "opacity"], "line-dasharray": [0.1, 2] },
     });
     map.addLayer({
       id: "route-today",

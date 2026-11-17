@@ -3,7 +3,7 @@
 // (docs/web-ui.md, "地図").
 
 import type { DayData } from "../data/store";
-import { isUncertain, modeInfo, type ModeKey } from "../data/model";
+import { isUncertain, modeInfo, PALETTE, type ModeKey } from "../data/model";
 
 export interface MapRoute {
   coords: [number, number][];
@@ -13,6 +13,8 @@ export interface MapRoute {
   dashed: boolean;
   /** Low-accuracy leg: drawn faint. */
   faint: boolean;
+  /** A stretch without a record (記録なし): a dotted grey line between its ends. */
+  gap: boolean;
   highlight: boolean;
   dim: boolean;
 }
@@ -61,10 +63,18 @@ export function contentOf(days: readonly DayData[], hl: Highlight | null = null,
         stays.push({ lon: s.lon, lat: s.lat, highlight: isHl });
         return;
       }
+      if (s.type === "unrecorded") {
+        const coords: [number, number][] = [
+          [s.from.lon, s.from.lat],
+          [s.to.lon, s.to.lat],
+        ];
+        routes.push({ coords, mode: "UNKNOWN_ACTIVITY_TYPE", color: PALETTE.unrecorded, dashed: false, faint: false, gap: true, highlight: isHl, dim });
+        return;
+      }
       for (const l of s.legs) {
         const coords = s.path.filter((f) => f.time >= l.start && f.time <= l.end).map((f): [number, number] => [f.lon, f.lat]);
         if (coords.length < 2) continue;
-        routes.push({ coords, mode: l.mode, color: modeInfo(l.mode).color, dashed: false, faint: isUncertain(l), highlight: isHl, dim });
+        routes.push({ coords, mode: l.mode, color: modeInfo(l.mode).color, dashed: false, faint: isUncertain(l), gap: false, highlight: isHl, dim });
       }
     });
   }
@@ -96,6 +106,6 @@ export function highlightBounds(c: MapContent): [number, number, number, number]
 
 /** Modes drawn, in the app's order, for the legend. */
 export function legendModes(c: MapContent): ModeKey[] {
-  const set = new Set(c.routes.map((r) => r.mode));
+  const set = new Set(c.routes.filter((r) => !r.gap).map((r) => r.mode));
   return [...set];
 }

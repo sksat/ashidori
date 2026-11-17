@@ -6,7 +6,7 @@
   --fg: #161d1b; --muted: #4b5854;
   --primary: #00695c; --primary-c: #b9ece3; --on-primary: #ffffff; --on-primary-c: #00201c;
   --secondary-c: #ffdbc8; --on-secondary-c: #331200;
-  --today: #d9540a; --today-ink: #983600;
+  --today: #d9540a; --today-ink: #983600; --gap: #9AA0A6;
   --tertiary: #6750a4; --tertiary-c: #e9ddff; --on-tertiary-c: #22005d;
   --ok: #1d6b28; --ok-c: #d6efd6; --warn: #7a4a00; --warn-c: #ffe9c7; --bad: #b3261e; --bad-c: #fbe1de;
   --focus: #0b57d0; --scrim: rgb(10 20 18 / .45);
@@ -24,7 +24,7 @@
     --fg: #e1e8e6; --muted: #a8b5b1;
     --primary: #6fd8c6; --primary-c: #0f4f46; --on-primary: #00382f; --on-primary-c: #b9ece3;
     --secondary-c: #5a2f17; --on-secondary-c: #ffdbc8;
-    --today: #ff9a5c; --today-ink: #ffb68a;
+    --today: #ff9a5c; --today-ink: #ffb68a; --gap: #9AA0A6;
     --tertiary: #cfbcff; --tertiary-c: #3a2d63; --on-tertiary-c: #e9ddff;
     --ok: #8bd895; --ok-c: #173a1c; --warn: #f2c26b; --warn-c: #3b2a0a; --bad: #ffa199; --bad-c: #4a1a19;
     --focus: #8ab4ff; --scrim: rgb(0 0 0 / .6);
@@ -40,7 +40,7 @@
   --fg: #e1e8e6; --muted: #a8b5b1;
   --primary: #6fd8c6; --primary-c: #0f4f46; --on-primary: #00382f; --on-primary-c: #b9ece3;
   --secondary-c: #5a2f17; --on-secondary-c: #ffdbc8;
-  --today: #ff9a5c; --today-ink: #ffb68a;
+  --today: #ff9a5c; --today-ink: #ffb68a; --gap: #9AA0A6;
   --tertiary: #cfbcff; --tertiary-c: #3a2d63; --on-tertiary-c: #e9ddff;
   --ok: #8bd895; --ok-c: #173a1c; --warn: #f2c26b; --warn-c: #3b2a0a; --bad: #ffa199; --bad-c: #4a1a19;
   --focus: #8ab4ff; --scrim: rgb(0 0 0 / .6);
@@ -165,6 +165,9 @@ time.tt { text-decoration: underline dotted var(--line-strong); text-underline-o
 .rail::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 3px; transform: translateX(-50%); background: var(--primary); }
 .row.v .rail i { position: absolute; left: 50%; top: 15px; width: 15px; height: 15px; transform: translateX(-50%); border-radius: 50%; background: var(--surface); border: 3px solid var(--primary); }
 .row.t .rail::before { width: 5px; border-radius: 3px; background: var(--c); }
+.row.u .rail::before { width: 0; background: none; border-left: 4px dotted var(--gap); }
+.row.u .pn { color: var(--muted); font-weight: 400; }
+.edited { font-size: 12px; color: var(--muted); margin-left: 4px; }
 .rowbtn { display: flex; flex-direction: column; align-items: stretch; width: 100%; text-align: left; border: 0; background: none; padding: 8px 10px; border-radius: 12px; min-height: 44px; }
 .rowbtn:hover { background: var(--surface2); }
 .rowbtn[aria-pressed="true"] { background: color-mix(in srgb, var(--primary-c) 55%, transparent); }
@@ -201,6 +204,7 @@ time.tt { text-decoration: underline dotted var(--line-strong); text-underline-o
 .legend li { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .sw { display: inline-block; width: 18px; height: 0; border-top: 4px solid var(--c); }
 .sw.dash { border-top-style: dashed; border-top-color: var(--today); }
+.sw.gap { border-top-style: dotted; border-top-color: var(--gap); }
 .sw.dot { width: 11px; height: 11px; border: 2.5px solid var(--map-halo); border-radius: 50%; background: var(--node); box-shadow: 0 0 0 1px var(--line-strong); }
 .sw.dot.fix { background: var(--primary); }
 .attrib { position: absolute; right: 8px; bottom: 6px; margin: 0; font-size: 11px; color: var(--muted); background: color-mix(in srgb, var(--surface) 85%, transparent); padding: 1px 8px; border-radius: 6px; max-width: 45%; text-align: right; line-height: 1.4; z-index: 2; }

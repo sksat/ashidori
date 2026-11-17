@@ -117,6 +117,8 @@ export interface Leg {
   medianSpeed: number;
   /** Fraction of the leg's time without a good position. */
   uncertain: number;
+  /** The user set the mode (an override applied). */
+  corrected?: boolean;
 }
 
 export interface Trip {
@@ -127,7 +129,22 @@ export interface Trip {
   legs: Leg[];
 }
 
-export type Segment = Visit | Trip;
+/**
+ * A stretch without positions (記録なし) between two places: how the user
+ * got from one to the other is unknown, so it is never counted as travel.
+ */
+export interface Unrecorded {
+  type: "unrecorded";
+  start: number;
+  end: number;
+  from: { lat: number; lon: number };
+  to: { lat: number; lon: number };
+}
+
+export type Segment = Visit | Trip | Unrecorded;
+
+/** Colours besides the modes' (core Palette): 記録なし and stays. */
+export const PALETTE = { unrecorded: "#9AA0A6", stay: "#006B5B" } as const;
 
 export const isUncertain = (l: Leg): boolean => l.uncertain >= 0.3;
 
