@@ -121,6 +121,23 @@ class UnrecordedSuite extends munit.FunSuite:
     assertEquals(unrecorded(out).size, 1, out.mkString("\n"))
   }
 
+  test("days without a fix inside a gap of several days are silent days, at any distance") {
+    val d0 = LocalDate.of(2026, 10, 1)
+    def start(d: LocalDate) = d.atStartOfDay(zone).toInstant.toEpochMilli
+    // Fixes on the 1st (evening) and the 6th (morning) only.
+    val first = Some(start(d0) + 20 * 3_600_000L)
+    val last = Some(start(d0.plusDays(5)) + 8 * 3_600_000L)
+    def silent(d: LocalDate, cause: Option[GapCause] = None) = Stats.silentDay(start(d), start(d.plusDays(1)), first, last, cause)
+    for k <- 1 to 4 do assert(silent(d0.plusDays(k)), s"day +$k")
+    // Before the first fix and after the last: no record at all, not a gap.
+    assert(!silent(d0.minusDays(1)))
+    assert(!silent(d0.plusDays(6)))
+    // Recording stopped by the user: not a gap in the record.
+    assert(!silent(d0.plusDays(2), Some(GapCause.Stopped)))
+    assert(silent(d0.plusDays(2), Some(GapCause.ServiceDown)))
+    assert(!Stats.silentDay(start(d0), start(d0.plusDays(1)), None, None, None))
+  }
+
   test("a day with nothing but a stretch without a record is a day without a record") {
     val d = LocalDate.of(2026, 10, 7)
     val ds = d.atStartOfDay(zone).toInstant.toEpochMilli

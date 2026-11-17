@@ -152,8 +152,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       // Lowered, the sheet shows the date and the totals, and a sliver of
       // the list below them says there is more.
       sheet.addOnLayoutChangeListener((_, _, _, _, _, _, _, _, _) =>
-        // The date row overlaps the lower half of the handle (DayParts.dragHandle).
-        val peek = handle.getHeight - dp(24) + dateHeader.getHeight + daySummary.getHeight + dp(20)
+        val peek = handle.getHeight + dateHeader.getHeight + daySummary.getHeight + dp(20)
         if handle.getHeight > 0 && peek != behavior.getPeekHeight then behavior.setPeekHeight(peek))
     else
       // Lowered sheet still shows the span chips and the date row.
@@ -274,11 +273,21 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   /** The calendar: dots on days with a record, grey where only part of the day was. */
   private def pickDay(): Unit =
     val zone = AshidoriApp.zone
+    // Read once per calendar, on the I/O thread: the first and last fix of
+    // the whole record and the lifecycle log.
+    lazy val firstFix = AshidoriApp.db.firstDataDateCached.map(_.atStartOfDay(zone).toInstant.toEpochMilli)
+    lazy val lastFix = AshidoriApp.db.lastFix().map(_.time)
+    lazy val events = net.sksat.ashidori.LifeLog.read()
     def status(d: LocalDate): DayParts.Recorded =
       val tl = TimelineRepo.day(d)
-      // All 記録なし (the phone off across the day): not a silent nothing.
+      val dayStart = d.atStartOfDay(zone).toInstant.toEpochMilli
+      val dayEnd = d.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
+      def silent =
+        val cause = RecordingGaps.explain(Seq((dayStart, dayEnd)), events).headOption.map(_.cause)
+        Stats.silentDay(dayStart, dayEnd, firstFix, lastFix, cause)
+      // All 記録なし (the phone off across the day, however long): not a silent nothing.
       if tl.onlyUnrecorded then DayParts.Recorded.Partial
-      else if tl.segments.isEmpty then DayParts.Recorded.None
+      else if tl.segments.isEmpty then (if silent then DayParts.Recorded.Partial else DayParts.Recorded.None)
       else
         val from = d.atStartOfDay(zone).toInstant.toEpochMilli
         val to = math.min(d.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli, System.currentTimeMillis())

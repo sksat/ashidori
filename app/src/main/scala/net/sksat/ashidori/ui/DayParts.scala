@@ -19,19 +19,16 @@ import Ui.*
 object DayParts:
   val dateFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("M月d日（E）", Locale.JAPANESE)
 
-  /** Material's drag handle, compact to look at: the grabber sits 14 dp from
-    * the top and the next row overlaps the lower half of its 48 dp touch
-    * target (that row's own controls take the touches on them). With
-    * `behavior`, TalkBack also offers to expand and to collapse the sheet.
+  /** Material's drag handle: a small grabber centred in a full 48 dp touch
+    * target that nothing overlaps. With `behavior`, TalkBack also offers to
+    * expand and to collapse the sheet.
     */
   def dragHandle(c: Context, behavior: Option[() => com.google.android.material.bottomsheet.BottomSheetBehavior[?]] = None): BottomSheetDragHandleView =
     given Context = c
     val h = BottomSheetDragHandleView(c)
     h.setMinimumHeight(dp(48))
-    h.setPadding(0, dp(14), 0, dp(30))
-    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
-    lp.bottomMargin = -dp(24)
-    h.setLayoutParams(lp)
+    h.setPadding(0, dp(22), 0, dp(22))
+    h.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)))
     for b <- behavior do
       import com.google.android.material.bottomsheet.BottomSheetBehavior as B
       androidx.core.view.ViewCompat.addAccessibilityAction(h, "シートを広げる", (_, _) => { b().setState(B.STATE_EXPANDED); true })

@@ -53,6 +53,16 @@ object Stats:
   def shown(segments: Vector[Segment]): Vector[Segment] =
     if segments.forall(_.isInstanceOf[Unrecorded]) then Vector.empty else segments
 
+  /** A day without a fix of its own that lies inside a stretch without a
+    * record: there is a fix before `dayStart` and one at or after `dayEnd`,
+    * however far away (`firstFix`, `lastFix`: the first and last fix of the
+    * whole record), and the record does not say the user stopped recording
+    * then (`cause`, from the lifecycle log when it still holds that time).
+    * The calendar marks such days as recorded only in part.
+    */
+  def silentDay(dayStart: Long, dayEnd: Long, firstFix: Option[Long], lastFix: Option[Long], cause: Option[GapCause]): Boolean =
+    firstFix.exists(_ < dayStart) && lastFix.exists(_ >= dayEnd) && !cause.contains(GapCause.Stopped)
+
   /** Time of `[from, to)` that no stay or trip covers: stretches without a
     * record and the part of the day before the first or after the last one.
     */
