@@ -409,7 +409,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       val spans = AshidoriApp.archive.read(Archive.EnergyStates, from, Long.MaxValue).map(Archive.energyOf) ++
         hotRows(Archive.EnergyStates, from, Long.MaxValue).map(r => Archive.energyOf(r.toIndexedSeq)) ++
         openEnergy().map(_._2).filter(_.start < now).map(_.span.copy(end = now))
-      (readings.distinctBy(_.time).sortBy(_.time), spans.distinctBy(_.start).sortBy(_.start))
+      // One version of each piece of a state change (EnergyLog.select), not one per start.
+      (readings.distinctBy(_.time).sortBy(_.time), EnergyLog.select(spans))
     }
 
   def insertGnssSession(start: Long, end: Long, file: String, reason: String): Unit = tx { db =>

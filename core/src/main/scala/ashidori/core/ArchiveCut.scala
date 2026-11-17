@@ -14,7 +14,7 @@ object ArchiveCut:
   def cutRow(t: Archive.TableDef, r: IndexedSeq[Any], from: Long, to: Long): Seq[IndexedSeq[Any]] =
     if t == Archive.EnergyStates then
       val s = Archive.energyOf(r)
-      val row = EnergyRow(s.start, Some(s.end), s.state, !s.endKnown)
+      val row = EnergyRow(s.start, Some(s.end), s.state, !s.endKnown, s.boot, s.seq)
       val parts = EnergyLog.clip(Seq(row), Seq((from, to)), Long.MaxValue)
       if parts == Seq(row) then Seq(r) else parts.map(p => Archive.energyRow(p.span).toIndexedSeq)
     else

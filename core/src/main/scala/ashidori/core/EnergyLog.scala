@@ -11,7 +11,7 @@ import scala.collection.mutable.ArrayBuffer
   */
 final case class EnergyRow(start: Long, end: Option[Long], state: EnergyState, endUnknown: Boolean = false,
                            boot: Long = 0L, seq: Long = 0L, id: Long = 0L):
-  def span: EnergySpan = EnergySpan(start, end.getOrElse(start), state, !endUnknown)
+  def span: EnergySpan = EnergySpan(start, end.getOrElse(start), state, !endUnknown, boot, seq, open = end.isEmpty)
 
 /** What one recorder (`boot`: one per process, numbered in start order by
   * a counter kept on disk) has had stored: its last change applied (`seq`)
@@ -55,6 +55,20 @@ object EnergyLog:
     */
   final case class Before(tail: Option[EnergyRow], checkpoint: Option[EnergyCheckpoint], newest: Boolean,
                           olderOpen: Seq[(EnergyRow, Option[Long])] = Nil)
+
+  /** One span per piece of a state change: the rows of the same origin
+    * (`boot`, `seq`) and the same start can be there twice, an earlier and
+    * a later version (the archive kept a row that was closed again after it
+    * was read). The later one wins: a closed one over an open one, one with
+    * a known end over one whose end is unknown, then the later end (a later
+    * confirmation). Rows of no origin (`boot` 0, before origins were kept)
+    * and rows of different origins are all kept, even with the same start.
+    */
+  def select(spans: Seq[EnergySpan]): Vector[EnergySpan] =
+    def rank(s: EnergySpan) = (if s.open then 0 else if s.endKnown then 2 else 1, s.end)
+    val (known, legacy) = spans.partition(_.boot != 0)
+    (known.groupBy(s => (s.boot, s.seq, s.start)).values.map(_.maxBy(rank)).toVector ++ legacy.distinct.toVector)
+      .sortBy(s => (s.start, s.end))
 
   /** Rows to delete (by id), rows to insert, and the recorder's new checkpoint. */
   final case class Change(remove: Seq[Long], insert: Seq[EnergyRow], checkpoint: EnergyCheckpoint)

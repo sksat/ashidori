@@ -59,7 +59,11 @@ final case class EnergyState(
   * closing it; it may have lasted longer (up to the next span), but that
   * time is not counted.
   */
-final case class EnergySpan(start: Long, end: Long, state: EnergyState, endKnown: Boolean = true):
+final case class EnergySpan(start: Long, end: Long, state: EnergyState, endKnown: Boolean = true,
+                            /** The state change it began with: recorder and seq (0: before they were kept). */
+                            boot: Long = 0L, seq: Long = 0L,
+                            /** Still open: `end` is when it was read. */
+                            open: Boolean = false):
   def ms: Long = end - start
 
 object EnergySpan:

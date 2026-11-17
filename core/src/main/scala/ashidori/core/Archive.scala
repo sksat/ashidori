@@ -50,7 +50,7 @@ object Archive:
     Column("start", Int64), Column("end", Int64), Column("gnss", Int32), Column("gnss_interval_ms", Int64),
     Column("provider", Str), Column("detail", Int32), Column("still", Int32), Column("screen_on", Int32),
     Column("charging", Int32), Column("mode", Str), Column("eff_mode", Str), Column("motion", Str), Column("env", Str),
-    Column("end_unknown", Int32)))
+    Column("end_unknown", Int32), Column("boot", Int64), Column("seq", Int64)))
   val GnssStatus = TableDef("gnss_status", Seq(
     Column("time", Int64), Column("visible", Int32), Column("used", Int32), Column("top4", Float64), Column("l5", Int32),
     Column("env", Str), Column("acc", Float32)))
@@ -331,12 +331,13 @@ object Archive:
     val e = s.state
     def b(x: Boolean) = if x then 1 else 0
     Seq(s.start, s.end, b(e.gnss), e.gnssIntervalMs, e.provider, b(e.detail), b(e.still), b(e.screenOn), b(e.charging),
-      e.mode, e.effMode, e.motion, e.env, b(!s.endKnown))
+      e.mode, e.effMode, e.motion, e.env, b(!s.endKnown), s.boot, s.seq)
   def energyOf(r: IndexedSeq[Any]): EnergySpan =
     def s(i: Int) = Option(r(i)).map(_.toString).getOrElse("")
     EnergySpan(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]),
       EnergyState(r(2) == 1, opt[Long](r(3)).getOrElse(0L), s(4), r(5) == 1, r(6) == 1, r(7) == 1, r(8) == 1,
-        s(9), s(10), s(11), s(12)), endKnown = !(r.size > 13 && r(13) == 1))
+        s(9), s(10), s(11), s(12)), endKnown = !(r.size > 13 && r(13) == 1),
+      boot = if r.size > 14 then opt[Long](r(14)).getOrElse(0L) else 0L, seq = if r.size > 15 then opt[Long](r(15)).getOrElse(0L) else 0L)
 
   /** Archive file names. */
   def dayFile(t: TableDef, day: java.time.LocalDate): String = s"${t.name}/$day.parquet"

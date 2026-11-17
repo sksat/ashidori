@@ -176,6 +176,29 @@ class EnergyLogSuite extends munit.FunSuite:
     assertEquals(u.view, Nil)
   }
 
+  test("reading: one version per piece of a state change, the definitive one; never by start alone") {
+    val a = EnergySpan(600, 610, st(1), endKnown = false, boot = 3, seq = 1)    // archived, closed at a confirmation
+    val b = EnergySpan(600, 620, st(1), boot = 3, seq = 1)                      // closed again later, known end
+    val open = EnergySpan(600, 700, st(1), boot = 3, seq = 1, open = true)      // as it was while open
+    assertEquals(EnergyLog.select(Seq(a, b, open)), Vector(b))
+    assertEquals(EnergyLog.select(Seq(a, open)), Vector(a))
+    // Two unknown ends: the later confirmation.
+    assertEquals(EnergyLog.select(Seq(a, a.copy(end = 615))), Vector(a.copy(end = 615)))
+    // Another origin with the same start (another recorder, a clock that went back): both stay.
+    val other = EnergySpan(600, 650, st(2), boot = 4, seq = 1)
+    assertEquals(EnergyLog.select(Seq(b, other)).toSet, Set(b, other))
+    // The pieces of one change split at midnight: each kept.
+    val day1 = EnergySpan(0, 100, st(1), boot = 5, seq = 2)
+    val day2 = EnergySpan(100, 200, st(1), boot = 5, seq = 2)
+    assertEquals(EnergyLog.select(Seq(day2, day1)), Vector(day1, day2))
+    // Rows of no origin (written before origins were kept): exact repeats once, the rest kept.
+    val l1 = EnergySpan(600, 610, st(1))
+    val l2 = EnergySpan(600, 620, st(1))
+    assertEquals(EnergyLog.select(Seq(l1, l2, l1)).toSet, Set(l1, l2))
+    // Through the archive's columns and back.
+    assertEquals(Archive.energyOf(Archive.energyRow(b).toIndexedSeq), b)
+  }
+
   test("the tracker keeps at most maxPending changes and counts the rest") {
     val t = EnergyTracker(1, maxPending = 3)
     for i <- 1 to 5 do t.update(i * 10L, Some(st(i)))
