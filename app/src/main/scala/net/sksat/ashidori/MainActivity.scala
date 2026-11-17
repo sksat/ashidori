@@ -277,6 +277,8 @@ class MainActivity extends AppCompatActivity:
     *   --ez ashidori.basemapImport true                install <external files>/basemap/<pinned file>
     *   --es ashidori.venuesUrl, --ez ashidori.venuesImport   the same for the venue index (venues/)
     * Either way the archive must match the pin (app/src/main/assets/{basemap,venues}-pin.json).
+    * For screenshots, to a running activity:
+    *   --es ashidori.mapAt 35.6812,139.7671,16         every open map's camera there (lat,lon,zoom)
     */
   private def debugDownloads(intent: Intent): Unit =
     Option(intent.getStringExtra("ashidori.basemapUrl")).foreach { u =>
@@ -291,6 +293,8 @@ class MainActivity extends AppCompatActivity:
     }
     if intent.getBooleanExtra("ashidori.venuesImport", false) then
       VenueData.pin.foreach(p => VenueDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"venues/${p.file}")))
+    Option(intent.getStringExtra("ashidori.mapAt")).flatMap(s => scala.util.Try(s.split(",").map(_.trim.toDouble)).toOption)
+      .collect { case Array(lat, lon, zoom) => maps.foreach(_.moveTo(ashidori.core.LatLng(lat, lon), zoom)) }
 
   private def handleIntent(intent: Intent): Unit =
     if intent.getBooleanExtra(MainActivity.ExtraOpenDiagnostics, false) && Settings.onboarded then

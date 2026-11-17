@@ -63,6 +63,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private var resumed = act.getLifecycle.getCurrentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
   /** The MapLibre view; null while dropped ([[dropMapView]]). */
   private var mapView: MapView = null
+  /** Venues of the on-device index ([[VenueLayer]]). */
+  private val venues = VenueLayer(act)
   /** Lifecycle calls the current [[mapView]] has had. */
   private var mvStarted = false
   private var mvResumed = false
@@ -187,7 +189,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     b.setLayoutParams(lp)
     b
 
-  /** Basemap version the loaded offline style was drawn from. */
+  /** Basemap version the loaded style was drawn from (the offline map, or
+    * a raster map's fonts, [[MapStyle.basemapFonts]]).
+    */
   private var loadedBasemap: Option[String] = None
 
   private def noMap: Boolean = shown.contains(Outcome.NoBasemap)
@@ -352,6 +356,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     val mv = mapView
     if mv != null then
       initialCamera = camera.orElse(initialCamera)
+      venues.detach()
       mapView = null
       mlMap = None
       map = None
@@ -370,8 +375,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     */
   private def loadStyle(m: MapLibreMap, base: Outcome[MapStyle]): Unit =
     map = None
+    venues.detach()
     shown = Some(base)
-    if base == Outcome.Draw(MapStyle.Offline) then loadedBasemap = Basemap.installedVersion
+    loadedBasemap = Basemap.installedVersion
     updateDetailButton()
     val builder = base match
       case Outcome.Draw(ms) => ms.builder
@@ -493,6 +499,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
           }
         }
       enableMyLocation(m, style)
+      // Shops and other places from the venue index, under the basemap's labels and our layers.
+      venues.attach(m, style, sprite = base == Outcome.Draw(MapStyle.Offline), below = "live-line")
       map = Some((m, style))
       val (run, cam) = pending.drain()
       run.foreach(_())
@@ -502,7 +510,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   // The basemap was downloaded or deleted: draw the map with or without it
   // (or a new version of it). Progress only updates the card.
   private val stopBasemap = BasemapDownload.listen { () =>
-    val stale = shown.contains(Outcome.Draw(MapStyle.Offline)) && loadedBasemap != Basemap.installedVersion
+    val usesBasemap = shown.exists {
+      case Outcome.Draw(s) => s == MapStyle.Offline || s.basemapFonts
+      case Outcome.NoBasemap => false
+    }
+    val stale = usesBasemap && loadedBasemap != Basemap.installedVersion
     refreshBaseMap(force = stale)
   }
 

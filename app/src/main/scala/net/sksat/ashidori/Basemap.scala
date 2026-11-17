@@ -45,6 +45,13 @@ object Basemap extends PinnedData:
   /** The offline map can be drawn: its data is installed and valid. */
   def available: Boolean = styleJson.nonEmpty
 
+  /** The offline map's fonts (every BMP range of its Noto stacks) as a
+    * style's `glyphs`, for styles without fonts of their own (raster maps):
+    * the venue layer's labels need them. None without the offline map.
+    */
+  def glyphs: Option[String] =
+    if available then dir.map(d => s"file://${d.getAbsolutePath}/fonts/{fontstack}/{range}.pbf") else None
+
   /** Credit lines of the downloaded copy (its manifest), for データの出典. */
   def attribution: Seq[String] =
     dir.flatMap(d => Try(ujson.read(Files.readAllBytes(File(d, "manifest.json").toPath))("attribution").arr.map(_.str).toSeq).toOption)

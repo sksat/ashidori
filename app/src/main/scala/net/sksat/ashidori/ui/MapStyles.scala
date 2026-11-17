@@ -30,6 +30,11 @@ enum MapStyle(val key: String, val label: String, val note: String):
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
 
+  /** A raster map whose style takes the offline map's fonts ([[Basemap.glyphs]]). */
+  def basemapFonts: Boolean = this match
+    case GsiStd | GsiPale | GsiPhoto | GsiRelief | Custom => true
+    case _ => false
+
   /** What a remembered consent names ([[SendGate.remember]]): the map, and
     * for [[Custom]] its URL, so a consent never carries over to another server.
     */
@@ -201,19 +206,22 @@ object MapStyle:
   /** GSI tiles must carry this attribution (terms of use). */
   private val gsiCredit = "<a href=\"https://maps.gsi.go.jp/development/ichiran.html\">地理院タイル</a>"
 
+  /** A raster map; with the offline map installed, its fonts on the device
+    * for the venue layer's labels ([[Basemap.glyphs]]).
+    */
   private def raster(url: String, maxZoom: Int = 18, credit: String = gsiCredit): String =
-    ujson.write(
-      ujson.Obj(
-        "version" -> 8,
-        "sources" -> ujson.Obj(
-          "base" -> ujson.Obj(
-            "type" -> "raster",
-            "tiles" -> ujson.Arr(url),
-            "tileSize" -> 256,
-            "maxzoom" -> maxZoom,
-            "attribution" -> credit
-          )
-        ),
-        "layers" -> ujson.Arr(ujson.Obj("id" -> "base", "type" -> "raster", "source" -> "base"))
-      )
+    val style = ujson.Obj(
+      "version" -> 8,
+      "sources" -> ujson.Obj(
+        "base" -> ujson.Obj(
+          "type" -> "raster",
+          "tiles" -> ujson.Arr(url),
+          "tileSize" -> 256,
+          "maxzoom" -> maxZoom,
+          "attribution" -> credit
+        )
+      ),
+      "layers" -> ujson.Arr(ujson.Obj("id" -> "base", "type" -> "raster", "source" -> "base"))
     )
+    Basemap.glyphs.foreach(g => style("glyphs") = g)
+    ujson.write(style)
