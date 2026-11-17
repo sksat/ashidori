@@ -21,7 +21,7 @@ object PeerFormat:
 
   def ago(t: Long, now: Long = System.currentTimeMillis()): String =
     val d = now - t
-    if d < 60_000 then "たった今"
+    if d < 60_000 then "1分以内"
     else if d < 3_600_000 then s"${d / 60_000}分前"
     else if d < 86_400_000 then s"${d / 3_600_000}時間前"
     else s"${d / 86_400_000}日前"
@@ -31,14 +31,14 @@ object PeerFormat:
 
   def mode(s: DeviceStatus): LoggingMode = LoggingMode.fromKey(s.mode)
 
-  /** "● バランス" in the mode's color, or "■ 停止中" in grey. */
+  /** "● バランス" in the mode's color, or "■ 記録停止中" in grey. */
   def recording(s: DeviceStatus, t: TextView)(using Ctx): Unit =
     if s.recording then
       val m = mode(s)
       t.setText(s"● ${m.label}")
       t.setTextColor(ModeInfo.color(m))
     else
-      t.setText("■ 停止中")
+      t.setText("■ 記録停止中")
       t.setTextColor(color(attr.onSurfaceVariant))
 
   /** "⚡ 82%" while charging, "🔋 82%" otherwise; low battery in red. */
@@ -55,8 +55,8 @@ object PeerFormat:
 
   /** A received status that could not be read, in the error color. */
   def problem(u: Unresolved)(using Ctx): TextView =
-    val retry = if u.attempts >= StatusSyncState.MaxAttempts then "" else "・再試行します"
-    text(s"⚠ 受信した状態を読み取れませんでした（${u.attempts}回）$retry", 13f, colorAttr = attr.error)
+    val retry = if u.attempts >= StatusSyncState.MaxAttempts then "" else "・再試行中"
+    text(s"⚠ 受信した状態を読み取れません（${u.attempts}回）$retry", 13f, colorAttr = attr.error)
 
 /** The 端末 section at the top of the ステータス tab: one row per other
   * device of the user. Hidden unless sync is set up with another device.

@@ -9,6 +9,7 @@ import Ui.*
 /** Settings hub. Each row says what it is and its current state. */
 final class SettingsScreen(act: MainActivity) extends Screen:
   private given Ctx = act
+  private val PrivacySwitch = "オンライン地図と地名検索"
   override val title = "設定"
 
   /** Attribution of the bundled data (from the generated manifests) and of
@@ -29,20 +30,20 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "位置参照情報: https://nlftp.mlit.go.jp/isj/",
       "GeoNames: https://www.geonames.org/（CC BY 4.0: https://creativecommons.org/licenses/by/4.0/）",
       "",
-      "■ 簡易地図（端末内の地図。初回にダウンロード）",
+      "■ オフライン地図",
       if basemap.nonEmpty then bullets(basemap) else BasemapStaticCredits,
       "OpenStreetMap: https://www.openstreetmap.org/copyright",
       "",
-      "■ 詳しい地図（サーバから取得）",
+      "■ オンライン地図",
       "・OpenFreeMap: © OpenMapTiles、© OpenStreetMap contributors",
       "・国土地理院: 地理院タイル",
       "",
-      "■ 施設データ（端末内の施設の検索。ダウンロードして使用）",
+      "■ 施設データ",
       if venues.nonEmpty then bullets(venues) else VenueStaticCredits,
       "OpenStreetMap: https://www.openstreetmap.org/copyright",
       "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。作り方: https://github.com/sksat/ashidori/tree/main/tools/venues",
       "",
-      "■ 近くの施設の検索（最新を取得したとき）",
+      "■ 施設のオンライン検索",
       "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）"
     )
     val body = text(lines.mkString("\n"), 14f)
@@ -70,10 +71,10 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     "Geofabrik の日本の抽出（https://download.geofabrik.de/asia/japan.html）。加工: チェックインの対象となる施設を抜き出し、索引形式に変換（ashidori）"
   ).map("・" + _).mkString("\n")
 
-  /** オン・オフ・対象外 of the privacy switch, behind its info button. */
+  /** オン・オフ of the privacy switch and what it does not cover, behind its info button. */
   private def showPrivacyInfo(): Unit =
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
-      .setTitle("位置情報を外部サービスに送らない")
+      .setTitle(PrivacySwitch)
       .setMessage(
         "地図の取得と地名の問い合わせで、本アプリが位置情報を自動で送信することを止めます。\n\n" +
         "オン: 地図は端末内の簡易地図で表示し、地名は端末内のデータで求めます。詳しい地図の表示は、操作したときのみ行い、その位置情報を送信します。詳しい地図は、選んだ地図（マップ、期間の画面のそれぞれ）でのみ、表示している間に取得します。その選択は再起動後も保ち、簡易地図に戻すか、この設定を切り替えると取り消します。\n\n" +
@@ -132,7 +133,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
   private val list = vbox()
   val view: View = scroll(list)
 
-  /** The 簡易地図 row, kept current while the download runs. */
+  /** The オフライン地図 row, kept current while the download runs. */
   private var basemapRow: Option[ListRow] = None
   private val stopBasemap = BasemapDownload.listen(() => basemapRow.foreach(showBasemap))
   /** The 施設データ row, likewise. */
@@ -157,7 +158,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
         TrackMap.privacyChanged(act)
       }))
 
-    val basemap = navRow("簡易地図", " ")(BasemapUi.showDialog(act))
+    val basemap = navRow("オフライン地図", " ")(BasemapUi.showDialog(act))
     showBasemap(basemap)
     basemapRow = Some(basemap)
     val venues = navRow("施設データ", " ")(VenueDataUi.showDialog(act))
@@ -172,17 +173,17 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
     val syncState =
       if SyncConfig.ready then s"同期中・${SyncConfig.serverUrl}"
-      else if SyncConfig.paired then "鍵の設定が必要です"
-      else "未設定（この端末だけに保存）"
+      else if SyncConfig.paired then "鍵の設定が必要"
+      else "未設定（この端末のみに保存）"
     add(sectionHeader("データ"), listGroup(
-      navRow("サーバ同期（エンドツーエンド暗号化）", syncState)(act.push(SyncSettingsScreen(act))),
+      navRow("サーバ同期", syncState)(act.push(SyncSettingsScreen(act))),
       navRow("エクスポート・インポート", "Timeline.json・GPX・Parquet・GNSS ログ")(act.push(DataScreen(act)))
     ))
 
     add(sectionHeader("情報"), listGroup(navRow("データの出典")(showSources())))
 
     add(sectionHeader("開発者向け"), listGroup(
-      navRow("端末診断", "GNSS とセンサーの能力・自己テスト")(act.push(DiagnosticsScreen(act)))))
+      navRow("端末診断", "衛星測位とセンサーの対応状況・自己テスト")(act.push(DiagnosticsScreen(act)))))
 
     val version = supportingText(s"ashidori ${BuildInfo.versionName}")
     version.setPadding(version.getPaddingLeft, dp(24), version.getPaddingRight, dp(24))

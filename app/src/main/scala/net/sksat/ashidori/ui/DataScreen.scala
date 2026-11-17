@@ -136,7 +136,7 @@ final class DataScreen(act: MainActivity) extends Screen:
             f
           case "gnsslog" =>
             val f = File(dir, s"ashidori-gnss-$range.zip")
-            if Exporter.gnssLogZip(a, b, f, progress) == 0 then throw IllegalStateException("この期間の詳細ログはありません")
+            if Exporter.gnssLogZip(a, b, f, progress) == 0 then throw IllegalStateException("この期間の生データはありません")
             f
           case _ =>
             val tls = Iterator.iterate(a)(_.plusDays(1)).takeWhile(!_.isAfter(b)).map(TimelineRepo.day).toVector

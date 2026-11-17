@@ -149,7 +149,7 @@ final class RegistrationMachine(
 
   /** Stores a new request with a fresh token, checked to be on disk. On `local`. */
   private def begin(id: Long, url: String, kind: String, code: String, name: String, username: String): PendingRegistration =
-    if current.get != id then throw IllegalStateException("登録をやめました")
+    if current.get != id then throw IllegalStateException("登録を中止しました")
     if storage.busy || pending.isDefined then throw IllegalStateException("登録の処理がすでに進んでいます")
     val p = PendingRegistration(url.stripSuffix("/"), kind, code, name, randomToken(), username)
     store(Some(p))
@@ -260,5 +260,5 @@ final class RegistrationMachine(
     try
       val p = onLocal(begin(id, url, kind, code, name, username))
       val answer = Try(send(p))
-      onLocal(finish(id, p, answer)).getOrElse(throw IllegalStateException("登録をやめました"))
+      onLocal(finish(id, p, answer)).getOrElse(throw IllegalStateException("登録を中止しました"))
     finally release(id)

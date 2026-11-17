@@ -29,7 +29,7 @@ final class PositioningPanel(act: MainActivity):
     col.setLayoutParams(weighted())
     hbox(accuracy, col)
 
-  // --- satellites: 「いま」 then 「履歴」, in one card ---
+  // --- satellites: 「現在」 then 「履歴」, in one card ---
   // The same rows in every state (receiving, acquiring, off); 「—」 where
   // there is nothing to show, and each value's age beside it.
   private val state = SensorUi.StateLine()
@@ -111,7 +111,7 @@ final class PositioningPanel(act: MainActivity):
       swatch(color(attr.primary), "使用衛星数（棒）"),
       swatch(color(attr.tertiary), "信号強度（線）", line = true)
     ),
-    hbox(swatch(color(attr.secondaryContainer), "屋内と判定")),
+    hbox(swatch(color(attr.secondaryContainer), "屋内")),
     spacer(4),
     history,
     historyNote
@@ -120,9 +120,9 @@ final class PositioningPanel(act: MainActivity):
   val views: Seq[View] = Seq(satellites)
 
   private def sourceLabel(p: String): String = p match
-    case "gps"                => "衛星（GNSS）"
+    case "gps"                => "衛星"
     case "fused" | "network"  => "Wi-Fi・基地局"
-    case Pdr.Provider         => "歩数と向きからの推定"
+    case Pdr.Provider         => "歩数と向きから推定"
     case "passive"            => "他アプリの測位"
     case "sim"                => "シミュレーション"
     case other                => other
@@ -199,7 +199,7 @@ final class PositioningPanel(act: MainActivity):
     else if LoggerState.environment == Environment.Indoor then
       state.set("停止中（屋内）", SensorUi.Tone.Off, s"$how・移動開始時に再確認")
     else if LoggerState.motion == MotionState.Stationary then
-      state.set("停止中（静止）", SensorUi.Tone.Off, s"$how・動くと再開")
+      state.set("停止中（静止）", SensorUi.Tone.Off, s"$how・移動開始時に再開")
     else state.set("停止中", SensorUi.Tone.Off, how)
 
     // 測位: the latest position, whatever its source; its age always shown,
@@ -224,10 +224,10 @@ final class PositioningPanel(act: MainActivity):
       usedRow.set(SensorUi.spans((s"$used 機", false), ("  使用", true), (s"・$seen 機", false), ("  捕捉", true)), satAge)
       signalRow.set(
         SensorUi.spans((f"$mean%.0f dB-Hz", false),
-          ("  強い4機の平均・" + (if mean >= 35 then "良好" else if mean >= 25 then "やや弱い" else "弱い"), true)),
+          ("  上位4機の平均・" + (if mean >= 35 then "良好" else if mean >= 25 then "やや弱い" else "弱い"), true)),
         satAge)
     else
-      val why = if !running then "" else if gnssOn then "捕捉中" else "受信機停止中"
+      val why = if !running then "" else if gnssOn then "探索中" else "停止中"
       usedRow.none(why)
       signalRow.none(why)
     for ((name, matches), ch) <- constellationKinds.zip(constellationChips) do
@@ -267,15 +267,15 @@ object PositioningPanel:
   var day = false
 
   private def every(ms: Long): String =
-    if ms < 60_000 then s"${(ms / 1000.0).toString.stripSuffix(".0")}秒ごと" else s"${ms / 60_000}分ごと"
+    if ms < 60_000 then s"${(ms / 1000.0).toString.stripSuffix(".0")} 秒間隔" else s"${ms / 60_000} 分間隔"
 
   /** How positions are obtained right now, as a state (not a sentence). */
   def sourceState(p: SamplingPlan): String =
     val how = p.source match
       case LocationSource.Gnss    => s"衛星・${every(p.intervalMs)}"
       case LocationSource.Network => s"Wi-Fi・基地局・${every(p.intervalMs)}"
-      case LocationSource.Passive => "休止（他アプリの位置のみ）"
-    how + (if p.rawGnss then " + 詳細ログ" else "")
+      case LocationSource.Passive => "他アプリの測位のみ"
+    how + (if p.rawGnss then "・生データ記録中" else "")
 
   /** Why the state is what it is, first part: the mode actually in effect
     * and why. None without a reason (also right after a switch, before the

@@ -74,7 +74,7 @@ object LifeLog:
     Thread.setDefaultUncaughtExceptionHandler { (t, e) =>
       try
         val at = e.getStackTrace.headOption.map(s => s" at ${s.getClassName}.${s.getMethodName}:${s.getLineNumber}").getOrElse("")
-        val proc = if AshidoriApp.isMaintenanceProcess then "まとめ処理 " else ""
+        val proc = if AshidoriApp.isMaintenanceProcess then "整理処理 " else ""
         add(LifeKind.Crash, s"$proc${t.getName}: ${describe(e)}$at")
       catch case _: Throwable => ()
       if prev != null then prev.uncaughtException(t, e)
@@ -91,7 +91,7 @@ object LifeLog:
         .filter(_.getTimestamp > seen).sortBy(_.getTimestamp)
       for i <- infos do
         val desc = Option(i.getDescription).filter(_.nonEmpty).map(" " + _).getOrElse("")
-        val proc = if i.getProcessName != null && i.getProcessName.endsWith(":maintenance") then "まとめ処理 " else ""
+        val proc = if i.getProcessName != null && i.getProcessName.endsWith(":maintenance") then "整理処理 " else ""
         add(LifeKind.ProcessExit,
           s"$proc${PlatformCodes.exitReason(i.getReason)} importance=${PlatformCodes.importance(i.getImportance)} status=${i.getStatus}$desc",
           i.getTimestamp)

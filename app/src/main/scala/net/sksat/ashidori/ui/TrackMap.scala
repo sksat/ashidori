@@ -116,7 +116,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     val b = FloatingActionButton(act)
     b.setImageResource(net.sksat.ashidori.R.drawable.ic_layers)
     b.setSize(FloatingActionButton.SIZE_MINI)
-    b.setContentDescription("地図の種類を変える")
+    b.setContentDescription("地図の種類を変更")
     b.setOnClickListener(_ => pickBaseMap())
     b
 
@@ -146,7 +146,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     compact(Ui.button(BasemapUi.downloadLabel(BasemapDownload.status))(BasemapUi.requestDownload(act))(using act))
   private val grantButton =
     val b = compact(Ui.button("", tonal = true)(setDetailed(true))(using act))
-    b.setText(TrackMap.twoLines(TrackMap.DetailLabel, TrackMap.KeptLine))
+    b.setText(TrackMap.DetailLabel)
     b
   /** Shown in place of the detail button while the map has no base map. */
   private val noMapCard =
@@ -208,10 +208,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     // this map (also after a restart) until switched back; two lines either
     // way, so the button keeps its height.
     detailButton.setText(
-      if !detailedFlag then TrackMap.twoLines(TrackMap.DetailLabel, TrackMap.KeptLine)
+      if !detailedFlag then TrackMap.DetailLabel
       // Back to the offline map, or to none when it is not downloaded.
-      else if Basemap.available then TrackMap.twoLines(s"簡易地図に戻す（${online}を表示中）", TrackMap.KeptOnLine)
-      else TrackMap.twoLines(s"詳しい地図を閉じる（${online}を表示中）", TrackMap.KeptOnLine))
+      else if Basemap.available then TrackMap.twoLines(s"オフライン地図に戻す（${online}を表示中）", TrackMap.KeptOnLine)
+      else TrackMap.twoLines(s"オンライン地図を終了（${online}を表示中）", TrackMap.KeptOnLine))
     // Sending is the exception: mark it with the tertiary (warning) colours.
     given Ui.Ctx = act
     if detailedFlag then Ui.tint(detailButton, Ui.color(Ui.attr.tertiaryContainer), Ui.color(Ui.attr.onTertiaryContainer))
@@ -544,7 +544,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
             t.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
             t
           case None =>
-            val t = Ui.text("選ぶと表示範囲を送信", 13f, colorAttr = Ui.attr.onTertiaryContainer)
+            val t = Ui.text("表示範囲を送信", 13f, colorAttr = Ui.attr.onTertiaryContainer)
             t.setGravity(Gravity.CENTER)
             t.setBackgroundColor(Ui.color(Ui.attr.tertiaryContainer))
             t
@@ -562,7 +562,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       card.setCardElevation(0)
       val texts = Ui.vbox(Ui.text(ms.label, 15f, bold = true), Ui.caption(ms.note))
       // Under a sample: what choosing it does, as the second line.
-      if sample.isDefined then texts.addView(Ui.text("選ぶと表示範囲を送信", 12f, colorAttr = Ui.attr.tertiary))
+      if sample.isDefined then texts.addView(Ui.text("表示範囲を送信", 12f, colorAttr = Ui.attr.tertiary))
       card.addView(Ui.vbox(face, Ui.padded(texts, 10, 6)))
       val lp = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
       lp.setMargins(Ui.dp(6), Ui.dp(6), Ui.dp(6), Ui.dp(6))

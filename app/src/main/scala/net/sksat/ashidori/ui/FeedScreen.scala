@@ -319,7 +319,9 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
     val rs = rows.rows(tl)
     rs.foreach(box.addView)
     if rs.isEmpty then
-      box.addView(padded(caption(if LoggerState.running then "記録待ち" else "記録停止中"), 52, 8))
+      // Today tells the recorder's state; a past day only that nothing was recorded.
+      box.addView(padded(caption(
+        if tl.date != today then "記録なし" else if LoggerState.running then "記録中・データなし" else "記録停止中"), 52, 8))
 
   /** Redraws the shown card of the period starting `a` (週 / 月) in place. */
   private def refreshPeriod(a: LocalDate): Unit =
@@ -443,7 +445,7 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
       val byMode = tls.flatMap(_.summary.distanceByMode).groupMapReduce(_._1)(_._2)(_ + _)
       val steps = tls.map(_.summary.steps).sum
       val places = visits.flatMap(_.placeId).distinct.size
-      box.addView(tabular(text(f"${fmtDistance(byMode.values.sum)}・$steps%,d歩・${places}か所・記録 ${active}日", 14f)))
+      box.addView(tabular(text(f"${fmtDistance(byMode.values.sum)}・$steps%,d歩・${places}か所・記録日数 ${active}日", 14f)))
       box.addView(modeBar(byMode))
       val m = modeLine(byMode)
       if m.nonEmpty then box.addView(caption(m))

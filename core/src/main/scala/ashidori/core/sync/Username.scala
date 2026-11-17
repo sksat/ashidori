@@ -17,5 +17,5 @@ object Username:
     val u = raw.trim
     if u.isEmpty then Some("ユーザ名を入力してください")
     else if u.length < 3 || u.length > 20 then Some("3〜20 文字で入力してください")
-    else if normalize(u).isEmpty then Some("英字・数字・_ だけを使えます")
+    else if normalize(u).isEmpty then Some("英小文字・数字・_ のみ使用できます")
     else None

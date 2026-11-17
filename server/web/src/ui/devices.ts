@@ -14,7 +14,7 @@ let refreshing = false;
 
 function recText(s: DeviceStatus | null): HTMLElement {
   if (!s) return h("span", { class: "muted" }, "状態なし");
-  if (!s.recording.on) return h("span", { class: "muted" }, "■ 停止中");
+  if (!s.recording.on) return h("span", { class: "muted" }, "■ 記録停止中");
   const m = RECORDING_MODES[s.recording.mode] ?? { label: s.recording.mode || "記録中", token: "--rm-bal" };
   return h("span", { class: "rec", css: { "--c": `var(${m.token})` } }, `● ${m.label}`);
 }
@@ -28,7 +28,7 @@ function batText(s: DeviceStatus | null): HTMLElement | null {
 function age(t: number | null): HTMLElement {
   if (t === null) return h("span", { class: "age" }, "未受信");
   const stale = Date.now() - t > STALE_MS;
-  return h("span", { class: `age${stale ? " stale" : ""}` }, stale ? icon("alert") : null, relTime(t), stale ? srOnly("（更新が止まっています）") : null);
+  return h("span", { class: `age${stale ? " stale" : ""}` }, stale ? icon("alert") : null, relTime(t), stale ? srOnly("（更新停止）") : null);
 }
 
 export function renderDevices(ctx: Ctx, main: HTMLElement): void {
@@ -162,7 +162,7 @@ export function renderDevices(ctx: Ctx, main: HTMLElement): void {
           onclick: async () => {
             const ok = await confirmDialog({
               title: "このブラウザの登録を解除しますか",
-              items: ["このブラウザから鍵と表示中の記録を消去します。", "再び見るには、アプリでもう一度登録します。", "取り消せません。"],
+              items: ["このブラウザから鍵と表示中の記録を消去します。", "再度閲覧するには、アプリで再登録が必要です。"],
               action: "登録を解除",
             });
             if (ok) await ctx.unregister();
@@ -186,7 +186,7 @@ function deviceDetail(ctx: Ctx, id: string): HTMLElement {
   const resolved = s?.lastFix ? getComputedStyle(document.documentElement).getPropertyValue(color.slice(4, -1)).trim() || null : null;
   panel.setContent({ routes: [], stays: [], fixes: s?.lastFix ? [{ lon: s.lastFix.lon, lat: s.lastFix.lat, acc: s.lastFix.acc, color: resolved }] : [] });
   panel.setHead(h("b", null, s?.lastFix ? `最終測位 ${shortTime(s.lastFix.t)}` : "最終測位なし"));
-  panel.setOverlay(...(s?.lastFix ? [] : ["位置はまだ届いていません"]));
+  panel.setOverlay(...(s?.lastFix ? [] : ["位置は未受信"]));
   const model = s?.device.model ?? "";
   const app = s?.app.versionName ? `${s.app.versionName}（${s.app.versionCode}）` : "";
   return h(
@@ -201,7 +201,7 @@ function deviceDetail(ctx: Ctx, id: string): HTMLElement {
         "dl",
         null,
         h("dt", null, "更新"),
-        h("dd", { class: stale ? "stale-t" : "" }, s ? `${shortTime(s.t)}（${relTime(s.t)}）` : "未受信", stale ? srOnly("更新が止まっています") : null),
+        h("dd", { class: stale ? "stale-t" : "" }, s ? `${shortTime(s.t)}（${relTime(s.t)}）` : "未受信", stale ? srOnly("更新停止") : null),
         h("dt", null, "記録"),
         h("dd", null, recText(s), s?.recording.on && s.recording.since > 0 ? `・${shortTime(s.recording.since)} から` : ""),
         h("dt", null, "電池"),

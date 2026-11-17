@@ -6,7 +6,7 @@
 // Where someone is looking on the map is location data. The viewer
 // therefore never reads the archive in pieces: HTTP Range requests for the
 // tiles in view would tell the server (and Cloudflare's edge) which area is
-// shown. Instead choosing 「簡易地図（端末内）」 (ui/mappanel.ts) downloads
+// shown. Instead choosing 「オフライン地図」 (ui/mappanel.ts) downloads
 // the whole archive in one request, the same for every user. It is verified
 // against the pin, kept in Cache Storage, and read locally from then on:
 // tiles, style, glyphs and sprites are slices of a Blob in this browser. A
@@ -313,7 +313,7 @@ export class BasemapError extends Error {
 let downloading: Promise<Basemap> | null = null;
 
 /**
- * Choosing 「簡易地図（端末内）」: the whole pinned archive in one request, without
+ * Choosing 「オフライン地図」: the whole pinned archive in one request, without
  * a Range header, verified, then kept in Cache Storage. `progress` gets
  * the bytes received so far.
  */

@@ -47,8 +47,8 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
   private def details(): View =
     val host = Try(java.net.URI(SyncConfig.serverUrl).getHost).toOption.flatMap(Option(_)).getOrElse(SyncConfig.serverUrl)
     val v = vbox(
-      caption(s"・閲覧するページは $host が配信します。サーバの管理者がページを書き換えると、記録を読まれる可能性があります。"),
-      caption("・ブラウザに渡す鍵は変わらないため、これまでの記録と、これから同じ鍵で送る記録をすべて読めます。期限はサーバが渡すのをやめるだけで、鍵が持ち出されると期限後も読めます。"),
+      caption(s"・閲覧ページは $host が配信します。サーバの管理者がページを改変すると、記録を読まれる可能性があります。"),
+      caption("・ブラウザは、これまでと今後の記録をすべて読めます。期限後はサーバが記録を提供しませんが、持ち出された鍵では期限後も読めます。"),
       caption("・ブラウザは記録を書いた端末を確かめられません。鍵とサーバを悪用されると、ブラウザに偽の記録を見せられる可能性があります。承認の後にまだ同期していない端末のアプリも、偽の記録を受け付ける可能性があります。"),
       caption("・復旧コードとアカウントの鍵はブラウザに渡しません。"),
       caption("・ブラウザの登録は、この画面、ブラウザ自身、サーバの管理者がいつでも終了できます。"),
@@ -112,7 +112,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
   /** Step 1: the expiry, then the QR code the browser shows (or its code, typed). */
   private def begin(done: () => Unit): Unit =
     // Blob authentication must be in force before any browser gets the batch key.
-    val wait = MaterialAlertDialogBuilder(act).setTitle("ブラウザでも見る").setMessage("ほかの端末の状態を確認しています…").setCancelable(false).show()
+    val wait = MaterialAlertDialogBuilder(act).setTitle("ブラウザでも見る").setMessage("ほかの端末の状態を確認中…").setCancelable(false).show()
     async(ViewerGate.check()) { r =>
       wait.dismiss()
       r.fold(e => Left(String.valueOf(e.getMessage)), identity) match
@@ -145,7 +145,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
     for b <- Seq(scan, typed) do
       b.setLayoutParams(LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT))
     val content = vbox(
-      caption("ブラウザで閲覧ページを開き、表示された QR コードを読み取ってください。"),
+      caption("ブラウザに表示された QR コードを読み取ってください"),
       spacer(8),
       text("期限", 14f, bold = true),
       ttl,
@@ -173,7 +173,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
   /** The fallback: the code the browser shows, typed. */
   private def askCode(ttl: Int, done: () => Unit): Unit =
         val code = EditText(act)
-        code.setHint("XXXX-XXXX")
+        code.setHint("ブラウザに表示されたコード")
         code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
         code.setTypeface(android.graphics.Typeface.MONOSPACE)
         val err = text("", 13f, colorAttr = attr.error)
@@ -280,27 +280,27 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
       body.removeAllViews()
       p match
         case Phase.Idle | Phase.WaitingReveal =>
-          body.addView(text("ブラウザの応答を待っています", 16f, bold = true))
+          body.addView(text("ブラウザの応答待ち", 16f, bold = true))
           body.addView(caption(s"コード ${VP.displayCode(code)}"))
           error.foreach(e => body.addView(caption(s"通信できませんでした。再試行します（${e.getMessage}）")))
           setButtons(Some("キャンセル" -> (() => close())), None)
         case Phase.Showing(words, _, t, tooMany) =>
-          body.addView(caption("ブラウザに表示された 4 語と同じか確かめてください。"))
+          body.addView(caption("ブラウザに表示された 4 語と一致するか確認してください。"))
           body.addView(wordsView(words))
           body.addView(spacer(8))
           body.addView(text("渡すもの", 14f, bold = true))
-          body.addView(caption("記録を読むための鍵（これまでの記録と、これから送る記録）"))
+          body.addView(caption("記録を読むための鍵（これまでと今後の記録）"))
           body.addView(text("期限", 14f, bold = true))
           body.addView(caption(ttlLabel(t)))
           body.addView(spacer(8))
-          body.addView(text("このブラウザは、これまでの記録と、これから送る記録を読めます。期限はサーバが渡すのをやめるだけで、鍵が持ち出されると期限後も読めます。", 13f))
+          body.addView(text("このブラウザは、これまでと今後の記録を読めます。持ち出された鍵では期限後も読めます。", 13f))
           if tooMany then
-            body.addView(text(s"記録を読めるブラウザが上限（${VP.MaxViewers} 台）に達しています。ほかのブラウザを終了してから、もう一度承認してください。", 13f, colorAttr = attr.error))
+            body.addView(text(s"記録を読めるブラウザが上限（${VP.MaxViewers} 台）です。ほかのブラウザを終了してから、再度承認してください。", 13f, colorAttr = attr.error))
             val others = vbox(caption("読み込み中…"))
             def reload(): Unit = loadViewers(others, () => { reload(); onChanged() })
             reload()
             body.addView(others)
-          error.foreach(e => body.addView(caption(s"通信できませんでした（${e.getMessage}）。もう一度承認してください。")))
+          error.foreach(e => body.addView(caption(s"通信できませんでした（${e.getMessage}）。再度承認してください。")))
           setButtons(Some("一致しない" -> (() => step(attempt.mismatch()))), Some("承認" -> (() => step(attempt.approve()))))
         case Phase.Approved(words, _, _) =>
           body.addView(text("ブラウザで「一致する」を押してください", 16f, bold = true))

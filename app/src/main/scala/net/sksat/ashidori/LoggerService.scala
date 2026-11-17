@@ -119,7 +119,7 @@ class LoggerService extends Service:
         // without 「常に許可」, this throws SecurityException (Android 14+).
         // Uncaught, it crashed the process, the sticky restart a second later
         // crashed again, and the OS gave up on the app until it was opened.
-        try startForeground(NotificationId, notification("記録を開始しています"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        try startForeground(NotificationId, notification("記録を開始中"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         catch case e: Exception =>
           LifeLog.add(LifeKind.ForegroundFailed, s"${if sticky then "自動再起動" else action.split('.').last}: ${LifeLog.describe(e)}")
           LifeLog.notifyStopped(this, "バックグラウンドから再開できませんでした")
@@ -368,7 +368,7 @@ class LoggerService extends Service:
     recorder.foreach { r =>
       r.stop()
       val end = System.currentTimeMillis()
-      LoggerWrites.submit(1, raw = false, "詳細ログの区間")(_.insertGnssSession(r.startedAt, end, "", r.reason))
+      LoggerWrites.submit(1, raw = false, "生データの区間")(_.insertGnssSession(r.startedAt, end, "", r.reason))
     }
     recorder = None
     LoggerState.onMain { LoggerState.detailFile = None }

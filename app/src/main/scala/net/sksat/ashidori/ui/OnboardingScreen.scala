@@ -110,21 +110,21 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
       case Step.Location =>
         page(
           "位置情報",
-          Seq("訪れた場所と移動経路を記録するために、正確な位置情報を使います。"),
+          Seq("訪れた場所と移動経路の記録に使用します。"),
           "許可する" -> (() => act.requestPermissions(Seq(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))(() => afterRequest(Step.Location))),
           Some("あとで" -> (() => next()))
         )
       case Step.Notify =>
         page(
           "通知",
-          Seq("記録中であることを通知に常に表示します。通知からすぐに記録を止めたり、詳細ログを取ったりできます。"),
+          Seq("記録中は通知を常に表示します。"),
           "許可する" -> (() => act.requestPermissions(Seq(Manifest.permission.POST_NOTIFICATIONS))(() => afterRequest(Step.Notify))),
           Some("あとで" -> (() => next()))
         )
       case Step.Activity =>
         page(
           "身体活動",
-          Seq("歩数を数え、徒歩・自転車・乗り物の区別に使います。電池の消費はほとんどありません。"),
+          Seq("歩数の計測と、徒歩・自転車・乗り物の判別に使用します。"),
           "許可する" -> (() => act.requestPermissions(Seq(Manifest.permission.ACTIVITY_RECOGNITION))(() => afterRequest(Step.Activity))),
           Some("あとで" -> (() => next()))
         )
@@ -141,7 +141,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
       case Step.Battery =>
         page(
           "電池の最適化",
-          Seq("OS が記録を止めてしまわないよう、ashidori を電池の最適化の対象外にすることをおすすめします。ashidori 自身が電池の使い方を調整します。") ++
+          Seq("OS による記録の停止を防ぐため、電池の最適化の対象外にすることを推奨します。") ++
             OnboardingScreen.vendorHint.toSeq,
           "対象外にする" -> (() => {
             act.startActivity(Intent(AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse(s"package:${act.getPackageName}")))
@@ -158,7 +158,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
         case Step.Background => "アプリを開いている間だけ記録します。あとで設定から変更できます。"
         case Step.Activity   => "歩数と移動手段の判定の精度が下がります。"
         case _               => "あとで設定から変更できます。"
-      page("許可されませんでした", Seq(note), "次へ" -> (() => next()), Some("もう一度" -> (() => render())))
+      page("許可されませんでした", Seq(note), "次へ" -> (() => next()), Some("再試行" -> (() => render())))
 
 object OnboardingScreen:
   /** Extra steps for vendors known to kill background apps aggressively. */

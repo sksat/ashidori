@@ -36,7 +36,7 @@ final class RailView(c: Context, val visit: Boolean, col: Int, top: Boolean, bot
   */
 final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = Seq(Span.Day)) extends Screen:
   private given Ctx = act
-  override def title: String = s"${span.label}の記録"
+  override def title: String = s"${span.period}の記録"
   private val timeFmt = DateTimeFormatter.ofPattern("H:mm")
   private val dateFmt = DateTimeFormatter.ofPattern("M月d日 (E)", Locale.JAPANESE)
   private var current: Option[DayTimeline] = None
@@ -59,8 +59,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   private val summary = hbox()
   private val list = vbox()
   // Until the day has loaded, the totals' room is already taken ("—").
+  summary.addView(stat("—", "移動距離"))
   summary.addView(stat("—", "歩数"))
-  summary.addView(stat("—", "移動"))
   summary.addView(stat("—", "滞在"))
   padded(summary, 8, 8)
 
@@ -79,7 +79,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     dateLabel.setGravity(Gravity.CENTER)
     dateLabel.setLayoutParams(weighted())
     dateLabel.setMinHeight(dp(48))
-    dateLabel.setContentDescription("日付を選ぶ")
+    dateLabel.setContentDescription("日付を選択")
     dateLabel.setOnClickListener(_ => pickDate())
     val chips = com.google.android.material.chip.ChipGroup(act)
     chips.setId(chipsId)
@@ -239,7 +239,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   private def pickDate(): Unit =
     val picker = MaterialDatePicker.Builder.datePicker()
-      .setTitleText("日付を選ぶ")
+      .setTitleText("日付を選択")
       .setSelection(anchor.atStartOfDay(ZoneOffset.UTC).toInstant.toEpochMilli)
       .setCalendarConstraints(CalendarConstraints.Builder().setValidator(DateValidatorPointBackward.now()).build())
       .build()
@@ -305,8 +305,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     fittedDate = Some(tl.date)
     current = Some(tl)
     summary.removeAllViews()
+    summary.addView(stat(fmtDistance(tl.summary.totalDistanceM), "移動距離"))
     summary.addView(stat(f"${tl.summary.steps}%,d", "歩数"))
-    summary.addView(stat(fmtDistance(tl.summary.totalDistanceM), "移動"))
     summary.addView(stat(tl.summary.visits.toString, "滞在"))
     padded(summary, 8, 8)
 
@@ -334,13 +334,15 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     list.addView(slot)
 
   private def emptyState(date: LocalDate): View =
+    // Today tells the recorder's state; a past day only that nothing was recorded.
+    val today = date == LocalDate.now(AshidoriApp.zone)
     val label = oneLine(text(
-      if !LoggerState.running then "記録停止中"
-      else if date == LocalDate.now(AshidoriApp.zone) then "記録待ち"
-      else "記録なし", 16f, bold = true))
+      if !today then "記録なし"
+      else if LoggerState.running then "記録中・データなし"
+      else "記録停止中", 16f, bold = true))
     label.setLayoutParams(weighted())
     val row = hbox(label)
-    if !LoggerState.running then row.addView(button("▶  記録を開始")(act.startLogging()))
+    if today && !LoggerState.running then row.addView(button("▶  記録を開始")(act.startLogging()))
     row
 
   /** Camera and shown day, for a recreated activity (the day tab only). */

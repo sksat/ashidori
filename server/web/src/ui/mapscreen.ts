@@ -77,12 +77,12 @@ export function renderMapScreen(ctx: Ctx, main: HTMLElement): void {
   const stats: [string, string][] =
     u === "day"
       ? [
+          [fmtKm(a.distanceM), "移動距離"],
           [nf(a.steps), "歩数"],
-          [fmtKm(a.distanceM), "移動"],
           [String(a.stays), "滞在"],
         ]
       : [
-          [fmtKm(a.distanceM), "移動"],
+          [fmtKm(a.distanceM), "移動距離"],
           [nf(a.steps), "歩数"],
           [String(a.places), "場所"],
         ];

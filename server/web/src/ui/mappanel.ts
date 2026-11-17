@@ -8,7 +8,7 @@
 // once when it is chosen, verified against the pin and kept in Cache
 // Storage; it is used without asking from then on. Should it be gone from
 // Cache Storage, the map shows no base map and offers
-// 「簡易地図を再取得（約 64 MB）」: it never falls back to an online map.
+// 「オフライン地図を再取得（約 64 MB）」: it never falls back to an online map.
 // Until a base map is ready, and without WebGL, the routes are drawn on a
 // plain canvas.
 
@@ -24,9 +24,9 @@ type Renderer = CanvasMap | GlMap;
 
 const narrow = () => matchMedia("(max-width: 959px)").matches;
 
-const NOTE = "オンラインの地図では、表示している範囲が地図の配信元に伝わります。簡易地図ではどこにも送りません。";
-const NO_BASEMAP = "サーバに簡易地図がありません";
-const refetchLabel = () => `簡易地図を再取得（約 ${approxMB()} MB）`;
+const NOTE = "オンライン地図では、表示範囲を地図の配信元に送信します。";
+const NO_BASEMAP = "サーバにオフライン地図のデータがありません";
+const refetchLabel = () => `オフライン地図を再取得（約 ${approxMB()} MB）`;
 
 // ---- shared by every map on the page ----
 
@@ -197,7 +197,7 @@ export class MapPanel {
       const none = !ok && !here;
       // Kept selectable while chosen, so that the choice stays visible.
       radio.disabled = none && key !== "offline";
-      this.offlineNote.textContent = none ? NO_BASEMAP : here ? "" : `約 ${approxMB()} MB を一度だけ取得`;
+      this.offlineNote.textContent = none ? NO_BASEMAP : here ? "" : `約 ${approxMB()} MB`;
     };
     update(true);
     void offered().then((ok) => !this.destroyed && update(ok));
@@ -237,13 +237,13 @@ export class MapPanel {
     this.renderMissing();
   }
 
-  /** The offline map is chosen but not here: 「簡易地図を再取得」, its progress, or why not. */
+  /** The offline map is chosen but not here: 「オフライン地図を再取得」, its progress, or why not. */
   private renderMissing(): void {
     if (currentStyle() !== "offline" || this.shown !== "none" || loadedBasemap()) return;
     const gen = this.generation;
     this.attrib.hidden = false;
     if (fetching.kind === "loading") {
-      replace(this.attrib, h("span", { role: "status" }, `簡易地図を読み込み中 ${fetching.pct}%`));
+      replace(this.attrib, h("span", { role: "status" }, `オフライン地図を読み込み中 ${fetching.pct}%`));
       return;
     }
     const failed = fetching.kind === "failed";

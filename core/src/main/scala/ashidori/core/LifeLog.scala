@@ -15,22 +15,22 @@ final case class LifeEvent(time: Long, kind: LifeKind, detail: String = ""):
 enum LifeKind(val key: String, val label: String, val problem: Boolean = false):
   case ProcessStart extends LifeKind("process", "アプリのプロセス起動")
   case ProcessExit extends LifeKind("exit", "プロセス終了（OS の記録）")
-  case Crash extends LifeKind("crash", "クラッシュ", problem = true)
+  case Crash extends LifeKind("crash", "異常終了", problem = true)
   case ServiceStart extends LifeKind("start", "記録サービス開始")
   case StickyRestart extends LifeKind("sticky", "記録サービスの自動再起動")
   case ServiceStop extends LifeKind("stop", "記録サービス終了")
-  case ForegroundFailed extends LifeKind("fgsfail", "記録サービスを開始できない", problem = true)
+  case ForegroundFailed extends LifeKind("fgsfail", "記録サービスの開始失敗", problem = true)
   case Boot extends LifeKind("boot", "端末の起動・アプリの更新")
   case Watchdog extends LifeKind("watchdog", "定期確認")
-  case StillEnter extends LifeKind("still", "静止（GNSS 停止）")
+  case StillEnter extends LifeKind("still", "静止（衛星測位を停止）")
   case StillExit extends LifeKind("move", "動きを検知")
   case Source extends LifeKind("source", "測位の切り替え")
   case Provider extends LifeKind("provider", "位置情報プロバイダ")
   case State extends LifeKind("state", "権限・電池の設定")
   case Note extends LifeKind("note", "注意", problem = true)
   /** Archiving finished days (a separate process). */
-  case Archive extends LifeKind("archive", "記録のまとめ")
-  case ArchiveSkip extends LifeKind("archiveskip", "記録のまとめを保留", problem = true)
+  case Archive extends LifeKind("archive", "記録の整理")
+  case ArchiveSkip extends LifeKind("archiveskip", "記録の整理を保留", problem = true)
   /** Logging on, but nothing reached the database for too long. */
   case WriteStall extends LifeKind("stall", "記録の保存が停止", problem = true)
   /** Repeated crashes: optional background work switched off. */
@@ -97,10 +97,10 @@ enum GapCause(val label: String):
   /** Recording switched off by the user. */
   case Stopped extends GapCause("記録停止中")
   /** The service or its process ended (killed, crashed, not restarted). */
-  case ServiceDown extends GapCause("記録サービスが停止していた")
+  case ServiceDown extends GapCause("記録サービスの停止")
   /** GNSS off on purpose, waiting for movement. */
-  case Still extends GapCause("静止中（GNSS 停止）")
-  case Unknown extends GapCause("原因不明（サービスは動作中のはず）")
+  case Still extends GapCause("静止中（正常）")
+  case Unknown extends GapCause("原因不明")
 
 object RecordingGaps:
   /** Gaps of at least `minGapMs` between `from` and `to` in the sorted fix

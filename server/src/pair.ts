@@ -60,7 +60,7 @@ body{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0
 </div>
 <p id="bad" hidden>このリンクは正しくありません。発行元で登録リンクを発行し直してください。</p>
 <h2>アプリがない場合</h2>
-<p><a href="${RELEASES_URL}">GitHub のリリースページ</a>から APK を入手してインストールし、このページをもう一度開きます。<span id="manual">アプリの「設定」→「サーバ同期」で、サーバの URL とペアリングコードを入力しても登録できます。</span></p>
+<p><a href="${RELEASES_URL}">GitHub のリリースページ</a>から APK を入手してインストールし、このページを再度開きます。<span id="manual">アプリの「設定」→「サーバ同期」で、サーバの URL とペアリングコードを入力しても登録できます。</span></p>
 <script nonce="${nonce}">${QR_SCRIPT}</script>
 <script nonce="${nonce}">
 const $ = (id) => document.getElementById(id);

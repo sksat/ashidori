@@ -79,7 +79,7 @@ object PairQrUi:
     val d = MaterialAlertDialogBuilder(act)
       .setTitle("QR コードを読み取る")
       .setView(padded(vbox(preview, status), 24, 8))
-      .setNegativeButton("やめる", null)
+      .setNegativeButton("キャンセル", null)
       .create()
 
     def found(text: String): Unit =

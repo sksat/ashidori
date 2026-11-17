@@ -40,7 +40,7 @@ import Ui.*
   */
 final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None) extends Screen:
   private given Ctx = act
-  override val title = "同期"
+  override val title = "サーバ同期"
   private val net = Executors.newSingleThreadExecutor()
   /** 「ブラウザでも見る」: the opt-in, the browsers that can read, and the approval. */
   private lazy val browsers = BrowserPairingUi(act, () => ())
@@ -129,7 +129,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     if SyncConfig.paired || SyncConfig.unpairing then
       toast("この端末は登録済みです。登録リンクを使うには、先に同期を解除してください")
     else if s.pending.isDefined || s.sending then
-      toast("登録の処理中です。登録リンクを使うには、先に現在の登録をやめてください")
+      toast("登録の処理中です。登録リンクを使うには、先に現在の登録を中止してください")
     else
       def apply(): Unit =
         lastUrl = l.server
@@ -145,7 +145,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
         MaterialAlertDialogBuilder(act)
           .setTitle("登録先のサーバの確認")
           .setMessage(s"この登録リンクは次のサーバへの登録用です。\n\n${l.server}\n\n信頼できるサーバの場合のみ続けてください。")
-          .setNegativeButton("やめる", null)
+          .setNegativeButton("キャンセル", null)
           .setPositiveButton("このサーバを使う", (_, _) => apply())
           .show()
 
@@ -302,7 +302,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
         else "このサーバに新しく登録します。"),
       caption("ユーザ名"),
       name,
-      caption("英小文字・数字・_ の 3〜20 文字。他の利用者に表示され、フォローの申請に使われます。"),
+      caption("英小文字・数字・_ の 3〜20 文字。ほかの利用者に表示されます。"),
       target(u),
       go
     )
@@ -339,10 +339,10 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     * an attempt still in flight, so it is never disabled.
     */
   private def pendingCard(s: RegistrationState): View =
-    val retry = button("もう一度送る")(Registration.retry())
+    val retry = button("再送信")(Registration.retry())
     retry.setEnabled(!s.sending && !busy)
-    val cancel = outlined("やめる") {
-      if !Registration.cancel() then toast("サーバの応答を保存しているため、やめられませんでした")
+    val cancel = outlined("中止") {
+      if !Registration.cancel() then toast("サーバの応答を保存中のため、中止できません")
     }
     val head = Seq(
       text("1. 端末を登録", 16f, bold = true),
@@ -394,7 +394,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     extras.putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
     clip.getDescription.setExtras(extras)
     act.getSystemService(classOf[ClipboardManager]).setPrimaryClip(clip)
-    toast("コピーしました。保存したらクリップボードを消してください")
+    toast("コピーしました。保存後はクリップボードを消去してください")
 
   /** Sets the key for the registration the dialog was opened for. */
   /** The key is written off the main thread; sync is enabled only once the
@@ -407,7 +407,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       r match
         case scala.util.Success(true) => SyncScheduler.schedule(act)
         case scala.util.Success(false) => toast("鍵はすでに設定されているか、登録が変わりました。鍵は変更していません")
-        case scala.util.Failure(e) => toast(s"鍵を保存できませんでした。同期は始めていません: ${e.getMessage}")
+        case scala.util.Failure(e) => toast(s"鍵を保存できませんでした。同期は未開始: ${e.getMessage}")
       render()
     }
 
@@ -429,11 +429,11 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       check.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
       val d = MaterialAlertDialogBuilder(act)
         .setTitle("復旧コードを控えてください")
-        .setMessage(s"$code\n\n別の端末の追加や、この端末をなくしたときの復元に必要です。パスワードマネージャーなどに保存してください。\n\n確認のため、最後の区切り（${tail.length}文字）を入力してください。\n$shape")
+        .setMessage(s"$code\n\n別の端末の追加や、この端末をなくした場合の復元に必要です。パスワードマネージャーなどに保存してください。\n\n確認のため、最後の区切り（${tail.length}文字）を入力してください。\n$shape")
         .setView(padded(vbox(check), 20, 0))
         .setCancelable(false)
         .setNeutralButton("コピー", null)
-        .setNegativeButton("やめる", null)
+        .setNegativeButton("キャンセル", null)
         .setPositiveButton("控えました", null)
         .create()
       secure(d, () => keyDialogOpen = false)
@@ -463,7 +463,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       val d = MaterialAlertDialogBuilder(act)
         .setTitle("復旧コードを入力")
         .setView(padded(vbox(layout), 20, 0))
-        .setNegativeButton("やめる", null)
+        .setNegativeButton("キャンセル", null)
         .setPositiveButton("設定", null)
         .create()
       secure(d, () => keyDialogOpen = false)
@@ -538,7 +538,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       (if err.nonEmpty then text(s"前回のエラー: $err", 13f, colorAttr = attr.error) else spacer(0)),
       action(button("今すぐ同期", tonal = true) {
         SyncScheduler.syncNow(act)
-        toast("同期を予約しました（ネットワークにつながると始まります）")
+        toast("同期を予約しました（ネットワーク接続時に開始）")
       })
     )
 
@@ -575,11 +575,11 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
               val id = d("id").str
               val revoked = d.obj.get("revoked").exists(_.bool)
               val me = id == SyncConfig.deviceId
-              val name = text(d("name").str + (if me then "（この端末）" else "") + (if revoked then "・失効" else ""), 15f)
+              val name = text(d("name").str + (if me then "（この端末）" else "") + (if revoked then "・登録取り消し済み" else ""), 15f)
               name.setLayoutParams(weighted())
               val row = hbox(name)
               if !revoked && !me then
-                row.addView(outlined("失効") {
+                row.addView(outlined("登録を取り消す") {
                   MaterialAlertDialogBuilder(act)
                     .setTitle("この端末を失効しますか")
                     .setMessage("失効した端末はサーバにアクセスできなくなります。端末をなくした場合は、あわせて鍵の作り直しも検討してください。")
@@ -661,7 +661,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
   private def unpair(): Unit =
     if !busy then
       setBusy(true)
-      toast("同期を止めています…")
+      toast("同期を停止中…")
       async(SyncConfig.forget(act)) { r =>
         setBusy(false)
         r.failed.foreach(e => toast(e.getMessage))

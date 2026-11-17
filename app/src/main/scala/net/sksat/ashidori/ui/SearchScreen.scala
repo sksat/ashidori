@@ -21,7 +21,7 @@ final class SearchScreen(act: MainActivity) extends Screen:
   private val dayFmt = DateTimeFormatter.ofPattern("yyyy/M/d (E)", Locale.JAPANESE)
 
   private val input = EditText(act)
-  input.setHint("場所の名前・地域・チェックイン先・日付")
+  input.setHint("場所・地域・チェックイン先・日付")
   input.setSingleLine(true)
   input.setMinHeight(dp(56))
   input.setTextSize(17f)

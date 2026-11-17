@@ -12,11 +12,11 @@ import ashidori.core.*
 import Ui.*
 
 /** Granularity of the timeline. */
-enum Span(val label: String):
-  case Day extends Span("日")
-  case Week extends Span("週")
-  case Month extends Span("月")
-  case Year extends Span("年")
+enum Span(val label: String, val period: String):
+  case Day extends Span("日", "1日")
+  case Week extends Span("週", "1週間")
+  case Month extends Span("月", "1か月")
+  case Year extends Span("年", "1年")
 
   /** First and last day of the span containing `d`. */
   def range(d: LocalDate): (LocalDate, LocalDate) = this match
@@ -80,7 +80,7 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
     val days = Iterator.iterate(a)(_.plusDays(1)).takeWhile(!_.isAfter(b)).toVector
     // The totals keep their place ("—") while the period is summed up.
     summary.removeAllViews()
-    summary.addView(stat("—", "移動"))
+    summary.addView(stat("—", "移動距離"))
     summary.addView(stat("—", "歩数"))
     summary.addView(stat("—", "場所"))
     padded(summary, 8, 8)
@@ -141,7 +141,7 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
     val total = byMode.values.sum
     val steps = tls.map(_.summary.steps)
     summary.removeAllViews()
-    summary.addView(stat(fmtDistance(total), "移動"))
+    summary.addView(stat(fmtDistance(total), "移動距離"))
     summary.addView(stat(f"${steps.sum}%,d", "歩数"))
     summary.addView(stat(ranked.size.toString, "場所"))
     padded(summary, 8, 8)
@@ -177,7 +177,7 @@ final class PeriodView(act: MainActivity, map: TrackMap, summary: LinearLayout, 
         val cities = rs.groupMapReduce(_._1._1)(_._2)(_ + _).toSeq.filter(_._1.nonEmpty).sortBy(-_._2).map(_._1)
         list.addView(padded(vbox(text(s"$country（${cities.size}都市）", 15f), caption(cities.take(15).mkString("・"))), 16, 4))
 
-    list.addView(section("日ごと"))
+    list.addView(section("日別"))
     val maxSteps = steps.maxOption.getOrElse(0).max(1)
     for tl <- tls.reverse if tl.segments.nonEmpty do
       val l = text(tl.date.format(dayFmt), 14f)

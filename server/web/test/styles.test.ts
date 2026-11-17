@@ -45,7 +45,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("map style choice", () => {
   it("offers the app's styles, 標準 by default", () => {
-    expect(MAP_STYLES.map((s) => s.label)).toEqual(["標準", "シンプル", "地理院 標準", "地理院 淡色", "航空写真", "簡易地図（端末内）"]);
+    expect(MAP_STYLES.map((s) => s.label)).toEqual(["標準", "シンプル", "地理院 標準", "地理院 淡色", "航空写真", "オフライン地図"]);
     expect(DEFAULT_STYLE).toBe("ofm-liberty");
     expect(readChoice(fakeStorage())).toBe("ofm-liberty");
     expect(readChoice(null)).toBe("ofm-liberty");
@@ -132,7 +132,7 @@ function cachesWith(entries: Map<string, Blob>): CacheStorage {
   return { open: async (name: string) => (expect(name).toBe(CACHE_NAME), cache as unknown as Cache) } as unknown as CacheStorage;
 }
 
-describe("a reload with 簡易地図 chosen", () => {
+describe("a reload with オフライン地図 chosen", () => {
   it("uses the kept archive without any request, and plans no online map", async () => {
     const { zip, pin } = await archive();
     const storage = fakeStorage();

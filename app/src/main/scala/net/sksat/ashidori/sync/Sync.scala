@@ -333,7 +333,7 @@ final class SyncClient(base: String, token: Option[String]):
       case 200 | 201 => (r.json("deviceId").str, r.json.obj.get("username").flatMap(_.strOpt))
       case 401 if invite.isDefined => throw RegistrationRejected("招待が無効です。期限切れ、使用済み、または取り消された可能性があります")
       case 409 if error == "username taken" => throw UsernameTakenError(username)
-      case 403 => throw SyncClient.AccountRefused("このサーバでは招待のない登録を受け付けていません")
+      case 403 => throw SyncClient.AccountRefused("このサーバでは招待なしの登録を受け付けていません")
       case 429 => throw RuntimeException("登録の試行回数が上限に達しました。時間をおいて再度お試しください")
       case c if refused(c) => throw RegistrationRejected(s"登録に失敗しました ($c): ${r.text.take(200)}")
       case c => throw RuntimeException(s"登録に失敗しました ($c): ${r.text.take(200)}")

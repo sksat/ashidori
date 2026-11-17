@@ -6,7 +6,7 @@ enum LoggingMode(val key: String, val label: String, val level: Int):
   case Balanced extends LoggingMode("balanced", "バランス", 1)
   case Precise extends LoggingMode("precise", "高精度", 2)
   /** Explicit "log everything": 1 Hz GNSS with raw measurements, all sensors. */
-  case Max extends LoggingMode("max", "全力ログ", 3)
+  case Max extends LoggingMode("max", "最高精度", 3)
 
 object LoggingMode:
   def fromKey(k: String): LoggingMode = values.find(_.key == k).getOrElse(Balanced)
@@ -14,9 +14,9 @@ object LoggingMode:
 
 enum MotionState(val label: String):
   case Stationary extends MotionState("静止")
-  case OnFoot extends MotionState("徒歩")
+  case OnFoot extends MotionState("歩行")
   case Vehicle extends MotionState("乗り物")
-  case Unknown extends MotionState("不明")
+  case Unknown extends MotionState("判定中")
 
 /** Where positions come from. Ordered by power cost. */
 enum LocationSource:
@@ -71,9 +71,9 @@ final case class SamplingPlan(
   def describe: String =
     val src = source match
       case LocationSource.Passive => "GNSS停止"
-      case LocationSource.Network => s"省電力測位 ${intervalMs / 1000}s"
+      case LocationSource.Network => s"Wi-Fi・基地局 ${intervalMs / 1000}s"
       case LocationSource.Gnss    => s"GNSS ${intervalMs / 1000.0}s"
-    src + (if rawGnss then " + 詳細ログ" else "")
+    src + (if rawGnss then " + 生データ" else "")
 
 /** Decides how hard to log, trading accuracy for battery.
   *

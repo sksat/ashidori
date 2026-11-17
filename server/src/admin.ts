@@ -128,7 +128,7 @@ admin.get("/", async (c) => {
   // All server-generated (fixed strings and numbers), safe to embed.
   const modeText =
     registrationMode(c.env) === "open"
-      ? "登録の方式: 招待または自由な登録（招待がなくてもアプリから登録できます）"
+      ? "登録の方式: 招待なしでも登録可"
       : "登録の方式: 招待のみ";
   const parsed = parseLimits(c.env);
   const limits = parsed.ok ? parsed.limits : null;
@@ -139,7 +139,7 @@ admin.get("/", async (c) => {
     misconfig.push(`設定が不正なため、利用者・端末・データの新規作成を停止しています: ${parsed.invalid.join(", ")}`);
   }
   if (registrationMode(c.env) === "open" && !selfRegistrationEdgeReady(c.env)) {
-    misconfig.push("レート制限の binding RL_ACCOUNT がないため、招待のない登録を停止しています。");
+    misconfig.push("レート制限の binding RL_ACCOUNT がないため、招待なしの登録を停止しています。");
   }
   const limitsText = misconfig.map((m) => `<p class="misconfig">${m}</p>`).join("");
   c.header(
@@ -171,7 +171,7 @@ ${limitsText}
 <table><thead><tr><th>作成</th><th>有効期限</th><th>状態</th><th></th></tr></thead><tbody id="invites"></tbody></table></section>
 <section><h2>利用者</h2>
 <p id="todo" class="todo"></p>
-<p>利用者 ${usage.userCount}${limits ? `（招待のない登録の上限 ${limits.maxUsers}）` : ""}、保存量 <span id="total"></span>、容量の上限は利用者ごとに <span id="quota"></span></p>
+<p>利用者 ${usage.userCount}${limits ? `（招待なしの登録の上限 ${limits.maxUsers}）` : ""}、保存量 <span id="total"></span>、容量の上限は利用者ごとに <span id="quota"></span></p>
 <table><thead><tr><th>ユーザ名</th><th>登録</th><th>状態</th><th>端末</th><th>使用量</th><th>最終アクセス</th><th></th></tr></thead><tbody id="users"></tbody></table></section>
 <section><h2>端末</h2>
 <p class="note">利用者が「なし」の端末は、利用者の導入前に登録されたものです。</p>
@@ -249,18 +249,18 @@ async function load() {
          [u.username ? "ユーザ名を変更" : "ユーザ名を設定", () => setName(u)],
          ["停止", async () => { if (confirm(who(u) + " を停止しますか。この利用者の端末は同期できなくなります。") && await api("/admin/users/" + encodeURIComponent(u.id) + "/disable")) load(); }]]
       : [["再開", async () => { if (await api("/admin/users/" + encodeURIComponent(u.id) + "/enable")) load(); }]];
-    const how = u.createdBy === SELF ? "自由な登録" : u.createdBy.startsWith(INVITED) ? "招待" : "管理者";
+    const how = u.createdBy === SELF ? "招待なし" : u.createdBy.startsWith(INVITED) ? "招待" : "管理者";
     const used = fmtBytes(u.storageBytes) + (QUOTA === null ? "" : " (" + Math.floor((u.storageBytes / QUOTA) * 100) + "%)");
     row(ut, [who(u), how, active ? "有効" : "停止中", String(u.deviceCount), used, fmt(u.lastSeenAt)], buttons);
   }
   const dt = $("devices"); dt.textContent = "";
   for (const d of devices) {
-    const buttons = d.revoked ? [] : [["失効", async () => {
-      if (confirm(d.name + " を失効させますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
+    const buttons = d.revoked ? [] : [["登録を取り消す", async () => {
+      if (confirm(d.name + " の登録を取り消しますか。") && await api("/admin/devices/" + encodeURIComponent(d.id) + "/revoke")) load();
     }]];
     const owner = d.userId === null ? "なし" : (d.username ?? "ユーザ名未設定");
     const label = d.kind === "viewer" ? "ブラウザ (期限 " + fmt(d.expiresAt) + ")" : d.name;
-    row(dt, [label + (d.revoked ? " (失効)" : ""), owner, fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
+    row(dt, [label + (d.revoked ? "（登録取り消し済み）" : ""), owner, fmt(d.createdAt), fmt(d.lastSeenAt)], buttons);
   }
   const ct = $("checkins"); ct.textContent = "";
   for (const p of checkins) {

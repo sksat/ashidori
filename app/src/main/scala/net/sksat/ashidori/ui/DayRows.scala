@@ -43,7 +43,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
   def visitRow(v: Visit, tl: DayTimeline): View =
     val place = v.placeId.flatMap(tl.places.get)
     val name = place.map { p =>
-      tl.suggestions.get(p.id).filter(_ => !p.named).map(n => s"$n？").getOrElse(p.displayName)
+      tl.suggestions.get(p.id).filter(_ => !p.named).map(n => s"$n（候補）").getOrElse(p.displayName)
     }.getOrElse("不明な場所")
     val chips = hbox()
     // The kind as a chip, unless it already is the name ("自宅").
@@ -68,8 +68,11 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
         }
         chips.addView(c)
       case None =>
-        if place.forall(!_.named) || v.confidence < 0.6 then
-          chips.addView(chip("場所を確認", color(attr.surfaceContainerHigh), color(attr.primary)))
+        // Name what the tap does: name an unnamed place, or correct an uncertain one.
+        if place.forall(!_.named) then
+          chips.addView(chip("名前を設定", color(attr.surfaceContainerHigh), color(attr.primary)))
+        else if v.confidence < 0.6 then
+          chips.addView(chip("場所を修正", color(attr.surfaceContainerHigh), color(attr.primary)))
     chips.setMinimumHeight(chipLineHeight.getOrElse(v.start, 0))
     chips.addOnLayoutChangeListener((_, _, t, _, b, _, _, _, _) =>
       if b - t > 0 then chipLineHeight(v.start) = math.max(chipLineHeight.getOrElse(v.start, 0), b - t))
@@ -97,7 +100,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit):
   def tripRow(t: Trip, tl: DayTimeline): View =
     val legs = t.legs.filter(_.mode != TransportMode.Still).reverse
     val rows = legs.map { l =>
-      val label = oneLine(text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "?" else ""), 15f))
+      val label = oneLine(text(s"${l.mode.emoji} ${l.mode.label}" + (if l.confidence < 0.5 then "（推定）" else ""), 15f))
       label.setLayoutParams(weighted())
       val detail = tabular(caption(
         // Rough legs (GNSS gaps, poor fixes): "約" on the distance; the map draws them faded.

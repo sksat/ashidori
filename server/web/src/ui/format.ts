@@ -71,10 +71,10 @@ export function shortTime(t: number): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 「たった今」「15分前」「3時間前」「2日前」; 7 日以上前は日付 */
+/** 「1分以内」「15分前」「3時間前」「2日前」; 7 日以上前は日付 */
 export function relTime(t: number, now = Date.now()): string {
   const x = now - t;
-  if (x < MIN) return "たった今";
+  if (x < MIN) return "1分以内";
   if (x < HOUR) return `${Math.floor(x / MIN)}分前`;
   if (x < DAY) return `${Math.floor(x / HOUR)}時間前`;
   if (x < 7 * DAY) return `${Math.floor(x / DAY)}日前`;

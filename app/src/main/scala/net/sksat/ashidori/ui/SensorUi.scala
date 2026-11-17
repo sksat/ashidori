@@ -11,14 +11,14 @@ import java.time.{Instant, ZoneId}
 import ashidori.core.*
 import Ui.*
 
-/** Building blocks shared by the sensor cards: a card is split into 「いま」
+/** Building blocks shared by the sensor cards: a card is split into 「現在」
   * (state, live values, each with its age) and 「履歴」 (a time series).
   */
 object SensorUi:
   /** How old a value is: 「3秒前」. */
   def fmtAge(ms: Long): String =
     val s = math.max(0L, ms) / 1000
-    if s < 2 then "いま"
+    if s < 2 then "現在"
     else if s < 60 then s"${s}秒前"
     else if s < 3600 then s"${s / 60}分前"
     else if s < 86_400 then s"${s / 3600}時間前"
@@ -47,7 +47,7 @@ object SensorUi:
         b.setSpan(RelativeSizeSpan(0.85f), at, b.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     b
 
-  /** 「いま」/「履歴」: a heading with a rule, and an optional control at the end. */
+  /** 「現在」/「履歴」: a heading with a rule, and an optional control at the end. */
   def section(title: String, trailing: View*)(using Ctx): LinearLayout =
     val t = text(title, 13f, bold = true, colorAttr = attr.primary)
     val rule = View(summon[Ctx])
@@ -63,7 +63,7 @@ object SensorUi:
   enum Tone:
     case Active, Waiting, Off
 
-  /** The state chip and, below it, why: 「停止中（静止）」 / 「動くと再開」. */
+  /** The state chip and, below it, why: 「停止中（静止）」 / 「移動開始時に再開」. */
   final class StateLine(using c: Ctx):
     private val chipView =
       val t = oneLine(text("", 13f, bold = true))
@@ -209,7 +209,7 @@ object SensorUi:
     h.setPadding(0, dp(1), 0, dp(1))
     h
 
-  /** Clock labels under a chart spanning [from, to]; the right end is 「いま」. */
+  /** Clock labels under a chart spanning [from, to]; the right end is 「現在」. */
   final class TimeAxis(using c: Ctx):
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     p.setTextSize(dp(10).toFloat)
@@ -223,7 +223,7 @@ object SensorUi:
       // Ticks on round clock times in the local zone.
       val offset = zone.getRules.getOffset(Instant.ofEpochMilli(from)).getTotalSeconds * 1000L
       var t = ((from + offset) / step + 1) * step - offset
-      val now = "いま"
+      val now = "現在"
       val nowW = p.measureText(now)
       val base = top + dp(11)
       canvas.drawText(now, right - nowW, base, p)

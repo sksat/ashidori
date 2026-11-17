@@ -15,10 +15,10 @@ import Ui.*
   */
 object ModeInfo:
   val summary: Map[LoggingMode, String] = Map(
-    LoggingMode.Eco -> "移動中30秒ごと。静止中は GNSS 停止",
-    LoggingMode.Balanced -> "移動中10秒ごと（乗り物5秒）。詳細ログは定期的に",
-    LoggingMode.Precise -> "移動中1〜2秒ごと。詳細ログは高頻度",
-    LoggingMode.Max -> "常時1秒ごと。詳細ログも常時"
+    LoggingMode.Eco -> "移動中 30 秒間隔・静止中は測位を停止",
+    LoggingMode.Balanced -> "移動中 10 秒間隔（乗り物 5 秒）",
+    LoggingMode.Precise -> "移動中 1〜2 秒間隔",
+    LoggingMode.Max -> "静止中も 1 秒間隔"
   )
   /** Each mode has its own color and symbol so the choice reads as a mode. */
   val color: Map[LoggingMode, Int] = Map(
@@ -35,7 +35,7 @@ object ModeInfo:
   )
   val battery: Map[LoggingMode, String] = Map(
     LoggingMode.Eco -> "電池: ごくわずか",
-    LoggingMode.Balanced -> "電池: 少なめ（おすすめ）",
+    LoggingMode.Balanced -> "電池: 少なめ（推奨）",
     LoggingMode.Precise -> "電池: やや多い",
     LoggingMode.Max -> "電池: 多い（短時間向け）"
   )
@@ -83,19 +83,19 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     (h, v)
   private val (sourceRow, sourceValue) = row("測位")
   private val (motionRow, motionValue) = row("動き")
-  private val (envRow, envValue) = row("場所")
+  private val (envRow, envValue) = row("屋内外")
   private val (batteryRow, batteryValue) = row("電池")
   private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow)
   /** Why it is like this: supplementary, so quieter and marked with ⓘ.
     * The mode note keeps its line even when empty: switching modes adds or
-    * removes it ("「高精度」で動作中: 充電中のため1段階上げ").
+    * removes it ("「高精度」で動作中: 充電中のため精度を1段階向上").
     */
   private val modeNote =
     val t = stableCaption(Seq("ⓘ " + PositioningPanel.ModeNoteSample))
     t.setPadding(0, dp(6), 0, 0)
     t
-  /** Indoors, the indoor note's lines stay reserved in every mode (全力ログ
-    * has none).
+  /** Indoors, the indoor note's lines stay reserved in every mode (最高精度
+    * has none). Tapping ⓘ tells when it checks for being outdoors again.
     */
   private val indoorNote =
     val t = stableCaption(PositioningPanel.indoorNoteVariants.map("ⓘ " + _))
@@ -226,8 +226,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private def schedule(m: LoggingMode): String =
     val p = SamplingPolicy.profiles(m)
     def every(ms: Long) = if ms >= 3_600_000 then s"${ms / 3_600_000}時間" else s"${ms / 60_000}分"
-    if m == LoggingMode.Max then "自動: 常に"
-    else s"自動: 移動中は${every(p.detailEveryMovingMs)}ごと・静止中は${every(p.detailEveryStillMs)}ごとに${fmtDuration(p.detailDurationMs)}"
+    if m == LoggingMode.Max then "自動: 常時"
+    else s"自動: 移動中 ${every(p.detailEveryMovingMs)}間隔・静止中 ${every(p.detailEveryStillMs)}間隔で各 ${fmtDuration(p.detailDurationMs)}"
   /** When the automatic detail logs run in the current mode; as tall as the
     * longest mode's schedule.
     */
@@ -332,7 +332,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
 
   def refresh(): Unit =
     val running = LoggerState.running
-    status.setText(if running then "記録中" else "停止中")
+    status.setText(if running then "記録中" else "記録停止中")
     status.setTextColor(color(if running then attr.onSurface else attr.onSurfaceVariant))
     val since = Settings.loggingSince
     elapsed.setText(
@@ -361,7 +361,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         val d = LoggerState.drainPctPerHour
         s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
     modeNote.setText(plan.flatMap(PositioningPanel.modeNote(_, Settings.mode)).fold("")("ⓘ " + _))
-    // Indoors the note keeps its room in every mode (全力ログ has none);
+    // Indoors the note keeps its room in every mode (最高精度 has none);
     // elsewhere it does not appear.
     indoorNote.setText(plan.flatMap(PositioningPanel.indoorNote).fold("")("ⓘ " + _))
     indoorNote.setVisibility(
@@ -372,7 +372,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     val manualLeft = Settings.burstUntil - now
     detailText.setText(LoggerState.detailFile match
       case Some(_) =>
-        (if manualLeft > 0 then s"● 記録中・あと${fmtDuration(manualLeft)}" else "● 記録中（自動）") +
+        (if manualLeft > 0 then s"● 記録中・残り${fmtDuration(manualLeft)}" else "● 記録中（自動）") +
           f"・測定値 ${LoggerState.rawMeasurementsSeen}%,d 件"
       case None =>
         val last = Settings.lastDetailStart

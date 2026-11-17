@@ -123,7 +123,7 @@ function renderTop(): void {
 function renderBanner(): void {
   const b = $("#banner")!;
   if (!state.online && ctx.store?.fetchedAt)
-    replace(b, h("div", { class: "bar info", role: "status" }, icon("wifioff"), `オフラインです。${absTime(ctx.store.fetchedAt)} 時点の内容を表示しています。`));
+    replace(b, h("div", { class: "bar info", role: "status" }, icon("wifioff"), `オフライン: ${absTime(ctx.store.fetchedAt)} 時点の内容`));
   else if (DEV_PANEL && ctx.session?.source === "dev") replace(b, h("div", { class: "bar dev" }, icon("key"), "開発用の登録で表示しています。"));
   else replace(b);
 }

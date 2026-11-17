@@ -95,8 +95,8 @@ object BasemapUi:
   /** Label of the card's download button: a retry after a failure. */
   def downloadLabel(st: BasemapStatus): String =
     val verb = st match
-      case _: BasemapStatus.Failed => "簡易地図の取得を再試行"
-      case _ => "簡易地図をダウンロード"
+      case _: BasemapStatus.Failed => "再試行"
+      case _ => "ダウンロード"
     if Basemap.sizeLabel.isEmpty then verb else s"$verb（${Basemap.sizeLabel}）"
 
   /** What the small chip on a map without a base map offers: its action
@@ -106,12 +106,12 @@ object BasemapUi:
   enum ChipAction:
     /** 「取得」: starts the download (asks first on a metered network). */
     case Download
-    /** Opens the 簡易地図 dialog: the reason, retry and delete. */
+    /** Opens the オフライン地図 dialog: the reason, retry and delete. */
     case Details(label: String, failed: Boolean)
 
   def chipTitle(st: BasemapStatus): String = st match
-    case BasemapStatus.Installed(_, _) => "簡易地図を読み込めません"
-    case _ => "簡易地図がありません"
+    case BasemapStatus.Installed(_, _) => "オフライン地図を読み込めません"
+    case _ => "オフライン地図なし"
 
   def chipAction(st: BasemapStatus): Option[ChipAction] = st match
     case BasemapStatus.Unavailable => None
@@ -146,7 +146,7 @@ object BasemapUi:
       "",
       "状態: " + statusLine(st)
     ) ++ failureLines(st) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote)
-    val b = MaterialAlertDialogBuilder(act).setTitle("簡易地図").setMessage(body.mkString("\n"))
+    val b = MaterialAlertDialogBuilder(act).setTitle("オフライン地図").setMessage(body.mkString("\n"))
     st match
       case BasemapStatus.Unavailable => ()
       case BasemapStatus.Installed(_, _) =>

@@ -80,7 +80,7 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     PeerStatus.problem(deviceId).foreach(u => body.addView(card(PeerFormat.problem(u),
       caption("サーバから受け取った最新の状態を、この端末の鍵で復号・解析できませんでした。下の表示はそれより前のものです。"))))
     PeerStatus.entries.get(deviceId) match
-      case None => body.addView(card(caption("状態を受信していません")))
+      case None => body.addView(card(caption("状態は未受信")))
       case Some(e) =>
         val s = e.status
         val now = System.currentTimeMillis()

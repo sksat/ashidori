@@ -98,5 +98,5 @@ export const RECORDING_MODES: Record<string, { label: string; token: string }> =
   eco: { label: "省電力", token: "--rm-eco" },
   balanced: { label: "バランス", token: "--rm-bal" },
   precise: { label: "高精度", token: "--rm-pre" },
-  max: { label: "全力ログ", token: "--rm-max" },
+  max: { label: "最高精度", token: "--rm-max" },
 };

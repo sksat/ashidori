@@ -13,7 +13,7 @@ import ashidori.core.*
 import Ui.*
 import SensorUi.*
 
-/** The phone's sensors: 「いま」 what the logger measures now and how old
+/** The phone's sensors: 「現在」 what the logger measures now and how old
   * each value is, then every sensor live while the card is on screen, then
   * 「履歴」 what they saw over the last hour or day.
   */
@@ -22,7 +22,7 @@ final class SensorPanel(act: MainActivity):
   private val sm = act.getSystemService(classOf[SensorManager])
   private lazy val hasStepCounter = sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) != null
 
-  // --- いま ---
+  // --- 現在 ---
   private val state = StateLine()
   private val motionRow = ValueRow("動き")
   private val shakeRow = ValueRow("揺れ")
@@ -71,12 +71,12 @@ final class SensorPanel(act: MainActivity):
     note.setLayoutParams(weighted())
     val bar = hbox(liveDot(), note, caption("直近10秒"))
     bar.setPadding(0, dp(8), 0, dp(6))
-    val axis = hbox(caption("10秒前"), stepLegend, caption("いま"))
+    val axis = hbox(caption("10秒前"), stepLegend, caption("現在"))
     axis.setPadding(0, dp(2), 0, 0)
     val accelBox = plotBox(plotHeader("加速度", "m/s²", accelVals.view), accelPlot, axis)
     val gyroBox = plotBox(plotHeader("ジャイロ", "rad/s", gyroVals.view), gyroPlot)
     val compassBox = plotBox(miniTitle("方位"), dial, headingText, headingNote)
-    val nowLabel = caption("いま")
+    val nowLabel = caption("現在")
     nowLabel.setGravity(Gravity.END)
     nowLabel.setLayoutParams(weighted())
     val pressureBox = plotBox(miniTitle("気圧"), pressureText, pressureNote, spacer(4), pressureSpark,
@@ -103,7 +103,7 @@ final class SensorPanel(act: MainActivity):
       legendItem(Swatch(MotionClass.Other), "その他")
     ),
     hbox(
-      legendItem(Swatch(MotionClass.Still), "静止（計測中）"),
+      legendItem(Swatch(MotionClass.Still), "静止"),
       legendItem(Swatch(MotionClass.Off), "センサー停止")
     )
   )
@@ -113,7 +113,7 @@ final class SensorPanel(act: MainActivity):
     title.setLayoutParams(weighted())
     card(
       hbox(title, oneLine(caption(android.os.Build.MODEL))),
-      section("いま"),
+      section("現在"),
       state.view,
       motionRow.view,
       shakeRow.view,
@@ -224,7 +224,7 @@ final class SensorPanel(act: MainActivity):
     gyroVals.set(live.gyro, fresh(live.gyro))
 
     stepLegend.setText(
-      if live.stepDetector.isEmpty && live.stepCounter.isEmpty then "歩の検知なし"
+      if live.stepDetector.isEmpty && live.stepCounter.isEmpty then "歩数センサーなし"
       else if live.stepsDenied then "歩数の権限なし"
       else
         val b = SpannableStringBuilder("│ ")
@@ -372,10 +372,10 @@ final class SensorPanel(act: MainActivity):
     for (t, name) <- Seq(
         Sensor.TYPE_ACCELEROMETER -> "加速度",
         Sensor.TYPE_GYROSCOPE -> "ジャイロ",
-        Sensor.TYPE_MAGNETIC_FIELD -> "磁気",
+        Sensor.TYPE_MAGNETIC_FIELD -> "地磁気",
         Sensor.TYPE_PRESSURE -> "気圧",
         Sensor.TYPE_STEP_COUNTER -> "歩数計",
-        Sensor.TYPE_SIGNIFICANT_MOTION -> "動き出しの検知",
+        Sensor.TYPE_SIGNIFICANT_MOTION -> "動き出し検知",
         Sensor.TYPE_AMBIENT_TEMPERATURE -> "温度"
       )
     do
@@ -436,7 +436,7 @@ final class SensorPanel(act: MainActivity):
     val s = LoggerState.sensors
     val running = LoggerState.running
     // A new window arrived since the history was drawn: draw it again
-    // (at most every 10 s), so its right end matches 「いま」.
+    // (at most every 10 s), so its right end matches 「現在」.
     if shown && LoggerState.lastWindow.exists(_.end > loadedUpTo) && now - loadedAt >= 10_000 then loadHistory()
     val win = LoggerState.lastWindow
     val accelOn = running && s.accelHz > 0
@@ -446,14 +446,14 @@ final class SensorPanel(act: MainActivity):
     // State of the accelerometer, and why.
     if !running then state.set("記録停止中", Tone.Off, "")
     else if accelOn then
-      val every = if s.accelBatchMs >= 1_000 then s"${s.accelBatchMs / 1_000}秒ごとに一括受信" else "逐次受信"
+      val every = if s.accelBatchMs >= 1_000 then s"${s.accelBatchMs / 1_000} 秒間隔で一括受信" else "逐次受信"
       if fresh.isDefined then state.set(s"計測中 ${s.accelHz} Hz", Tone.Active, every)
       else state.set("一括受信待ち", Tone.Waiting, s"計測中 ${s.accelHz} Hz・$every")
     else if LoggerState.motion == MotionState.Stationary then
       // What will turn it back on: the significant-motion interrupt, else
       // the step counter, else only the periodic re-check.
       state.set("停止中（静止）", Tone.Off,
-        if s.motionTrigger then "動くと再開" else if hasStepCounter then "歩き出すと再開" else "移動の検知待ち")
+        if s.motionTrigger || hasStepCounter then "移動開始時に再開" else "移動の検知待ち")
     else state.set("停止中", Tone.Off, "")
 
     // 動き: the logger's classification, since when, and the age of its latest evidence.
@@ -491,7 +491,7 @@ final class SensorPanel(act: MainActivity):
         Option(LoggerState.stepsAt).filter(_ > 0).map(now - _))
 
     extras.setText(
-      "歩行推定 " + (if s.pdr then "動作中" else "待機（屋内歩行時のみ）") +
+      "歩行推定 " + (if s.pdr then "動作中" else "待機") +
         "・生データ " + (if s.imuHz > 0 then f"記録中 ${s.imuHz} Hz" else "待機"))
 
   /** The phone's motion sensors: what exists, who made it, how fast it can go. */
@@ -504,13 +504,13 @@ final class SensorPanel(act: MainActivity):
       Sensor.TYPE_STEP_COUNTER -> "歩数計",
       Sensor.TYPE_STEP_DETECTOR -> "歩行検出",
       Sensor.TYPE_ROTATION_VECTOR -> "回転ベクトル（向き）",
-      Sensor.TYPE_SIGNIFICANT_MOTION -> "動き出し検知（割り込み）"
+      Sensor.TYPE_SIGNIFICANT_MOTION -> "動き出し検知"
     )
     val body = wanted.map { (t, label) =>
       Option(sm.getDefaultSensor(t, true)).orElse(Option(sm.getDefaultSensor(t))) match
         case Some(s) =>
           val maxHz = if s.getMinDelay > 0 then s" 最大 ${1_000_000 / s.getMinDelay}Hz" else ""
-          val fifo = if s.getFifoMaxEventCount > 0 then f"・まとめ受信 ${s.getFifoMaxEventCount}%,d 件" else ""
+          val fifo = if s.getFifoMaxEventCount > 0 then f"・一括受信 ${s.getFifoMaxEventCount}%,d 件" else ""
           val wake = if s.isWakeUpSensor then "・wake-up" else ""
           s"$label\n  ${s.getVendor} ${s.getName}$maxHz$fifo$wake"
         case None => s"$label\n  なし"

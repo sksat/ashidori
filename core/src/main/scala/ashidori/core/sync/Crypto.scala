@@ -196,7 +196,7 @@ object RecoveryCode:
       else
         val (key, check) = bytes.splitAt(32)
         val expect = MessageDigest.getInstance("SHA-256").digest(key).take(2)
-        if expect.sameElements(check) then Right(key) else Left("チェックサムが一致しません（入力ミス）")
+        if expect.sameElements(check) then Right(key) else Left("入力に誤りがあります")
 
   private def base32(b: Array[Byte]): String =
     val sb = StringBuilder()

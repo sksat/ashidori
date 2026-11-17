@@ -7,13 +7,13 @@ import net.sksat.ashidori.{AshidoriApp, Basemap, Settings}
 import ashidori.core.{BaseMapPolicy, OfflineBasemapStyle}
 import ashidori.core.BaseMapPolicy.Outcome
 
-/** Selectable base maps. "簡易地図" is drawn from data in the app and never
+/** Selectable base maps. "オフライン地図" is drawn from data in the app and never
   * uses the network; the others fetch tiles of the visible area from their
   * servers. The built-in online ones are free to use without an API key;
   * "カスタム" takes any XYZ raster tile URL (e.g. a provider with a key).
   */
 enum MapStyle(val key: String, val label: String, val note: String):
-  case Offline extends MapStyle("offline", "簡易地図", "端末内のデータで表示。通信しない")
+  case Offline extends MapStyle("offline", "オフライン地図", "通信なし")
   case Standard extends MapStyle("ofm-liberty", "標準", "OpenStreetMap（OpenFreeMap）")
   case Light extends MapStyle("ofm-positron", "シンプル", "淡い配色で経路が見やすい（OpenFreeMap）")
   case GsiStd extends MapStyle("gsi-std", "地理院 標準", "国土地理院の標準地図")
@@ -106,7 +106,7 @@ object MapStyle:
     if s.online then e.putString("mapStyleOnline", s.key)
     e.apply()
 
-  /** The online map last chosen: what "詳しい地図" asks for when [[current]] is offline. */
+  /** The online map last chosen: what "オンライン地図" asks for when [[current]] is offline. */
   def lastOnline: MapStyle =
     byKey(prefs.getString("mapStyleOnline", "")).filter(_.online)
       .orElse(Some(current).filter(_.online)).getOrElse(Standard)

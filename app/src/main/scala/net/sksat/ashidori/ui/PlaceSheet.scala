@@ -87,7 +87,7 @@ final class PlaceSheet(
         spacer(8),
         actions,
         spacer(12),
-        text(if visits.nonEmpty then s"訪問履歴（${visits.size}回）" else "", 15f, bold = true),
+        text(if visits.nonEmpty then s"滞在履歴（${visits.size}回）" else "", 15f, bold = true),
         visitList,
         text("この場所でのチェックイン", 15f, bold = true),
         history
@@ -116,7 +116,7 @@ final class PlaceSheet(
 
   /** Past check-ins nearby first, then OpenStreetMap venues from the venue
     * index and the saved results: nothing is sent. The online search runs
-    * only when the user presses 「最新を取得」.
+    * only when the user presses 「オンラインで検索」.
     */
   /** Candidate rows, then one status line (updated as the search goes on), then the button. */
   private val candidateRows = vbox()
@@ -140,7 +140,7 @@ final class PlaceSheet(
         candidateRows.removeAllViews()
         candidates.addView(candidateRows)
         candidates.addView(candidateStatus)
-        for (v, d) <- past.take(4) do candidateRows.addView(candidateRow(v, s"以前チェックイン・${d.round}m"))
+        for (v, d) <- past.take(4) do candidateRows.addView(candidateRow(v, s"チェックイン済み・${d.round} m"))
         val fromIndex = offline match
           case VenueData.Lookup.Found(vs) => CheckInSheet.fresh(past.toVector, vs).take(6)
           case _ => Vector.empty
@@ -160,16 +160,16 @@ final class PlaceSheet(
     for (v, d) <- shown do candidateRows.addView(candidateRow(v, s"保存済み・${v.category}・${d.round}m"))
     shown
 
-  /** 「最新を取得」: the only way to the online search. */
+  /** 「オンラインで検索」: the only way to the online search. Sending is the exception: tertiary colours. */
   private def latestButton(shown: Seq[(Venue, Double)]): Unit =
-    lazy val once: View = outlined("最新を取得（位置情報を送信）") {
+    lazy val once: View = outlined("オンラインで検索（位置を送信）") {
       candidates.removeView(once)
       searchOnline(shown)
     }
     candidates.addView(once)
 
   /** OpenStreetMap venues near the place: sends its position to the server,
-    * only when the user pressed 「最新を取得」. `shown` are the candidates
+    * only when the user pressed 「オンラインで検索」. `shown` are the candidates
     * already shown; new ones go below them, and the status line says how
     * the search ended.
     */
@@ -188,8 +188,8 @@ final class PlaceSheet(
           val fresh = CheckInSheet.fresh(shown.toVector, a.venues)
           for (v, d) <- fresh.take(6) do candidateRows.addView(candidateRow(v, s"${v.category}・${d.round}m"))
           setStatus(
-            if fresh.isEmpty && shown.isEmpty then "近くに候補がありません（OpenStreetMap、" + a.server + "）"
-            else s"最新の施設を取得しました（OpenStreetMap、${a.server}）。")
+            if fresh.isEmpty && shown.isEmpty then "近くに候補なし（OpenStreetMap）"
+            else "OpenStreetMap から取得")
       )
     }
 
@@ -198,7 +198,7 @@ final class PlaceSheet(
       val cs = AshidoriApp.db.checkInsAtPlace(place.id)
       act.runOnUiThread { () =>
         history.removeAllViews()
-        if cs.isEmpty then history.addView(caption("まだありません"))
+        if cs.isEmpty then history.addView(caption("なし"))
         for c <- cs.take(20) do
           val r = padded(vbox(text(c.venueName, 15f), caption(fmt(c.time) + (if c.comment.nonEmpty then s"「${c.comment}」" else ""))), 0, 4)
           onOpenDay.foreach { open =>

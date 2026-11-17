@@ -120,7 +120,7 @@ function tripRow(ctx: Ctx, d: DayData, t: Trip, i: number): HTMLElement {
         return h(
           "span",
           { class: "leg" },
-          h("span", { class: "lm" }, emoji(m.emoji), ` ${m.label}${l.confidence < 0.5 ? "?" : ""}`),
+          h("span", { class: "lm" }, emoji(m.emoji), ` ${m.label}${l.confidence < 0.5 ? "（推定）" : ""}`),
           h("span", { class: "ld num" }, `${l.uncertain >= 0.3 ? "約" : ""}${fmtDist(l.distanceM)}・${fmtDur(l.end - l.start)}${l.steps > 0 ? `・${nf(l.steps)}歩` : ""}`),
         );
       }),
@@ -160,7 +160,7 @@ function dayCard(ctx: Ctx, d: DayData): HTMLElement {
         h("span", { class: "ds num" }, `${nf(d.summary.steps)}歩・${fmtKm(d.summary.totalDistanceM)}`),
       ),
     ),
-    d.partial ? h("p", { class: "partial" }, icon("alert"), "一部の記録を受信していません") : null,
+    d.partial ? h("p", { class: "partial" }, icon("alert"), "一部の記録が未受信") : null,
     narrow() ? mini(contentOf([d], hl), d.date) : null,
     h("ol", { class: "rows", "aria-label": `${mdLabel(d.date)}の滞在と移動` }, rows(ctx, d)),
   );
@@ -189,7 +189,7 @@ function todayCard(ctx: Ctx): HTMLElement | null {
     ),
     h(
       "p",
-      { class: "todaymark", tabindex: 0, "data-tip": "今日の経路は、日が終わってから届きます。" },
+      { class: "todaymark", tabindex: 0, "data-tip": "今日の経路は翌日以降に表示" },
       h("i"),
       when ? `最終測位 ${when}` : "測位なし",
     ),
@@ -215,7 +215,7 @@ function periodCard(ctx: Ctx, key: string): HTMLElement {
       ),
     ),
     narrow() ? mini(contentOf(days), key) : null,
-    h("p", { class: "sum num" }, `${fmtKm(a.distanceM)}・${nf(a.steps)}歩・${a.places}か所・記録 ${a.days}日`),
+    h("p", { class: "sum num" }, `${fmtKm(a.distanceM)}・${nf(a.steps)}歩・${a.places}か所・記録日数 ${a.days}日`),
     modeBar(a.modes),
   );
 }

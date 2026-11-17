@@ -156,9 +156,9 @@ function optIn(): HTMLElement {
     "ul",
     { hidden: true, id: "optin-more" },
     h("li", null, `配信元: ${location.host}`),
-    h("li", null, "このブラウザは、これまでの記録と、これから送る記録を読めます。"),
-    h("li", null, "期限はサーバが記録を渡すのをやめるだけです。鍵が持ち出されると、期限の後も読めます。"),
-    h("li", null, "サーバの管理者が画面を書き換えると、記録を見られる可能性があります。"),
+    h("li", null, "このブラウザは、これまでと今後の記録を読めます。"),
+    h("li", null, "期限後はサーバが記録を提供しませんが、持ち出された鍵では期限後も読めます。"),
+    h("li", null, "サーバの管理者がページを改変すると、記録を読まれる可能性があります。"),
     h("li", null, "登録はいつでも解除できます。"),
   );
   const btn = h("button", { class: "linkbtn", type: "button", "aria-expanded": "false", "aria-controls": "optin-more" }, "詳しく");
@@ -227,11 +227,11 @@ function codeStep(v: Extract<View, { k: "code" }>): HTMLElement {
     "section",
     { class: "card ppanel", "aria-busy": code ? null : "true" },
     heading(STEPS[0]),
-    h("p", null, "アプリの「ブラウザでも見る」で QR コードを読み取ってください。"),
+    h("p", null, "アプリの「ブラウザでも見る」で読み取り"),
     h("div", { class: "qrshow" }, v.qr ? qrSvg(v.qr, "アプリで読み取る QR コード") : h("span", { class: "qrwait" }, code ? "QR コードを表示できません。下のコードを入力してください。" : "QR コードを準備しています")),
-    h("p", { class: "hint" }, "読み取れない場合は、アプリで「コードを入力」を選び、このコードを入力してください。"),
+    h("p", { class: "hint" }, "読み取れない場合はコードを入力"),
     h("div", { class: "codeshow" }, h("span", { class: "codebig", "aria-label": code ? `コード ${code.split("").join(" ")}` : "コードを準備しています" }, code ? displayCode(code) : "····-····"), copy),
-    v.claimed ? h("p", { class: "pstate", role: "status" }, icon("okcirc"), "アプリで受け付けました。確認コードを準備しています。") : null,
+    v.claimed ? h("p", { class: "pstate", role: "status" }, icon("okcirc"), "アプリで受付済み。確認コードを準備中") : null,
     code ? countdown() : null,
     h("div", { class: "formact" }, h("button", { class: "btn ghost", type: "button", onclick: () => void abandon() }, "中止する")),
   );
@@ -255,7 +255,7 @@ function wordsStep(v: Extract<View, { k: "words" }>): HTMLElement {
       ]
     : v.waiting
     ? [
-        h("p", { class: "pstate", id: "pair-wait", tabindex: -1, role: "status" }, icon("info"), "アプリでの承認を待っています。"),
+        h("p", { class: "pstate", id: "pair-wait", tabindex: -1, role: "status" }, icon("info"), "アプリでの承認待ち"),
         h("div", { class: "formact" }, h("button", { class: "btn danger", type: "button", onclick: () => void control?.mismatch() }, "中止する")),
       ]
     : [
@@ -270,7 +270,7 @@ function wordsStep(v: Extract<View, { k: "words" }>): HTMLElement {
     "section",
     { class: "card ppanel" },
     heading("確認コードの照合"),
-    h("p", null, "アプリに表示された 4 語と同じであることを確かめてください。"),
+    h("p", null, "アプリに表示された 4 語と一致するか確認してください。"),
     h("ol", { class: "sas", lang: "ja" }, v.words.map((w) => h("li", null, w))),
     h(
       "div",
@@ -432,7 +432,7 @@ export function renderUnregistered(ctx: Ctx, main: HTMLElement, reason: Unregist
             h("h1", { id: "h1", tabindex: -1 }, reason === "expired" ? "このブラウザの登録の期限が切れました" : "このブラウザの登録は解除されました"),
             h("p", null, "鍵はこのブラウザから消去しました。"),
           ),
-          h("button", { class: "btn primary", type: "button", onclick: () => ctx.go("timeline") }, "もう一度登録する"),
+          h("button", { class: "btn primary", type: "button", onclick: () => ctx.go("timeline") }, "再登録"),
         ),
       ),
     ),

@@ -25,7 +25,7 @@ export const MAP_STYLES: readonly MapStyleDef[] = [
   { key: "gsi-std", label: "地理院 標準" },
   { key: "gsi-pale", label: "地理院 淡色" },
   { key: "gsi-photo", label: "航空写真" },
-  { key: "offline", label: "簡易地図（端末内）" },
+  { key: "offline", label: "オフライン地図" },
 ];
 
 export const DEFAULT_STYLE: MapStyleKey = "ofm-liberty";

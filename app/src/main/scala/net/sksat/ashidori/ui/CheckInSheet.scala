@@ -27,7 +27,7 @@ enum VenueError(val message: String, val withCache: String, val withIndex: Strin
 
 /** Online venue search on OpenStreetMap (Overpass), shared by the
   * check-in sheet and the place sheet. It runs only when the user presses
-  * 「最新を取得（位置情報を送信）」: nothing sends a position to it by itself,
+  * 「オンラインで検索（位置を送信）」: nothing sends a position to it by itself,
   * whatever 「位置情報を外部サービスに送らない」 says (the press is the
   * consent, as for any explicit action). The sheets show the venue index
   * ([[VenueData]]) and the saved results ([[VenueCache]], 90 days) without
@@ -154,7 +154,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val LocalOnly = "過去の場所とチェックイン先のみを表示しています。"
   private val IndexBroken = "施設データを読み込めません。設定から再取得してください。"
   private def savedFrom(hit: VenueCache.Hit) =
-    s"保存済みの施設（${CheckInSheet.age(System.currentTimeMillis() - hit.fetchedAt)}に取得）を表示しています。"
+    s"保存済みの施設（${CheckInSheet.age(System.currentTimeMillis() - hit.fetchedAt)}に取得）"
   private def fromIndex(date: Option[String]) =
     s"端末内の施設データ${date.fold("")(d => s"（$d）")}を表示しています。"
   private def latestFrom(server: String) = s"最新の施設を取得しました（OpenStreetMap、$server）。"
@@ -165,20 +165,21 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val status = stableCaption(
     VenueError.values.toSeq.flatMap(e => Seq(e.message, e.withCache, e.withIndex)) ++
       Seq(NoLocation, NoVenues, NoVenuesSaved, NoVenuesIndex, LocalOnly, IndexBroken, latestFrom("overpass.kumi.systems"),
-        "近くの施設を検索中…", "保存済みの施設（88日前に取得）を表示しています。",
+        "近くの施設を検索中…", "保存済みの施設（88日前に取得）",
         fromIndex(Some("2026年12月31日時点"))))
   private val list = vbox()
-  /** The only way to the online search: the user presses it (「最新を取得」). */
+  /** The only way to the online search: the user presses it. Sending is
+    * the exception, so it has the tertiary (warning) colours.
+    */
   private val searchOnce =
     val b = outlined("最新を取得（位置情報を送信）")(here.foreach(searchOnline))
     b.setVisibility(View.GONE)
     b
-  private val footnote = caption("")
 
   // Compose step
   private val chosen = text("", 18f, bold = true)
   private val comment = EditText(act)
-  comment.setHint("ひとこと（任意）")
+  comment.setHint("コメント")
   private val priv = MaterialSwitch(act)
   priv.setText("非公開にする（エクスポートや共有に含めない）")
   priv.setMinHeight(dp(48))
@@ -203,8 +204,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       status,
       searchOnce,
       list,
-      spacer(12),
-      footnote
+      spacer(12)
     )
 
   def show(): Unit =
@@ -294,7 +294,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     here = Some(p)
     // Local candidates, the venue index and saved venues: nothing is sent,
     // so check-in works without a network. The online search runs only when
-    // the user presses 「最新を取得」.
+    // the user presses 「オンラインで検索」.
     AshidoriApp.io.execute { () =>
       val local = localCandidates(p)
       val offline = VenueData.lookup(p)
@@ -314,12 +314,11 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
           case VenueData.Lookup.Missing => hit.fold(LocalOnly)(savedFrom)
         )
         searchOnce.setVisibility(View.VISIBLE)
-        footnote.setText(SendNote)
       }
     }
 
   /** Venue search on OpenStreetMap: sends the position to the server. Only
-    * when the user pressed 「最新を取得」.
+    * when the user pressed 「オンラインで検索」.
     */
   private def searchOnline(p: LatLng): Unit =
     hideSearchOnce()

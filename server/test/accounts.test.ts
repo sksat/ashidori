@@ -446,7 +446,7 @@ describe("storage quota", () => {
       { ...OPEN, USER_QUOTA_BYTES: "1048576" },
     );
     const page = await res.text();
-    expect(page).toContain("登録の方式: 招待または自由な登録");
+    expect(page).toContain("登録の方式: 招待なしでも登録可");
     expect(page).toContain("const QUOTA = 1048576;");
     expect(page).toContain(`const MAX_TOTAL = ${50 * 1024 ** 3};`);
     const closed = await (await adminCall("/admin/")).text();
