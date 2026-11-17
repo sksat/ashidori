@@ -201,3 +201,42 @@ class DbMigrationSuite extends munit.FunSuite:
     assertEquals(run(db, s"UPDATE energy_state SET end=12000 WHERE start=9000; DELETE FROM energy_state WHERE $where2; SELECT changes();"),
       Vector("2"))
   }
+
+  test("a 0.21.0 battery commit (5 columns) repaired after the upgrade: rows as SQLite gives them, NULL temperature as NaN") {
+    val db = v6Db()
+    val day = (0 until 40).map(i => (2000L + i * 300_000L, 90 - i % 20))
+    run(db, day.map((t, p) => insert("battery", "time, pct, charging, screen_on, mode, plan", s"$t, $p, 0, 1, 'balanced', 'x'")).mkString)
+    // As 0.21.0 archived the day: 5 columns, its check made on rows of 5.
+    val chunk = day.map((t, p) => Seq[Any](t, p, 0, 1, "balanced"))
+    val prev = Seq(Seq[Any](1500L, 80, 0, 1, "balanced"))
+    val f = File.createTempFile("battery", ".parquet")
+    f.deleteOnExit()
+    scala.util.Using.resource(java.io.BufferedOutputStream(java.io.FileOutputStream(f))) { o =>
+      val w = parquet.ParquetWriter(o, Archive.Battery.columns.take(5), 100)
+      (prev ++ chunk).foreach(w.write)
+      w.close()
+    }
+    val sampler = ChunkSampler()
+    chunk.foreach(r => sampler.add(r.toIndexedSeq))
+    val target = CommitIntent.Target("battery/2025-10-09.parquet", 41, f.length,
+      Some(sampler.check(CommitIntent.Prev.File(1, 1234), carried = 1, added = 40, range = Some((1500L, day.last._1)))))
+    run(db, helperUpgrade(db))
+    // The chunk's rows read as the app reads them after the upgrade (ArchiveSql.batteryRow on SQLite's values).
+    val json = run(db, s".mode json\nSELECT ${ArchiveSql.BatteryColumns} FROM battery WHERE time >= 2000 ORDER BY time, rowid;").mkString
+    val rows = ujson.read(if json.isEmpty then "[]" else json).arr.toVector.map { o =>
+      val v = ArchiveSql.BatteryColumns.split(',').toIndexedSeq.map(c => o(c) match
+        case ujson.Null                        => null
+        case ujson.Num(n) if n == math.rint(n) => n.toLong
+        case ujson.Num(n)                      => n
+        case x                                 => x.str)
+      ArchiveSql.batteryRow(v).toIndexedSeq
+    }
+    assertEquals(rows.size, 40)
+    assert(rows.forall(r => r(9).asInstanceOf[Float].isNaN), "NULL temperature reads as NaN")
+    val bag = RowBag()
+    rows.foreach(r => bag.add(CommitRepair.fit(r, 5)))
+    val back = scala.util.Using.resource(parquet.ParquetReader.open(f.getPath))(_.rowIterator.toVector)
+    assertEquals(CommitRepair.verify(target, 41, back.iterator, Some(bag)), Right(()))
+    // A row with a temperature does not fit 5 columns: it matches nothing (kept in SQLite).
+    assertEquals(CommitRepair.fit(rows.head.updated(9, 30.5f), 5).size, 11)
+  }

@@ -951,11 +951,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
           Archive.motionRow(MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4)))
         }
       case Archive.Battery =>
-        def opt(c: Cursor, i: Int, v: => Any): Any = if c.isNull(i) then null else v
-        query(s"""SELECT time,pct,charging,screen_on,mode,charge_uah,current_avg_ua,current_now_ua,voltage_mv,temp_c,plug
-          |FROM battery WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid""".stripMargin, args*) { c =>
-          Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getInt(3), c.getString(4), opt(c, 5, c.getLong(5)),
-            opt(c, 6, c.getInt(6)), opt(c, 7, c.getInt(7)), opt(c, 8, c.getInt(8)), flt(c, 9), c.getString(10))
+        // Through the same conversion the repair's tests use on SQLite's values.
+        query(s"SELECT ${ArchiveSql.BatteryColumns} FROM battery WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
+          args*) { c =>
+          ArchiveSql.batteryRow((0 until c.getColumnCount).map(i => c.getType(i) match
+            case Cursor.FIELD_TYPE_NULL    => null
+            case Cursor.FIELD_TYPE_INTEGER => c.getLong(i)
+            case Cursor.FIELD_TYPE_FLOAT   => c.getDouble(i)
+            case _                         => c.getString(i)))
         }
       // Closed spans only: the open one is archived once it is closed.
       case Archive.EnergyStates =>

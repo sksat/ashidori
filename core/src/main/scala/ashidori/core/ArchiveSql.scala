@@ -13,6 +13,21 @@ package ashidori.core
   * takes.
   */
 object ArchiveSql:
+  /** The columns of `battery` the archive reads from SQLite, in its order. */
+  val BatteryColumns = "time,pct,charging,screen_on,mode,charge_uah,current_avg_ua,current_now_ua,voltage_mv,temp_c,plug"
+
+  /** A battery row of the archive from the values SQLite gives for
+    * [[BatteryColumns]] (null for NULL; Long, Double or String otherwise):
+    * as the app reads it (a NULL temperature is NaN, a NULL count 0).
+    */
+  def batteryRow(v: IndexedSeq[Any]): Seq[Any] =
+    def long(i: Int): Long = v(i) match { case null => 0L; case n: Long => n; case n: Int => n.toLong; case d: Double => d.toLong; case s => s.toString.toLong }
+    def int(i: Int): Int = long(i).toInt
+    def orNull(i: Int, f: Int => Any): Any = if v(i) == null then null else f(i)
+    def str(i: Int): String = if v(i) == null then null else v(i).toString
+    val temp: Float = v(9) match { case null => Float.NaN; case n: Long => n.toFloat; case n: Int => n.toFloat; case d: Double => d.toFloat; case s => s.toString.toFloat }
+    Seq(long(0), int(1), int(2), int(3), str(4), orNull(5, long), orNull(6, int), orNull(7, int), orNull(8, int), temp, str(10))
+
   val CreateFloor = "CREATE TABLE IF NOT EXISTS rowid_floor(tbl TEXT PRIMARY KEY, next INTEGER NOT NULL)"
 
   /** Raises the floor of `table` to above its largest rowid. */

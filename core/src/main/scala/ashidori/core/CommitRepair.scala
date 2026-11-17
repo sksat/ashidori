@@ -50,8 +50,17 @@ object CommitRepair:
   def fit(r: IndexedSeq[Any], width: Int): IndexedSeq[Any] =
     if r.size == width then r
     else if r.size > width then
-      if r.iterator.drop(width).forall(_ == null) then r.take(width) else r
+      if r.iterator.drop(width).forall(absent) then r.take(width) else r
     else r ++ IndexedSeq.fill(width - r.size)(null)
+
+  /** No value: null, or NaN (a floating value SQLite gave as NULL), which
+    * the Parquet writer stores as null and the row hash takes as null.
+    */
+  private def absent(v: Any): Boolean = v match
+    case null      => true
+    case d: Double => d.isNaN
+    case f: Float  => f.isNaN
+    case _         => false
 
   /** Where one table of the commit stands. */
   enum State:
