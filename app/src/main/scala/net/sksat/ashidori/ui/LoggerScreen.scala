@@ -68,6 +68,21 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     a.setRepeatMode(android.animation.ValueAnimator.REVERSE)
     a.setRepeatCount(android.animation.ValueAnimator.INFINITE)
     a
+  /** The lamp blinks only while on screen: stopped when the app goes to the
+    * background or the view leaves the window, started again by refresh()
+    * (onShow comes again on return) while still recording.
+    */
+  private def stopBlink(): Unit =
+    blink.cancel()
+    recDot.setAlpha(1f)
+  act.getLifecycle.addObserver(new androidx.lifecycle.LifecycleEventObserver:
+    override def onStateChanged(src: androidx.lifecycle.LifecycleOwner, ev: androidx.lifecycle.Lifecycle.Event): Unit =
+      if ev == androidx.lifecycle.Lifecycle.Event.ON_STOP then stopBlink()
+  )
+  recDot.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener:
+    def onViewAttachedToWindow(v: View): Unit = if LoggerState.running && !blink.isStarted then blink.start()
+    def onViewDetachedFromWindow(v: View): Unit = stopBlink()
+  )
   private val status = oneLine(text("", 20f, bold = true))
   private val elapsed = tabular(oneLine(caption("")))
   private val recBadge =
@@ -360,10 +375,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       else "")
     recDot.getBackground.asInstanceOf[android.graphics.drawable.GradientDrawable]
       .setColor(if running then 0xffe53935.toInt else color(attr.outlineVariant))
-    if running then { if !blink.isStarted then blink.start() }
-    else
-      blink.cancel()
-      recDot.setAlpha(1f)
+    if running && recDot.isAttachedToWindow then { if !blink.isStarted then blink.start() }
+    else stopBlink()
     // Both stay laid out (INVISIBLE, not GONE): the slot keeps its height.
     start.setVisibility(if running then View.INVISIBLE else View.VISIBLE)
     stopRow.setVisibility(if running then View.VISIBLE else View.INVISIBLE)

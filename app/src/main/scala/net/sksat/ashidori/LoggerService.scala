@@ -601,7 +601,7 @@ class LoggerService extends Service:
   private def notification(text: String): Notification =
     def pi(action: String, code: Int) =
       PendingIntent.getService(this, code, Intent(this, classOf[LoggerService]).setAction(action), PendingIntent.FLAG_IMMUTABLE)
-    val open = PendingIntent.getActivity(this, 0, Intent(this, classOf[MainActivity]), PendingIntent.FLAG_IMMUTABLE)
+    val open = PendingIntent.getActivity(this, LoggerService.Codes.OpenApp, Intent(this, classOf[MainActivity]), PendingIntent.FLAG_IMMUTABLE)
     Notification.Builder(this, AshidoriApp.ChannelLogging)
       .setSmallIcon(R.drawable.ic_notification)
       .setContentTitle("ashidori 記録中")
@@ -609,7 +609,7 @@ class LoggerService extends Service:
       .setContentIntent(open)
       .setOngoing(true)
       .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
-      .addAction(Notification.Action.Builder(null, ui.PositioningPanel.BurstLabel, pi(ActionBurst, 1)).build())
+      .addAction(Notification.Action.Builder(null, ui.PositioningPanel.BurstLabel, pi(ActionBurst, LoggerService.Codes.Burst)).build())
       .addAction(Notification.Action.Builder(null, "ステータス", openLogger(confirmStop = false)).build())
       // 停止 opens the app's stop confirmation rather than stopping at once:
       // recording is meant to run until stopped on purpose, so a stray tap
@@ -620,9 +620,8 @@ class LoggerService extends Service:
   private def openLogger(confirmStop: Boolean): PendingIntent =
     PendingIntent.getActivity(
       this,
-      // Distinct from each other and from LifeLog's 再開 (4): extras do not
-      // tell PendingIntents apart, so a shared code would overwrite them.
-      if confirmStop then 5 else 3,
+      // Extras do not tell PendingIntents apart: see LoggerService.Codes.
+      if confirmStop then LoggerService.Codes.Stop else LoggerService.Codes.Status,
       Intent(this, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true)
         .putExtra(MainActivity.ExtraConfirmStop, confirmStop).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
       PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
@@ -637,6 +636,26 @@ class LoggerService extends Service:
     s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"
 
 object LoggerService:
+  /** Request codes of every PendingIntent in the app, in one place so that
+    * collisions are visible. Extras are not part of a PendingIntent's
+    * identity: two getActivity intents with the same code and
+    * FLAG_UPDATE_CURRENT overwrite each other's extras (and so their
+    * destination). Codes elsewhere are listed here as plain numbers.
+    */
+  object Codes:
+    // PendingIntent.getActivity
+    /** The ongoing notification itself: opens the app. */
+    val OpenApp = 0
+    // 3: Alerts.openDiagnostics (alert notifications → 端末診断)
+    // 4: LifeLog.notifyStopped (記録停止 and its 再開)
+    /** The ongoing notification's 停止: the stop confirmation. */
+    val Stop = 5
+    /** The ongoing notification's ステータス. */
+    val Status = 6
+    // PendingIntent.getService
+    /** The ongoing notification's 5分間 生データを記録. */
+    val Burst = 1
+
   val ActionStart = "net.sksat.ashidori.START"
   val ActionStop = "net.sksat.ashidori.STOP"
   val ActionBurst = "net.sksat.ashidori.BURST"

@@ -161,6 +161,7 @@ object LifeLog:
     try
       val nm = c.getSystemService(classOf[NotificationManager])
       nm.createNotificationChannel(NotificationChannel(ChannelAlerts, "記録の停止", NotificationManager.IMPORTANCE_DEFAULT))
+      // Request code: see LoggerService.Codes.
       val open = PendingIntent.getActivity(c, 4,
         Intent(c, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
         PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT)
