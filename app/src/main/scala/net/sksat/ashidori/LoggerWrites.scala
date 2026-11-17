@@ -59,7 +59,9 @@ object LoggerWrites:
       case Some(id) =>
         exec.execute { () =>
           var lost = false
-          try commit(write)
+          try
+            debugFailWrite(kind)
+            commit(write)
           catch
             case NonFatal(e) =>
               lost = true
@@ -78,6 +80,15 @@ object LoggerWrites:
 
   def rawLines(batch: Seq[(Long, String)]): Unit =
     submit(batch.size, raw = true, WriteKind.RawLines, batch)(_.insertRawLines(batch))
+
+  /** Debug builds: writes of `kind` fail while `files/maintenance/debug-fail-write-<key>`
+    * exists (to test the stall alert per kind).
+    */
+  private def debugFailWrite(kind: WriteKind): Unit =
+    val app = AshidoriApp.app
+    if (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 &&
+        File(Maintenance.dir, s"debug-fail-write-${kind.key}").exists then
+      throw java.io.IOException(s"debug: failing writes of ${kind.key}")
 
   private def commit(write: Db => Unit): Unit =
     val start = SystemClock.uptimeMillis()
