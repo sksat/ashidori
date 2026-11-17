@@ -76,7 +76,8 @@ class WriteSafetySuite extends munit.FunSuite:
   test("stall alert: a battery write does not clear it while positions keep failing") {
     val b = WriteBacklog()
     val m = WriteStall.Monitor()
-    def check(now: Long) = m.update(noCommit = false, WriteStall.queuedTooLong(b.oldestUnsaved.map(_._2), now))
+    def check(now: Long) = m.update(noCommit = false, WriteStall.queuedTooLong(b.oldestUnsaved.map(_._2), now),
+      b.unsavedSince.keySet, b.savedTimes)
     val f = b.offer(5, raw = false, "位置", now = 0L).get
     b.done(f, 5, raw = false, now = 10L, lost = true)
     val t = WriteStall.OldestMs + 1
@@ -100,25 +101,66 @@ class WriteSafetySuite extends munit.FunSuite:
     val m = WriteStall.Monitor(restored = Some(Set("fixes", "raw_lines")))
     assert(m.reported)
     // After the restart nothing is stalled, but only battery rows were saved.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery")), None)
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("battery" -> 5L)), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("battery" -> 5L, "fixes" -> 6L)), None)
     assert(m.reported)
+    assertEquals(m.kinds, Set("raw_lines"))
     // Every kind it named saved again: over.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes", "raw_lines")), Some(false))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("battery" -> 5L, "fixes" -> 6L, "raw_lines" -> 7L)), Some(false))
     assertEquals(m.kinds, Set.empty[String])
-    // Raised again in this process: the kinds unsaved now are kept.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = true, unsaved = Set("動き"), saved = Set("位置")), Some(true))
-    assertEquals(m.kinds, Set("動き"))
-    // In the same process it clears as before (not waiting for a save of each kind).
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
+    // Raised again in this process: the kinds unsaved now are kept, and
+    // cleared only once each is saved after that.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = true, unsaved = Set("motion"), saved = Map("fixes" -> 8L, "motion" -> 3L)), Some(true))
+    assertEquals(m.kinds, Set("motion"))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("fixes" -> 9L, "motion" -> 3L)), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("fixes" -> 9L, "motion" -> 10L)), Some(false))
+  }
+
+  test("stall alert: a kind that stalls while it is up is kept, across a restart, until it is saved") {
+    var t = 0L
+    val saved = scala.collection.mutable.Map.empty[String, Long]
+    def save(k: String) = { t += 1; saved(k) = t }
+    save("fixes"); save("motion")
+    val m = WriteStall.Monitor()
+    // Positions stall: notified for positions.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = true, Set("fixes"), saved.toMap), Some(true))
+    assertEquals(m.kinds, Set("fixes"))
+    // Motion stalls as well: added.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = true, Set("fixes", "motion"), saved.toMap), None)
+    assertEquals(m.kinds, Set("fixes", "motion"))
+    // Positions recover (saved, nothing waiting); motion still waits.
+    save("fixes")
+    assertEquals(m.update(noCommit = false, unsavedTooLong = true, Set("motion"), saved.toMap), None)
+    assertEquals(m.kinds, Set("motion"))
+    // Restart: the alert as kept on disk.
+    val after = WriteStall.Monitor(restored = Some(m.kinds))
+    saved.clear()
+    // Positions saved after the restart, nothing stalled: still up for motion.
+    save("fixes")
+    assertEquals(after.update(noCommit = false, unsavedTooLong = false, Set.empty, saved.toMap), None)
+    assert(after.reported)
+    assertEquals(after.kinds, Set("motion"))
+    // Motion saved: over.
+    save("motion")
+    assertEquals(after.update(noCommit = false, unsavedTooLong = false, Set.empty, saved.toMap), Some(false))
+  }
+
+  test("stall alert: a kind saved earlier but waiting or failing again is not resolved by that earlier save") {
+    val m = WriteStall.Monitor()
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, Set("fixes"), Map("fixes" -> 4L)), Some(true))
+    // Not stalled any more, but positions not saved since: up.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 4L)), None)
+    // Saved, but a batch of them waits again: up.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, Set("fixes"), Map("fixes" -> 5L)), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 5L)), Some(false))
   }
 
   test("stall alert found only by its notification (0.21.0): cleared after a save, while nothing is stalled") {
     val m = WriteStall.Monitor(restored = Some(Set.empty))
     assertEquals(m.update(noCommit = false, unsavedTooLong = false), None)
     // Still stalled after a save: kept.
-    assertEquals(m.update(noCommit = true, unsavedTooLong = false, saved = Set("電池")), None)
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池")), Some(false))
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, saved = Map("battery" -> 1L)), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("battery" -> 1L)), Some(false))
     // Nothing restored: as before.
     val fresh = WriteStall.Monitor()
     assert(!fresh.reported)
@@ -169,7 +211,7 @@ class WriteSafetySuite extends munit.FunSuite:
     val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
     // Raised: posted, but keeping it on disk fails.
     fx.failStore = 1
-    assertEquals(alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)(), Some(true))
+    assertEquals(alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Map.empty)(), Some(true))
     assert(fx.shown)
     // In memory it reads as stored; on disk it is not: stored again until
     // a commit works.
@@ -178,26 +220,26 @@ class WriteSafetySuite extends munit.FunSuite:
     // Saving works again before the next check: the alert clears, and the
     // notification goes even though the raise was only partly done.
     fx.failCancel = 1
-    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))(), Some(false))
+    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 1L))(), Some(false))
     assert(fx.shown, "the cancel failed")
-    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))(), None)
+    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 1L))(), None)
     assert(!fx.shown)
     assertEquals(fx.kept, None)
     assertEquals(fx.disk, None)
     // Raised, the post fails and then works; kept on disk with its kinds.
     fx.failPost = 1
-    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Map.empty)()
     assert(!fx.shown)
     assertEquals(fx.disk, Some(Set("raw_lines")))
-    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Map.empty)()
     assert(fx.shown)
     // Dismissed by the user while still up: not posted again.
     fx.shown = false
-    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Map.empty)()
     assert(!fx.shown)
     // After a restart, an alert kept on disk is shown again.
     val again = WriteStall.Alert(WriteStall.Monitor(fx.kept), fx)
-    again.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    again.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Map.empty)()
     assert(fx.shown)
   }
 
@@ -205,11 +247,13 @@ class WriteSafetySuite extends munit.FunSuite:
     val fx = FakeEffects()
     fx.failStore = 3
     val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    val clock = java.util.concurrent.atomic.AtomicLong()
     val changes = java.util.concurrent.ConcurrentLinkedQueue[Boolean]()
     val threads = (1 to 8).map(i => Thread(() =>
       for j <- 1 to 50 do
         val stalled = (j / 10) % 2 == 0
-        alert.check(noCommit = stalled, unsavedTooLong = false, if stalled then Set("fixes") else Set.empty, Set("fixes"))(changes.add(_))
+        alert.check(noCommit = stalled, unsavedTooLong = false, if stalled then Set("fixes") else Set.empty,
+          Map("fixes" -> clock.incrementAndGet()))(changes.add(_))
     ))
     threads.foreach(_.start())
     threads.foreach(_.join())
@@ -217,7 +261,7 @@ class WriteSafetySuite extends munit.FunSuite:
     // Every change told once, alternating; the effects end as the monitor says.
     val seq = changes.toArray.toSeq.map(_.asInstanceOf[Boolean])
     assert(seq.sliding(2).forall(p => p.size < 2 || p(0) != p(1)), seq)
-    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> clock.incrementAndGet()))()
     assertEquals(fx.shown, alert.monitor.reported)
     assertEquals(fx.kept.isDefined, alert.monitor.reported)
     assertEquals(fx.disk.isDefined, alert.monitor.reported)
@@ -227,18 +271,18 @@ class WriteSafetySuite extends munit.FunSuite:
     val fx = FakeEffects()
     val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
     fx.failStore = 2
-    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Map.empty)()
     // Memory says stored; the disk does not. The next checks store again.
     assertEquals((fx.kept, fx.disk), (Some(Set("fixes")), None))
-    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Map.empty)()
     assertEquals(fx.disk, None)
-    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Map.empty)()
     assertEquals(fx.disk, Some(Set("fixes")))
     // Cleared: the same for the cleared state.
     fx.failStore = 1
-    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 1L))()
     assertEquals((fx.kept, fx.disk), (None, Some(Set("fixes"))))
-    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 1L))()
     assertEquals(fx.disk, None)
   }
 
@@ -253,7 +297,7 @@ class WriteSafetySuite extends munit.FunSuite:
     // An alert restored with the migrated kinds clears only once they are saved.
     val kinds = Set("位置", "詳細ログ").flatMap(WriteKind.fromStored).map(_.key)
     val m = WriteStall.Monitor(Some(kinds))
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes")), None)
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("fixes", "raw_lines")), Some(false))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("battery" -> 1L, "fixes" -> 2L)), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Map("fixes" -> 2L, "raw_lines" -> 3L)), Some(false))
   }
 

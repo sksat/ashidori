@@ -138,7 +138,7 @@ object LoggerWrites:
     val now = SystemClock.uptimeMillis()
     // Per kind: a position batch that failed or waits stays visible however
     // many battery rows are saved meanwhile.
-    val (oldest, unsaved, saved) = backlog.synchronized((backlog.oldestUnsaved, backlog.unsavedSince.keySet, backlog.savedKinds))
+    val (oldest, unsaved, saved) = backlog.synchronized((backlog.oldestUnsaved, backlog.unsavedSince.keySet, backlog.savedTimes))
     val noCommit = WriteStall.stalled(lastCommitUptime, now, threshold)
     // Cleared only once every kind is saved again (not by any write); one
     // check at a time, a failed notification or save tried again.

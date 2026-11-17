@@ -71,6 +71,9 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
   /** Kinds saved at least once in this process. */
   def savedKinds: Set[String] = savedAt.keySet.toSet
 
+  /** Per kind saved in this process: when it was last saved (uptime). */
+  def savedTimes: Map[String, Long] = savedAt.toMap
+
   /** When data of `kind` was last saved (uptime), if in this process. */
   def lastSaved(kind: String): Option[Long] = savedAt.get(kind)
 
@@ -159,37 +162,56 @@ object WriteStall:
   val OldestMs: Long = 3 * 60_000L
 
   /** The stall alert's state: raised when either condition holds, cleared
-    * only when both are resolved (every kind saved again), not by any write
-    * that succeeds.
+    * only when both are resolved and every kind it names has been saved
+    * again, not by any write that succeeds.
+    *
+    * While it is up, [[kinds]] is the union of the kinds not resolved: the
+    * kinds unsaved when it was raised, and every kind found unsaved while
+    * it is up (a kind that stalls later). A kind leaves only once it has
+    * been saved after it was added and nothing of it waits or failed since.
     *
     * The app keeps the alert on disk ([[kinds]] while [[reported]]): an
-    * alert raised before a restart is `restored` and cleared only once each
-    * kind it named has been saved after the restart (some kind, if it named
-    * none), as well as nothing being stalled now.
+    * alert raised before a restart is `restored`, and each kind it names
+    * must be saved after the restart (some kind, if it names none).
     */
   final class Monitor(restored: Option[Set[String]] = None):
     var reported: Boolean = restored.isDefined
-    /** The kinds not saved when the alert was raised. */
+    /** The kinds not resolved while the alert is up. */
     var kinds: Set[String] = restored.getOrElse(Set.empty)
-    private var carried = restored.isDefined
+    // Per kind in `kinds`: its last save (uptime) seen when it was added;
+    // None: any save in this process resolves it (restored kinds).
+    private var since: Map[String, Option[Long]] = kinds.map(_ -> None).toMap
+    // Restored with no kinds (0.21.0 kept only the notification): some
+    // kind must be saved in this process.
+    private var anySave = restored.exists(_.isEmpty)
 
     /** Some(true): report the stall now; Some(false): it is over now.
-      * `unsaved`: kinds not saved now; `saved`: kinds saved since the start.
+      * `unsaved`: kinds not saved now (waiting or failed); `saved`: per kind,
+      * when it was last saved in this process (uptime).
       */
     def update(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String] = Set.empty,
-               saved: Set[String] = Set.empty): Option[Boolean] =
+               saved: Map[String, Long] = Map.empty): Option[Boolean] =
       val stalled = noCommit || unsavedTooLong
-      def savedAgain = !carried || (if kinds.isEmpty then saved.nonEmpty else kinds.subsetOf(saved))
+      def add(ks: Set[String]) =
+        for k <- ks if !since.contains(k) do since += k -> saved.get(k)
+      def resolved(k: String) =
+        !unsaved(k) && saved.get(k).exists(at => since(k).forall(at > _))
       if stalled && !reported then
         reported = true
-        carried = false
-        kinds = unsaved
+        anySave = false
+        since = Map.empty
+        add(unsaved)
+        kinds = since.keySet
         Some(true)
-      else if !stalled && reported && savedAgain then
-        reported = false
-        carried = false
-        kinds = Set.empty
-        Some(false)
+      else if reported then
+        add(unsaved)
+        since = since.filterNot((k, _) => resolved(k))
+        kinds = since.keySet
+        if anySave && saved.nonEmpty then anySave = false
+        if !stalled && kinds.isEmpty && !anySave then
+          reported = false
+          Some(false)
+        else None
       else None
 
   /** The alert's side effects: the notification and its state on disk.
@@ -222,7 +244,7 @@ object WriteStall:
     /** Some(true): raised now; Some(false): cleared now (`onChange` is told,
       * once per change).
       */
-    def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Set[String])
+    def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Map[String, Long])
              (onChange: Boolean => Unit = _ => ()): Option[Boolean] = synchronized {
       val change = monitor.update(noCommit, unsavedTooLong, unsaved, saved)
       change.foreach { up =>
