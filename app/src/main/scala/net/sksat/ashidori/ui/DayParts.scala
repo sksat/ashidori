@@ -19,6 +19,25 @@ import Ui.*
 object DayParts:
   val dateFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("M月d日（E）", Locale.JAPANESE)
 
+  /** Material's drag handle, compact to look at: the grabber sits 14 dp from
+    * the top and the next row overlaps the lower half of its 48 dp touch
+    * target (that row's own controls take the touches on them). With
+    * `behavior`, TalkBack also offers to expand and to collapse the sheet.
+    */
+  def dragHandle(c: Context, behavior: Option[() => com.google.android.material.bottomsheet.BottomSheetBehavior[?]] = None): BottomSheetDragHandleView =
+    given Context = c
+    val h = BottomSheetDragHandleView(c)
+    h.setMinimumHeight(dp(48))
+    h.setPadding(0, dp(14), 0, dp(30))
+    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48))
+    lp.bottomMargin = -dp(24)
+    h.setLayoutParams(lp)
+    for b <- behavior do
+      import com.google.android.material.bottomsheet.BottomSheetBehavior as B
+      androidx.core.view.ViewCompat.addAccessibilityAction(h, "シートを広げる", (_, _) => { b().setState(B.STATE_EXPANDED); true })
+      androidx.core.view.ViewCompat.addAccessibilityAction(h, "シートを畳む", (_, _) => { b().setState(B.STATE_COLLAPSED); true })
+    h
+
   /** 「‹ 11月17日（月） ▾ ›」: the arrows move a day, the date opens the calendar. */
   final class DateHeader(c: Context, shift: Int => Unit, pick: () => Unit) extends LinearLayout(c):
     private given Context = c
@@ -216,11 +235,7 @@ object DayParts:
       glp.setMargins(dp(12), 0, dp(12), 0)
       grid.setLayoutParams(glp)
       // The grabber with the same spacing as the day sheet's.
-      val grab = BottomSheetDragHandleView(act)
-      grab.setMinimumHeight(0)
-      grab.setPadding(0, dp(14), 0, dp(6))
-      grab.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
-      dialog.setContentView(vbox(grab, header, grid, legend, buttons))
+      dialog.setContentView(vbox(dragHandle(act), header, grid, legend, buttons))
       dialog.getBehavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED)
       dialog.setOnDismissListener(_ => generation += 1)
       dialog.show()

@@ -106,14 +106,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     s
 
   private val handle =
-    if dayOnly then
-      // The grabber with Material's spacing above it; the date row follows
-      // close below (its own 48 dp rows are the touch targets).
-      val h = BottomSheetDragHandleView(act)
-      h.setMinimumHeight(0)
-      h.setPadding(0, dp(14), 0, dp(6))
-      h.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
-      h
+    if dayOnly then DayParts.dragHandle(act, Some(() => behavior))
     else
       val h = View(act)
       val d = android.graphics.drawable.GradientDrawable()
@@ -159,7 +152,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       // Lowered, the sheet shows the date and the totals, and a sliver of
       // the list below them says there is more.
       sheet.addOnLayoutChangeListener((_, _, _, _, _, _, _, _, _) =>
-        val peek = handle.getHeight + dateHeader.getHeight + daySummary.getHeight + dp(20)
+        // The date row overlaps the lower half of the handle (DayParts.dragHandle).
+        val peek = handle.getHeight - dp(24) + dateHeader.getHeight + daySummary.getHeight + dp(20)
         if handle.getHeight > 0 && peek != behavior.getPeekHeight then behavior.setPeekHeight(peek))
     else
       // Lowered sheet still shows the span chips and the date row.
@@ -282,7 +276,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     val zone = AshidoriApp.zone
     def status(d: LocalDate): DayParts.Recorded =
       val tl = TimelineRepo.day(d)
-      if tl.segments.isEmpty then DayParts.Recorded.None
+      // All 記録なし (the phone off across the day): not a silent nothing.
+      if tl.onlyUnrecorded then DayParts.Recorded.Partial
+      else if tl.segments.isEmpty then DayParts.Recorded.None
       else
         val from = d.atStartOfDay(zone).toInstant.toEpochMilli
         val to = math.min(d.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli, System.currentTimeMillis())
@@ -333,8 +329,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       period.load(span, date)
       return
     dateHeader.show(date, today)
-    if !current.exists(_.date == date) then
-      // Another day: its own totals and list, nothing selected.
+    // Another day: its own totals and list, nothing selected; except the
+    // first load after recreation, whose day keeps the restored selection.
+    val restoring = current.isEmpty && restored.exists(_.selected.isDefined) && fittedDate.contains(date)
+    if !current.exists(_.date == date) && !restoring then
       rows.clearSelection()
       map.clearHighlight()
       daySummary.clear()

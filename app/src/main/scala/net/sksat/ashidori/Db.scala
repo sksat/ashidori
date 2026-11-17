@@ -360,9 +360,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   // --- mode overrides -------------------------------------------------------
 
-  def modeOverrides(from: Long, to: Long): Vector[(Long, Long, TransportMode)] =
-    query("SELECT start,end,mode FROM mode_overrides WHERE end>? AND start<? ORDER BY updated_at DESC", from, to) { c =>
-      (c.getLong(0), c.getLong(1), TransportMode.fromKey(c.getString(2)))
+  /** This device's corrections overlapping `[from, to)`, in the order they
+    * win ([[ModeOverride.newestFirst]]): `updated_at`, then the change
+    * counter (`sync_rev`, the order they are uploaded in), newest first.
+    */
+  def modeOverrides(from: Long, to: Long): Vector[ModeOverride] =
+    query("SELECT start,end,mode,updated_at,COALESCE(sync_rev,rowid) FROM mode_overrides WHERE end>? AND start<? " +
+      "ORDER BY updated_at DESC, COALESCE(sync_rev,rowid) DESC", from, to) { c =>
+      ModeOverride(c.getLong(0), c.getLong(1), TransportMode.fromKey(c.getString(2)), c.getLong(3), seq = c.getLong(4))
     }
 
   def setModeOverride(start: Long, end: Long, mode: TransportMode): Unit = tx { db =>

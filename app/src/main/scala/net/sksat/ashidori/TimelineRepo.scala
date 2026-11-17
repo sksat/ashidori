@@ -10,7 +10,11 @@ final case class DayTimeline(
     places: Map[Long, Place],
     checkIns: Vector[CheckIn],
     /** placeId -> venue name of a past check-in close to an unnamed place */
-    suggestions: Map[Long, String] = Map.empty
+    suggestions: Map[Long, String] = Map.empty,
+    /** Nothing but stretches without a record (shown as a day without one;
+      * the calendar marks it as recorded only in part)
+      */
+    onlyUnrecorded: Boolean = false
 ):
   def path: Vector[Fix] = segments.collect { case t: Trip => t.path }.flatten
 
@@ -65,9 +69,11 @@ object TimelineRepo:
 
     val corrected = TimelineBuilder.applyOverrides(linked, db.modeOverrides(dayStart - Margin, dayEnd + Margin))
     // A day that is all 記録なし (the phone off from the day before to the day after) is a day without a record.
-    val segs = Stats.shown(Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty))
+    val ofDay = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
+    val segs = Stats.shown(ofDay)
     val steps = db.steps(dayStart, dayEnd)
-    DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places))
+    DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places),
+      onlyUnrecorded = ofDay.nonEmpty && segs.isEmpty)
 
   /** For unnamed visited places, the nearest earlier check-in venue (≤100 m). */
   private def suggest(segs: Seq[Segment], places: Map[Long, Place]): Map[Long, String] =

@@ -48,12 +48,8 @@ final class PlacePicker(act: MainActivity, place: Place, visit: Option[Visit], o
     slp.setMargins(dp(16), dp(8), dp(16), 0)
     search.setLayoutParams(slp)
     status.setPadding(dp(20), dp(4), dp(20), dp(4))
-    val grab = BottomSheetDragHandleView(act)
-    grab.setMinimumHeight(0)
-    grab.setPadding(0, dp(14), 0, dp(6))
-    grab.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
     val root = vbox(
-      grab,
+      DayParts.dragHandle(act),
       padded(text("場所を選択", 18f, bold = true), 20, 4),
       list,
       status,
