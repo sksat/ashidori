@@ -63,11 +63,7 @@ object TimelineRepo:
       case s        => s
     }
 
-    val overrides = db.modeOverrides(dayStart - Margin, dayEnd + Margin)
-    val corrected = linked.map {
-      case t: Trip => t.copy(legs = t.legs.map(l => applyOverride(l, overrides)))
-      case s       => s
-    }
+    val corrected = TimelineBuilder.applyOverrides(linked, db.modeOverrides(dayStart - Margin, dayEnd + Margin))
     val segs = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
     val steps = db.steps(dayStart, dayEnd)
     DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places))
@@ -98,9 +94,3 @@ object TimelineRepo:
         case None => acc
     }
 
-  /** A user correction applies to a leg if they overlap by more than half. */
-  private def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =
-    os.find { (s, e, _) =>
-      val ov = math.min(e, l.end) - math.max(s, l.start)
-      ov > (l.end - l.start) / 2
-    }.fold(l)((_, _, m) => l.copy(mode = m, confidence = 1.0))

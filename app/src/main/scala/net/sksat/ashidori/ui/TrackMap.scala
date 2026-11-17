@@ -19,8 +19,15 @@ import net.sksat.ashidori.*
 import ashidori.core.*
 import ashidori.core.BaseMapPolicy.Outcome
 
-/** A line on the map with its color (CSS hex). */
-final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine, dashed: Boolean = false)
+/** A line on the map with its color (CSS hex). `dashed`: drawn faint (a
+  * rough position); `gap`: a stretch without a record (記録なし), grey dots.
+  */
+final case class MapPath(points: Seq[Fix], color: String = TrackMap.DefaultLine, dashed: Boolean = false, gap: Boolean = false)
+
+object MapPath:
+  /** 記録なし: from where the record stopped to where it resumed. */
+  def unrecorded(u: Unrecorded): MapPath =
+    MapPath(Seq(Fix(u.start, u.from.lat, u.from.lon), Fix(u.end, u.to.lat, u.to.lon)), Palette.Unrecorded, gap = true)
 
 /** A marker on the map; `key` comes back in click callbacks. */
 /** `weight` scales the circle (e.g. number of visits). */
@@ -389,7 +396,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
           PropertyFactory.lineOpacity(0.9f),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
           PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-        ).withFilter(Expression.eq(Expression.get("dashed"), Expression.literal(false)))
+        ).withFilter(Expression.all(
+          Expression.eq(Expression.get("dashed"), Expression.literal(false)),
+          Expression.eq(Expression.get("gap"), Expression.literal(false))))
       )
       // Where the position was only roughly known (GNSS gap, poor accuracy).
       style.addLayer(
@@ -399,19 +408,53 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
           // data-driven colors (seen on the emulator's GL).
           PropertyFactory.lineWidth(3f),
           PropertyFactory.lineOpacity(0.4f)
-        ).withFilter(Expression.eq(Expression.get("dashed"), Expression.literal(true)))
+        ).withFilter(Expression.all(
+          Expression.eq(Expression.get("dashed"), Expression.literal(true)),
+          Expression.eq(Expression.get("gap"), Expression.literal(false))))
+      )
+      // 記録なし: grey dots in one colour (dashes did not render with
+      // data-driven colours, see above).
+      style.addLayer(
+        LineLayer("track-gap", "track").withProperties(
+          PropertyFactory.lineColor(Palette.Unrecorded),
+          PropertyFactory.lineWidth(4f),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+          PropertyFactory.lineDasharray(Array[java.lang.Float](0.1f, 2.2f))
+        ).withFilter(Expression.eq(Expression.get("gap"), Expression.literal(true)))
+      )
+      // The selected item: its line thicker on a halo, or a ring at a stay.
+      style.addLayer(
+        LineLayer("highlight-halo", "highlight").withProperties(
+          PropertyFactory.lineColor("#ffffff"),
+          PropertyFactory.lineWidth(12f),
+          PropertyFactory.lineOpacity(0.9f),
+          PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
+        ).withFilter(Expression.eq(Expression.geometryType(), Expression.literal("LineString")))
       )
       style.addLayer(
         LineLayer("highlight-line", "highlight").withProperties(
-          PropertyFactory.lineColor("#e8710a"),
-          PropertyFactory.lineWidth(7f),
+          PropertyFactory.lineColor(Expression.toColor(Expression.coalesce(Expression.get("color"), Expression.literal(TrackMap.DefaultLine)))),
+          PropertyFactory.lineWidth(8f),
           PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
           PropertyFactory.lineCap(Property.LINE_CAP_ROUND)
-        )
+        ).withFilter(Expression.all(
+          Expression.eq(Expression.geometryType(), Expression.literal("LineString")),
+          Expression.eq(Expression.get("gap"), Expression.literal(false))))
+      )
+      style.addLayer(
+        LineLayer("highlight-gap", "highlight").withProperties(
+          PropertyFactory.lineColor(Palette.Unrecorded),
+          PropertyFactory.lineWidth(8f),
+          PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+          PropertyFactory.lineDasharray(Array[java.lang.Float](0.1f, 1.8f))
+        ).withFilter(Expression.all(
+          Expression.eq(Expression.geometryType(), Expression.literal("LineString")),
+          Expression.eq(Expression.get("gap"), Expression.literal(true))))
       )
       style.addLayer(
         CircleLayer("visit-circles", "visits").withProperties(
-          PropertyFactory.circleColor("#006B5B"),
+          PropertyFactory.circleColor(Palette.Stay),
           PropertyFactory.circleOpacity(0.85f),
           // More visits, bigger circle.
           PropertyFactory.circleRadius(
@@ -421,6 +464,15 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
           PropertyFactory.circleStrokeColor("#ffffff"),
           PropertyFactory.circleStrokeWidth(2f)
         )
+      )
+      style.addLayer(
+        CircleLayer("highlight-ring", "highlight").withProperties(
+          PropertyFactory.circleRadius(14f),
+          PropertyFactory.circleColor(Palette.Stay),
+          PropertyFactory.circleOpacity(0.25f),
+          PropertyFactory.circleStrokeColor(Palette.Stay),
+          PropertyFactory.circleStrokeWidth(3f)
+        ).withFilter(Expression.eq(Expression.geometryType(), Expression.literal("Point")))
       )
       style.addLayer(
         CircleLayer("checkin-circles", "checkins").withProperties(
@@ -667,11 +719,25 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       Option(style.getSourceAs[GeoJsonSource]("live")).foreach(_.setGeoJson(lines(Seq(MapPath(points)))))
     }
 
-  def highlight(path: Seq[Fix]): Unit =
-    withStyle("highlight") { (m, style) =>
-      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(lines(Seq(MapPath(path))))
+  /** Draws `path` thicker over the rest and (`fit`) fits the camera to it. */
+  def highlight(path: MapPath, fit: Boolean = true): Unit =
+    withStyle("highlight") { (_, style) =>
+      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(lines(Seq(path)))
     }
-    moveCamera(TrackMap.CameraIntent.Show(path.map(_.latLng)))
+    if fit then moveCamera(TrackMap.CameraIntent.Show(path.points.map(_.latLng)))
+
+  /** A ring at a stay, (`fit`) centred on the map. */
+  def highlightPlace(at: LatLng, fit: Boolean = true): Unit =
+    withStyle("highlight") { (_, style) =>
+      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(
+        FeatureCollection.fromFeature(Feature.fromGeometry(Point.fromLngLat(at.lon, at.lat))))
+    }
+    if fit then moveCamera(TrackMap.CameraIntent.Focus(at, 16))
+
+  def clearHighlight(): Unit =
+    withStyle("highlight") { (_, style) =>
+      style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
+    }
 
   /** Where the camera is: centre and zoom (None before the map is ready). */
   def camera: Option[(LatLng, Double)] =
@@ -689,7 +755,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
 
   def setLayerVisible(layer: String, visible: Boolean): Unit =
     val ids = layer match
-      case "track"    => Seq("track-line", "track-dashed")
+      case "track"    => Seq("track-line", "track-dashed", "track-gap")
       case "visit"    => Seq("visit-circles")
       case "checkin"  => Seq("checkin-circles")
       case other      => Seq(other)
@@ -704,7 +770,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       if distinct.size >= 2 then
         val b = LatLngBounds.Builder().includes(distinct.map(p => MLatLng(p.lat, p.lon)).asJava).build()
         val pad = Ui.dp(40)(using act)
-        m.easeCamera(CameraUpdateFactory.newLatLngBounds(b, pad, pad, pad, pad + bottomInset))
+        // Never more padding than the map is tall (a sheet still being laid
+        // out reports all of it covered): MapLibre would zoom out to the world.
+        val h = Option(mapView).map(_.getHeight).getOrElse(0)
+        val bottom = if h > 0 then math.max(0, math.min(bottomInset, h - 3 * pad - Ui.dp(120)(using act))) else 0
+        m.easeCamera(CameraUpdateFactory.newLatLngBounds(b, pad, pad, pad, pad + bottom))
       else
         distinct.headOption
           .orElse(myLocation.map(l => LatLng(l.getLatitude, l.getLongitude)))
@@ -837,6 +907,7 @@ object TrackMap:
       val props = JsonObject()
       props.addProperty("color", p.color)
       props.addProperty("dashed", p.dashed)
+      props.addProperty("gap", p.gap)
       Feature.fromGeometry(LineString.fromLngLats(pts.map(f => Point.fromLngLat(f.lon, f.lat)).asJava), props)
     }.asJava)
 
