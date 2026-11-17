@@ -187,36 +187,123 @@ final class VenueLayer(ctx: android.content.Context):
 
   // ---- accessibility: the drawn venues as virtual views ----
 
-  /** A drawn venue: what is read, and where it is on the map. */
-  private final case class Node(text: String, at: Rect)
+  /** A drawn venue: its virtual view id, what is read, and where its icon and label are. */
+  private final case class Node(id: Int, text: String, at: Rect)
   /** The drawn venues as last read; None: to be read when asked. */
   private var nodes: Option[Vector[Node]] = Some(Vector.empty)
   private val nodesChanged: Runnable = () => accessibilityChanged()
+  /** Virtual view ids by OpenStreetMap id, for the life of this layer: an
+    * id never names another venue, so focus stays on its venue as the map
+    * moves (the ids of the venues seen in a session: a few thousand).
+    */
+  private val virtualIds = scala.collection.mutable.HashMap.empty[String, Int]
+  private def a11yOn = ctx.getSystemService(classOf[android.view.accessibility.AccessibilityManager]).isEnabled
 
+  /** The drawn venues may have changed. A focused venue that is gone loses
+    * the focus (it does not move to another venue).
+    */
   private def accessibilityChanged(): Unit =
     nodes = None
+    val focused = helper.getAccessibilityFocusedVirtualViewId
+    if focused != ExploreByTouchHelper.INVALID_ID && a11yOn && !currentNodes.exists(_.id == focused) then
+      helper.getAccessibilityNodeProvider(accessibilityView)
+        .performAction(focused, AccessibilityNodeInfoCompat.ACTION_CLEAR_ACCESSIBILITY_FOCUS, null)
     helper.invalidateRoot()
 
-  /** The venues the map draws now (after collisions), top to bottom, at
-    * most [[MaxNodes]]. Read only when an accessibility service asks.
+  /** The part of the map that the app's own views drawn over it (the
+    * sheet, buttons, banners) leave visible: a rectangle without the
+    * covers that span the map's width, and the smaller covers inside it.
+    */
+  private def unobscured(): (Rect, Seq[Rect]) =
+    val v = accessibilityView
+    val at = Array(0, 0)
+    v.getLocationInWindow(at)
+    val area = Rect(0, 0, v.getWidth, v.getHeight)
+    val covers = scala.collection.mutable.ArrayBuffer.empty[Rect]
+    def add(c: View): Unit =
+      if c.getVisibility == View.VISIBLE && c.getWidth > 0 && c.getHeight > 0 then c match
+        // A container without a background covers only with its children.
+        case g: android.view.ViewGroup if c.getBackground == null =>
+          for i <- 0 until g.getChildCount do add(g.getChildAt(i))
+        case _ =>
+          val l = Array(0, 0)
+          c.getLocationInWindow(l)
+          val r = Rect(l(0) - at(0), l(1) - at(1), l(0) - at(0) + c.getWidth, l(1) - at(1) + c.getHeight)
+          if r.intersect(area) then covers += r
+    // Drawn over the map: later siblings, and raised ones, up to the root.
+    var child: View = v
+    var parent = v.getParent
+    while parent.isInstanceOf[android.view.ViewGroup] do
+      val g = parent.asInstanceOf[android.view.ViewGroup]
+      val i = g.indexOfChild(child)
+      for j <- 0 until g.getChildCount if j != i do
+        val c = g.getChildAt(j)
+        if j > i || c.getZ > child.getZ then add(c)
+      child = g
+      parent = g.getParent
+    val (wide, small) = covers.partition(_.width >= area.width * 0.8)
+    for c <- wide do
+      if c.centerY > area.centerY then area.bottom = math.min(area.bottom, c.top)
+      else area.top = math.max(area.top, c.bottom)
+    (area, small.filter(r => Rect.intersects(r, area)).toSeq)
+
+  /** The venues the map draws now in the visible part (after collisions),
+    * at most [[MaxNodes]] by rank and distance from the centre, top to
+    * bottom. Read on the main thread, only when an accessibility service
+    * asks (or a focused venue may be gone).
     */
   private def currentNodes: Vector[Node] = nodes.getOrElse {
+    val t0 = System.nanoTime()
     val read = target.fold(Vector.empty[Node]) { (m, _) =>
-      val box = RectF(0, 0, accessibilityView.getWidth.toFloat, accessibilityView.getHeight.toFloat)
-      val half = (24 * ctx.getResources.getDisplayMetrics.density).toInt
-      Try(m.queryRenderedFeatures(box, LayerId).asScala.toVector).getOrElse(Vector.empty).flatMap { f =>
-        (f.geometry(), Option(Try(f.getStringProperty("name")).getOrElse(null))) match
-          case (p: Point, Some(name)) =>
-            val s = m.getProjection.toScreenLocation(MLatLng(p.latitude, p.longitude))
-            val kind = Option(Try(f.getStringProperty("kind")).getOrElse(null)).filter(_.nonEmpty)
-            val r = Rect(s.x.toInt - half, s.y.toInt - half, s.x.toInt + half, s.y.toInt + half)
-            if r.intersect(0, 0, accessibilityView.getWidth, accessibilityView.getHeight) then
-              Some(Node(kind.fold(name)(k => s"$name、$k"), r))
-            else None
-          case _ => None
-      }.distinctBy(_.text).sortBy(n => (n.at.centerY / (2 * half), n.at.centerX)).take(MaxNodes)
+      val (area, covers) = unobscured()
+      if area.isEmpty then Vector.empty
+      else
+        val cam = m.getCameraPosition
+        val zoom = cam.zoom
+        val c = Option(cam.target).fold(LatLng(0, 0))(t => LatLng(t.getLatitude, t.getLongitude))
+        val cos = math.cos(math.toRadians(c.lat))
+        def str(f: org.maplibre.geojson.Feature, k: String) = Option(Try(f.getStringProperty(k)).getOrElse(null))
+        def num(f: org.maplibre.geojson.Feature, k: String) = Try(f.getNumberProperty(k).doubleValue).getOrElse(99.0)
+        val found = Try(m.queryRenderedFeatures(RectF(area), LayerId).asScala.toVector).getOrElse(Vector.empty)
+          .flatMap(f => (f.geometry(), str(f, "id"), str(f, "name")) match
+            case (p: Point, Some(id), Some(name)) => Some((f, p, id, name))
+            case _ => None)
+          .distinctBy(_._3)
+          // The cap before any conversion to the screen.
+          .sortBy { (f, p, _, _) =>
+            val rank = if zoom >= VenueMapLayer.CloseZoom then num(f, "rc") else num(f, "r")
+            val dy = p.latitude - c.lat
+            val dx = (p.longitude - c.lon) * cos
+            rank * 1e6 + dx * dx + dy * dy
+          }.take(MaxNodes)
+        val d = ctx.getResources.getDisplayMetrics.density
+        // As the layer's text-size (dp): 10 up to zoom 17, 16 from zoom 19.
+        val em = d * (if zoom <= 17 then 10.0 else if zoom >= 19 then 16.0 else 10 + (zoom - 17) * 3).toFloat
+        val icon = (9 * d).toInt
+        found.flatMap { (f, p, id, name) =>
+          val s = m.getProjection.toScreenLocation(MLatLng(p.latitude, p.longitude))
+          val (x, y) = (s.x.toInt, s.y.toInt)
+          if !area.contains(x, y) || covers.exists(_.contains(x, y)) then None
+          else
+            // The label beside the icon (right first, as text-variable-anchor),
+            // wrapped at 8 ems: wide characters 1 em, others about 0.6.
+            val ems = name.codePoints().toArray.map(cp => if Character.isIdeographic(cp) || cp >= 0x3000 then 1.0 else 0.6).sum
+            val w = (math.min(ems, 8.0) * em).toInt
+            val h = (math.max(1.0, math.ceil(ems / 8.0)) * em * 1.2).toInt
+            val gap = (1.1 * em).toInt
+            val label =
+              if x + gap + w <= area.right then Rect(x + icon, y - h / 2, x + gap + w, y + h / 2)
+              else Rect(x - gap - w, y - h / 2, x - icon, y + h / 2)
+            val r = Rect(x - icon, y - icon, x + icon, y + icon)
+            r.union(label)
+            if !r.intersect(area) then None
+            else
+              val vid = virtualIds.getOrElseUpdate(id, virtualIds.size)
+              Some(Node(vid, str(f, "kind").filter(_.nonEmpty).fold(name)(k => s"$name、$k"), r))
+        }.sortBy(n => (n.at.centerY / math.max(1, 2 * icon), n.at.centerX))
     }
     nodes = Some(read)
+    Log.d(f"venues: ${read.size} accessibility nodes in ${(System.nanoTime() - t0) / 1e6}%.1f ms (main)")
     read
   }
 
@@ -231,12 +318,11 @@ final class VenueLayer(ctx: android.content.Context):
 
   private lazy val helper: ExploreByTouchHelper = new ExploreByTouchHelper(accessibilityView):
     override def getVirtualViewAt(x: Float, y: Float): Int =
-      val i = currentNodes.indexWhere(_.at.contains(x.toInt, y.toInt))
-      if i >= 0 then i else ExploreByTouchHelper.INVALID_ID
+      currentNodes.find(_.at.contains(x.toInt, y.toInt)).fold(ExploreByTouchHelper.INVALID_ID)(_.id)
     override def getVisibleVirtualViews(ids: java.util.List[Integer]): Unit =
-      currentNodes.indices.foreach(i => ids.add(i))
+      currentNodes.foreach(n => ids.add(n.id))
     override def onPopulateNodeForVirtualView(id: Int, node: AccessibilityNodeInfoCompat): Unit =
-      currentNodes.lift(id) match
+      currentNodes.find(_.id == id) match
         case Some(n) =>
           node.setContentDescription(n.text)
           node.setBoundsInParent(n.at)
@@ -276,7 +362,7 @@ object VenueLayer:
   val MaxGeoJsonChars = 256 * 1024
   /** A name longer than this is cut (with "…"): labels wrap at 8 ems anyway. */
   val MaxNameChars = 48
-  /** Virtual views for accessibility at most. */
+  /** Virtual views for accessibility at most (the first by rank and distance). */
   val MaxNodes = 100
   /** Read around the view, in parts of its size on each side, so a short pan shows them at once. */
   val Margin = 0.25
@@ -312,6 +398,7 @@ object VenueLayer:
         "type" -> "Feature",
         "geometry" -> ujson.Obj("type" -> "Point", "coordinates" -> ujson.Arr(i.venue.lon, i.venue.lat)),
         "properties" -> ujson.Obj(
+          "id" -> i.venue.id,
           "name" -> cut(i.venue.name),
           "kind" -> kind,
           "img" -> (if sprite && st.icon.nonEmpty then st.icon else dotId(st.group)),
