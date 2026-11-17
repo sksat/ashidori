@@ -277,7 +277,9 @@ describe("adjacent legs of one mode merged, against the app on the same rows", (
   it("merges a slow start, a drive around a short outage and a corrected walk into their neighbours", () => {
     const vehicleLegs = (name: string) =>
       exp.cases.find((c) => c.name === name)!.segments.flatMap((s) => (s.type === "trip" ? [s.legs.filter((l) => l.mode !== "STILL").map((l) => l.mode)] : []));
-    expect(vehicleLegs("none")).toEqual([["IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"], ["WALKING", "IN_PASSENGER_VEHICLE"], ["IN_PASSENGER_VEHICLE"]]);
+    const car = "IN_PASSENGER_VEHICLE";
+    // 13:00: as one leg 地下鉄, so cut in halves; the first two join again at the cut.
+    expect(vehicleLegs("none")).toEqual([[car], [car], ["WALKING", car], [car], [car, car]]);
     expect(vehicleLegs("onePart")[3]).toEqual(["IN_BUS", "IN_PASSENGER_VEHICLE"]);
     expect(vehicleLegs("bothParts")[3]).toEqual(["IN_BUS"]);
     // Changed to 電車 for the whole leg, then 取り消し (the app writes back the mode shown before): バス again.

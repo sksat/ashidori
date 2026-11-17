@@ -576,22 +576,29 @@ interface Piece {
  * it still shows that mode: without a correction on any part, if it is
  * classified so itself; with one, always (the mode the record says for the
  * whole as `inferred`). If not, each half of the run (by legs) is tried the
- * same way: O(n log n). Corrections are applied to the parts first, so each
+ * same way, then the two legs at the cut once as a pair: O(n log n). Corrections are applied to the parts first, so each
  * keeps the span it was saved for. Never across a stretch without a record.
  */
 function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex): Piece[] {
-  const joined = (run: Piece[]): Piece[] => {
-    if (run.length < 2) return run;
+  // `run` as one leg, if it still shows its mode.
+  const asOne = (run: Piece[]): Piece | undefined => {
     const first = run[0]!;
     const last = run[run.length - 1]!;
     const mode = first.leg.mode;
     const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion);
-    const ok = !unrecorded && (run.some((x) => x.leg.corrected === true) || l.mode === mode);
-    if (!ok) {
-      const h = Math.trunc(run.length / 2);
-      return [...joined(run.slice(0, h)), ...joined(run.slice(h))];
-    }
-    return [{ from: first.from, to: last.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false }];
+    if (unrecorded || !(run.some((x) => x.leg.corrected === true) || l.mode === mode)) return undefined;
+    return { from: first.from, to: last.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false };
+  };
+  const joined = (run: Piece[]): Piece[] => {
+    if (run.length < 2) return run;
+    const whole = asOne(run);
+    if (whole) return [whole];
+    const h = Math.trunc(run.length / 2);
+    const a = joined(run.slice(0, h));
+    const b = joined(run.slice(h));
+    // The halves keep the run's mode; their legs at the cut may still go together.
+    const pair = asOne([a[a.length - 1]!, b[0]!]);
+    return pair ? [...a.slice(0, -1), pair, ...b.slice(1)] : [...a, ...b];
   };
   const out: Piece[] = [];
   let i = 0;

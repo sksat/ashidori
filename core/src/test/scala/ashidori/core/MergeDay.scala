@@ -9,7 +9,10 @@ import java.time.{LocalDate, ZoneId}
   *  - 10:00 12 m/s for 8 min, 100 s without a position (350 m, under an
   *    overpass), 12 m/s for 8 min;
   *  - 11:00 a walk of 5 min, then 12 m/s for 8 min (stays two legs);
-  *  - 12:00 as at 09:00 (for corrections).
+  *  - 12:00 as at 09:00 (for corrections);
+  *  - 13:00 5 m/s for 3 min, 12 m/s for 2 min, then 10 min without a
+  *    position over 2.1 km: each part 車, but the three as one, and the last
+  *    two, 地下鉄 (mostly an outage, at a subway's speed); the first two 車.
   * The accelerometer records a car's vibration without steps while driving.
   * Stays of 20 min sit between them.
   */
@@ -22,7 +25,7 @@ object MergeDay:
 
   final case class Out(fixes: Vector[Fix], motion: Vector[MotionWindow])
 
-  def build(): Out = build(at(8, 40), Seq(at(9, 0), at(10, 0), at(11, 0), at(12, 0)))
+  def build(): Out = build(at(8, 40), Seq(at(9, 0), at(10, 0), at(11, 0), at(12, 0), at(13, 0)))
 
   /** Stays until each start, then the trips in the order above (cycling
     * through them), and a stay of 20 min after the last.
@@ -60,7 +63,11 @@ object MergeDay:
 
     for (s, i) <- starts.zipWithIndex do
       stay(s)
-      i % 4 match
+      i % 5 match
+        case 4 =>
+          drive(3, 5.0)
+          drive(2, 12.0)
+          outage(600, 2100.0)
         case 0 | 3 =>
           drive(5, 5.0)
           drive(8, 12.0)

@@ -251,8 +251,11 @@ object TimelineBuilder:
     *  - with one, always: the user said what the parts were. It shows the
     *    corrected mode, with the mode the record says for the whole as
     *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
-    * If not, each half of the run (by legs) is tried in the same way, so a
-    * run is built at most once per halving: O(n log n), however many legs.
+    * If not, each half of the run (by legs) is tried in the same way, and
+    * then the two legs on either side of the cut, if they show the same
+    * mode, are tried once as a pair (the cut must not leave 車, 車). Each
+    * interval is built at most a few times per halving: O(n log n), however
+    * many legs.
     * Corrections are applied to the parts first, so a correction saved for
     * one part keeps the span it was saved for: it neither drops off nor
     * spreads to its neighbour. One saved for a merged leg covers each of its
@@ -260,15 +263,20 @@ object TimelineBuilder:
     * a record (the trip ends there) or a visit (another trip).
     */
   private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams): Vector[Piece] =
+    /** `run` as one leg, if it still shows its mode. */
+    def asOne(run: Seq[Piece]): Option[Piece] =
+      val mode = run.head.leg.mode
+      val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p)
+      Option.when(!unrecorded && (run.exists(_.leg.corrected) || l.mode == mode))(Piece(run.head.from, run.last.to,
+        if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
     def joined(run: Vector[Piece]): Vector[Piece] =
       if run.size < 2 then run
       else
-        val mode = run.head.leg.mode
-        val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p)
-        val ok = !unrecorded && (run.exists(_.leg.corrected) || l.mode == mode)
-        if !ok then joined(run.take(run.size / 2)) ++ joined(run.drop(run.size / 2))
-        else Vector(Piece(run.head.from, run.last.to,
-          if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
+        asOne(run).fold {
+          val (a, b) = (joined(run.take(run.size / 2)), joined(run.drop(run.size / 2)))
+          // The halves keep the run's mode; their legs at the cut may still go together.
+          asOne(Seq(a.last, b.head)).fold(a ++ b)(m => (a.init :+ m) ++ b.tail)
+        }(Vector(_))
     val out = Vector.newBuilder[Piece]
     var i = 0
     while i < ps.size do

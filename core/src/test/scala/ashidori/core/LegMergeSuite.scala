@@ -42,6 +42,14 @@ class LegMergeSuite extends munit.FunSuite:
     assertEqualsDouble(parts(1).distanceM, 410.0, 1.0)
   }
 
+  test("a run that is another mode as one leg is cut in halves, and the legs at the cut join again") {
+    val parts = tripAt(split, 13)
+    assertEquals(parts.map(_.mode), Vector(Car, Car, Car), show(split))
+    // As one leg, and the last two as one: 地下鉄. So [A] [B, C] -> [A] [B] [C], then A + B at the cut.
+    val ls = tripAt(segs, 13)
+    assertEquals(ls.map(l => (l.start, l.end, l.mode)), Vector((parts(0).start, parts(1).end, Car), (parts(2).start, parts(2).end, Car)), show(segs))
+  }
+
   test("a walk, then a drive: still two legs") {
     assertEquals(tripAt(segs, 11).map(_.mode), Vector(Walking, Car), show(segs))
   }
@@ -52,8 +60,8 @@ class LegMergeSuite extends munit.FunSuite:
     assertEquals(a.durationByMode, b.durationByMode)
     assertEquals(a.distanceByMode.keySet, b.distanceByMode.keySet)
     for (m, d) <- a.distanceByMode do assertEqualsDouble(d, b.distanceByMode(m), 1e-6)
-    // 9:00 and 12:00 lose one leg each, 10:00 two.
-    assertEquals(legs(segs).size, legs(split).size - 4)
+    // 9:00, 12:00 and 13:00 lose one leg each, 10:00 two.
+    assertEquals(legs(segs).size, legs(split).size - 5)
   }
 
   // --- corrections ------------------------------------------------------
