@@ -117,6 +117,73 @@ object DebugData:
       }
     (out ++ quarantined) :+ s"$day unconverted=$unconverted commitPending=${AshidoriApp.archive.commitPending}"
 
+  /** Debug recorders of `day`: boots no real counter reaches, one pair per day. */
+  private def debugBoot(day: LocalDate, k: Int): Long =
+    900_000L + java.time.temporal.ChronoUnit.DAYS.between(day, LocalDate.now(AshidoriApp.zone)) * 10 + k
+
+  /** Signals of the energy and elevation recording for `day` (debug): two
+    * recorders ([[debugBoot]])
+    * with three state changes each, the first one's last span left open;
+    * 2 hours of pressure at 5 s; battery readings every 5 minutes; an hour
+    * of 1 Hz fixes, half with an MSL altitude. Through the app's own writes.
+    */
+  def insertSignals(day: LocalDate): String =
+    val db = AshidoriApp.db
+    val t0 = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli + 9 * 3_600_000L
+    def st(i: Int) = EnergyState(i % 2 == 0, 1000L * (i + 1), "gps", false, i % 3 == 0, i % 2 == 1, false,
+      "balanced", "balanced", "OnFoot", "Outdoor")
+    val a = (1 to 3).map(i => EnergyTransition(i, t0 + i * 20 * 60_000L, Some(st(i))))
+    db.applyEnergy(SmallRecord.Energy(debugBoot(day, 1), a, t0 + 70 * 60_000L, Some(st(3))))
+    val b = (1 to 3).map(i => EnergyTransition(i, t0 + 3 * 3_600_000L + i * 20 * 60_000L, Some(st(i + 3))))
+    db.applyEnergy(SmallRecord.Energy(debugBoot(day, 2), b, t0 + 5 * 3_600_000L, Some(st(6))))
+    db.applyEnergy(SmallRecord.Energy(debugBoot(day, 2), Nil, t0 + 5 * 3_600_000L, None).copy(transitions =
+      Seq(EnergyTransition(4, t0 + 5 * 3_600_000L, None))))
+    db.insertPressure((0 until 1440).map(i => PressureSample(t0 + i * 5000L, 1005f + (i % 100) * 0.01f)))
+    for i <- 0 until 72 do
+      db.insertBattery(BatteryReading(t0 + i * 300_000L, 90 - i / 4, false, i % 2 == 0, "balanced", Some(4_000_000L - i * 5000L),
+        Some(150_000), Some(160_000), Some(3900), 30.5f, Some("none")), "debug")
+    db.insertFixes((0 until 3600).map(i => Fix(t0 + i * 1000L, 35.6 + i * 1e-5, 139.7, 4f, 80.0, 1.2f, 90f, "gps", 12,
+      altAccuracy = 3f, msl = if i % 2 == 0 then 41.0 + i * 0.001 else Double.NaN, mslAccuracy = if i % 2 == 0 then 3.5f else Float.NaN)))
+    s"$day: ${db.counts().filter((k, _) => Seq("energy_state", "pressure", "battery", "fixes").contains(k))}"
+
+  /** A late record of `day`'s first recorder: one more change
+    * after its last confirmation, as an overflow file imported late would bring.
+    */
+  def closeLate(day: LocalDate): String =
+    val db = AshidoriApp.db
+    val t0 = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli + 9 * 3_600_000L
+    val s = EnergyState(true, 9000L, "gps", false, false, false, false, "balanced", "balanced", "Vehicle", "Outdoor")
+    db.applyEnergy(SmallRecord.Energy(debugBoot(day, 1), Seq(EnergyTransition(4, t0 + 80 * 60_000L, Some(s))), t0 + 90 * 60_000L, Some(s)))
+    s"$day: energy_state=${db.counts()("energy_state")}"
+
+  /** Per signal table of `day` (fixes, motion, battery, gnss_status,
+    * energy_state, pressure): rows in its day file, rows still in SQLite,
+    * and distinct rows of both (a row in both is a duplicate); and the
+    * state spans as the app reads them (start, end, unknown end).
+    */
+  def auditSignals(day: LocalDate): Seq[String] =
+    val db = AshidoriApp.db
+    val root = AshidoriApp.archive.root
+    val from = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
+    val to = day.plusDays(1).atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
+    val month = java.time.YearMonth.from(day)
+    val out = for t <- Archive.SignalTables yield
+      val hot = db.hotRows(t, from, to)
+      val hashes = scala.collection.mutable.HashSet.empty[Long]
+      hot.foreach(r => hashes += ArchiveMerge.hash(r.toIndexedSeq))
+      var n = 0L
+      for f <- Seq(java.io.File(root, Archive.dayFile(t, day)), java.io.File(root, Archive.monthFile(t, month))) if f.exists do
+        scala.util.Using.resource(Archive.open(t, f.getPath))(_.rowIterator.foreach { r =>
+          val k = ArchiveMerge.key(r)
+          if k >= from && k < to then
+            n += 1
+            hashes += ArchiveMerge.hash(r)
+        })
+      s"$day ${t.name} archive=$n sqlite=${hot.size} distinct=${hashes.size}"
+    val spans = db.energyData(from, to)._2.filter(s => s.start >= from && s.start < to)
+      .map(s => f"${(s.start - from) / 60_000}%d-${(s.end - from) / 60_000}%d${if s.endKnown then "" else "?"}")
+    out ++ Seq(s"$day spans ${spans.mkString(" ")}", s"$day deletions pending=${db.archiveDeletionsPending().size}")
+
   def insertRaw(day: LocalDate, hours: Double, startMinute: Int = 600): Long =
     val db = AshidoriApp.db
     val start = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli + startMinute * 60_000L

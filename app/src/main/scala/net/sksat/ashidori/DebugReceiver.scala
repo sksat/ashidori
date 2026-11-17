@@ -20,6 +20,13 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.BACKUP --es file name.zip  backup into the external files dir
   *   ... -a ashidori.debug.RESCUE --es file name.zip  rescue backup (files as they are) likewise
   *   ... -a ashidori.debug.QUARANTINE_EXPORT --es file name.zip  quarantined files likewise
+  *   ... -a ashidori.debug.ENERGY [--ei daysAgo 2]    state spans (two recorders, one left open), pressure,
+  *                                                    battery readings and fixes of a past day
+  *   ... -a ashidori.debug.CLOSE_LATE [--ei daysAgo 2] a late record of the day's first recorder (closes its span again)
+  *   ... -a ashidori.debug.DELETE --ei daysAgo 2 --ei fromMinute 600 --ei minutes 60   delete a range (Db.deleteRange)
+  *   ... -a ashidori.debug.SPILL_SMALL                a small-row batch (pressure) in an overflow file
+  *   ... -a ashidori.debug.IMPORT                     import overflow files now (raw lines and small rows)
+  *   ... -a ashidori.debug.AUDIT_SIGNALS [--ei daysAgo 2]  per signal table: rows archived, in SQLite, distinct
   *   ... -a ashidori.debug.REPAIR                     「整理を修復」 (a job)
   *   ... -a ashidori.debug.REPAIR_NOW                 the same outside JobScheduler (DebugMaintenanceService)
   *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
@@ -101,6 +108,27 @@ class DebugReceiver extends BroadcastReceiver:
           val pending = AshidoriApp.archive.commitPending
           Log.i(s"read $d fixes=${fixes.size} distinct=${fixes.map(f => (f.time, f.lat, f.lon)).distinct.size} pending=$pending")
         , "ashidori-read").start()
+      case "ashidori.debug.ENERGY" =>
+        val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 2))
+        Thread(() => Log.i(s"energy seed: ${DebugData.insertSignals(d)}"), "ashidori-energy").start()
+      case "ashidori.debug.CLOSE_LATE" =>
+        val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 2))
+        Thread(() => Log.i(s"late close: ${DebugData.closeLate(d)}"), "ashidori-late").start()
+      case "ashidori.debug.DELETE" =>
+        val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 2))
+        val from = d.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli + intent.getIntExtra("fromMinute", 600) * 60_000L
+        val to = from + intent.getIntExtra("minutes", 60) * 60_000L
+        LoggerWrites.deleteRange(from, to)(r => Log.i(s"deleted [$from, $to): $r"))
+      case "ashidori.debug.SPILL_SMALL" =>
+        Thread(() =>
+          val t = System.currentTimeMillis()
+          SmallOverflow.spill(ashidori.core.SmallRecord.Pressure((0 until 10).map(i => ashidori.core.PressureSample(t + i * 5000L, 1000f))))
+          Log.i("spilled a small-row batch")
+        , "ashidori-spill-small").start()
+      case "ashidori.debug.IMPORT" => LoggerWrites.markStart()
+      case "ashidori.debug.AUDIT_SIGNALS" =>
+        val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 2))
+        Thread(() => DebugData.auditSignals(d).foreach(l => Log.i(s"audit $l")), "ashidori-audit-signals").start()
       case "ashidori.debug.REPAIR" => Maintenance.repairNow(c)
       case "ashidori.debug.REPAIR_NOW" => c.startService(Intent(c, classOf[DebugMaintenanceService]).putExtra("repair", true))
       case "ashidori.debug.AUDIT" =>
