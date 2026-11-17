@@ -339,15 +339,28 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     query("SELECT COALESCE(MAX(boot), 0) FROM energy_checkpoint")(_.getLong(0)).head
 
   /** Ranges the user deleted ([[deleteRange]]): nothing is written into
-    * them again. Read once per process, kept up to date by deleteRange.
+    * them again, and the archive's rows in them are not shown. Read again
+    * every few seconds (the other process may have added one), and at once
+    * after deleteRange in this process.
     */
   def deletedRanges(): Vector[(Long, Long)] =
-    deletedCache.getOrElse {
+    val now = android.os.SystemClock.uptimeMillis()
+    deletedCache.filter(_._1 > now - 5_000L).map(_._2).getOrElse {
       val d = query("SELECT start, end FROM deleted_range ORDER BY start")(c => (c.getLong(0), c.getLong(1)))
-      deletedCache = Some(d)
+      deletedCache = Some((now, d))
       d
     }
-  @volatile private var deletedCache: Option[Vector[(Long, Long)]] = None
+  @volatile private var deletedCache: Option[(Long, Vector[(Long, Long)])] = None
+
+  /** Deleted ranges whose rows may still be in archive files: (rowid, from, to). */
+  def archiveDeletionsPending(): Vector[(Long, Long, Long)] =
+    query("SELECT rowid, start, end FROM deleted_range WHERE archived_at IS NULL ORDER BY start")(c =>
+      (c.getLong(0), c.getLong(1), c.getLong(2)))
+
+  /** The archive holds no row of this deleted range any more. */
+  def markArchiveDeleted(rowid: Long): Unit =
+    w.execSQL("UPDATE deleted_range SET archived_at=? WHERE rowid=?",
+      Array[AnyRef](java.lang.Long.valueOf(System.currentTimeMillis()), java.lang.Long.valueOf(rowid)))
 
   /** Whether time `t` lies outside every deleted range. */
   private def kept(t: Long): Boolean = Deletion.kept(deletedRanges(), t)
@@ -1124,8 +1137,9 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * files are dropped when they are written ([[kept]]). Run it on the
     * write thread ([[LoggerWrites.deleteRange]]), after what was queued.
     *
-    * The archive (day and month files) is not touched here: see
-    * docs/design/energy-elevation.md, "日の削除".
+    * The archive's day and month files are cut afterwards, in the
+    * maintenance process ([[ArchiveStore.deleteRange]]); until then their
+    * rows in the range are not shown ([[ArchiveStore.read]]).
     */
   def deleteRange(from: Long, to: Long): Unit =
     tx { db =>

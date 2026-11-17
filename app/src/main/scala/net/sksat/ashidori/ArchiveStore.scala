@@ -70,9 +70,14 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       orEmpty(Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
     }.toVector.sortBy(ArchiveMerge.key)
 
-  private def inWindow(from: Long, to: Long)(r: IndexedSeq[Any]): Boolean =
-    val k = ArchiveMerge.key(r)
-    k >= from && k < to
+  /** In [from, to), and not in a range the user deleted (whose rows a file
+    * may still hold until [[deleteRange]] has cut it).
+    */
+  private def inWindow(from: Long, to: Long): IndexedSeq[Any] => Boolean =
+    val deleted = scala.util.Try(AshidoriApp.db.deletedRanges()).getOrElse(Vector.empty)
+    r =>
+      val k = ArchiveMerge.key(r)
+      k >= from && k < to && Deletion.kept(deleted, k)
 
   /** Archived rows of `t` in [from, to) in time order, read a row group at
     * a time (for exports of the large raw tables). Close the iterator's
@@ -88,7 +93,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   def lastRow(t: Archive.TableDef): Option[IndexedSeq[Any]] =
     archivedFiles(t).lastOption.flatMap { f =>
       orEmpty(None)(Using.resource(Archive.open(t, f.getPath)) { r =>
-        if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.toSeq.lastOption
+        val keep = inWindow(Long.MinValue, Long.MaxValue)
+        if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.filter(keep).toSeq.lastOption
       })
     }
 
@@ -793,6 +799,71 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           case e: Throwable =>
             rw.abort()
             throw e
+
+  // --- a range the user deleted ---------------------------------------------------------
+
+  /** Cuts the rows of [from, to), a range the user deleted
+    * ([[Db.deleteRange]], whose SQLite rows are gone already), out of every
+    * archive file that holds some. Returns whether every file is done (not
+    * stopped).
+    *
+    * This is the only place archived rows are removed on purpose, so it is
+    * held to the commit rules and kept narrow:
+    *  - Only rows in a deleted range go; a state span crossing its edge
+    *    keeps its parts outside ([[EnergyLog.clip]]). A file with no row in
+    *    it is left as it is; one left without rows stays, empty (no data
+    *    file is deleted).
+    *  - The new version is written whole to `<file>.tmp`, synced, its
+    *    footer's rows checked against the rows kept, and read back whole:
+    *    the same rows in the same order (a running hash of every column).
+    *  - One file per commit (a [[CommitIntent]] whose check says the new
+    *    version carries `kept` rows from the previous one and adds none,
+    *    deleting nothing in SQLite), under the table's lock, after checking
+    *    that the file is still the one read. A crash in it is resolved like
+    *    any commit: the repair never publishes the tmp (rule A), the
+    *    previous file stays and the range stays pending, to be cut again by
+    *    the next run.
+    */
+  def deleteRange(db: Db, from: Long, to: Long, stop: () => Boolean, progress: String => Unit): Boolean =
+    var done = true
+    for t <- Archive.All; f <- filesFor(t, from, to) do
+      if stop() then done = false
+      else cut(db, t, f, from, to, progress)
+    done
+
+  private def cut(db: Db, t: Archive.TableDef, f: File, from: Long, to: Long, progress: String => Unit): Unit =
+    val rel = root.toPath.relativize(f.toPath).toString
+    val before = state(f)
+    // A file with nothing of the range is not rewritten.
+    if !reading(t)(ArchiveCut.touches(t, f.getPath, from, to)) then return
+    progress(s"削除した期間を $rel から除く")
+    val tmp = tmpOf(rel)
+    // Held while the tmp is written: no rescue backup takes it half written.
+    val written =
+      tmpLock.lock()
+      try
+        if tmp.exists && !tmp.delete() then throw java.io.IOException(s"cannot replace $tmp")
+        val fos = FileOutputStream(tmp)
+        try
+          val out = BufferedOutputStream(fos, 1 << 16)
+          val w = ArchiveCut.write(t, f.getPath, out, groupRows(t), from, to)
+          out.flush()
+          fos.getFD.sync()
+          w
+        finally fos.close()
+      finally tmpLock.unlock()
+    try
+      ArchiveCut.check(t, tmp.getPath, written, from, to).left.foreach(why => throw IllegalStateException(s"$rel: $why"))
+      val prev = before.fold(CommitIntent.Prev.Absent)((r, s) => CommitIntent.Prev.File(r, s))
+      commit(db, CommitIntent(Seq(ArchiveCut.target(rel, prev, written, tmp.length, tmp.getPath)), CommitIntent.Delete.Files(Nil)),
+        Seq(t.name), () =>
+          // Under the lock: still the file that was read.
+          if state(f) != before then throw IllegalStateException(s"$rel changed while the range was cut"))
+      LifeLog.add(LifeKind.Archive, s"削除した期間を除外: $rel（残り ${written.rows} 行）")
+    catch
+      case e: Throwable =>
+        if !intentNames(rel) then tmp.delete()
+        throw e
 
   /** Pre-Parquet text logs (one file per session or day) go into raw_lines,
     * from where the normal compaction archives them.

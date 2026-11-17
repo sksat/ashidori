@@ -260,6 +260,15 @@ object Maintenance:
           // Not a failure of this run: nothing to archive until it is resolved.
           Progress.set("記録の整理が停止（要確認）", running = false)
           return false
+      // Ranges the user deleted: cut out of the archive files first (their
+      // SQLite rows are gone already). One left pending is cut again next time.
+      for (id, from, to) <- db.archiveDeletionsPending() if !halt() do
+        try
+          if archive.deleteRange(db, from, to, halt, l => Progress.set(l)) then db.markArchiveDeleted(id)
+          else left = true
+        catch case NonFatal(e) =>
+          LifeLog.add(LifeKind.Note, s"削除した期間をアーカイブから除けず（次回再試行）: ${LifeLog.describe(e)}")
+          Log.w("cutting a deleted range out of the archive failed", e)
       val legacy = Option(ctx.getExternalFilesDir(null)).map(File(_, "gnss"))
       legacy.foreach(d => Try(archive.migrateLegacyLogs(db, d)).failed.foreach(e => Log.w("legacy log migration failed", e)))
       val now = System.currentTimeMillis()

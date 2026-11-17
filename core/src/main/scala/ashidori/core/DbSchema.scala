@@ -74,7 +74,8 @@ object DbSchema:
     * into them again. Not archived.
     */
   val CreateDeletedRange: String =
-    "CREATE TABLE IF NOT EXISTS deleted_range(start INTEGER NOT NULL, end INTEGER NOT NULL, deleted_at INTEGER NOT NULL)"
+    """CREATE TABLE IF NOT EXISTS deleted_range(start INTEGER NOT NULL, end INTEGER NOT NULL, deleted_at INTEGER NOT NULL,
+      |archived_at INTEGER)""".stripMargin
 
   /** From version 7 to 8. `fixes`: the columns `fixes` has now. */
   def toV8(fixes: Set[String]): Seq[String] =

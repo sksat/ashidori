@@ -175,7 +175,9 @@ object CommitIntent:
           case "hot"   => Delete.Hot(d(1), d(2).toLong, d(3).toLong, d(4).toLong)
           case "raw"   => Delete.Raw(d(1).toLong, d(2).toLong, d(3).toLong, cursorOf(d(4)), cursorOf(d(5)), longs(d(6)))
           case "ids"   => Delete.Ids(longs(d(1)))
-          case "files" => Delete.Files(d.drop(1).toSeq)
+          // No path (a cut of a deleted range replaces a file, deletes
+          // none): an empty list, never the empty path (the archive root).
+          case "files" => Delete.Files(d.drop(1).toSeq.filter(_.nonEmpty))
         val marker = lines.find(l => l == RepairingLine || l.startsWith(RepairingLine + "\t"))
         CommitIntent(files, delete, repairing = guards.nonEmpty || marker.isDefined,
           repairTag = marker.map(_.drop(RepairingLine.length).trim).getOrElse(""),
