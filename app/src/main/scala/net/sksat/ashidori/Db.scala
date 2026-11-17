@@ -461,14 +461,19 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if firstDay.isEmpty then firstDay = firstDataDate()
     firstDay
 
-  /** First day with any position, archived or not. */
-  def firstDataDate(): Option[java.time.LocalDate] =
+  /** First day with any position, archived or not: the archive's files and
+    * SQLite read under the positions' lock as the other readers do (rule
+    * C), so no commit moves the oldest rows from one to the other between
+    * the two reads.
+    */
+  def firstDataDate(): Option[java.time.LocalDate] = AshidoriApp.archive.reading(Archive.Fixes) {
     val archived = AshidoriApp.archive.archivedFiles(Archive.Fixes).headOption.map { f =>
       val n = f.getName.stripSuffix(".parquet")
       if n.length == 7 then java.time.YearMonth.parse(n).atDay(1) else java.time.LocalDate.parse(n)
     }
     val hot = firstFixTime().map(t => java.time.Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).toLocalDate)
     (archived.toSeq ++ hot).minOption
+  }
 
   /** Days (epoch-day numbers in the given offset) that have any fix, for calendar dots. */
   def daysWithData(from: Long, to: Long, offsetMs: Long): Set[Long] =
