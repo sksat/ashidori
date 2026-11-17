@@ -106,7 +106,14 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     s
 
   private val handle =
-    if dayOnly then BottomSheetDragHandleView(act)
+    if dayOnly then
+      // The grabber with Material's spacing above it; the date row follows
+      // close below (its own 48 dp rows are the touch targets).
+      val h = BottomSheetDragHandleView(act)
+      h.setMinimumHeight(0)
+      h.setPadding(0, dp(14), 0, dp(6))
+      h.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
+      h
     else
       val h = View(act)
       val d = android.graphics.drawable.GradientDrawable()
@@ -128,6 +135,11 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     v.setElevation(dp(6).toFloat)
     v
   private val behavior = BottomSheetBehavior[LinearLayout]()
+  /** Recreated: the sheet's height, selection and scroll as saved ([[saveState]]). */
+  private val restored: Option[TimelineScreen.Restored] =
+    Option(saved).filter(b => dayOnly && b.containsKey(TimelineScreen.KeySheet)).map(b =>
+      TimelineScreen.Restored(b.getInt(TimelineScreen.KeySheet), Option(b.getString(TimelineScreen.KeySelected)), b.getInt(TimelineScreen.KeyScroll)))
+  private var scrollRestored = false
 
   val view: View =
     val coord = androidx.coordinatorlayout.widget.CoordinatorLayout(act)
@@ -143,7 +155,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       // Three heights: the totals, half, and nearly all (a strip of the map
       // stays above). Lowered at first: the map leads.
       behavior.setExpandedOffset(dp(72))
-      behavior.setState(BottomSheetBehavior.STATE_COLLAPSED)
+      behavior.setState(restored.map(_.sheet).getOrElse(BottomSheetBehavior.STATE_COLLAPSED))
       // Lowered, the sheet shows the date and the totals, and a sliver of
       // the list below them says there is more.
       sheet.addOnLayoutChangeListener((_, _, _, _, _, _, _, _, _) =>
@@ -370,6 +382,11 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       openLink.setVisibility(View.GONE)
     else
       rows.rows(tl).foreach(dayList.addView)
+      // Recreated: the list where it was scrolled to, once.
+      restored.filter(_ => !scrollRestored).foreach { r =>
+        scrollRestored = true
+        scroller.post(() => scroller.scrollTo(0, r.scroll))
+      }
       openLink.setVisibility(View.VISIBLE)
 
   /** Redraws the selected item's highlight (the day's data was replaced). */
@@ -379,6 +396,9 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     case other           => other.path.filter(_.points.size >= 2).foreach(map.highlight(_, fit = false))
 
   /** Camera and shown day, for a recreated activity (the day tab only). */
+  /** Camera, shown day, sheet height, selected item and the list's scroll,
+    * for a recreated activity (the day tab only).
+    */
   def saveState(out: Bundle): Unit =
     if dayOnly then
       for d <- fittedDate; (p, zoom) <- map.camera do
@@ -386,14 +406,28 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
         out.putDouble(TimelineScreen.KeyLat, p.lat)
         out.putDouble(TimelineScreen.KeyLon, p.lon)
         out.putDouble(TimelineScreen.KeyZoom, zoom)
+      // Settling or dragging: where it was going is not known, keep half.
+      val st = behavior.getState match
+        case s @ (BottomSheetBehavior.STATE_COLLAPSED | BottomSheetBehavior.STATE_HALF_EXPANDED | BottomSheetBehavior.STATE_EXPANDED) => s
+        case _ => BottomSheetBehavior.STATE_HALF_EXPANDED
+      out.putInt(TimelineScreen.KeySheet, st)
+      rows.selection.foreach(out.putString(TimelineScreen.KeySelected, _))
+      out.putInt(TimelineScreen.KeyScroll, scroller.getScrollY)
 
   // Recreated after the process was killed (or a configuration change): the
   // camera where it was, and that day not fitted again.
   if dayOnly && saved != null && saved.containsKey(TimelineScreen.KeyZoom) then
     fittedDate = Option(saved.getString(TimelineScreen.KeyDate)).map(LocalDate.parse)
     map.moveTo(LatLng(saved.getDouble(TimelineScreen.KeyLat), saved.getDouble(TimelineScreen.KeyLon)), saved.getDouble(TimelineScreen.KeyZoom))
+  // The selected item, drawn again once its day has loaded (render).
+  restored.flatMap(_.selected).foreach(rows.restoreSelection)
 
 object TimelineScreen:
+  /** The sheet as it was when the activity went away. */
+  private final case class Restored(sheet: Int, selected: Option[String], scroll: Int)
+  private val KeySheet = "map.sheet"
+  private val KeySelected = "map.selected"
+  private val KeyScroll = "map.scroll"
   private val KeyDate = "map.date"
   private val KeyLat = "map.lat"
   private val KeyLon = "map.lon"

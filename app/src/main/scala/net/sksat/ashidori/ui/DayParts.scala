@@ -181,6 +181,7 @@ object DayParts:
         t.setContentDescription(description)
         t.setLayoutParams(LinearLayout.LayoutParams(dp(48), dp(48)))
         ripple(t, borderless = true)
+        a11yRole(t, classOf[android.widget.Button])
         t.setOnClickListener { _ =>
           val m = month.plusMonths(n)
           if !m.isAfter(YearMonth.from(today)) then
@@ -214,7 +215,12 @@ object DayParts:
       val glp = matchWrap
       glp.setMargins(dp(12), 0, dp(12), 0)
       grid.setLayoutParams(glp)
-      dialog.setContentView(vbox(BottomSheetDragHandleView(act), header, grid, legend, buttons))
+      // The grabber with the same spacing as the day sheet's.
+      val grab = BottomSheetDragHandleView(act)
+      grab.setMinimumHeight(0)
+      grab.setPadding(0, dp(14), 0, dp(6))
+      grab.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
+      dialog.setContentView(vbox(grab, header, grid, legend, buttons))
       dialog.getBehavior.setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED)
       dialog.setOnDismissListener(_ => generation += 1)
       dialog.show()
