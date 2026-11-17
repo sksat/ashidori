@@ -30,18 +30,9 @@ object CommitStatus:
   def waitsForUser(intentText: String): Boolean =
     read(file).flatMap(_.linesIterator.nextOption()).contains(crc(intentText))
 
-  private def repairFile = File(Maintenance.dir, "commit-repairing")
-
-  /** A repair of the commit `id` ([[CommitRepair.id]]) began: durable. */
-  def begin(id: String): Unit = if !repairing(id) then Maintenance.write(repairFile, id)
-
-  def repairing(id: String): Boolean = read(repairFile).exists(_.trim == id)
-
-  /** The commit record is gone: both marks with it. */
+  /** The commit record is gone: the mark with it. */
   def clear(): Unit =
-    val a = file.delete()
-    val b = repairFile.delete()
-    if a || b then Try(ArchiveStore.syncDir(file.getParentFile))
+    if file.delete() then Try(ArchiveStore.syncDir(file.getParentFile))
 
   /** Waiting for the user: one line per table. */
   def stuck(): Option[Seq[String]] =
@@ -56,9 +47,11 @@ object CommitStatus:
     import CommitRepair.{Action, State}
     val what = (s.state, s.action) match
       case (_, Action.DeleteRows) => "置き換え済み・検証済み"
-      case (State.NotPublished, _) => "置き換え前（一時ファイルが欠けているか壊れている）"
       case (State.Quarantined, _) => "隔離済み"
       case (State.Published, Action.Quarantine(why, _)) => s"置き換え済み・検証できない（$why）"
+      case (State.NotPublished, Action.Quarantine(why, _)) => s"置き換え前・$why"
+      case (State.NotPublished, Action.DropTmp(true)) => "置き換え前（以前の版を確認できないため一時ファイルを隔離）"
+      case (State.NotPublished, _) => "置き換え前（一時ファイルは不要）"
       case (_, Action.Quarantine(why, _)) => s"状態が不明（$why）"
       case _ => s.state.toString
     s"${s.target.path}: $what"

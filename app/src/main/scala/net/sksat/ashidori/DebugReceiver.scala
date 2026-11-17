@@ -19,6 +19,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.THREADS                    log every thread's stack
   *   ... -a ashidori.debug.BACKUP --es file name.zip  backup into the external files dir
   *   ... -a ashidori.debug.RESCUE --es file name.zip  rescue backup (files as they are) likewise
+  *   ... -a ashidori.debug.QUARANTINE_EXPORT --es file name.zip  quarantined files likewise
   *   ... -a ashidori.debug.REPAIR                     「まとめを修復」 (a job)
   *   ... -a ashidori.debug.REPAIR_NOW                 the same outside JobScheduler (DebugMaintenanceService)
   *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
@@ -82,6 +83,14 @@ class DebugReceiver extends BroadcastReceiver:
             Log.i(s"rescue done: $n bytes to $f")
           catch case e: Throwable => Log.e("rescue failed", e)
         , "ashidori-rescue").start()
+      case "ashidori.debug.QUARANTINE_EXPORT" =>
+        val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("quarantine.zip"))
+        Thread(() =>
+          try
+            val n = Backup.writeQuarantine(c, android.net.Uri.fromFile(f), (d, t) => ())
+            Log.i(s"quarantine export done: $n bytes to $f")
+          catch case e: Throwable => Log.e("quarantine export failed", e)
+        , "ashidori-quarantine-export").start()
       case "ashidori.debug.REPAIR" => Maintenance.repairNow(c)
       case "ashidori.debug.REPAIR_NOW" => c.startService(Intent(c, classOf[DebugMaintenanceService]).putExtra("repair", true))
       case "ashidori.debug.AUDIT" =>

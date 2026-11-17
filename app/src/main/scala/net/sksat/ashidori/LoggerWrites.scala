@@ -37,6 +37,8 @@ object LoggerWrites:
   // An alert raised before a restart stays until saving is seen to work
   // again in this process.
   private lazy val stall = WriteStall.Monitor(Alerts.restoredStall())
+  // The last change of the alert failed and is being tried again (logged once).
+  @volatile private var stallRetry = false
 
   /** Queues `write` (of `rows` rows) for the database. Raw batches carry
     * their lines, so they can be spilled to a file.
@@ -145,11 +147,13 @@ object LoggerWrites:
         val detail =
           if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
           else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
-        LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
-        Alerts.stall(unsaved)
+        if !stallRetry then LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
+        stallRetry = !Alerts.stall(unsaved)
+        if stallRetry then stall.synchronized(stall.failed())
       case Some(false) =>
-        LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
-        Alerts.clearStall()
+        if !stallRetry then LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
+        stallRetry = !Alerts.clearStall()
+        if stallRetry then stall.synchronized(stall.failed())
       case None => ()
 
   /** Count of rows given up, kept on disk (shown in 端末診断). */

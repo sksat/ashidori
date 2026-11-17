@@ -123,6 +123,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def holding[A](tables: Archive.TableDef*)(f: => A): A = locked(tables.map(_.name).distinct.sorted, exclusive = false, f)
 
+  private val tmpLock = TmpLock(File(root, ".lock-tmp"))
+
+  /** Runs `f` while no tmp file is being written (by either process): a
+    * Rewrite holds this from creating its tmp file until it is complete.
+    */
+  def holdingTmps[A](f: => A): A =
+    tmpLock.lock()
+    try f
+    finally tmpLock.unlock()
+
   /** Runs `f` with the tables' locks held exclusive (commits). */
   private def writing[A](tables: Seq[String])(f: => A): A = locked(tables.distinct.sorted, exclusive = true, f)
 
@@ -162,7 +172,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     private val prev = existing.fold(CommitIntent.Prev.Absent)(e => CommitIntent.Prev.File(e.rows, dest.length))
     private val sampler = ChunkSampler()
     private var range: Option[(Long, Long)] = None
-    private val fos = FileOutputStream(tmp)
+    // Held until closed: no rescue backup takes a tmp file while it is
+    // being written ([[holdingTmps]]).
+    private val fos =
+      tmpLock.lock()
+      try FileOutputStream(tmp)
+      catch
+        case e: Throwable =>
+          tmpLock.unlock()
+          existing.foreach(x => Try(x.close()))
+          throw e
     private val out = BufferedOutputStream(fos, 1 << 16)
     private val writer = ParquetWriter(out, t.columns, groupRows(t))
     // Archived groups wholly before the new rows are copied as stored.
@@ -210,6 +229,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         closed = true
         Try(out.close())
         existing.foreach(e => Try(e.close()))
+        tmpLock.unlock()
 
     /** Drops the new version, unless a commit record names it: from then on
       * only finishing the commit (recovery) may use or remove it.
@@ -346,8 +366,14 @@ final class ArchiveStore(val root: File, zone: ZoneId):
 
   private def finishCommit(db: Db, intent: CommitIntent, manual: Boolean, progress: String => Unit): Unit =
     val disk = intent.files.map(t => t.path -> CommitIntent.OnDisk(state(file(t.path)), state(tmpOf(t.path)))).toMap
+    // Whatever the case, it reads whole files and SQLite's rows of the
+    // chunk before deleting anything: done in the maintenance process,
+    // asked for now.
+    if !AshidoriApp.isMaintenanceProcess then
+      Maintenance.requestRepair()
+      throw CommitStuck()
     // A repair that began is continued, whatever the files look like now.
-    CommitRepair.resume(intent, disk, CommitStatus.repairing(CommitRepair.id(intent))) match
+    val result = CommitRepair.resume(intent, disk) match
       case CommitIntent.Recovery.Finish(renames) =>
         renames.foreach(rename)
         // A rename seen on disk may not be durable yet (the process died
@@ -356,26 +382,23 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         for t <- intent.files do
           syncFile(file(t.path))
           syncDir(file(t.path).getParentFile)
-        runDelete(db, intent.delete)
-        LifeLog.add(LifeKind.Archive, "中断されたまとめを完了")
-        clearIntent()
+        // Rows are deleted only once every one is found in its file.
+        repair(db, intent, manual, progress, recovering = true)
       case CommitIntent.Recovery.Drop =>
-        intent.files.foreach(t => tmpOf(t.path).delete())
-        LifeLog.add(LifeKind.Note, "中断されたまとめを取り消し（記録は端末内に保持）")
-        clearIntent()
+        // Nothing published: a tmp file goes only if the file in place reads
+        // whole as recorded; otherwise it is kept aside.
+        repair(db, intent, manual, progress, recovering = true)
       case CommitIntent.Recovery.Stuck =>
-        // Part published, the rest lost: neither finished nor undone.
-        if !AshidoriApp.isMaintenanceProcess then
-          Maintenance.requestRepair()
-          throw CommitStuck()
-        repair(db, intent, manual, progress) match
-          case CommitRepair.Result.Resolved(_) =>
-            LifeLog.add(LifeKind.Archive, s"中断されたまとめを表ごとに解決（${if manual then "まとめを修復" else "自動"}）")
-          case CommitRepair.Result.NeedsUser(steps) =>
-            intentText.foreach(CommitStatus.mark(_, steps))
-            LifeLog.add(LifeKind.ArchiveRepair,
-              "中断されたまとめを自動では解決できない（記録は端末内に保持、まとめを停止。端末診断の「まとめを修復」で解決）")
-            throw CommitStuck()
+        // Part published, the rest lost: resolved table by table.
+        repair(db, intent, manual, progress)
+    result match
+      case CommitRepair.Result.Resolved(_) =>
+        LifeLog.add(LifeKind.Archive, s"中断されたまとめを解決（${if manual then "まとめを修復" else "自動"}）")
+      case CommitRepair.Result.NeedsUser(steps) =>
+        intentText.foreach(CommitStatus.mark(_, steps))
+        LifeLog.add(LifeKind.ArchiveRepair,
+          "中断されたまとめを自動では解決できない（記録は端末内に保持、まとめを停止。端末診断の「まとめを修復」で解決）")
+        throw CommitStuck()
 
   /** Removes the commit record, durably. */
   private def clearIntent(): Unit =
@@ -384,7 +407,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     CommitStatus.clear()
 
   /** [[CommitRepair]] of a commit that cannot be finished, under its tables' locks. */
-  private def repair(db: Db, recorded: CommitIntent, manual: Boolean, progress: String => Unit): CommitRepair.Result =
+  private def repair(db: Db, recorded: CommitIntent, manual: Boolean, progress: String => Unit,
+                     recovering: Boolean = false): CommitRepair.Result =
     // A record of 0.21.0 has no checks: completed from SQLite (which still
     // holds every row of the commit) and stored before anything changes.
     val intent =
@@ -401,15 +425,34 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       java.nio.file.Files.move(from.toPath, to.toPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
       syncDir(to.getParentFile)
       syncDir(from.getParentFile)
+    // The chunk's rows still in SQLite (or day files of a month merge), per
+    // table, read once for every published file.
+    lazy val chunks: Either[String, Map[String, ChunkIndex]] =
+      progress("端末内の行を読んでいます")
+      Try {
+        val idx = intent.files.map(t => CommitRepair.tableOf(t.path) -> ChunkIndex()).toMap
+        forEachChunkRow(db, intent.delete)((table, row) => idx.get(table).foreach(_.add(row)))
+        idx
+      }.toEither.left.map(e => s"端末内の行を読めない: ${LifeLog.describe(e)}")
+    def whole(path: String)(check: ParquetReader.FileReader => Either[String, Unit]): Either[String, Unit] =
+      Try(ParquetReader.open(file(path).getPath)).fold(
+        e => Left(s"開けない: ${LifeLog.describe(e)}"),
+        r => try check(r) finally r.close())
     CommitRepair.run(intent, new CommitRepair.Ops:
       def dest(path: String) = state(file(path))
       def tmpExists(path: String) = tmpOf(path).exists
       def quarantined(path: String) = File(qdir, path).exists
       def verify(t: CommitIntent.Target) =
-        progress(s"検証中: ${t.path}")
-        Try(ParquetReader.open(file(t.path).getPath)).fold(
-          e => Left(s"開けない: ${LifeLog.describe(e)}"),
-          r => try CommitRepair.verify(t, r.rows, r.rowIterator) finally r.close())
+        chunks.flatMap { idx =>
+          progress(s"検証中: ${t.path}")
+          whole(t.path)(r => CommitRepair.verify(t, r.rows, r.rowIterator, idx.get(CommitRepair.tableOf(t.path))))
+        }
+      def verifyPrevious(t: CommitIntent.Target) =
+        if !file(t.path).exists then Right(())
+        else
+          progress(s"以前の版を検証中: ${t.path}")
+          val expected = t.check.map(_.prev).collect { case CommitIntent.Prev.File(rows, _) => rows }
+          whole(t.path)(r => CommitRepair.verifyWhole(r.rows, r.rowIterator, expected))
       def quarantine(t: CommitIntent.Target, why: String, onlyCopy: Boolean) =
         val q = File(qdir, t.path)
         Attention.add(Attention.Entry(System.currentTimeMillis(), t.path, root.toPath.relativize(q.toPath).toString, onlyCopy, why))
@@ -423,7 +466,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           move(tmpOf(t.path), q)
       def dropTmp(path: String) =
         if tmpOf(path).delete() then syncDir(file(path).getParentFile)
-      def begin() = CommitStatus.begin(CommitRepair.id(intent))
+      def begin() =
+        // Durable before the first change; 0.21.0 stops at a record so marked.
+        if !intentText.flatMap(CommitIntent.decode).exists(_.repairing) then
+          Maintenance.write(intentFile, CommitIntent.encode(intent.copy(repairing = true)))
       def sync(paths: Seq[String]) =
         for p <- paths do
           syncFile(file(p))
@@ -435,7 +481,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       def log(line: String) =
         LifeLog.add(LifeKind.ArchiveRepair, line)
         progress(line)
-    , manual)
+    , manual, recovering)
 
   /** The raw lines of a portion ([[ArchiveSql.rawPortion]]), a chunk at a
     * time: (rowid, time, line).
@@ -466,24 +512,32 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       runDelete(db, CommitIntent.Delete.Files(gone))
       gone.size.toLong
 
-  /** A record of 0.21.0 with what [[CommitRepair.verify]] needs, from the
-    * chunk's rows (still all in SQLite, or in the day files of a month merge).
+  /** Every row of a commit's chunk still in SQLite (or in the day files of
+    * a month merge), with its table: the rows a normal commit deletes
+    * ([[runDelete]]) that convert to a row. Throws if a file does not read.
     */
-  private def completeChecks(db: Db, i: CommitIntent): CommitIntent =
-    val samplers = i.files.map(t => CommitRepair.tableOf(t.path) -> ChunkSampler()).toMap
-    def add(table: String, row: IndexedSeq[Any]): Unit = samplers.get(table).foreach(_.add(row))
+  private def forEachChunkRow(db: Db, d: CommitIntent.Delete)(f: (String, IndexedSeq[Any]) => Unit): Unit =
     def parsed(lines: Iterable[(Long, Long, String)], kept: Long => Boolean): Unit =
-      for (rowid, time, line) <- lines if !kept(rowid) do Archive.parse(line, time).foreach((t, row) => add(t.name, row))
-    i.delete match
+      for (rowid, time, line) <- lines if !kept(rowid) do Archive.parse(line, time).foreach((t, row) => f(t.name, row))
+    d match
       case raw: CommitIntent.Delete.Raw =>
         val kept = raw.kept.toSet
         portionLines(db, raw)(parsed(_, kept))
       case CommitIntent.Delete.Ids(ids) => parsed(db.rawLinesById(ids), _ => false)
       case CommitIntent.Delete.Hot(table, from, to, max) =>
-        Archive.All.find(_.name == table).foreach(t => db.hotRows(t, from, to, max).foreach(r => add(table, r.toIndexedSeq)))
+        Archive.All.find(_.name == table).foreach(t => db.hotRows(t, from, to, max).foreach(r => f(table, r.toIndexedSeq)))
       case CommitIntent.Delete.Files(paths) =>
-        for p <- paths do
-          Try(Using.resource(ParquetReader.open(file(p).getPath))(_.rowIterator.foreach(add(CommitRepair.tableOf(p), _))))
+        for p <- paths if file(p).exists do
+          Using.resource(ParquetReader.open(file(p).getPath))(_.rowIterator.foreach(f(CommitRepair.tableOf(p), _)))
+
+  /** A record of 0.21.0 with what [[CommitRepair.verify]] needs, from the
+    * chunk's rows (still all in SQLite, or in the day files of a month
+    * merge). Its previous files stay unknown: such a record is repaired
+    * only by hand.
+    */
+  private def completeChecks(db: Db, i: CommitIntent): CommitIntent =
+    val samplers = i.files.map(t => CommitRepair.tableOf(t.path) -> ChunkSampler()).toMap
+    forEachChunkRow(db, i.delete)((table, row) => samplers.get(table).foreach(_.add(row)))
     i.copy(files = i.files.map { t =>
       if t.check.isDefined then t
       else
@@ -686,8 +740,9 @@ object ArchiveStore:
   /** Files a repair moved aside, under the archive root: `quarantine/<commit id>/<table>/<file>`. */
   val QuarantineDir = "quarantine"
 
-  /** An unfinished commit could not be finished or resolved automatically:
-    * its tables are neither read nor archived until 「まとめを修復」.
+  /** An unfinished commit is not resolved yet: its tables are neither read
+    * nor archived until it is (by the maintenance process, asked for at
+    * once, or by 「まとめを修復」 when it waits for the user).
     */
   final class CommitStuck extends IllegalStateException("an interrupted archive commit cannot be finished")
 
@@ -766,6 +821,35 @@ object ArchiveStore:
           else if !x.hasNext then y.next()
           else if ArchiveMerge.key(x.head) <= ArchiveMerge.key(y.head) then x.next()
           else y.next()
+
+  /** A lock shared by the processes (a file lock) and reentrant for the
+    * threads of this one: held by each writer of a tmp file, and by the
+    * rescue backup. Lock and unlock on the same thread.
+    */
+  private final class TmpLock(f: File):
+    private val local = java.util.concurrent.locks.ReentrantLock()
+    private var held: Option[(RandomAccessFile, java.nio.channels.FileLock)] = None
+
+    def lock(): Unit =
+      local.lock()
+      if local.getHoldCount == 1 then
+        try
+          val raf = RandomAccessFile(f, "rw")
+          try held = Some((raf, raf.getChannel.lock()))
+          catch
+            case e: Throwable =>
+              Try(raf.close())
+              throw e
+        catch
+          case e: Throwable =>
+            local.unlock()
+            throw e
+
+    def unlock(): Unit =
+      if local.getHoldCount == 1 then
+        held.foreach((raf, l) => { Try(l.release()); Try(raf.close()) })
+        held = None
+      local.unlock()
 
   /** One table's lock, shared by the processes (a file lock) and the
     * threads of this one: shared for readers, exclusive for commits. A JVM

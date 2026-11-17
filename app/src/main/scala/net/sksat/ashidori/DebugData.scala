@@ -101,7 +101,16 @@ object DebugData:
       val bad = read.failed.toOption.fold("")(e => s" UNREADABLE after $n rows (${e.getClass.getSimpleName})")
       val distinct = hashes.get(t.name).map(_.size.toLong).getOrElse(0L)
       s"$day ${t.name} archive=$n sqlite=${hot(t.name)} total=${n + hot(t.name)} distinct=$distinct$bad"
-    out :+ s"$day unconverted=$unconverted commitPending=${AshidoriApp.archive.commitPending}"
+    // Files a repair quarantined for this day: their rows, as far as they read.
+    val quarantined =
+      Option(java.io.File(root, ArchiveStore.QuarantineDir).listFiles()).toSeq.flatten.flatMap { c =>
+        Archive.RawTables.map(t => java.io.File(c, Archive.dayFile(t, day))).filter(_.exists)
+      }.map { f =>
+        var n = 0L
+        val ok = scala.util.Try(scala.util.Using.resource(ashidori.core.parquet.ParquetReader.open(f.getPath))(_.rowIterator.foreach(_ => n += 1)))
+        s"$day quarantined ${root.toPath.relativize(f.toPath)} rows=$n${if ok.isFailure then " (unreadable from there)" else ""}"
+      }
+    (out ++ quarantined) :+ s"$day unconverted=$unconverted commitPending=${AshidoriApp.archive.commitPending}"
 
   def insertRaw(day: LocalDate, hours: Double, startMinute: Int = 600): Long =
     val db = AshidoriApp.db

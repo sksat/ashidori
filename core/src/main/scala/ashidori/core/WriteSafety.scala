@@ -148,6 +148,8 @@ object WriteStall:
     /** The kinds not saved when the alert was raised. */
     var kinds: Set[String] = restored.getOrElse(Set.empty)
     private var carried = restored.isDefined
+    // The state before the change `update` last returned.
+    private var before: Option[(Boolean, Set[String], Boolean)] = None
 
     /** Some(true): report the stall now; Some(false): it is over now.
       * `unsaved`: kinds not saved now; `saved`: kinds saved since the start.
@@ -156,6 +158,7 @@ object WriteStall:
                saved: Set[String] = Set.empty): Option[Boolean] =
       val stalled = noCommit || unsavedTooLong
       def savedAgain = !carried || (if kinds.isEmpty then saved.nonEmpty else kinds.subsetOf(saved))
+      before = Some((reported, kinds, carried))
       if stalled && !reported then
         reported = true
         carried = false
@@ -166,7 +169,21 @@ object WriteStall:
         carried = false
         kinds = Set.empty
         Some(false)
-      else None
+      else
+        before = None
+        None
+
+    /** The app could not carry out the change `update` just returned (post
+      * or cancel the notification, or keep its state on disk): back to the
+      * state before it, so the next update returns it again.
+      */
+    def failed(): Unit =
+      before.foreach { (r, k, c) =>
+        reported = r
+        kinds = k
+        carried = c
+      }
+      before = None
 
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)

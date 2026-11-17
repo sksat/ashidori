@@ -66,14 +66,21 @@ object Alerts:
   /** Raises the stall alert; `kinds`: those not saved now. The alert is
     * kept on disk ([[restoredStall]]).
     */
-  def stall(kinds: Set[String]): Unit =
-    prefs.edit().putLong("stallAt", System.currentTimeMillis()).putBoolean("stallUp", true)
+  def stall(kinds: Set[String]): Boolean =
+    val kept = prefs.edit().putLong("stallAt", System.currentTimeMillis()).putBoolean("stallUp", true)
       .putStringSet("stallKinds", kinds.asJava).commit()
-    notify(StallId, "記録が保存されていません（端末診断で確認）")
+    if !kept then Log.w("keeping the stall alert on disk failed")
+    notify(StallId, "記録が保存されていません（端末診断で確認）") && kept
 
-  def clearStall(): Unit =
-    Try(ctx.getSystemService(classOf[NotificationManager]).cancel(StallId))
-    prefs.edit().putBoolean("stallUp", false).remove("stallKinds").commit()
+  /** Whether the notification is gone and that is on disk; if not, the
+    * caller tries again ([[WriteStall.Monitor.failed]]).
+    */
+  def clearStall(): Boolean =
+    val cancelled = Try(ctx.getSystemService(classOf[NotificationManager]).cancel(StallId))
+    cancelled.failed.foreach(e => Log.w("cancelling the stall notification failed", e))
+    // Kept up on disk until the cancel worked: tried again after a restart too.
+    val kept = cancelled.isSuccess && prefs.edit().putBoolean("stallUp", false).remove("stallKinds").commit()
+    cancelled.isSuccess && kept
 
   /** A stall alert raised before this process started and not cleared: the
     * kinds it named. An alert of 0.21.0 (not kept on disk) is found by its
@@ -109,8 +116,8 @@ object Alerts:
       Intent(c, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenDiagnostics, true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
       PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT)
 
-  private def notify(id: Int, text: String): Unit =
-    Try {
+  private def notify(id: Int, text: String): Boolean =
+    val posted = Try {
       val c = ctx
       val n = Notification.Builder(c, Channel)
         .setSmallIcon(R.drawable.ic_notification)
@@ -119,4 +126,6 @@ object Alerts:
         .setAutoCancel(true)
         .build()
       c.getSystemService(classOf[NotificationManager]).notify(id, n)
-    }.failed.foreach(e => Log.w("alert notification failed", e))
+    }
+    posted.failed.foreach(e => Log.w("alert notification failed", e))
+    posted.isSuccess

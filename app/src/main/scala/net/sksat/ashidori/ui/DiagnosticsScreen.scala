@@ -51,13 +51,14 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   dataStatus.setEllipsize(android.text.TextUtils.TruncateAt.END)
   @volatile private var backupRunning = false
   private var backupLine: Option[String] = None
-  private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup(rescue = false))
+  private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup(Backup.Mode.Normal))
   private val maintainButton = outlined("記録をまとめ直す")(runMaintenance())
   // An archive commit that could not be finished, and files a repair
   // quarantined: shown only then.
   private val repairTitle = text("記録のまとめ（要確認）", 16f, bold = true, colorAttr = attr.error)
   private val repairText = text("", 14f)
-  private val rescueButton = button("救出用バックアップ", tonal = true)(startBackup(rescue = true))
+  private val rescueButton = button("救出用バックアップ", tonal = true)(startBackup(Backup.Mode.Rescue))
+  private val exportQuarantineButton = outlined("隔離したファイルを書き出す")(startBackup(Backup.Mode.Quarantine))
   private val repairButton = outlined("まとめを修復")(confirmRepair())
   private val seenButton = outlined("確認済みにする")(acknowledge())
   private val repairCard = card(
@@ -66,6 +67,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     caption("救出用バックアップは、まとめの途中のファイルと記録を含め、端末内のファイルをそのまま ZIP にまとめます。"),
     spacer(8),
     rescueButton,
+    exportQuarantineButton,
     repairButton,
     seenButton
   )
@@ -196,11 +198,13 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       stuck.map(ls => "記録は端末内に保持し、記録を続けています。" +: ls)
         .orElse(Option.when(pendingCommit)(Seq("途中で中断したまとめがあります。自動で完了します。"))).toSeq.flatten ++
       Option.when(attention.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
-      attention.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残ります" else ""))
+      attention.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残ります" else "")) ++
+      Option.when(attention.nonEmpty)("隔離したファイルは救出用バックアップと「隔離したファイルを書き出す」に含みます。").toSeq
     repairText.setText(lines.mkString("\n"))
     repairTitle.setText(if stuck.isDefined then "記録のまとめが停止（要確認）" else "記録のまとめ（要確認）")
     repairButton.setVisibility(if pendingCommit then View.VISIBLE else View.GONE)
     seenButton.setVisibility(if attention.exists(!_.seen) then View.VISIBLE else View.GONE)
+    exportQuarantineButton.setVisibility(if attention.nonEmpty then View.VISIBLE else View.GONE)
 
   private def showDataStatus(): Unit =
     val line = backupLine.orElse {
@@ -212,6 +216,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     val maintaining = Maintenance.Progress.get().exists(_._2)
     backupButton.setEnabled(!backupRunning)
     rescueButton.setEnabled(!backupRunning)
+    exportQuarantineButton.setEnabled(!backupRunning)
     maintainButton.setEnabled(!maintaining)
     repairButton.setEnabled(!maintaining)
     // A repair or maintenance run just ended: the card follows.
@@ -242,9 +247,12 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       act.runOnUiThread(() => showSaving())
     }
 
-  private def startBackup(rescue: Boolean): Unit =
-    val name = if rescue then Backup.defaultName().replace("backup", "rescue") else Backup.defaultName()
-    act.createZip(name) { uri =>
+  private def startBackup(mode: Backup.Mode): Unit =
+    val (kind, label) = mode match
+      case Backup.Mode.Normal     => ("backup", "")
+      case Backup.Mode.Rescue     => ("rescue", "救出用バックアップを")
+      case Backup.Mode.Quarantine => ("quarantine", "隔離したファイルを")
+    act.createZip(Backup.defaultName(kind = kind)) { uri =>
       backupRunning = true
       backupLine = Some("書き出しの準備をしています")
       showDataStatus()
@@ -256,12 +264,15 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
                 backupLine = Some(s"書き出し中… ${mb(done)} / ${mb(total)}")
                 showDataStatus()
               }
-            val n = if rescue then Backup.writeRescue(act, uri, report) else Backup.write(act, uri, report)
-            s"${if rescue then "救出用バックアップを" else ""}書き出しました（${mb(n)}）"
+            val n = mode match
+              case Backup.Mode.Normal     => Backup.write(act, uri, report)
+              case Backup.Mode.Rescue     => Backup.writeRescue(act, uri, report)
+              case Backup.Mode.Quarantine => Backup.writeQuarantine(act, uri, report)
+            s"${label}書き出しました（${mb(n)}）"
           catch
             case _: ArchiveStore.CommitStuck =>
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
-              "記録のまとめが停止しているため書き出せません（救出用バックアップを使用）"
+              "未完了のまとめがあるため書き出せません（救出用バックアップを使用）"
             case e: Throwable =>
               Log.w("backup failed", e)
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))

@@ -125,3 +125,24 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(fresh.update(noCommit = false, unsavedTooLong = false), None)
   }
 
+  test("stall alert: a change the app could not carry out (save or cancel failed) is tried again") {
+    val m = WriteStall.Monitor(restored = Some(Set("位置")))
+    // Saving works again, but cancelling the notification fails.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
+    m.failed()
+    assert(m.reported)
+    assertEquals(m.kinds, Set("位置"))
+    // Next check: cleared again, until it works.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), None)
+    // Raising it: keeping it on disk failed, so it is raised again.
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), Some(true))
+    m.failed()
+    assert(!m.reported)
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), Some(true))
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), None)
+    // failed() with nothing just returned changes nothing.
+    m.failed()
+    assert(m.reported)
+  }
+

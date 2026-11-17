@@ -16,10 +16,20 @@ package ashidori.core
   * [[CommitRepair]] resolves it table by table. For that each target also
   * records what its new file must hold ([[Check]]). Records of 0.21.0 have
   * no check; the repair completes it from SQLite first.
+  *
+  * `repairing`: a repair of it began ([[CommitRepair]]); recovery then only
+  * continues the repair. It is written as an extra file line naming
+  * [[GuardDir]], a table 0.21.0 does not know: 0.21.0 decodes the record
+  * but fails on that table's lock before it acts, so it keeps the record
+  * and stops (as for a stuck commit) instead of dropping it (which would
+  * delete tmp files a repair may still need).
   */
-final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete)
+final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete, repairing: Boolean = false)
 
 object CommitIntent:
+  /** The guard's pseudo table (see above). */
+  val GuardDir = "repair-guard"
+
   /** An archive file (relative to the archive root) and its new version. */
   final case class Target(path: String, rows: Long, size: Long, check: Option[Check] = None)
 
@@ -112,7 +122,8 @@ object CommitIntent:
       case Delete.Raw(f, to, m, a, u, kept) => s"raw\t$f\t$to\t$m\t${cursor(a)}\t${cursor(u)}\t${kept.mkString(",")}"
       case Delete.Ids(ids)                  => s"ids\t${ids.mkString(",")}"
       case Delete.Files(ps)                 => s"files\t${ps.mkString("\t")}"
-    (files :+ delete :+ "end").mkString("\n") + "\n"
+    val guard = Option.when(i.repairing)(s"file\t$GuardDir/begun\t-1\t-1").toSeq
+    ((guard ++ files) :+ delete :+ "end").mkString("\n") + "\n"
 
   /** None for a record cut short (no `end`) or unknown. */
   def decode(s: String): Option[CommitIntent] =
@@ -120,7 +131,8 @@ object CommitIntent:
     if !lines.lastOption.contains("end") then None
     else
       scala.util.Try {
-        val files = lines.filter(_.startsWith("file\t")).map(_.split("\t", -1)).map { a =>
+        val (guards, fileLines) = lines.filter(_.startsWith("file\t")).partition(_.startsWith(s"file\t$GuardDir/"))
+        val files = fileLines.map(_.split("\t", -1)).map { a =>
           Target(a(1), a(2).toLong, a(3).toLong, Option.when(a.length > 4 && a(4) == "v2")(decodeCheck(a.toSeq.drop(5))))
         }
         val d = lines.filterNot(l => l.startsWith("file\t") || l == "end").head.split("\t", -1)
@@ -129,5 +141,5 @@ object CommitIntent:
           case "raw"   => Delete.Raw(d(1).toLong, d(2).toLong, d(3).toLong, cursorOf(d(4)), cursorOf(d(5)), longs(d(6)))
           case "ids"   => Delete.Ids(longs(d(1)))
           case "files" => Delete.Files(d.drop(1).toSeq)
-        CommitIntent(files, delete)
+        CommitIntent(files, delete, repairing = guards.nonEmpty)
       }.toOption
