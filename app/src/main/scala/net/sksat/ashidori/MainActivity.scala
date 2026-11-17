@@ -204,21 +204,36 @@ class MainActivity extends AppCompatActivity:
           catch case e: Exception => Log.e("debug sync failed", e)
         }
     if debuggable then debugDownloads(getIntent)
+    // Debug builds: `--es ashidori.date 2026-11-12` opens that day on the map tab.
+    if debuggable then Option(getIntent.getStringExtra("ashidori.date")).foreach(d => selectedDate = LocalDate.parse(d))
     if debuggable && getIntent.getBooleanExtra("ashidori.sim", false) then
       AshidoriApp.io.execute { () =>
         val today = LocalDate.now(AshidoriApp.zone)
         // `--ei ashidori.simDays N` seeds N days back: weekdays commute, weekends out, a trip now and then.
         val n = getIntent.getIntExtra("ashidori.simDays", 2)
-        for i <- (n - 1) to 0 by -1; d = today.minusDays(i) if i % 9 != 4 do
-          import ashidori.core.sim.Scenarios
+        // `--es ashidori.simGap 08:00-10:30` leaves a commute day without a
+        // record then (記録なし): `--es ashidori.simGapDate 2026-11-12`, else yesterday.
+        val gap = Option(getIntent.getStringExtra("ashidori.simGap")).map(_.split("-").map(java.time.LocalTime.parse))
+        val gapDay = Option(getIntent.getStringExtra("ashidori.simGapDate")).map(LocalDate.parse).getOrElse(today.minusDays(1))
+        def inGap(d: LocalDate, t: Long) = d == gapDay && gap.exists { g =>
+          val lt = java.time.Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).toLocalTime
+          !lt.isBefore(g(0)) && lt.isBefore(g(1))
+        }
+        // `--ez ashidori.simReset true` removes simulated data seeded before.
+        if getIntent.getBooleanExtra("ashidori.simReset", false) then AshidoriApp.db.deleteSimulated()
+        import ashidori.core.sim.Scenarios
+        val days = (n - 1 to 0 by -1).filter(_ % 9 != 4).map(i => (i, today.minusDays(i)))
+        val extra = if gap.isDefined && !days.exists(_._2 == gapDay) then Seq((0, gapDay)) else Nil
+        for (i, d) <- days ++ extra do
           val sc =
-            if i % 23 == 6 then Scenarios.flight(d, i)
+            if d == gapDay && gap.isDefined then Scenarios.commute(d, i)
+            else if i % 23 == 6 then Scenarios.flight(d, i)
             else if d.getDayOfWeek.getValue >= 6 then Scenarios.weekend(d, i)
             else Scenarios.commute(d, i)
           val out = ashidori.core.sim.TrajectorySimulator.run(sc)
           val now = System.currentTimeMillis()
-          AshidoriApp.db.insertFixes(out.fixes.filter(_.time < now).map(_.copy(provider = "sim")))
-          AshidoriApp.db.insertMotion(out.motion.filter(_.start < now), "sim")
+          AshidoriApp.db.insertFixes(out.fixes.filter(f => f.time < now && !inGap(d, f.time)).map(_.copy(provider = "sim")))
+          AshidoriApp.db.insertMotion(out.motion.filter(m => m.start < now && !inGap(d, m.start)), "sim")
         TimelineRepo.invalidate()
         runOnUiThread(() => current.foreach(_.onShow()))
       }
