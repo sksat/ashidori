@@ -12,7 +12,7 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(b.offer(3, raw = false, "battery", now = 3L), None)
     assertEquals(b.pending, 68L)
     assertEquals((b.totalLost, b.totalSpilled), (3L, 60L))
-    assertEquals(b.note(0L), Some("位置・動きなど 3 行を保存できず・生データ 60 行をファイルに退避・待ち 68 行"))
+    assertEquals(b.note(0L), Some("位置・動きなど 3 行を保存できず・60 行をファイルに退避・待ち 68 行"))
     b.done(r1.get, 60, raw = true, now = 10L)
     assertEquals(b.note(5000L), None)
     val r2 = b.offer(90, raw = true, "raw", now = 5400L).get

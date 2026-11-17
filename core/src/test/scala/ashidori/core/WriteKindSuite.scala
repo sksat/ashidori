@@ -22,3 +22,16 @@ class WriteKindSuite extends munit.FunSuite:
     assertEquals(b.unsavedSince.keySet, Set(WriteKind.Pressure.key))
     assert(b.lastSaved(WriteKind.EnergyState.key).contains(10L))
   }
+
+  test("a batch kept in an overflow file is not lost, but its kind counts as not saved") {
+    val b = WriteBacklog()
+    val p = b.offer(10, raw = false, WriteKind.Pressure.key, now = 5).get
+    b.done(p, 10, raw = false, now = 20, failed = true)
+    b.spill(10)
+    assertEquals((b.totalLost, b.totalSpilled, b.pending), (0L, 10L, 0L))
+    assertEquals(b.unsavedSince, Map(WriteKind.Pressure.key -> 5L))
+    // Saved again: no longer unsaved.
+    val q = b.offer(1, raw = false, WriteKind.Pressure.key, now = 30).get
+    b.done(q, 1, raw = false, now = 31)
+    assertEquals(b.unsavedSince, Map.empty[String, Long])
+  }
