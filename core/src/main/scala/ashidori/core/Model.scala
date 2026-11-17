@@ -14,7 +14,12 @@ final case class Fix(
     speed: Float = Float.NaN,
     bearing: Float = Float.NaN,
     provider: String = "gps",
-    satellites: Int = -1
+    satellites: Int = -1,
+    /** Accuracy of [[altitude]] (WGS84 ellipsoidal height), metres, 68 % */
+    altAccuracy: Float = Float.NaN,
+    /** Altitude above mean sea level (Android 14+ geoid model), metres */
+    msl: Double = Double.NaN,
+    mslAccuracy: Float = Float.NaN
 ):
   def hasSpeed: Boolean = !speed.isNaN
   def hasAccuracy: Boolean = !accuracy.isNaN

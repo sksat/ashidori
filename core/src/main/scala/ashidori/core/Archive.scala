@@ -13,13 +13,38 @@ object Archive:
   final case class TableDef(name: String, columns: Seq[Column]):
     def colNames: Seq[String] = columns.map(_.name)
 
+  /** Positions. `alt` is the WGS84 ellipsoidal height. The columns after
+    * `provider` were added in schema 3: `alt_acc` is the accuracy of `alt`,
+    * `msl` the altitude above mean sea level and `msl_acc` its accuracy
+    * (Android 14+; null before and on older devices).
+    */
   val Fixes = TableDef("fixes", Seq(
     Column("time", Int64), Column("lat", Float64), Column("lon", Float64), Column("acc", Float32),
-    Column("alt", Float64), Column("speed", Float32), Column("bearing", Float32), Column("provider", Str)))
+    Column("alt", Float64), Column("speed", Float32), Column("bearing", Float32), Column("provider", Str),
+    Column("alt_acc", Float32), Column("msl", Float64), Column("msl_acc", Float32)))
+  /** Barometric pressure, hPa (schema 3): 5 s medians while moving, at most
+    * one a minute while still. See [[PressureDecimator]].
+    */
+  val Pressure = TableDef("pressure", Seq(Column("time", Int64), Column("hpa", Float32)))
   val Motion = TableDef("motion", Seq(
     Column("start", Int64), Column("end", Int64), Column("std", Float32), Column("mean", Float32), Column("steps", Int32)))
+  /** Battery readings. The columns after `mode` were added in schema 2
+    * (after app 0.20.0); files written before have only the first five, and
+    * [[conform]] reads them with nulls there. Currents are discharge-positive
+    * µA (see [[BatteryReading]]); `temp_c` is °C; `plug` is none, ac, usb,
+    * wireless or dock.
+    */
   val Battery = TableDef("battery", Seq(
-    Column("time", Int64), Column("pct", Int32), Column("charging", Int32), Column("screen_on", Int32), Column("mode", Str)))
+    Column("time", Int64), Column("pct", Int32), Column("charging", Int32), Column("screen_on", Int32), Column("mode", Str),
+    Column("charge_uah", Int64), Column("current_avg_ua", Int32), Column("current_now_ua", Int32),
+    Column("voltage_mv", Int32), Column("temp_c", Float32), Column("plug", Str)))
+  /** What the logger was doing from `start` to `end` (schema 2): one row per
+    * stretch of unchanged state, split at local midnight. See [[EnergyState]].
+    */
+  val EnergyStates = TableDef("energy_state", Seq(
+    Column("start", Int64), Column("end", Int64), Column("gnss", Int32), Column("gnss_interval_ms", Int64),
+    Column("provider", Str), Column("detail", Int32), Column("still", Int32), Column("screen_on", Int32),
+    Column("charging", Int32), Column("mode", Str), Column("eff_mode", Str), Column("motion", Str), Column("env", Str)))
   val GnssStatus = TableDef("gnss_status", Seq(
     Column("time", Int64), Column("visible", Int32), Column("used", Int32), Column("top4", Float64), Column("l5", Int32),
     Column("env", Str), Column("acc", Float32)))
@@ -69,7 +94,26 @@ object Archive:
 
   /** Tables built from raw lines (kind = first CSV field). */
   val RawTables: Seq[TableDef] = Seq(GnssRaw, GnssSat, GnssNav, Nmea, Imu, GnssFix)
-  val All: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus) ++ RawTables
+  /** Tables kept in SQLite until their day is archived (small, uploaded on any network). */
+  val SignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus, EnergyStates, Pressure)
+  val All: Seq[TableDef] = SignalTables ++ RawTables
+
+  /** Version of the archive layout. 2 added the battery columns after `mode`
+    * and the `energy_state` table; 3 the elevation columns of `fixes` and
+    * the `pressure` table. Readers match columns by name, so older files
+    * read with nulls in the newer columns.
+    */
+  val SchemaVersion = 3
+
+  /** Rows of a file in the column order of `t`, matched by name: a column
+    * the file lacks (written by an older version) reads as null, and one `t`
+    * no longer has is dropped.
+    */
+  def conform(t: TableDef, file: ashidori.core.parquet.ParquetReader.Table): Iterator[IndexedSeq[Any]] =
+    if file.columns.map(_.name) == t.colNames then file.rowIterator
+    else
+      val arrays = t.columns.map(c => file.data.get(c.name).filter(_ => file.columns.exists(f => f.name == c.name && f.tpe == c.tpe))).toIndexedSeq
+      Iterator.range(0, file.rows).map(i => arrays.map(_.fold(null: Any)(_(i))))
 
   /** Which raw table a line belongs to. */
   def tableFor(kind: String): Option[TableDef] = kind match
@@ -179,16 +223,49 @@ object Archive:
       case GnssFix => ("Fix" +: (row.slice(1, 8) ++ Seq(row(0)) ++ row.drop(8)).map(s)).mkString(",")
       case _       => row.map(s).mkString(",")
 
-  def fixRow(f: Fix): Seq[Any] = Seq(f.time, f.lat, f.lon, f.accuracy, f.altitude, f.speed, f.bearing, f.provider)
+  def fixRow(f: Fix): Seq[Any] =
+    def nf(v: Float): Any = if v.isNaN then null else v
+    def nd(v: Double): Any = if v.isNaN then null else v
+    Seq(f.time, f.lat, f.lon, f.accuracy, f.altitude, f.speed, f.bearing, f.provider, nf(f.altAccuracy), nd(f.msl), nf(f.mslAccuracy))
+  /** A conformed fixes row (files before schema 3: nulls after `provider`). */
   def fixOf(r: IndexedSeq[Any]): Fix =
     def fl(v: Any) = if v == null then Float.NaN else v.asInstanceOf[Float]
     def db(v: Any) = if v == null then Double.NaN else v.asInstanceOf[Double]
-    Fix(r(0).asInstanceOf[Long], db(r(1)), db(r(2)), fl(r(3)), db(r(4)), fl(r(5)), fl(r(6)), Option(r(7)).map(_.toString).getOrElse(""))
+    def at(i: Int): Any = if i < r.size then r(i) else null
+    Fix(r(0).asInstanceOf[Long], db(r(1)), db(r(2)), fl(r(3)), db(r(4)), fl(r(5)), fl(r(6)), Option(r(7)).map(_.toString).getOrElse(""),
+      altAccuracy = fl(at(8)), msl = db(at(9)), mslAccuracy = fl(at(10)))
+
+  def pressureRow(s: PressureSample): Seq[Any] = Seq(s.time, s.hPa)
+  def pressureOf(r: IndexedSeq[Any]): PressureSample =
+    PressureSample(r(0).asInstanceOf[Long], Option(r(1)).map(_.asInstanceOf[Float]).getOrElse(Float.NaN))
 
   def motionRow(m: MotionWindow): Seq[Any] = Seq(m.start, m.end, m.accelStd, m.accelMean, m.steps)
   def motionOf(r: IndexedSeq[Any]): MotionWindow =
     def fl(v: Any) = if v == null then Float.NaN else v.asInstanceOf[Float]
     MotionWindow(r(0).asInstanceOf[Long], r(1).asInstanceOf[Long], fl(r(2)), fl(r(3)), Option(r(4)).map(_.asInstanceOf[Int]).getOrElse(0))
+
+  private def opt[A](v: Any): Option[A] = Option(v).map(_.asInstanceOf[A])
+
+  def batteryRow(b: BatteryReading): Seq[Any] =
+    Seq(b.time, b.pct, if b.charging then 1 else 0, if b.screenOn then 1 else 0, b.mode,
+      b.chargeUah.map(Long.box).orNull, b.currentAvgUa.map(Int.box).orNull, b.currentNowUa.map(Int.box).orNull,
+      b.voltageMv.map(Int.box).orNull, b.tempC, b.plug.orNull)
+  /** A conformed battery row (old files: nulls after `mode`). */
+  def batteryOf(r: IndexedSeq[Any]): BatteryReading =
+    BatteryReading(r(0).asInstanceOf[Long], opt[Int](r(1)).getOrElse(-1), r(2) == 1, r(3) == 1,
+      Option(r(4)).map(_.toString).getOrElse(""), opt[Long](r(5)), opt[Int](r(6)), opt[Int](r(7)), opt[Int](r(8)),
+      opt[Float](r(9)).getOrElse(Float.NaN), opt[Any](r(10)).map(_.toString))
+
+  def energyRow(s: EnergySpan): Seq[Any] =
+    val e = s.state
+    def b(x: Boolean) = if x then 1 else 0
+    Seq(s.start, s.end, b(e.gnss), e.gnssIntervalMs, e.provider, b(e.detail), b(e.still), b(e.screenOn), b(e.charging),
+      e.mode, e.effMode, e.motion, e.env)
+  def energyOf(r: IndexedSeq[Any]): EnergySpan =
+    def s(i: Int) = Option(r(i)).map(_.toString).getOrElse("")
+    EnergySpan(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]),
+      EnergyState(r(2) == 1, opt[Long](r(3)).getOrElse(0L), s(4), r(5) == 1, r(6) == 1, r(7) == 1, r(8) == 1,
+        s(9), s(10), s(11), s(12)))
 
   /** Archive file names. */
   def dayFile(t: TableDef, day: java.time.LocalDate): String = s"${t.name}/$day.parquet"

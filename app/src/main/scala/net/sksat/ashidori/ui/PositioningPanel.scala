@@ -34,6 +34,7 @@ final class PositioningPanel(act: MainActivity):
   // there is nothing to show, and each value's age beside it.
   private val state = SensorUi.StateLine()
   private val fixRow = SensorUi.ValueRow("測位")
+  private val elevationRow = SensorUi.ValueRow("標高")
   private val usedRow = SensorUi.ValueRow("衛星")
   private val signalRow = SensorUi.ValueRow("信号")
   /** Fixed cells in a fixed order, one per constellation: a constellation
@@ -93,6 +94,7 @@ final class PositioningPanel(act: MainActivity):
     SensorUi.section("現在"),
     state.view,
     fixRow.view,
+    elevationRow.view,
     usedRow.view,
     signalRow.view,
     spacer(4),
@@ -216,6 +218,21 @@ final class PositioningPanel(act: MainActivity):
             (if stale then "・古い値" else "", true)),
           Some(now - f.time), stale = stale)
       case None => fixRow.none(if running then "測位待ち" else "")
+
+    // 標高: MSL altitude of the latest fix that has one (network fixes and
+    // dead reckoning usually have no altitude).
+    LoggerState.recentFixes.findLast(!_.msl.isNaN) match
+      case Some(f) =>
+        val stale = now - f.time > StaleMs
+        val acc = if f.mslAccuracy > 0 then f"  ±${f.mslAccuracy}%.0f m" else ""
+        elevationRow.set(SensorUi.spans((f"${f.msl}%.0f m", false), (acc, true), (if stale then "・古い値" else "", true)),
+          Some(now - f.time), stale = stale)
+      case None =>
+        elevationRow.none(
+          if android.os.Build.VERSION.SDK_INT < 34 then "Android 14 以上が必要"
+          else if !running then ""
+          else if LoggerState.lastFix.exists(_.altitude.isNaN) then "直近の測位に高度なし"
+          else "測位待ち")
 
     val satAge = Option(LoggerState.satellitesAt).filter(_ > 0).map(now - _)
     if on then

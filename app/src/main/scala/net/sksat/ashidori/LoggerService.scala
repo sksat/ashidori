@@ -52,6 +52,11 @@ class LoggerService extends Service:
   private val replan: Runnable = () => evaluate(force = true)
   private var lastBatterySample = 0L
   private var drain = Double.NaN
+  /** Battery readings and state spans for the energy analysis. */
+  private lazy val energy = EnergyRecorder(this, bm, db, handler, () => plan.foreach(energyUpdate))
+  /** Barometer and MSL altitude for the elevation estimate. */
+  private lazy val pressure = PressureRecorder(sm, handler, db)
+  private lazy val mslAltitude = MslAltitude(this)
 
   private var plan: Option[SamplingPlan] = None
   /** (provider, interval, batch, minDistance) currently registered */
@@ -166,6 +171,7 @@ class LoggerService extends Service:
       // then anyway; the samples are the same ones delivered later otherwise.
       LoggerState.flushSensors = () => handler.post(() => sm.flush(sensorListener))
       LoggerState.onMain { LoggerState.running = true }
+      energy.start(pm.isInteractive)
       tick()
     evaluate(force = true)
 
@@ -178,6 +184,8 @@ class LoggerService extends Service:
     handler.post { () =>
       handler.removeCallbacksAndMessages(null)
       stopRecorder()
+      energy.stop(System.currentTimeMillis())
+      pressure.stop()
       lm.removeUpdates(locationListener)
       if statusRegistered then lm.unregisterGnssStatusCallback(statusCallback)
       sm.unregisterListener(sensorListener)
@@ -216,9 +224,8 @@ class LoggerService extends Service:
     if now - lastBatterySample >= 5 * 60_000 then
       lastBatterySample = now
       val p = plan
-      val screen = pm.isInteractive
-      val mode = Settings.mode.key
-      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(now, pct, charging, screen, mode, p.map(_.describe).getOrElse("")))
+      val reading = energy.reading(now, pm.isInteractive)
+      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(reading, p.map(_.describe).getOrElse("")))
       // A read: on the UI's I/O thread, not the logger's write path.
       AshidoriApp.io.execute { () =>
         // Never fails the logger's process (rule C; and anything else).
@@ -336,6 +343,7 @@ class LoggerService extends Service:
     updatePdr()
     val still = p.accelHz == 0 && estimator.current == MotionState.Stationary
     if still then armSigMotion() else disarmSigMotion()
+    pressure.update(moving = !still, p.accelBatchMs)
     if still != stillLogged then
       stillLogged = still
       if still then
@@ -345,8 +353,25 @@ class LoggerService extends Service:
       else
         LifeLog.add(LifeKind.StillExit, (if wakeReason.nonEmpty then wakeReason else "設定・状態の変化") + s"・${p.describe}")
     wakeReason = ""
+    energyUpdate(p)
     LoggerState.sensors = SensorState(accelReg, if accelReg > 0 then p.accelBatchMs else 0L, sigMotionArmed, pdrSensors,
       recorder.map(_.imuHz).getOrElse(0), accelSince)
+
+  /** The state as far as it costs energy; a change starts a new span. */
+  private def energyUpdate(p: SamplingPlan): Unit =
+    energy.update(System.currentTimeMillis(), EnergyState(
+      gnss = p.source == LocationSource.Gnss,
+      gnssIntervalMs = p.intervalMs,
+      provider = locReg.map(_._1).getOrElse(""),
+      detail = recorder.isDefined,
+      still = p.accelHz == 0 && estimator.current == MotionState.Stationary,
+      screenOn = energy.screenOn,
+      charging = energy.plugged,
+      mode = Settings.mode.key,
+      effMode = p.effectiveMode.key,
+      motion = estimator.current.toString,
+      env = indoor.current.toString
+    ), p.describe)
 
   /** Step detector + rotation vector only while walking indoors: the gyro
     * on some phones cannot batch, so this keeps the CPU awake.
@@ -414,6 +439,7 @@ class LoggerService extends Service:
 
   private def onLocations(ls: Seq[Location]): Unit =
     for l <- ls do
+      val (msl, mslAcc) = mslAltitude.of(l)
       val f = Fix(
         l.getTime,
         l.getLatitude,
@@ -423,7 +449,10 @@ class LoggerService extends Service:
         if l.hasSpeed then l.getSpeed else Float.NaN,
         if l.hasBearing then l.getBearing else Float.NaN,
         l.getProvider,
-        -1
+        -1,
+        altAccuracy = if l.hasVerticalAccuracy then l.getVerticalAccuracyMeters else Float.NaN,
+        msl = msl,
+        mslAccuracy = mslAcc
       )
       pendingFixes += f
       LoggerState.recentFixes = (LoggerState.recentFixes :+ f).takeRight(600)

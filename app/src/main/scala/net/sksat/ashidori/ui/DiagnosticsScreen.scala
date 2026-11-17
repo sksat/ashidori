@@ -33,6 +33,10 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val recording = vbox()
   /** The same as plain text, for the copied report. */
   private var recordingText = ""
+  /** Battery use of the last week, attributed (also in the copied report). */
+  private val energy = EnergyPanel()
+  /** Positioning with the screen on and off (also in the copied report). */
+  private val fixQuality = FixQualityPanel()
 
   private val debuggable =
     (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -104,7 +108,10 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
             else Nil
           ))*
         ),
+        energy.view,
+        fixQuality.view,
         recording,
+        spacer(16),
         card(body),
         spacer(24)
       )
@@ -122,7 +129,16 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     sections("permissions") = permissions()
     sections("scala") = scalaSelfTest()
     sections("db") = AshidoriApp.db.counts().toSeq.sorted.map((k, v) => s"$k=$v").mkString(" ")
+    sections(s"energy (last ${EnergyStats.Days} days)") = "computing"
+    sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = "computing"
     render()
+    EnergyStats.load { a =>
+      energy.show(a.energy)
+      fixQuality.show(a.fixes)
+      sections(s"energy (last ${EnergyStats.Days} days)") = EnergyModel.describe(a.energy)
+      sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = FixQuality.describe(a.fixes)
+      render()
+    }
     AshidoriApp.io.execute(() =>
       val r = simE2E()
       act.runOnUiThread(() =>

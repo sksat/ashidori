@@ -10,8 +10,9 @@ import net.sksat.ashidori.*
 import ashidori.core.*
 import Ui.*
 
-/** Battery impact estimates shown next to each mode. Rough guidance until
-  * measured on real devices.
+/** Battery impact estimates shown next to each mode: rough guidance, kept
+  * as the fallback. The measured estimate from this device's own data
+  * ([[EnergyUi.modeLine]]) is shown under it once there is enough.
   */
 object ModeInfo:
   val summary: Map[LoggingMode, String] = Map(
@@ -231,6 +232,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   /** As tall as the longest mode's description, so the cards below stay put. */
   private val modeInfo = stableCaption(modes.map(modeText))
   modeInfo.setPadding(0, dp(4), 0, 0)
+  /** The measured estimate for the chosen mode: one line, always there. */
+  private val modeMeasured = tabular(oneLine(caption(EnergyUi.modeLine(Settings.mode))))
 
   private def paintModes(): Unit =
     val chosen = Settings.mode
@@ -248,6 +251,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       t.setTextColor(if m == chosen then c else color(attr.onSurfaceVariant))
       t.setTypeface(null, if m == chosen then android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
     modeInfo.setText(modeText(chosen))
+    modeMeasured.setText(EnergyUi.modeLine(chosen))
 
   private def selectMode(m: LoggingMode): Unit =
     if Settings.mode != m then
@@ -287,7 +291,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         banner.view,
         peers.view,
         card(header, spacer(10), panel.accuracyRow, spacer(6), stateRows, modeNote, indoorNote, spacer(4), controls),
-        card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
+        card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo, modeMeasured)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
         card(
           { val t = text("生データ記録", 16f, bold = true); t.setLayoutParams(weighted())
@@ -311,6 +315,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     unobserve = LoggerState.observe(() => refresh())
     peers.onShow()
     paintModes()
+    EnergyStats.load(_ => modeMeasured.setText(EnergyUi.modeLine(Settings.mode)))
     refresh()
     panel.onShow()
     sensorPanel.onShow()

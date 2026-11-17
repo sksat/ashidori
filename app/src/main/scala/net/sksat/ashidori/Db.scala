@@ -50,6 +50,38 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     createSyncOutbox(db)
     addChangeCounter(db)
     createVenueCache(db)
+    addEnergy(db)
+    addElevation(db)
+
+  /** Vertical accuracy and MSL altitude of fixes, and barometric pressure
+    * ([[Elevation]]). Only adds what is missing.
+    */
+  private def addElevation(db: SQLiteDatabase): Unit =
+    val existing = Using.resource(db.rawQuery("PRAGMA table_info(fixes)", null)) { c =>
+      val names = Set.newBuilder[String]
+      while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
+      names.result()
+    }
+    Seq("alt_acc", "msl", "msl_acc").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE fixes ADD COLUMN $c REAL"))
+    db.execSQL("CREATE TABLE IF NOT EXISTS pressure(time INTEGER NOT NULL, hpa REAL NOT NULL)")
+    db.execSQL("CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)")
+
+  /** Battery readings beyond the percentage, and the logger's state spans
+    * ([[EnergyState]]), for the energy analysis. The open span (the current
+    * state) has a NULL end until the state changes.
+    */
+  private def addEnergy(db: SQLiteDatabase): Unit =
+    val existing = Using.resource(db.rawQuery("PRAGMA table_info(battery)", null)) { c =>
+      val names = Set.newBuilder[String]
+      while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
+      names.result()
+    }
+    Seq("charge_uah INTEGER", "current_avg_ua INTEGER", "current_now_ua INTEGER", "voltage_mv INTEGER", "temp_c REAL", "plug TEXT")
+      .filterNot(c => existing(c.takeWhile(_ != ' '))).foreach(c => db.execSQL(s"ALTER TABLE battery ADD COLUMN $c"))
+    db.execSQL("""CREATE TABLE IF NOT EXISTS energy_state(start INTEGER NOT NULL, end INTEGER, gnss INTEGER,
+      |gnss_interval_ms INTEGER, provider TEXT, detail INTEGER, still INTEGER, screen_on INTEGER, charging INTEGER,
+      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT)""".stripMargin)
+    db.execSQL("CREATE INDEX IF NOT EXISTS energy_state_start ON energy_state(start)")
 
   /** Rowids of the archived tables are never reused ([[claimRowids]]), and
     * the import of pre-Parquet text logs records its progress. Created on
@@ -158,6 +190,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       addChangeCounter(db)
     // Self-contained (IF NOT EXISTS): safe to run again from a later step.
     if oldV < 6 then createVenueCache(db)
+    if oldV < 7 then addEnergy(db)
+    if oldV < 8 then addElevation(db)
 
   private def w = getWritableDatabase
   private def r = getReadableDatabase
@@ -205,6 +239,9 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       nanToNull(cv, "bearing", f.bearing)
       cv.put("provider", f.provider)
       cv.put("sats", java.lang.Integer.valueOf(f.satellites))
+      nanToNull(cv, "alt_acc", f.altAccuracy)
+      nanToNull(cv, "msl", f.msl)
+      nanToNull(cv, "msl_acc", f.mslAccuracy)
       db.insertOrThrow("fixes", null, cv)
   }
 
@@ -224,17 +261,95 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       db.insertOrThrow("motion", null, cv)
   }
 
-  def insertBattery(time: Long, pct: Int, charging: Boolean, screenOn: Boolean, mode: String, plan: String): Unit =
+  def insertBattery(b: BatteryReading, plan: String): Unit =
     val cv = ContentValues()
-    cv.put("time", java.lang.Long.valueOf(time))
-    cv.put("pct", java.lang.Integer.valueOf(pct))
-    cv.put("charging", java.lang.Integer.valueOf(if charging then 1 else 0))
-    cv.put("screen_on", java.lang.Integer.valueOf(if screenOn then 1 else 0))
-    cv.put("mode", mode)
+    cv.put("time", java.lang.Long.valueOf(b.time))
+    cv.put("pct", java.lang.Integer.valueOf(b.pct))
+    cv.put("charging", java.lang.Integer.valueOf(if b.charging then 1 else 0))
+    cv.put("screen_on", java.lang.Integer.valueOf(if b.screenOn then 1 else 0))
+    cv.put("mode", b.mode)
     cv.put("plan", plan)
+    b.chargeUah.foreach(v => cv.put("charge_uah", java.lang.Long.valueOf(v)))
+    b.currentAvgUa.foreach(v => cv.put("current_avg_ua", java.lang.Integer.valueOf(v)))
+    b.currentNowUa.foreach(v => cv.put("current_now_ua", java.lang.Integer.valueOf(v)))
+    b.voltageMv.foreach(v => cv.put("voltage_mv", java.lang.Integer.valueOf(v)))
+    if !b.tempC.isNaN then cv.put("temp_c", java.lang.Double.valueOf(b.tempC.toDouble))
+    b.plug.foreach(cv.put("plug", _))
     tx { db =>
       cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "battery", 1)))
       db.insertOrThrow("battery", null, cv)
+    }
+
+  private def energyValues(e: EnergyState): ContentValues =
+    val cv = ContentValues()
+    def b(x: Boolean) = java.lang.Integer.valueOf(if x then 1 else 0)
+    cv.put("gnss", b(e.gnss))
+    cv.put("gnss_interval_ms", java.lang.Long.valueOf(e.gnssIntervalMs))
+    cv.put("provider", e.provider)
+    cv.put("detail", b(e.detail))
+    cv.put("still", b(e.still))
+    cv.put("screen_on", b(e.screenOn))
+    cv.put("charging", b(e.charging))
+    cv.put("mode", e.mode)
+    cv.put("eff_mode", e.effMode)
+    cv.put("motion", e.motion)
+    cv.put("env", e.env)
+    cv
+
+  /** Closes the open span(s) at `end` (split at local midnight) and opens
+    * one for `next` from `end`, if given. One transaction.
+    *
+    * A span is closed by deleting its open row and inserting the closed
+    * one(s), never by an update: archiving deletes the closed rows of a day
+    * up to the largest rowid at its start ([[maxRowids]]), so a row closed
+    * while it runs must get a new rowid above that, or it would be deleted
+    * without having been archived.
+    */
+  def switchEnergyState(end: Long, next: Option[EnergyState]): Unit = tx { db =>
+    for (rowid, span) <- openEnergy() do
+      val parts = EnergySpan.splitDays(span.copy(end = math.max(span.start, end)), AshidoriApp.zone)
+      db.delete("energy_state", "rowid=? AND end IS NULL", Array(rowid.toString))
+      var id = claimRowids(db, "energy_state", parts.size)
+      for p <- parts do
+        val cv = energyValues(p.state)
+        cv.put("rowid", java.lang.Long.valueOf(id))
+        id += 1
+        cv.put("start", java.lang.Long.valueOf(p.start))
+        cv.put("end", java.lang.Long.valueOf(p.end))
+        db.insertOrThrow("energy_state", null, cv)
+    next.foreach { st =>
+      val cv = energyValues(st)
+      cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "energy_state", 1)))
+      cv.put("start", java.lang.Long.valueOf(end))
+      db.insertOrThrow("energy_state", null, cv)
+    }
+  }
+
+  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env"
+  private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan =
+    def s(i: Int) = Option(c.getString(at + i)).getOrElse("")
+    EnergySpan(c.getLong(at), end, EnergyState(c.getInt(at + 2) != 0, c.getLong(at + 3), s(4), c.getInt(at + 5) != 0,
+      c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)))
+
+  /** Spans not closed yet: normally the current one; more after the process was killed. */
+  private def openEnergy(): Vector[(Long, EnergySpan)] =
+    query(s"SELECT rowid,$energyCols FROM energy_state WHERE end IS NULL ORDER BY start") { c =>
+      (c.getLong(0), energyOf(c, 1, c.getLong(1)))
+    }
+
+  /** When the latest battery reading in SQLite was taken (0 = none). */
+  def lastBatteryTime(): Long =
+    query("SELECT MAX(time) FROM battery")(c => if c.isNull(0) then 0L else c.getLong(0)).head
+
+  /** Readings and state spans since `from` for the energy analysis; the open span ends `now`. */
+  def energyData(from: Long, now: Long): (Vector[BatteryReading], Vector[EnergySpan]) =
+    AshidoriApp.archive.reading(Archive.Battery, Archive.EnergyStates) {
+      val readings = AshidoriApp.archive.read(Archive.Battery, from, Long.MaxValue).map(Archive.batteryOf) ++
+        hotRows(Archive.Battery, from, Long.MaxValue).map(r => Archive.batteryOf(r.toIndexedSeq))
+      val spans = AshidoriApp.archive.read(Archive.EnergyStates, from, Long.MaxValue).map(Archive.energyOf) ++
+        hotRows(Archive.EnergyStates, from, Long.MaxValue).map(r => Archive.energyOf(r.toIndexedSeq)) ++
+        openEnergy().map(_._2).filter(_.start < now).map(_.copy(end = now))
+      (readings.distinctBy(_.time).sortBy(_.time), spans.distinctBy(_.start).sortBy(_.start))
     }
 
   def insertGnssSession(start: Long, end: Long, file: String, reason: String): Unit =
@@ -279,9 +394,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   def hotFixes(from: Long, to: Long): Vector[Fix] =
     val (x, xa) = notPending("fixes")
-    query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<?$x ORDER BY time", (Seq(from, to) ++ xa)*) { c =>
-      Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
-    }
+    query(s"SELECT $fixCols FROM fixes WHERE time>=? AND time<?$x ORDER BY time", (Seq(from, to) ++ xa)*)(fixOf)
 
   def lastFix(): Option[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
     hotLastFix().orElse(AshidoriApp.archive.lastRow(Archive.Fixes).map(Archive.fixOf))
@@ -289,9 +402,37 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   private def hotLastFix(): Option[Fix] =
     val (x, xa) = notPending("fixes")
-    query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*) { c =>
-      Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
-    }.headOption
+    query(s"SELECT $fixCols FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*)(fixOf).headOption
+
+  private val fixCols = "time,lat,lon,acc,alt,speed,bearing,provider,sats,alt_acc,msl,msl_acc"
+  private def fixOf(c: Cursor): Fix =
+    Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8),
+      flt(c, 9), dbl(c, 10), flt(c, 11))
+
+  def insertPressure(ps: Iterable[PressureSample]): Unit = tx { db =>
+    val st = db.compileStatement("INSERT INTO pressure(rowid, time, hpa) VALUES(?, ?, ?)")
+    try
+      var id = claimRowids(db, "pressure", ps.size)
+      for p <- ps do
+        st.bindLong(1, id)
+        id += 1
+        st.bindLong(2, p.time)
+        st.bindDouble(3, p.hPa.toDouble)
+        st.executeInsert()
+    finally st.close()
+  }
+
+  /** Barometric pressure in [from, to), archived and recent, for [[Elevation.estimate]]. */
+  def pressure(from: Long, to: Long): Vector[PressureSample] = AshidoriApp.archive.reading(Archive.Pressure) {
+    once("pressure", AshidoriApp.archive.read(Archive.Pressure, from, to).map(Archive.pressureOf) ++ hotPressure(from, to))(p =>
+      Archive.pressureRow(p).toIndexedSeq).sortBy(_.time)
+  }
+
+  private def hotPressure(from: Long, to: Long, maxRowid: Long = Long.MaxValue): Vector[PressureSample] =
+    val (x, xa) = notPending("pressure")
+    query(s"SELECT time,hpa FROM pressure WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid", (Seq[Any](from, to, maxRowid) ++ xa)*) { c =>
+      PressureSample(c.getLong(0), c.getFloat(1))
+    }
 
   def motion(from: Long, to: Long): Vector[MotionWindow] = AshidoriApp.archive.reading(Archive.Motion) {
     once("motion", AshidoriApp.archive.read(Archive.Motion, from, to).map(Archive.motionOf) ++ hotMotion(from, to))(m =>
@@ -325,7 +466,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
 
   def counts(): Map[String, Long] =
-    Seq("fixes", "motion", "battery", "places", "checkins", "gnss_sessions").map { t =>
+    Seq("fixes", "motion", "battery", "energy_state", "pressure", "places", "checkins", "gnss_sessions").map { t =>
       t -> query(s"SELECT COUNT(*) FROM $t")(_.getLong(0)).head
     }.toMap
 
@@ -607,18 +748,18 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Whether any archived table still holds rows of [from, to) in SQLite. */
   def hasHotRows(from: Long, to: Long): Boolean =
     Db.ArchivedTables.exists { (t, col) =>
-      query(s"SELECT EXISTS(SELECT 1 FROM $t WHERE $col>=? AND $col<?)", from, to)(_.getInt(0)).head == 1
+      query(s"SELECT EXISTS(SELECT 1 FROM $t WHERE $col>=? AND $col<? AND ${Db.archivable(t)})", from, to)(_.getInt(0)).head == 1
     }
 
   /** Rows of an archived table in [from, to) up to `maxRowid`. */
   def countArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
     val col = Db.ArchivedTables(table)
-    query(s"SELECT COUNT(*) FROM $table WHERE $col>=? AND $col<? AND rowid<=?", from, to, maxRowid)(_.getLong(0)).head
+    query(s"SELECT COUNT(*) FROM $table WHERE $col>=? AND $col<? AND rowid<=? AND ${Db.archivable(table)}", from, to, maxRowid)(_.getLong(0)).head
 
   /** Deletes rows of an archived table in [from, to) up to `maxRowid`. */
   def deleteArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
     val col = Db.ArchivedTables(table)
-    deleteChunked(table, s"$col>=? AND $col<? AND rowid<=?", Seq(from, to, maxRowid))
+    deleteChunked(table, s"$col>=? AND $col<? AND rowid<=? AND ${Db.archivable(table)}", Seq(from, to, maxRowid))
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
     val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, Db.DeleteChunk))
@@ -634,7 +775,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   /** Earliest time still held in SQLite for an archived table (None if empty). */
   def oldestHot(): Option[Long] =
-    Db.ArchivedTables.toSeq.flatMap((t, col) => query(s"SELECT MIN($col) FROM $t")(c => if c.isNull(0) then None else Some(c.getLong(0))).head)
+    Db.ArchivedTables.toSeq.flatMap((t, col) =>
+      query(s"SELECT MIN($col) FROM $t WHERE ${Db.archivable(t)}")(c => if c.isNull(0) then None else Some(c.getLong(0))).head)
       .minOption
 
   /** Rows of one archived table in [from, to) up to `maxRowid`, typed as in
@@ -647,9 +789,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val args = Seq[Any](from, to, maxRowid) ++ xa
     t match
       case Archive.Fixes =>
-        query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
-          args*) { c =>
-          Archive.fixRow(Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8)))
+        query(s"SELECT $fixCols FROM fixes WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid", args*) { c =>
+          Archive.fixRow(fixOf(c))
         }
       case Archive.Motion =>
         query(s"SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
@@ -657,15 +798,24 @@ final class Db(ctx: Context, name: String = "ashidori.db")
           Archive.motionRow(MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4)))
         }
       case Archive.Battery =>
-        query(s"SELECT time,pct,charging,screen_on,mode FROM battery WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
+        def opt(c: Cursor, i: Int, v: => Any): Any = if c.isNull(i) then null else v
+        query(s"""SELECT time,pct,charging,screen_on,mode,charge_uah,current_avg_ua,current_now_ua,voltage_mv,temp_c,plug
+          |FROM battery WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid""".stripMargin, args*) { c =>
+          Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getInt(3), c.getString(4), opt(c, 5, c.getLong(5)),
+            opt(c, 6, c.getInt(6)), opt(c, 7, c.getInt(7)), opt(c, 8, c.getInt(8)), flt(c, 9), c.getString(10))
+        }
+      // Closed spans only: the open one is archived once it is closed.
+      case Archive.EnergyStates =>
+        query(s"SELECT $energyCols FROM energy_state WHERE ${Db.archivable("energy_state")} AND start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
           args*) { c =>
-          Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getInt(3), c.getString(4))
+          Archive.energyRow(energyOf(c, 0, c.getLong(1)))
         }
       case Archive.GnssStatus =>
         query(s"SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
           args*) { c =>
           Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4), c.getString(5), flt(c, 6))
         }
+      case Archive.Pressure => hotPressure(from, to, maxRowid).map(Archive.pressureRow)
       case _ => Vector.empty
 
   /** When the newest fix in SQLite was taken (the logger's last persisted
@@ -874,7 +1024,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
 object Db:
-  val Version = 6
+  val Version = 8
 
 
   /** On corruption, keep the files (and say so): Android's default handler
@@ -890,7 +1040,13 @@ object Db:
 
   /** Tables archived to Parquet, and their time column. */
   val ArchivedTables: Map[String, String] = scala.collection.immutable.ListMap(
-    "fixes" -> "time", "motion" -> "start", "battery" -> "time", "gnss_status" -> "time", "raw_lines" -> "time")
+    "fixes" -> "time", "motion" -> "start", "battery" -> "time", "gnss_status" -> "time", "energy_state" -> "start",
+    "pressure" -> "time", "raw_lines" -> "time")
+
+  /** Which rows of an archived table archiving takes (an SQL condition): all
+    * but the open span of `energy_state`, which stays until it is closed.
+    */
+  def archivable(table: String): String = if table == "energy_state" then "end IS NOT NULL" else "1"
 
   /** Rows per DELETE when archiving: short write transactions. */
   val DeleteChunk = 5000
