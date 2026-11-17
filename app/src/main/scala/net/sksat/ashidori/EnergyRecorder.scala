@@ -21,7 +21,7 @@ import ashidori.core.*
   * system sends while awake.
   */
 final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, onChange: () => Unit):
-  private val tracker = EnergyTracker(EnergyTracker.newToken(System.currentTimeMillis()))
+  private val tracker = EnergyTracker(EnergyRecorder.nextBoot())
   /** Screen and charger as last broadcast. */
   var screenOn: Boolean = true
   var plugged: Boolean = false
@@ -102,6 +102,25 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
     )
 
 object EnergyRecorder:
+  private def bootFile = java.io.File(AshidoriApp.app.getFilesDir, "energy-boot")
+
+  /** This process's recorder number: one above every earlier one, kept on
+    * disk before it is used (atomically, fsynced). Above the highest the
+    * database has seen as well, in case the file was lost (data restored
+    * from a backup) or could not be written last time. Ordering by it, not
+    * by the clock, keeps restarts in order when the clock goes back.
+    */
+  def nextBoot(): Long = synchronized {
+    val onFile = scala.util.Try(String(java.nio.file.Files.readAllBytes(bootFile.toPath), "UTF-8").trim.toLong).getOrElse(0L)
+    val inDb = scala.util.Try(AshidoriApp.db.energyMaxBoot()).getOrElse(0L)
+    val n = math.max(onFile, inDb) + 1
+    try Maintenance.write(bootFile, n.toString)
+    catch case scala.util.control.NonFatal(e) =>
+      Log.w("boot counter not saved", e)
+      LifeLog.add(LifeKind.Note, s"記録の状態の通し番号を保存できず: ${LifeLog.describe(e)}")
+    n
+  }
+
   def plugName(p: Int): String = p match
     case 0                                   => "none"
     case BatteryManager.BATTERY_PLUGGED_AC       => "ac"

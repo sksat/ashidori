@@ -157,14 +157,14 @@ class DbMigrationSuite extends munit.FunSuite:
     // The same tables as a database created new.
     val fresh = tempDb()
     create(fresh)
-    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure", "deleted_range") do
+    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure", "deleted_range", "fix_msl") do
       assertEquals(tableInfo(db, t), tableInfo(fresh, t), t)
     assertEquals(run(db, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;"),
       run(fresh, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;"))
 
     // Running a step again (a pre-release database had part of it) changes nothing.
     migrate(db)
-    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure", "deleted_range") do
+    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure", "deleted_range", "fix_msl") do
       assertEquals(tableInfo(db, t), tableInfo(fresh, t), t)
 
     // New rows after the migration take rowids above the old ones.

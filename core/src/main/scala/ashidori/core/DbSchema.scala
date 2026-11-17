@@ -32,17 +32,25 @@ object DbSchema:
   val CreateEnergyState: String =
     """CREATE TABLE IF NOT EXISTS energy_state(start INTEGER NOT NULL, end INTEGER, gnss INTEGER,
       |gnss_interval_ms INTEGER, provider TEXT, detail INTEGER, still INTEGER, screen_on INTEGER, charging INTEGER,
-      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT, end_unknown INTEGER NOT NULL DEFAULT 0)""".stripMargin
+      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT, end_unknown INTEGER NOT NULL DEFAULT 0,
+      |boot INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL DEFAULT 0)""".stripMargin
 
-  /** Version 7: the last state change applied and when the state was last
-    * confirmed and stored ([[EnergyCheckpoint]]). One row; not archived.
+  /** Version 7: per recorder (boot), the last state change applied and
+    * when the state was last confirmed and stored ([[EnergyCheckpoint]]).
+    * Not archived.
     */
   val CreateEnergyCheckpoint: String =
-    """CREATE TABLE IF NOT EXISTS energy_checkpoint(id INTEGER PRIMARY KEY CHECK(id=0), token TEXT NOT NULL,
-      |seq INTEGER NOT NULL, confirmed_at INTEGER NOT NULL)""".stripMargin
+    """CREATE TABLE IF NOT EXISTS energy_checkpoint(boot INTEGER PRIMARY KEY, seq INTEGER NOT NULL,
+      |confirmed_at INTEGER NOT NULL)""".stripMargin
 
   /** Version 8: the vertical accuracy of `alt` and the MSL altitude of fixes. */
   val FixColumns: Seq[(String, String)] = Seq("alt_acc" -> "REAL", "msl" -> "REAL", "msl_acc" -> "REAL")
+
+  /** Version 8: MSL altitudes computed after their fixes were saved
+    * (derived data, joined to `fixes` by time while the fixes are in SQLite;
+    * see [[MslAltitude]] in the app). Not archived.
+    */
+  val CreateFixMsl: String = "CREATE TABLE IF NOT EXISTS fix_msl(time INTEGER NOT NULL, msl REAL NOT NULL, msl_acc REAL)"
 
   /** Version 8: barometric pressure ([[PressureSample]]). */
   val CreatePressure: String = "CREATE TABLE IF NOT EXISTS pressure(time INTEGER NOT NULL, hpa REAL NOT NULL)"
@@ -53,6 +61,10 @@ object DbSchema:
   def toV7(battery: Set[String], energyState: Set[String] = Set.empty): Seq[String] =
     BatteryColumns.filterNot((n, _) => battery(n)).map((n, t) => s"ALTER TABLE battery ADD COLUMN $n $t") ++
       Seq(CreateEnergyState, "CREATE INDEX IF NOT EXISTS energy_state_start ON energy_state(start)") ++
+      // A pre-release build created the table without these.
+      Seq("boot", "seq").filter(c => energyState.nonEmpty && !energyState(c))
+        .map(c => s"ALTER TABLE energy_state ADD COLUMN $c INTEGER NOT NULL DEFAULT 0") ++
+      Seq("CREATE INDEX IF NOT EXISTS energy_state_boot ON energy_state(boot, seq)") ++
       // A pre-release build created the table without it.
       Option.when(energyState.nonEmpty && !energyState("end_unknown"))(
         "ALTER TABLE energy_state ADD COLUMN end_unknown INTEGER NOT NULL DEFAULT 0") ++
@@ -67,7 +79,8 @@ object DbSchema:
   /** From version 7 to 8. `fixes`: the columns `fixes` has now. */
   def toV8(fixes: Set[String]): Seq[String] =
     FixColumns.filterNot((n, _) => fixes(n)).map((n, t) => s"ALTER TABLE fixes ADD COLUMN $n $t") ++
-      Seq(CreatePressure, "CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)", CreateDeletedRange)
+      Seq(CreatePressure, "CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)", CreateDeletedRange,
+        CreateFixMsl, "CREATE INDEX IF NOT EXISTS fix_msl_time ON fix_msl(time)")
 
   /** Which rows of an archived table archiving takes (an SQL condition):
     * all but the open span of `energy_state`, which stays in SQLite until

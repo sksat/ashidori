@@ -4,7 +4,8 @@ import java.time.ZoneOffset
 import scala.collection.mutable.ArrayBuffer
 
 /** State changes reach the table once and in order whatever happens to the
-  * records that carry them: dropped, failed, sent twice, imported late.
+  * records that carry them: dropped, failed, sent twice, imported late,
+  * across restarts, with a clock that goes back.
   */
 class EnergyLogSuite extends munit.FunSuite:
   private val zone = ZoneOffset.UTC
@@ -12,38 +13,39 @@ class EnergyLogSuite extends munit.FunSuite:
   private def st(i: Int) = EnergyState(i % 2 == 0, 1000L * (i + 1), "gps", false, i % 3 == 0, i % 2 == 1, false,
     "balanced", "balanced", "Walking", "Outdoor")
 
-  /** The table as the app keeps it: closed rows and the open one(s). */
+  /** The table as the app keeps it, applying a record as Db.applyEnergy does. */
   private final class Store(deleted: Seq[(Long, Long)] = Nil):
-    val closed = ArrayBuffer.empty[EnergyRow]
-    var open = Vector.empty[EnergyRow]
-    var cp: Option[EnergyCheckpoint] = None
+    var rows = Vector.empty[EnergyRow]
+    val cps = scala.collection.mutable.Map.empty[Long, EnergyCheckpoint]
+    private var nextId = 1L
     def apply(r: SmallRecord.Energy): Unit =
-      EnergyLog.apply(open, cp, r, zone, deleted).foreach { ch =>
-        if ch.replaceOpen then
-          open = ch.insert.filter(_.end.isEmpty).toVector
-          closed ++= ch.insert.filter(_.end.isDefined)
-        cp = Some(ch.checkpoint)
+      val b = r.boot
+      val tail = rows.filter(_.boot == b).sortBy(x => (x.seq, x.start)).lastOption
+      val newest = cps.keys.maxOption.forall(_ <= b)
+      val olderOpen = if newest then rows.filter(x => x.end.isEmpty && x.boot < b).map(x => (x, cps.get(x.boot).map(_.confirmedAt))) else Nil
+      val ch = EnergyLog.apply(EnergyLog.Before(tail, cps.get(b), newest, olderOpen), r, zone, deleted)
+      rows = rows.filterNot(x => ch.remove.contains(x.id)) ++ ch.insert.map { x =>
+        nextId += 1
+        x.copy(id = nextId)
       }
-    def rows: Seq[(Long, Option[Long], EnergyState, Boolean)] =
-      (closed ++ open).sortBy(r => (r.start, r.end.getOrElse(Long.MaxValue))).map(r => (r.start, r.end, r.state, r.endUnknown)).toSeq
+      cps(b) = ch.checkpoint
+    def view: Seq[(Long, Option[Long], EnergyState, Boolean)] =
+      rows.sortBy(r => (r.start, r.end.getOrElse(Long.MaxValue))).map(r => (r.start, r.end, r.state, r.endUnknown))
 
   test("a lost record is covered by the next; a late or repeated one changes nothing") {
     val s = Store()
-    val t = EnergyTracker("0000000000001-a")
+    val t = EnergyTracker(1)
     t.update(100, Some(st(1)))
     val r1 = t.record(100)
     t.update(200, Some(st(2)))
     val r2 = t.record(200)
     t.update(300, Some(st(3)))
     val r3 = t.record(300)
-    // r1 dropped (queue full), r2 failed: neither confirmed. r3 carries all three.
     assertEquals(r3.transitions.map(_.seq), Seq(1L, 2L, 3L))
     s(r3)
     t.confirmed(3)
-    // r1 and r2 come back later from their overflow files, and r3 again.
     s(r2); s(r1); s(r3)
-    assertEquals(s.rows, Seq((100L, Some(200L), st(1), false), (200L, Some(300L), st(2), false), (300L, None, st(3), false)))
-    // Confirmed changes are not sent again.
+    assertEquals(s.view, Seq((100L, Some(200L), st(1), false), (200L, Some(300L), st(2), false), (300L, None, st(3), false)))
     assertEquals(t.record(400).transitions, Nil)
   }
 
@@ -51,7 +53,7 @@ class EnergyLogSuite extends munit.FunSuite:
     val rnd = scala.util.Random(7)
     for round <- 0 until 50 do
       val s = Store()
-      val t = EnergyTracker(f"$round%013d-x")
+      val t = EnergyTracker(1)
       val late = ArrayBuffer.empty[SmallRecord.Energy]
       val truth = ArrayBuffer.empty[(Long, EnergyState)]
       var now = 1_000L
@@ -64,78 +66,118 @@ class EnergyLogSuite extends munit.FunSuite:
         truth += now -> st(i)
         val r = t.record(now)
         rnd.nextInt(4) match
-          case 0 => ()                    // dropped
-          case 1 => late += r             // kept in a file, imported later
+          case 0 => ()
+          case 1 => late += r
           case _ =>
             s(r)
-            if rnd.nextBoolean() then s(r) // sent twice
+            if rnd.nextBoolean() then s(r)
             r.transitions.lastOption.foreach(x => t.confirmed(x.seq))
-      // A heartbeat that is stored, then the late ones in any order.
       val hb = t.record(now + 10)
       s(hb)
       hb.transitions.lastOption.foreach(x => t.confirmed(x.seq))
       rnd.shuffle(late.toSeq).foreach(s(_))
       val expected = truth.zip(truth.drop(1).map(x => Some(x._1)) :+ None).map { case ((a, x), b) => (a, b, x, false) }
-      assertEquals(s.rows, expected.toSeq, s"round $round")
+      assertEquals(s.view, expected.toSeq, s"round $round")
   }
 
   test("a new process closes the previous one's open row at its last confirmation, marked unknown") {
     val s = Store()
-    val a = EnergyTracker("0000000000001-a")
+    val a = EnergyTracker(1)
     a.update(100, Some(st(1)))
     s(a.record(100))
     s(a.record(500)) // heartbeat
-    // Process A is killed; B starts.
-    val b = EnergyTracker("0000000000900-b")
+    val b = EnergyTracker(2)
     b.update(1000, Some(st(2)))
     s(b.record(1000))
-    assertEquals(s.rows, Seq((100L, Some(500L), st(1), true), (1000L, None, st(2), false)))
-    // A record of A that comes late (from its overflow file) is ignored.
-    a.update(700, Some(st(3)))
-    s(a.record(700))
-    assertEquals(s.rows, Seq((100L, Some(500L), st(1), true), (1000L, None, st(2), false)))
+    assertEquals(s.view, Seq((100L, Some(500L), st(1), true), (1000L, None, st(2), false)))
+  }
+
+  test("an earlier process's records imported after the next one wrote are put in place, not dropped") {
+    val s = Store()
+    val a = EnergyTracker(1)
+    a.update(100, Some(st(1)))
+    s(a.record(100))
+    // Process 1's later changes only reached overflow files: 60 of them
+    // (more than one import pass takes), then it was killed.
+    val spilled = ArrayBuffer.empty[SmallRecord.Energy]
+    for i <- 1 to 60 do
+      a.update(100 + i * 10L, Some(st(i % 5 + 1)))
+      spilled += a.record(100 + i * 10L)
+    // Process 2 starts and stores first.
+    val b = EnergyTracker(2)
+    b.update(5000, Some(st(4)))
+    s(b.record(5000))
+    assertEquals(s.view.head, (100L, Some(100L), st(1), true))
+    // The import comes in passes of up to 50 files, between process 2's records.
+    spilled.take(50).foreach(s(_))
+    b.update(6000, Some(st(5)))
+    s(b.record(6000))
+    spilled.drop(50).foreach(s(_))
+    val one = s.view.filter(_._1 < 5000)
+    assertEquals(one.size, 61)
+    // In order, each until the next, the last until process 1's last confirmation.
+    assertEquals(one.map(_._1), (0 to 60).map(i => 100 + i * 10L))
+    assertEquals(one.init.map(_._4), Seq.fill(60)(false))
+    assertEquals(one.last, (700L, Some(700L), st(60 % 5 + 1), true))
+    assertEquals(s.view.filter(_._1 >= 5000), Seq((5000L, Some(6000L), st(4), false), (6000L, None, st(5), false)))
+  }
+
+  test("a clock that goes back: changes stay in order, and a restart with an earlier clock is accepted") {
+    val s = Store()
+    val a = EnergyTracker(1)
+    a.update(10_000, Some(st(1)))
+    a.update(9_000, Some(st(2)))  // the clock went back a second
+    a.update(9_500, Some(st(3)))
+    s(a.record(9_500))
+    assertEquals(s.view, Seq((10_000L, Some(10_000L), st(1), false), (10_000L, Some(10_000L), st(2), false),
+      (10_000L, None, st(3), false)))
+    // Restart with the clock an hour earlier: still the later process.
+    val b = EnergyTracker(2)
+    b.update(2_000, Some(st(4)))
+    s(b.record(2_000))
+    assert(s.view.contains((2_000L, None, st(4), false)), s.view.toString)
+    assert(s.view.contains((10_000L, Some(10_000L), st(3), true)), s.view.toString)
   }
 
   test("without any confirmation, the leftover is zero length and marked unknown") {
     val s = Store()
-    s.open = Vector(EnergyRow(100, None, st(1)))
-    val b = EnergyTracker("0000000000900-b")
+    s.rows = Vector(EnergyRow(100, None, st(1), id = 1))
+    val b = EnergyTracker(2)
     b.update(1000, Some(st(2)))
     s(b.record(1000))
-    assertEquals(s.rows.head, (100L, Some(100L), st(1), true))
+    assertEquals(s.view.head, (100L, Some(100L), st(1), true))
   }
 
   test("an open row is closed at each midnight the state was confirmed past") {
     val s = Store()
-    val t = EnergyTracker("0000000000001-a")
-    val start = 10 * Day - 3_600_000L // 23:00
+    val t = EnergyTracker(1)
+    val start = 10 * Day - 3_600_000L
     t.update(start, Some(st(1)))
     s(t.record(start))
-    s(t.record(start + 30 * 60_000L)) // still the same day: nothing closed
+    s(t.record(start + 30 * 60_000L))
     assertEquals(s.rows.size, 1)
-    s(t.record(12 * Day + 60_000L)) // two midnights later
-    assertEquals(s.rows, Seq((start, Some(10 * Day), st(1), false), (10 * Day, Some(11 * Day), st(1), false),
+    s(t.record(12 * Day + 60_000L))
+    assertEquals(s.view, Seq((start, Some(10 * Day), st(1), false), (10 * Day, Some(11 * Day), st(1), false),
       (11 * Day, Some(12 * Day), st(1), false), (12 * Day, None, st(1), false)))
   }
 
   test("nothing is written into a deleted range") {
     val s = Store(deleted = Seq((150L, 250L)))
-    val t = EnergyTracker("0000000000001-a")
+    val t = EnergyTracker(1)
     t.update(100, Some(st(1)))
     t.update(200, Some(st(2)))
     t.update(300, Some(st(3)))
     s(t.record(300))
-    assertEquals(s.rows, Seq((100L, Some(150L), st(1), false), (250L, Some(300L), st(2), false), (300L, None, st(3), false)))
-    // A range not over yet: the open row inside it waits.
+    assertEquals(s.view, Seq((100L, Some(150L), st(1), false), (250L, Some(300L), st(2), false), (300L, None, st(3), false)))
     val u = Store(deleted = Seq((500L, 10_000L)))
-    val v = EnergyTracker("0000000000001-a")
+    val v = EnergyTracker(1)
     v.update(600, Some(st(1)))
     u(v.record(600))
-    assertEquals(u.rows, Nil)
+    assertEquals(u.view, Nil)
   }
 
   test("the tracker keeps at most maxPending changes and counts the rest") {
-    val t = EnergyTracker("t", maxPending = 3)
+    val t = EnergyTracker(1, maxPending = 3)
     for i <- 1 to 5 do t.update(i * 10L, Some(st(i)))
     assertEquals(t.record(100).transitions.map(_.seq), Seq(3L, 4L, 5L))
     assertEquals(t.dropped, 2L)
@@ -143,7 +185,7 @@ class EnergyLogSuite extends munit.FunSuite:
   }
 
   test("records round-trip through their overflow line") {
-    val t = EnergyTracker("0000000000001-a")
+    val t = EnergyTracker(42)
     t.update(100, Some(st(1)))
     t.update(200, None)
     val r = t.record(250)
@@ -152,8 +194,8 @@ class EnergyLogSuite extends munit.FunSuite:
     val back = SmallRecord.decode(SmallRecord.encode(fx)).asInstanceOf[SmallRecord.Fixes].fixes.head
     assertEquals((back.time, back.lat, back.msl, back.provider, back.satellites), (1_760_000_000_123L, 35.5, 41.5, "gps", 12))
     assert(back.altitude.isNaN && back.speed.isNaN && back.altAccuracy.isNaN)
-    val b: SmallRecord.Battery = new SmallRecord.Battery(BatteryReading(5L, 80, true, false, "eco", Some(3_000_000L), Some(-5), None, Some(4000), Float.NaN,
-      Some("usb")), "GNSS 10 秒間隔")
+    val b: SmallRecord.Battery = new SmallRecord.Battery(BatteryReading(5L, 80, true, false, "eco", Some(3_000_000L), Some(-5), None,
+      Some(4000), Float.NaN, Some("usb")), "GNSS 10 秒間隔")
     val bb = SmallRecord.decode(SmallRecord.encode(b)).asInstanceOf[SmallRecord.Battery]
     assertEquals((bb.reading.copy(tempC = 0f), bb.plan), (b.reading.copy(tempC = 0f), b.plan))
     for r <- Seq(SmallRecord.Motion(Seq(MotionWindow(1, 2, 0.5f, 0.1f, 3))), SmallRecord.Pressure(Seq(PressureSample(9, 1001.5f))),

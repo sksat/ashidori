@@ -5,50 +5,67 @@ import scala.collection.mutable.ArrayBuffer
 
 /** A row of `energy_state`: open (`end` None: the current state) or closed.
   * `endUnknown`: the state was last confirmed at `end`; when it really ended
-  * is not known (the process ended without closing it).
+  * is not known (the process ended without closing it). `boot` and `seq`
+  * name the state change that started it (kept in SQLite only); `id` is the
+  * rowid (0 for a row not stored yet).
   */
-final case class EnergyRow(start: Long, end: Option[Long], state: EnergyState, endUnknown: Boolean = false):
+final case class EnergyRow(start: Long, end: Option[Long], state: EnergyState, endUnknown: Boolean = false,
+                           boot: Long = 0L, seq: Long = 0L, id: Long = 0L):
   def span: EnergySpan = EnergySpan(start, end.getOrElse(start), state, !endUnknown)
 
-/** The last record of state changes applied: the recorder (`token`, one
-  * per process, ordered by start time), its last change applied (`seq`),
+/** What one recorder (`boot`: one per process, numbered in start order by
+  * a counter kept on disk) has had stored: its last change applied (`seq`)
   * and when its state was last confirmed and stored (`confirmedAt`).
   */
-final case class EnergyCheckpoint(token: String, seq: Long, confirmedAt: Long)
+final case class EnergyCheckpoint(boot: Long, seq: Long, confirmedAt: Long)
 
 /** How a record of state changes ([[SmallRecord.Energy]]) changes the
-  * `energy_state` table. Pure: the app runs it in one transaction with the
-  * open rows and the checkpoint it reads, the tests against a model.
+  * `energy_state` table. Pure: the app runs it in one transaction with what
+  * it reads ([[Before]]), the tests against a model.
   *
-  *  - Changes at or below the checkpoint's `seq` of the same recorder were
-  *    applied before: a record sent again (a retry, a copy imported from
-  *    its overflow file) changes nothing twice.
-  *  - The first record of a new recorder (a new process) closes what the
-  *    previous one left open at the previous checkpoint's `confirmedAt`,
-  *    marked `endUnknown`; with no checkpoint, at its start (zero length,
-  *    still marked unknown, never mistaken for a real zero-length span).
-  *  - A record of an older recorder than the checkpoint's is ignored: its
-  *    process is over and its spans were closed when the next one started.
-  *  - The open row is closed at every local midnight up to `confirmedAt`
-  *    (and reopened at midnight), so no row stays open across days.
-  *  - Rows are never updated: the open row is replaced (deleted, and the
-  *    result inserted with new rowids; see [[DbSchema.archivable]]).
-  *  - Nothing is written inside a deleted range ([[deleted]]): rows are cut
-  *    at its edges.
+  * The history is each recorder's changes in `seq` order, the recorders in
+  * `boot` order. Each recorder's rows depend only on its own changes and
+  * checkpoint, so records may arrive in any order:
+  *  - Changes at or below the recorder's checkpoint `seq` were applied
+  *    before: a record sent again, or a copy imported from its overflow
+  *    file, changes nothing twice.
+  *  - Changes that come late are inserted where they belong: the
+  *    recorder's last row is re-closed at the first of them, and the rest
+  *    follow. A record of an earlier recorder that comes after a later one
+  *    stored its rows is applied the same way, never dropped.
+  *  - A recorder that is not the latest is over: its last row is closed at
+  *    its `confirmedAt`, marked `endUnknown`. When a later recorder stores
+  *    its first record, the earlier ones' open rows are closed so.
+  *  - A change is never earlier than the one before it of the same
+  *    recorder (a clock that went back starts it at the previous one's
+  *    time instead). Recorders are ordered by their counter, not by clock
+  *    times, so a clock going back across a restart does not reorder them.
+  *  - The latest recorder's open row is closed at every local midnight up
+  *    to `confirmedAt` (and reopened at midnight): no row stays open across
+  *    days.
+  *  - Rows are never updated: a row that changes is deleted and inserted
+  *    anew with a new rowid ([[DbSchema.archivable]]).
+  *  - Nothing is written inside a deleted range: rows are cut at its edges.
   */
 object EnergyLog:
-  /** `replaceOpen`: delete the open rows and insert `insert` (closed and
-    * open rows); otherwise only the checkpoint changes.
+  /** The table as far as a record of one recorder touches it. `tail`: the
+    * recorder's last row (by seq, then start); `newest`: no later recorder
+    * stored anything; `olderOpen`: open rows of earlier recorders, with
+    * their recorders' `confirmedAt` if known.
     */
-  final case class Change(replaceOpen: Boolean, insert: Seq[EnergyRow], checkpoint: EnergyCheckpoint)
+  final case class Before(tail: Option[EnergyRow], checkpoint: Option[EnergyCheckpoint], newest: Boolean,
+                          olderOpen: Seq[(EnergyRow, Option[Long])] = Nil)
+
+  /** Rows to delete (by id), rows to insert, and the recorder's new checkpoint. */
+  final case class Change(remove: Seq[Long], insert: Seq[EnergyRow], checkpoint: EnergyCheckpoint)
 
   private def midnightOf(t: Long, zone: ZoneId): Long =
     Instant.ofEpochMilli(t).atZone(zone).toLocalDate.atStartOfDay(zone).toInstant.toEpochMilli
 
-  /** Closed rows of [start, end), cut at local midnights; the last one marked unknown if asked. */
-  private def closed(start: Long, end: Long, state: EnergyState, unknown: Boolean, zone: ZoneId): Seq[EnergyRow] =
-    val parts = EnergySpan.splitDays(EnergySpan(start, math.max(start, end), state), zone)
-    parts.zipWithIndex.map((p, i) => EnergyRow(p.start, Some(p.end), state, unknown && i == parts.size - 1))
+  /** Closed rows of [r.start, end), cut at local midnights; the last one marked unknown if asked. */
+  private def closed(r: EnergyRow, end: Long, unknown: Boolean, zone: ZoneId): Seq[EnergyRow] =
+    val parts = EnergySpan.splitDays(EnergySpan(r.start, math.max(r.start, end), r.state), zone)
+    parts.zipWithIndex.map((p, i) => r.copy(start = p.start, end = Some(p.end), endUnknown = unknown && i == parts.size - 1, id = 0L))
 
   /** Rows cut out of the deleted ranges. An open row starting inside one
     * starts at its end, or is dropped if that end is not reached yet.
@@ -59,61 +76,63 @@ object EnergyLog:
         val end = r.end.getOrElse(Long.MaxValue)
         if end <= a || r.start >= b then Seq(r)
         else
-          val before = Option.when(r.start < a)(r.copy(end = Some(a), endUnknown = false))
+          val before = Option.when(r.start < a)(r.copy(end = Some(a), endUnknown = false, id = 0L))
           val after =
             if end <= b then None
-            else if r.end.isEmpty then Option.when(b <= now)(r.copy(start = b))
-            else Some(r.copy(start = b))
+            else if r.end.isEmpty then Option.when(b <= now)(r.copy(start = b, id = 0L))
+            else Some(r.copy(start = b, id = 0L))
           before.toSeq ++ after.toSeq
       }
     }
 
-  def apply(open: Seq[EnergyRow], cp: Option[EnergyCheckpoint], r: SmallRecord.Energy, zone: ZoneId,
-            deleted: Seq[(Long, Long)] = Nil): Option[Change] =
-    if cp.exists(_.token > r.token) then return None
-    val same = cp.exists(_.token == r.token)
+  def apply(before: Before, r: SmallRecord.Energy, zone: ZoneId, deleted: Seq[(Long, Long)] = Nil): Change =
+    val b = r.boot
+    val seq0 = before.checkpoint.map(_.seq).getOrElse(0L)
+    val conf0 = before.checkpoint.map(_.confirmedAt).getOrElse(Long.MinValue)
+    val ts = r.transitions.filter(_.seq > seq0).sortBy(_.seq)
+    val confirmedIn = Seq(conf0, r.confirmedAt) ++ ts.map(_.at)
+    // The row new changes or a later confirmation extend: the recorder's
+    // open row, or its last row closed only provisionally (unknown end).
+    val tail = before.tail
+    val start: Option[EnergyRow] = tail.filter(t => t.end.isEmpty ||
+      (t.endUnknown && (ts.nonEmpty || (!before.newest && confirmedIn.max > t.end.get))))
     val out = ArrayBuffer.empty[EnergyRow]
-    var cur: Vector[EnergyRow] = open.toVector
-    var changed = false
-    def closeAll(at: Long, unknown: Boolean): Unit =
-      for o <- cur do out ++= closed(o.start, at, o.state, unknown, zone)
-      if cur.nonEmpty then changed = true
-      cur = Vector.empty
-    if !same then
-      // The previous process's open rows: confirmed until its checkpoint.
-      val at = cp.map(_.confirmedAt).getOrElse(Long.MinValue)
-      for o <- cur do out ++= closed(o.start, math.max(o.start, at), o.state, unknown = true, zone)
-      if cur.nonEmpty then changed = true
-      cur = Vector.empty
-    var seq = if same then cp.get.seq else 0L
-    var confirmed = if same then cp.get.confirmedAt else Long.MinValue
-    for t <- r.transitions.sortBy(_.seq) if t.seq > seq do
-      val start = (cur.map(_.start) :+ t.at).max
-      closeAll(start, unknown = false)
-      t.state.foreach { s =>
-        cur = Vector(EnergyRow(start, None, s))
-        changed = true
+    var cur = start
+    var lastAt = tail.map(_.start).getOrElse(Long.MinValue)
+    for t <- ts do
+      val at = math.max(t.at, lastAt)
+      cur.foreach(c => out ++= closed(c, at, unknown = false, zone))
+      cur = t.state.map(s => EnergyRow(at, None, s, boot = b, seq = t.seq))
+      lastAt = at
+    val confirmed = (confirmedIn :+ lastAt).max
+    val remove = ArrayBuffer.empty[Long]
+    start.foreach(s => if s.id != 0 then remove += s.id)
+    if before.newest then
+      // Still in the state at `confirmed`: closed at each midnight before it.
+      cur = cur.map { o =>
+        val m = midnightOf(confirmed, zone)
+        if o.start < m then
+          out ++= closed(o, m, unknown = false, zone)
+          o.copy(start = m, id = 0L)
+        else o
       }
-      seq = t.seq
-      confirmed = math.max(confirmed, t.at)
-    confirmed = math.max(confirmed, r.confirmedAt)
-    // Still in the state at `confirmed`: closed at each midnight before it.
-    cur = cur.flatMap { o =>
-      val m = midnightOf(confirmed, zone)
-      if o.start < m then
-        out ++= closed(o.start, m, o.state, unknown = false, zone)
-        changed = true
-        Seq(EnergyRow(m, None, o.state))
-      else Seq(o)
-    }
-    // No open row (a deleted range took it) while the recorder is in a state.
-    if cur.isEmpty && !changed && r.current.isDefined && open.isEmpty && same then
-      cur = Vector(EnergyRow(confirmed, None, r.current.get))
-      changed = true
+      // The earlier recorders are over.
+      for (o, at) <- before.olderOpen do
+        remove += o.id
+        out ++= closed(o, at.getOrElse(o.start), unknown = true, zone)
+      // No open row (a deleted range took it) while the recorder is in a state.
+      if cur.isEmpty && ts.isEmpty && tail.forall(_.end.isDefined) && r.current.isDefined then
+        cur = Some(EnergyRow(confirmed, None, r.current.get, boot = b, seq = seq0))
+    else
+      // A later recorder exists: this one's last state lasted at least until `confirmed`.
+      cur.foreach(c => out ++= closed(c, confirmed, unknown = true, zone))
+      cur = None
     val rows = clip((out ++ cur).toSeq, deleted, confirmed)
-    val clipped = rows != (out ++ cur).toSeq
-    Some(Change(changed || clipped, if changed || clipped then rows else Nil,
-      EnergyCheckpoint(r.token, seq, if same then math.max(cp.get.confirmedAt, confirmed) else confirmed)))
+    val cp = EnergyCheckpoint(b, ts.lastOption.fold(seq0)(_.seq), confirmed)
+    // Nothing changed but the checkpoint (a heartbeat): leave the rows alone.
+    if remove.size == 1 && start.exists(s => rows == Seq(s)) && before.olderOpen.isEmpty then Change(Nil, Nil, cp)
+    else if remove.isEmpty && rows.isEmpty then Change(Nil, Nil, cp)
+    else Change(remove.toSeq, rows.map(_.copy(id = 0L)), cp)
 
 /** The recorder's side: the state changes not confirmed as stored yet, in
   * order. Every record it hands over carries all of them, so a record that
@@ -121,7 +140,7 @@ object EnergyLog:
   * late is a no-op ([[EnergyLog]]). At most `maxPending` are kept; older
   * ones beyond that are dropped and counted.
   */
-final class EnergyTracker(val token: String, maxPending: Int = 2000):
+final class EnergyTracker(val boot: Long, maxPending: Int = 2000):
   private var seq = 0L
   private var state: Option[EnergyState] = None
   private val pending = ArrayBuffer.empty[EnergyTransition]
@@ -150,13 +169,9 @@ final class EnergyTracker(val token: String, maxPending: Int = 2000):
   def record(now: Long): SmallRecord.Energy =
     val c = confirmedSeq
     pending.filterInPlace(_.seq > c)
-    SmallRecord.Energy(token, pending.toVector, now, state)
+    SmallRecord.Energy(boot, pending.toVector, now, state)
 
   /** The record holding changes up to `seq` is stored (any thread). */
   def confirmed(upTo: Long): Unit = synchronized { if upTo > confirmedSeq then confirmedSeq = upTo }
 
   def unconfirmed: Int = pending.count(_.seq > confirmedSeq)
-
-object EnergyTracker:
-  /** A token that sorts after those of earlier processes. */
-  def newToken(now: Long): String = f"$now%013d-${java.util.UUID.randomUUID().toString.take(8)}"

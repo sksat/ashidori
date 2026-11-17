@@ -2,8 +2,8 @@ package ashidori.core
 
 /** One state change of the logger for the `energy_state` table: from `at`
   * the logger is in `state` (None: stopped). `seq` orders the changes of
-  * one recorder (one process, identified by a token) and makes applying
-  * them again a no-op.
+  * one recorder (one process, numbered by its boot counter) and makes
+  * applying them again a no-op.
   */
 final case class EnergyTransition(seq: Long, at: Long, state: Option[EnergyState])
 
@@ -23,7 +23,7 @@ enum SmallRecord:
   /** State changes not yet confirmed (in order), and the time the current
     * state was last confirmed (`current`; None when stopped).
     */
-  case Energy(token: String, transitions: Seq[EnergyTransition], confirmedAt: Long, current: Option[EnergyState])
+  case Energy(boot: Long, transitions: Seq[EnergyTransition], confirmedAt: Long, current: Option[EnergyState])
   /** MSL altitudes computed after their fixes were saved: (fix time, msl, accuracy). */
   case FixMsl(values: Seq[(Long, Double, Float)])
 
@@ -78,7 +78,7 @@ object SmallRecord:
         Obj("t" -> "gnss_status", "v" -> Arr(l(t), Num(vis), Num(used), d(top4), Num(l5), env, f(acc)))
       case RawSession(s, e, file, reason) => Obj("t" -> "raw_session", "v" -> Arr(l(s), l(e), file, reason))
       case Pressure(ps) => Obj("t" -> "pressure", "v" -> Arr.from(ps.map(p => Arr(l(p.time), f(p.hPa)))))
-      case Energy(token, ts, at, cur) => Obj("t" -> "energy", "token" -> token, "at" -> l(at), "current" -> cur.fold(Null)(state),
+      case Energy(boot, ts, at, cur) => Obj("t" -> "energy", "boot" -> l(boot), "at" -> l(at), "current" -> cur.fold(Null)(state),
         "v" -> Arr.from(ts.map(x => Arr(l(x.seq), l(x.at), x.state.fold(Null)(state)))))
       case FixMsl(vs) => Obj("t" -> "fix_msl", "v" -> Arr.from(vs.map((t, m, a) => Arr(l(t), d(m), f(a)))))
     ujson.write(o)
@@ -98,7 +98,7 @@ object SmallRecord:
       case "gnss_status" => GnssStatus(gl(v(0)), v(1).num.toInt, v(2).num.toInt, gd(v(3)), v(4).num.toInt, v(5).str, gf(v(6)))
       case "raw_session" => RawSession(gl(v(0)), gl(v(1)), v(2).str, v(3).str)
       case "pressure" => Pressure(v.arr.toSeq.map(a => PressureSample(gl(a(0)), gf(a(1)))))
-      case "energy" => Energy(o("token").str, v.arr.toSeq.map(a => EnergyTransition(gl(a(0)), gl(a(1)),
+      case "energy" => Energy(gl(o("boot")), v.arr.toSeq.map(a => EnergyTransition(gl(a(0)), gl(a(1)),
         if a(2).isNull then None else Some(stateOf(a(2))))), gl(o("at")), if o("current").isNull then None else Some(stateOf(o("current"))))
       case "fix_msl" => FixMsl(v.arr.toSeq.map(a => (gl(a(0)), gd(a(1)), gf(a(2)))))
       case other => throw IllegalArgumentException(s"record type $other")

@@ -294,29 +294,49 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv
 
   /** Applies a record of the logger's state changes ([[EnergyLog]]): in
-    * one transaction with the open rows and the checkpoint it reads. A
-    * closed or replaced open row is deleted and inserted anew with new
-    * rowids, never updated ([[DbSchema.archivable]]).
+    * one transaction with the rows and checkpoints it reads. A row that
+    * changes is deleted and inserted anew with a new rowid, never updated
+    * ([[DbSchema.archivable]]).
     */
   def applyEnergy(r: SmallRecord.Energy): Unit = tx { db =>
-    val open = openEnergy()
-    EnergyLog.apply(open.map(_._2), energyCheckpoint(), r, AshidoriApp.zone, deletedRanges()).foreach { ch =>
-      if ch.replaceOpen then
-        for (rowid, _) <- open do db.delete("energy_state", "rowid=? AND end IS NULL", Array(rowid.toString))
-        var id = claimRowids(db, "energy_state", ch.insert.size)
-        for row <- ch.insert do
-          val cv = energyValues(row.state)
-          cv.put("rowid", java.lang.Long.valueOf(id))
-          id += 1
-          cv.put("start", java.lang.Long.valueOf(row.start))
-          row.end.foreach(e => cv.put("end", java.lang.Long.valueOf(e)))
-          cv.put("end_unknown", java.lang.Integer.valueOf(if row.endUnknown then 1 else 0))
-          db.insertOrThrow("energy_state", null, cv)
-      val c = ch.checkpoint
-      db.execSQL("INSERT OR REPLACE INTO energy_checkpoint(id, token, seq, confirmed_at) VALUES(0, ?, ?, ?)",
-        Array[AnyRef](c.token, java.lang.Long.valueOf(c.seq), java.lang.Long.valueOf(c.confirmedAt)))
-    }
+    val b = r.boot
+    val tail = query(s"SELECT rowid,$energyCols FROM energy_state WHERE boot=? ORDER BY seq DESC, start DESC LIMIT 1", b) { c =>
+      rowOf(c, 1).copy(id = c.getLong(0))
+    }.headOption
+    val cp = query("SELECT boot, seq, confirmed_at FROM energy_checkpoint WHERE boot=?", b)(c =>
+      EnergyCheckpoint(c.getLong(0), c.getLong(1), c.getLong(2))).headOption
+    val newest = energyMaxBoot() <= b
+    val olderOpen =
+      if !newest then Nil
+      else
+        query(s"""SELECT rowid,$energyCols,(SELECT confirmed_at FROM energy_checkpoint k WHERE k.boot=energy_state.boot)
+          |FROM energy_state WHERE end IS NULL AND boot<?""".stripMargin, b) { c =>
+          (rowOf(c, 1).copy(id = c.getLong(0)), Option.when(!c.isNull(17))(c.getLong(17)))
+        }
+    val ch = EnergyLog.apply(EnergyLog.Before(tail, cp, newest, olderOpen), r, AshidoriApp.zone, deletedRanges())
+    for id <- ch.remove do db.delete("energy_state", "rowid=?", Array(id.toString))
+    insertEnergyRows(db, ch.insert)
+    val c = ch.checkpoint
+    db.execSQL("INSERT OR REPLACE INTO energy_checkpoint(boot, seq, confirmed_at) VALUES(?, ?, ?)",
+      Array[AnyRef](java.lang.Long.valueOf(c.boot), java.lang.Long.valueOf(c.seq), java.lang.Long.valueOf(c.confirmedAt)))
   }
+
+  private def insertEnergyRows(db: SQLiteDatabase, rows: Seq[EnergyRow]): Unit =
+    var id = claimRowids(db, "energy_state", rows.size)
+    for row <- rows do
+      val cv = energyValues(row.state)
+      cv.put("rowid", java.lang.Long.valueOf(id))
+      id += 1
+      cv.put("start", java.lang.Long.valueOf(row.start))
+      row.end.foreach(e => cv.put("end", java.lang.Long.valueOf(e)))
+      cv.put("end_unknown", java.lang.Integer.valueOf(if row.endUnknown then 1 else 0))
+      cv.put("boot", java.lang.Long.valueOf(row.boot))
+      cv.put("seq", java.lang.Long.valueOf(row.seq))
+      db.insertOrThrow("energy_state", null, cv)
+
+  /** The highest boot of the state recorder stored (0: none). */
+  def energyMaxBoot(): Long =
+    query("SELECT COALESCE(MAX(boot), 0) FROM energy_checkpoint")(_.getLong(0)).head
 
   /** Ranges the user deleted ([[deleteRange]]): nothing is written into
     * them again. Read once per process, kept up to date by deleteRange.
@@ -332,18 +352,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Whether time `t` lies outside every deleted range. */
   private def kept(t: Long): Boolean = Deletion.kept(deletedRanges(), t)
 
-  def energyCheckpoint(): Option[EnergyCheckpoint] =
-    query("SELECT token, seq, confirmed_at FROM energy_checkpoint WHERE id=0")(c =>
-      EnergyCheckpoint(c.getString(0), c.getLong(1), c.getLong(2))).headOption
-
-  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown"
+  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown,boot,seq"
   private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan = rowOf(c, at).span.copy(end = end)
   private def rowOf(c: Cursor, at: Int): EnergyRow =
     def s(i: Int) = Option(c.getString(at + i)).getOrElse("")
     EnergyRow(c.getLong(at), Option.when(!c.isNull(at + 1))(c.getLong(at + 1)),
       EnergyState(c.getInt(at + 2) != 0, c.getLong(at + 3), s(4), c.getInt(at + 5) != 0,
         c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)),
-      !c.isNull(at + 13) && c.getInt(at + 13) != 0)
+      !c.isNull(at + 13) && c.getInt(at + 13) != 0, c.getLong(at + 14), c.getLong(at + 15))
 
   /** Rows not closed yet: normally the current one; more after the process was killed. */
   private def openEnergy(): Vector[(Long, EnergyRow)] =
@@ -442,7 +458,13 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val (x, xa) = notPending("fixes")
     query(s"SELECT $fixCols FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*)(fixOf(_)).headOption
 
-  private val fixCols = "time,lat,lon,acc,alt,speed,bearing,provider,sats,alt_acc,msl,msl_acc"
+  /** The columns of a fix. The MSL altitude converted after the fix was
+    * saved is in `fix_msl` ([[updateFixMsl]]), joined here: derived data,
+    * never written into a fix row.
+    */
+  private val fixCols = "time,lat,lon,acc,alt,speed,bearing,provider,sats,alt_acc," +
+    "COALESCE(msl,(SELECT m.msl FROM fix_msl m WHERE m.time=fixes.time LIMIT 1))," +
+    "CASE WHEN msl IS NULL THEN (SELECT m.msl_acc FROM fix_msl m WHERE m.time=fixes.time LIMIT 1) ELSE msl_acc END"
   private def fixOf(c: Cursor, at: Int = 0): Fix =
     Fix(c.getLong(at), c.getDouble(at + 1), c.getDouble(at + 2), flt(c, at + 3), dbl(c, at + 4), flt(c, at + 5), flt(c, at + 6),
       c.getString(at + 7), c.getInt(at + 8), flt(c, at + 9), dbl(c, at + 10), flt(c, at + 11))
@@ -737,17 +759,21 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     db.execSQL("INSERT OR REPLACE INTO legacy_import(file, lines) VALUES(?, 1)", Array[AnyRef](key))
   }
 
-  /** MSL altitudes computed after their fixes were saved ([[MslAltitude]]).
-    * A fix already archived (or deleted) is left as it is.
+  /** MSL altitudes computed after their fixes were saved ([[MslAltitude]]):
+    * derived data, appended to `fix_msl` and joined to the fixes while they
+    * are in SQLite (also when a day is archived). A fix row is never
+    * written to, so archiving, which may have read the fix already, is not
+    * affected: an altitude that comes after its day was read is simply not
+    * in the archive (null there, shown as 「—」).
     */
   def updateFixMsl(vs: Seq[(Long, Double, Float)]): Unit = tx { db =>
-    val st = db.compileStatement("UPDATE fixes SET msl=?, msl_acc=? WHERE time=? AND msl IS NULL")
+    val st = db.compileStatement("INSERT INTO fix_msl(time, msl, msl_acc) VALUES(?, ?, ?)")
     try
-      for (t, m, a) <- vs if !m.isNaN do
-        st.bindDouble(1, m)
-        if a.isNaN then st.bindNull(2) else st.bindDouble(2, a.toDouble)
-        st.bindLong(3, t)
-        st.executeUpdateDelete()
+      for (t, m, a) <- vs if !m.isNaN && kept(t) do
+        st.bindLong(1, t)
+        st.bindDouble(2, m)
+        if a.isNaN then st.bindNull(3) else st.bindDouble(3, a.toDouble)
+        st.executeInsert()
     finally st.close()
   }
 
@@ -825,7 +851,13 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Deletes rows of an archived table in [from, to) up to `maxRowid`. */
   def deleteArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
     val col = Db.ArchivedTables(table)
-    deleteChunked(table, s"$col>=? AND $col<? AND rowid<=? AND ${DbSchema.archivable(table)}", Seq(from, to, maxRowid))
+    val n = deleteChunked(table, s"$col>=? AND $col<? AND rowid<=? AND ${DbSchema.archivable(table)}", Seq(from, to, maxRowid))
+    // The derived MSL altitudes of the archived fixes go with them, once
+    // none of the day's fixes is left in SQLite (an altitude that came
+    // after the archive read the fixes is dropped: it can be derived again).
+    if table == "fixes" && countArchived("fixes", from, to, Long.MaxValue) == 0 then
+      deleteChunked("fix_msl", "time>=? AND time<?", Seq(from, to))
+    n
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
     val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, Db.DeleteChunk))
@@ -1109,15 +1141,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       }
       val parts = EnergyLog.clip(crossing.map(_._2), Seq((from, to)), System.currentTimeMillis())
       for (rowid, _) <- crossing do db.delete("energy_state", "rowid=?", Array(rowid.toString))
-      var id = claimRowids(db, "energy_state", parts.size)
-      for row <- parts do
-        val cv = energyValues(row.state)
-        cv.put("rowid", java.lang.Long.valueOf(id))
-        id += 1
-        cv.put("start", java.lang.Long.valueOf(row.start))
-        row.end.foreach(e => cv.put("end", java.lang.Long.valueOf(e)))
-        cv.put("end_unknown", java.lang.Integer.valueOf(if row.endUnknown then 1 else 0))
-        db.insertOrThrow("energy_state", null, cv)
+      insertEnergyRows(db, parts)
+      db.delete("fix_msl", "time>=? AND time<?", a)
       // Raw-data sessions (not archived: updated in place).
       val sessions = query("SELECT rowid, start, end, file, reason FROM gnss_sessions WHERE start<? AND end>?", to, from) { c =>
         (c.getLong(0), c.getLong(1), c.getLong(2), c.getString(3), c.getString(4))
