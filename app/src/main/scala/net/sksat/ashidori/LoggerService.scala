@@ -56,7 +56,12 @@ class LoggerService extends Service:
   private lazy val energy = EnergyRecorder(this, bm, handler, () => plan.foreach(energyUpdate))
   /** Barometer and MSL altitude for the elevation estimate. */
   private lazy val pressure = PressureRecorder(sm, handler)
-  private lazy val mslAltitude = MslAltitude(this)
+  private lazy val mslAltitude = MslAltitude(this, handler, vs => handler.post { () =>
+    // The status screen's latest fixes get their MSL altitude too.
+    val byTime = vs.map((t, m, a) => t -> (m, a)).toMap
+    LoggerState.recentFixes = LoggerState.recentFixes.map(f =>
+      byTime.get(f.time).filter(_ => f.msl.isNaN).fold(f)((m, a) => f.copy(msl = m, mslAccuracy = a)))
+  })
 
   private var plan: Option[SamplingPlan] = None
   /** (provider, interval, batch, minDistance) currently registered */
@@ -191,6 +196,7 @@ class LoggerService extends Service:
       disarmSigMotion()
       accumulator.flush().foreach(pendingMotion += _)
       flush(force = true)
+      mslAltitude.close()
       // The barometer's FIFO is flushed and kept before the thread ends.
       pressure.stop(() => thread.quitSafely())
     }
@@ -440,7 +446,8 @@ class LoggerService extends Service:
 
   private def onLocations(ls: Seq[Location]): Unit =
     for l <- ls do
-      val (msl, mslAcc) = mslAltitude.of(l)
+      // Saved as it came; the MSL altitude follows when converted (MslAltitude).
+      val (msl, mslAcc) = mslAltitude.fromPlatform(l)
       val f = Fix(
         l.getTime,
         l.getLatitude,
@@ -456,6 +463,7 @@ class LoggerService extends Service:
         mslAccuracy = mslAcc
       )
       pendingFixes += f
+      if msl.isNaN then mslAltitude.request(l, f.time)
       LoggerState.recentFixes = (LoggerState.recentFixes :+ f).takeRight(600)
       recorder.foreach(_.onFix(l))
       if f.provider == LocationManager.GPS_PROVIDER then indoor.onFix(f.time)

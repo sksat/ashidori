@@ -128,30 +128,70 @@ final class PressureRecorder(sm: SensorManager, handler: Handler):
 object PressureRecorder:
   val FlushTimeoutMs: Long = 5_000L
 
-/** Altitude above mean sea level for fixes (Android 14+).
+/** Altitude above mean sea level for fixes (Android 14+), filled in after
+  * the fix is saved.
   *
   * Android reports the WGS84 ellipsoidal height; the geoid model of
   * `AltitudeConverter` gives the MSL altitude. It loads the model's tiles
-  * from the platform's assets on first use in an area (disk I/O, so never
-  * on the main thread) and keeps them cached; later conversions are
-  * arithmetic. A fix that already has an MSL altitude keeps it.
+  * from the platform's assets on first use in an area (disk I/O, which
+  * can take seconds), so it never runs on the logger's thread: the fix is
+  * saved as it came (MSL altitude null unless the platform gave one), and
+  * this thread converts a copy and saves the altitudes a few seconds later
+  * ([[SmallRecord.FixMsl]]). At most [[MaxQueued]] fixes wait; more are
+  * left without (counted). A fix archived or deleted meanwhile is left as
+  * it is.
   */
-final class MslAltitude(ctx: Context):
+final class MslAltitude(ctx: Context, handler: Handler, onConverted: Seq[(Long, Double, Float)] => Unit):
+  import MslAltitude.*
+  private val exec = java.util.concurrent.ThreadPoolExecutor(1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+    java.util.concurrent.ArrayBlockingQueue[Runnable](MaxQueued), (r: Runnable) => Thread(r, "ashidori-msl"),
+    (_: Runnable, _: java.util.concurrent.ThreadPoolExecutor) => skipped.incrementAndGet())
   private lazy val converter = android.location.altitude.AltitudeConverter()
+  private val done = ArrayBuffer.empty[(Long, Double, Float)]
   private var loggedFirst = false
+  /** Fixes left without an MSL altitude because too many waited. */
+  val skipped = java.util.concurrent.atomic.AtomicLong()
 
-  /** (MSL altitude, its accuracy), NaN where unknown. */
-  def of(l: Location): (Double, Float) =
-    if Build.VERSION.SDK_INT < 34 || !l.hasAltitude then (Double.NaN, Float.NaN)
-    else
-      if !l.hasMslAltitude then
+  /** The MSL altitude the platform already gave the fix, if any (NaN otherwise). */
+  def fromPlatform(l: Location): (Double, Float) =
+    if Build.VERSION.SDK_INT >= 34 && l.hasMslAltitude then
+      (l.getMslAltitudeMeters, if l.hasMslAltitudeAccuracy then l.getMslAltitudeAccuracyMeters else Float.NaN)
+    else (Double.NaN, Float.NaN)
+
+  /** Converts a copy of `l` (whose fix is saved with time `time`) on this thread. */
+  def request(l: Location, time: Long): Unit =
+    if Build.VERSION.SDK_INT >= 34 && l.hasAltitude && !l.hasMslAltitude then
+      val copy = Location(l)
+      exec.execute { () =>
         val t0 = SystemClock.elapsedRealtimeNanos()
-        try converter.addMslAltitudeToLocation(ctx, l)
+        try converter.addMslAltitudeToLocation(ctx, copy)
         catch
-          case e: java.io.IOException          => Log.w("MSL altitude: model not loaded", e)
-          case _: IllegalArgumentException     => ()
+          case e: java.io.IOException      => Log.w("MSL altitude: model not loaded", e)
+          case _: IllegalArgumentException => ()
         if !loggedFirst then
           loggedFirst = true
           Log.i(f"MSL altitude: first conversion took ${(SystemClock.elapsedRealtimeNanos() - t0) / 1e6}%.1f ms")
-      (if l.hasMslAltitude then l.getMslAltitudeMeters else Double.NaN,
-        if l.hasMslAltitudeAccuracy then l.getMslAltitudeAccuracyMeters else Float.NaN)
+        if copy.hasMslAltitude then
+          // Saved in batches: 50, or what is in [[FlushMs]] after the first.
+          if done.isEmpty then handler.postDelayed(saveLater, FlushMs)
+          done += ((time, copy.getMslAltitudeMeters, if copy.hasMslAltitudeAccuracy then copy.getMslAltitudeAccuracyMeters else Float.NaN))
+        if done.size >= 50 then save()
+      }
+
+  private val saveLater: Runnable = () => scala.util.Try(exec.execute(() => save()))
+
+  private def save(): Unit =
+    if done.nonEmpty then
+      val vs = done.toVector
+      done.clear()
+      LoggerWrites.small(SmallRecord.FixMsl(vs))
+      onConverted(vs)
+
+  /** Saves what is converted and ends the thread (the logger stopped). */
+  def close(): Unit =
+    scala.util.Try(exec.execute(() => save()))
+    exec.shutdown()
+
+object MslAltitude:
+  val MaxQueued = 600
+  val FlushMs: Long = 5_000L
