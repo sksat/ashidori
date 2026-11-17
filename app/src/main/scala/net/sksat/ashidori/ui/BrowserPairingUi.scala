@@ -48,7 +48,7 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
     val host = Try(java.net.URI(SyncConfig.serverUrl).getHost).toOption.flatMap(Option(_)).getOrElse(SyncConfig.serverUrl)
     val v = vbox(
       caption(s"・閲覧ページは $host が配信します。サーバの管理者がページを改変すると、記録を読まれる可能性があります。"),
-      caption("・ブラウザは、これまでと今後の記録をすべて読めます。期限後はサーバが記録を提供しませんが、持ち出された鍵では期限後も読めます。"),
+      caption("・この同期グループの、過去と今後に同期する記録を読めます。期限はサーバから取得できる期間です。持ち出された鍵は期限後や登録解除後も使えます。"),
       caption("・ブラウザは記録を書いた端末を確かめられません。鍵とサーバを悪用されると、ブラウザに偽の記録を見せられる可能性があります。承認の後にまだ同期していない端末のアプリも、偽の記録を受け付ける可能性があります。"),
       caption("・復旧コードとアカウントの鍵はブラウザに渡しません。"),
       caption("・ブラウザの登録は、この画面、ブラウザ自身、サーバの管理者がいつでも終了できます。"),
@@ -288,11 +288,11 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
           body.addView(wordsView(words))
           body.addView(spacer(8))
           body.addView(text("渡すもの", 14f, bold = true))
-          body.addView(caption("記録を読むための鍵（これまでと今後の記録）"))
+          body.addView(caption("記録を読むための鍵（過去と今後に同期する記録）"))
           body.addView(text("期限", 14f, bold = true))
           body.addView(caption(ttlLabel(t)))
           body.addView(spacer(8))
-          body.addView(text("このブラウザは、これまでと今後の記録を読めます。持ち出された鍵では期限後も読めます。", 13f))
+          body.addView(text("この同期グループの、過去と今後に同期する記録を読めます。期限はサーバから取得できる期間です。持ち出された鍵は期限後や登録解除後も使えます。", 13f))
           if tooMany then
             body.addView(text(s"記録を読めるブラウザが上限（${VP.MaxViewers} 台）です。ほかのブラウザを終了してから、再度承認してください。", 13f, colorAttr = attr.error))
             val others = vbox(caption("読み込み中…"))

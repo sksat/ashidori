@@ -169,8 +169,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     actions.clear()
     body.addView(
       card(
-        text("🔒 記録を読める人", 16f, bold = true),
-        caption("記録を読めるのは自分の端末だけで、サーバの管理者は読めません。復旧コードをなくすと復元できません。")
+        text("🔒 記録の保護", 16f, bold = true),
+        caption("記録は端末で暗号化して同期します。同じ同期グループの端末と、承認したブラウザで読めます。鍵のある端末をすべて失い、復旧コードもないと復元できません。")
       )
     )
     if !SyncConfig.paired then
@@ -423,7 +423,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       check.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO)
       val d = MaterialAlertDialogBuilder(act)
         .setTitle("復旧コードを控えてください")
-        .setMessage(s"$code\n\n別の端末の追加や、この端末をなくした場合の復元に必要です。パスワードマネージャーなどに保存してください。\n\n確認のため、最後の区切り（${tail.length}文字）を入力してください。\n$shape")
+        .setMessage(s"$code\n\n別の端末の追加や、この端末をなくした場合の復元に必要です。パスワードマネージャーなどに保存してください。復旧コードは他人に渡さないでください。\n\n確認のため、最後の区切り（${tail.length}文字）を入力してください。\n$shape")
         .setView(padded(vbox(check), 20, 0))
         .setCancelable(false)
         .setNeutralButton("コピー", null)
@@ -496,7 +496,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       val code = RecoveryCode.encode(k)
       val d = MaterialAlertDialogBuilder(act)
         .setTitle("復旧コード")
-        .setMessage(code)
+        .setMessage(s"$code\n\n復旧コードは他人に渡さないでください")
         .setNeutralButton("コピー", null)
         .setPositiveButton("閉じる", null)
         .create()

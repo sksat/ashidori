@@ -50,7 +50,7 @@ body{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0
 <p id="code"></p>
 </div>
 <div id="invite" hidden>
-<p>このサーバへの招待です（1 回のみ有効）</p>
+<p>新規登録用の招待です（1回のみ使用可）</p>
 </div>
 <p><a id="open" href="#">アプリで開く</a></p>
 <p id="note" class="note"></p>
