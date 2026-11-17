@@ -633,7 +633,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
             at = ArchiveMerge.Cursor(time, rowid)
             read += lines.size
             if lines.size < chunk then more = false
-            progress(s"$d 詳細ログ ${total + read} 行")
+            progress(s"$d 生データ ${total + read} 行")
         // Stopped (by the OS) or not: what was read is written out, so every
         // run makes progress however short the time it is given.
         if !more then done = true

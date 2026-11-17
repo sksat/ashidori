@@ -12,7 +12,7 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(b.offer(3, raw = false, "battery", now = 3L), None)
     assertEquals(b.pending, 68L)
     assertEquals((b.totalLost, b.totalSpilled), (3L, 60L))
-    assertEquals(b.note(0L), Some("位置・動きなど 3 行を保存できず・詳細ログ 60 行をファイルに退避・待ち 68 行"))
+    assertEquals(b.note(0L), Some("位置・動きなど 3 行を保存できず・生データ 60 行をファイルに退避・待ち 68 行"))
     b.done(r1.get, 60, raw = true, now = 10L)
     assertEquals(b.note(5000L), None)
     val r2 = b.offer(90, raw = true, "raw", now = 5400L).get
@@ -97,14 +97,14 @@ class WriteSafetySuite extends munit.FunSuite:
 
   test("stall alert across a restart: cleared once each kind it named is saved again, not before") {
     // Raised before the restart, for positions and raw lines.
-    val m = WriteStall.Monitor(restored = Some(Set("位置", "詳細ログ")))
+    val m = WriteStall.Monitor(restored = Some(Set("fixes", "raw_lines")))
     assert(m.reported)
     // After the restart nothing is stalled, but only battery rows were saved.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池")), None)
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池", "位置")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes")), None)
     assert(m.reported)
     // Every kind it named saved again: over.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池", "位置", "詳細ログ")), Some(false))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes", "raw_lines")), Some(false))
     assertEquals(m.kinds, Set.empty[String])
     // Raised again in this process: the kinds unsaved now are kept.
     assertEquals(m.update(noCommit = false, unsavedTooLong = true, unsaved = Set("動き"), saved = Set("位置")), Some(true))
@@ -144,5 +144,19 @@ class WriteSafetySuite extends munit.FunSuite:
     // failed() with nothing just returned changes nothing.
     m.failed()
     assert(m.reported)
+  }
+
+  test("write kinds: stable keys apart from the labels shown") {
+    assertEquals(WriteKind.values.map(_.key).distinct.size, WriteKind.values.size)
+    assertEquals(WriteKind.RawLines.key, "raw_lines")
+    assertEquals(WriteKind.RawLines.label, "生データ")
+    for k <- WriteKind.values do assertEquals(WriteKind.fromKey(k.key), Some(k))
+    // Counted by key, shown by label: renaming a label keeps what was counted.
+    val b = WriteBacklog()
+    val id = b.offer(3, raw = true, WriteKind.RawLines.key, now = 0L).get
+    b.done(id, 3, raw = true, now = 1L)
+    assertEquals(b.savedKinds, Set("raw_lines"))
+    assertEquals(b.savedKinds.map(WriteKind.label), Set("生データ"))
+    assertEquals(WriteKind.label("unknown"), "unknown")
   }
 

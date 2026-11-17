@@ -43,8 +43,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val crashRow = row("異常終了（直近24時間）", "", "…")()
   private val pendingRow = row("保存待ち", "", "…")()
   private val kindRow = row("種類ごとの最後の保存", "", "")()
-  private val archiveRow = row("記録のまとめ", "", "…")()
-  private val syncRow = row("自動の同期", "", "…")(Some(() => resumeSync()))
+  private val archiveRow = row("記録の整理", "", "…")()
+  private val syncRow = row("自動同期", "", "…")(Some(() => resumeSync()))
   /** One line for the backup and maintenance below: progress, result or error. */
   private val dataStatus = caption("")
   dataStatus.setSingleLine(true)
@@ -52,7 +52,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   @volatile private var backupRunning = false
   private var backupLine: Option[String] = None
   private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup(Backup.Mode.Normal))
-  private val maintainButton = outlined("記録をまとめ直す")(runMaintenance())
+  private val maintainButton = outlined("記録を再整理")(runMaintenance())
   // An archive commit that could not be finished, and files a repair
   // quarantined: shown only then.
   private val repairTitle = text("記録の整理（要確認）", 16f, bold = true, colorAttr = attr.error)
@@ -64,7 +64,6 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val repairCard = card(
     repairTitle,
     repairText,
-    caption("救出用バックアップは、整理の途中のファイルと記録を含め、端末内のファイルをそのまま ZIP に入れます。"),
     spacer(8),
     rescueButton,
     exportQuarantineButton,
@@ -83,7 +82,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         repairCard,
         card(
           text("記録データ", 16f, bold = true),
-          caption("バックアップは記録を端末内の形式のまま ZIP にまとめます。地図と施設データは含みません。"),
+          caption("地図と施設データは含みません。"),
           spacer(8),
           backupButton,
           maintainButton,
@@ -92,7 +91,6 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         card(
           (Seq(
             text("端末診断", 18f, bold = true),
-            caption("結果は「レポートをコピー」でまとめてコピーできます。"),
             spacer(8),
             button("レポートをコピー")(copy()),
             probeButton
@@ -162,18 +160,18 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
           (if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}") +
             (if lost > 0 then s"・保存できなかった行 累計 $lost" else ""))
         pendingRow.subtitle.setTextColor(color(if lost > 0 then attr.error else attr.onSurfaceVariant))
-        val kinds = LoggerWrites.progress(Seq("位置", "動き", "詳細ログ"))
+        val kinds = LoggerWrites.progress(Seq(WriteKind.Fixes, WriteKind.Motion, WriteKind.RawLines))
         kindRow.setSubtitle(kinds.map { (k, saved, unsaved) =>
           s"$k " + unsaved.map(u => s"${fmtDuration(u)}前から未保存").orElse(saved.map(a => s"${fmtDuration(a)}前")).getOrElse("—")
         }.mkString("・"))
         kindRow.subtitle.setTextColor(color(if kinds.exists(_._3.exists(_ > WriteStall.OldestMs)) then attr.error else attr.onSurfaceVariant))
         syncRow.setSubtitle(if syncStopped then "異常終了が続いたため停止中（タップで再開）" else "")
-        syncRow.setValue(if syncStopped then "停止中" else "動作")
+        syncRow.setValue(if syncStopped then "停止中" else "動作中")
         syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))
         archiveRow.setSubtitle(
           if stuck.isDefined then "途中で中断した整理を自動では完了できません（記録は端末内に保持）"
           else if pendingCommit then "途中で中断した整理があります（自動で完了します）"
-          else if safe then "異常終了が続いたため停止中（「記録をまとめ直す」で再開）"
+          else if safe then "異常終了が続いたため停止中（「記録を再整理」で再開）"
           else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
           else "充電中、または起動の30分後に自動で行います")
         archiveRow.setValue(
@@ -209,7 +207,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private def showDataStatus(): Unit =
     val line = backupLine.orElse {
       Maintenance.Progress.get().map { (t, running, l) =>
-        if running then s"まとめています: $l" else s"記録のまとめ: $l（${stamp(t)}）"
+        if running then s"整理中: $l" else s"記録の整理: $l（${stamp(t)}）"
       }
     }
     dataStatus.setText(line.getOrElse(" "))
@@ -254,7 +252,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       case Backup.Mode.Quarantine => ("quarantine", "隔離したファイルを")
     act.createZip(Backup.defaultName(kind = kind)) { uri =>
       backupRunning = true
-      backupLine = Some("書き出しの準備をしています")
+      backupLine = Some("書き出しの準備中")
       showDataStatus()
       Thread(() =>
         val result =
@@ -289,7 +287,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private def resumeSync(): Unit =
     if Maintenance.SafeMode.syncStopped then
       Maintenance.SafeMode.resumeSync(act)
-      Toast.makeText(act, "自動の同期を再開しました", Toast.LENGTH_SHORT).show()
+      Toast.makeText(act, "自動同期を再開しました", Toast.LENGTH_SHORT).show()
       showSaving()
 
   private def runMaintenance(): Unit =
@@ -363,8 +361,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     val eventsBox = vbox()
     recording.addView(sectionHeader(s"記録の途切れ（直近${GapDays}日・${GapMinMs / 60_000}分以上）"))
     recording.addView(gapsBox)
-    recording.addView(supportingText("精度 100 m 以内の測位がない時間。原因は下の動作の記録から推定する。静止中の途切れは正常。"))
-    recording.addView(sectionHeader("動作の記録"))
+    recording.addView(supportingText("精度 100 m 以内の測位がない時間。原因は下の動作ログから推定する。静止中の途切れは正常。"))
+    recording.addView(sectionHeader("動作ログ"))
     recording.addView(eventsBox)
     recording.addView(supportingText(s"新しい順に${EventRows}件。「レポートをコピー」にはすべて（最大${LifeLog.Keep * 2}件）を含める。位置は記録しない。"))
     recordingText = s"## recording\nservice=${if running then "running" else "stopped"} enabled=${Settings.loggingEnabled} ${h.summary}"
@@ -391,7 +389,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
            })*))
         eventsBox.removeAllViews()
         eventsBox.addView(listGroup(
-          (if events.isEmpty then Seq(row("まだありません")())
+          (if events.isEmpty then Seq(row("なし")())
            else events.reverse.take(EventRows).map { e =>
              // The time stays quiet; a problem shows in the title.
              val r = row(e.label, e.detail, stamp(e.time))()

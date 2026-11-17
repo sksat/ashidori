@@ -1,5 +1,21 @@
 package ashidori.core
 
+/** A kind of the logger's rows, as the write queue counts them: a stable
+  * `key` (also kept on disk with the stall alert) and the `label` shown.
+  */
+enum WriteKind(val key: String, val label: String):
+  case Fixes extends WriteKind("fixes", "位置")
+  case Motion extends WriteKind("motion", "動き")
+  case Battery extends WriteKind("battery", "電池")
+  case GnssStatus extends WriteKind("gnss_status", "GNSS の状態")
+  case RawLines extends WriteKind("raw_lines", "生データ")
+  case RawSessions extends WriteKind("raw_sessions", "生データの区間")
+
+object WriteKind:
+  def fromKey(k: String): Option[WriteKind] = values.find(_.key == k)
+  /** The label of `key` (the key itself if unknown). */
+  def label(key: String): String = fromKey(key).fold(key)(_.label)
+
 /** Accounting of the logger's queue of rows not yet in SQLite.
   *
   * Every batch is counted from the moment it is handed over until it is
@@ -98,8 +114,8 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
     else
       val parts = Seq(
         Option.when(lostOther > 0)(s"位置・動きなど ${lostOther} 行を保存できず"),
-        Option.when(lostRaw > 0)(s"詳細ログ ${lostRaw} 行を保存できず"),
-        Option.when(spilled > 0)(s"詳細ログ ${spilled} 行をファイルに退避"),
+        Option.when(lostRaw > 0)(s"生データ ${lostRaw} 行を保存できず"),
+        Option.when(spilled > 0)(s"生データ ${spilled} 行をファイルに退避"),
         Option.when(slowest >= slowMs)(s"保存待ち最大 ${slowest / 1000} 秒"),
         Some(s"待ち $pending 行")
       ).flatten

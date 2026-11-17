@@ -87,11 +87,11 @@ object Backup:
       else db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin +
         (if rescue then size(Maintenance.dir) else 0L)
     if dir.getUsableSpace < need then
-      throw java.io.IOException(s"空き容量が足りません（${need >> 20} MB 必要）")
+      throw java.io.IOException(s"空き容量不足（${need >> 20} MB 必要）")
     // While it runs: stop before the logger has no room left.
     def checkSpace(): Unit =
       if dir.getUsableSpace < LoggingMargin then
-        throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB を切ったため中断しました（記録の領域を残すため）")
+        throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB 未満のため中断（記録用の領域を確保）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     def walk(f: File): Seq[File] =
       if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)

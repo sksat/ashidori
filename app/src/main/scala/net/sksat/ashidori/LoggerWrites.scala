@@ -43,9 +43,10 @@ object LoggerWrites:
   /** Queues `write` (of `rows` rows) for the database. Raw batches carry
     * their lines, so they can be spilled to a file.
     */
-  def submit(rows: Int, raw: Boolean, what: String, lines: Seq[(Long, String)] = Nil)(write: Db => Unit): Unit =
+  def submit(rows: Int, raw: Boolean, kind: WriteKind, lines: Seq[(Long, String)] = Nil)(write: Db => Unit): Unit =
     val now = SystemClock.uptimeMillis()
-    backlog.synchronized(backlog.offer(rows, raw, what, now)) match
+    val what = kind.label
+    backlog.synchronized(backlog.offer(rows, raw, kind.key, now)) match
       case None =>
         if raw && lines.nonEmpty then
           // Over the cap: to a file, imported later (Overflow).
@@ -75,10 +76,10 @@ object LoggerWrites:
         }
 
   def fixes(fs: Seq[Fix]): Unit =
-    if fs.nonEmpty then submit(fs.size, raw = false, "位置")(_.insertFixes(fs))
+    if fs.nonEmpty then submit(fs.size, raw = false, WriteKind.Fixes)(_.insertFixes(fs))
 
   def rawLines(batch: Seq[(Long, String)]): Unit =
-    submit(batch.size, raw = true, "詳細ログ", batch)(_.insertRawLines(batch))
+    submit(batch.size, raw = true, WriteKind.RawLines, batch)(_.insertRawLines(batch))
 
   private def commit(write: Db => Unit): Unit =
     val start = SystemClock.uptimeMillis()
@@ -112,14 +113,14 @@ object LoggerWrites:
   /** Rows waiting to be committed. */
   def pending: Long = backlog.synchronized(backlog.pending)
 
-  /** Per kind (位置, 動き, 詳細ログ, ...): how long ago it was last saved in
-    * this process, and for how long it has not been (ms), for 端末診断.
+  /** Per kind: its label, how long ago it was last saved in this process,
+    * and for how long it has not been (ms), for 端末診断.
     */
-  def progress(kinds: Seq[String]): Seq[(String, Option[Long], Option[Long])] =
+  def progress(kinds: Seq[WriteKind]): Seq[(String, Option[Long], Option[Long])] =
     val now = SystemClock.uptimeMillis()
     backlog.synchronized {
       val unsaved = backlog.unsavedSince
-      kinds.map(k => (k, backlog.lastSaved(k).map(now - _), unsaved.get(k).map(now - _)))
+      kinds.map(k => (k.label, backlog.lastSaved(k.key).map(now - _), unsaved.get(k.key).map(now - _)))
     }
 
   /** The logger (re)started: the stall clock starts now, and lines left in
@@ -146,7 +147,7 @@ object LoggerWrites:
       case Some(true) =>
         val detail =
           if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
-          else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
+          else s"${WriteKind.label(oldest.get._1)}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
         if !stallRetry then LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
         stallRetry = !Alerts.stall(unsaved)
         if stallRetry then stall.synchronized(stall.failed())

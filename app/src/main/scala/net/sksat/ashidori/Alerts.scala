@@ -61,7 +61,7 @@ object Alerts:
     if !Maintenance.SafeMode.active && CrashLoop.tripped(exits.map(_.getTimestamp), now, since) then
       Maintenance.SafeMode.set(ctx)
       LifeLog.add(LifeKind.SafeMode,
-        s"異常終了が続いたため、記録のまとめと同期を停止（記録は継続。アプリの更新か「記録をまとめ直す」で再開）")
+        "異常終了が続いたため、記録の整理と同期を停止（記録は継続）")
 
   /** Raises the stall alert; `kinds`: those not saved now. The alert is
     * kept on disk ([[restoredStall]]).
@@ -70,7 +70,7 @@ object Alerts:
     val kept = prefs.edit().putLong("stallAt", System.currentTimeMillis()).putBoolean("stallUp", true)
       .putStringSet("stallKinds", kinds.asJava).commit()
     if !kept then Log.w("keeping the stall alert on disk failed")
-    notify(StallId, "記録が保存されていません（端末診断で確認）") && kept
+    notify(StallId, "記録の保存が停止") && kept
 
   /** Whether the notification is gone and that is on disk; if not, the
     * caller tries again ([[WriteStall.Monitor.failed]]).
@@ -91,8 +91,10 @@ object Alerts:
       .getOrElse(false)
     if prefs.getBoolean("stallUp", false) then
       // Gone with a reboot (or swiped away): shown again while unresolved.
-      if !posted then notify(StallId, "記録が保存されていません（端末診断で確認）")
-      Some(Option(prefs.getStringSet("stallKinds", null)).map(_.asScala.toSet).getOrElse(Set.empty))
+      if !posted then notify(StallId, "記録の保存が停止")
+      // Keys of WriteKind; anything else is dropped (then any save clears it).
+      Some(Option(prefs.getStringSet("stallKinds", null)).map(_.asScala.toSet).getOrElse(Set.empty)
+        .filter(k => WriteKind.fromKey(k).isDefined))
     else Option.when(posted)(Set.empty[String])
 
   def lastStall: Long = prefs.getLong("stallAt", 0L)
@@ -105,11 +107,11 @@ object Alerts:
     val stalled = now - lastStall < DayMs || prefs.getBoolean("stallUp", false)
     if CommitStatus.stuck().isDefined then Some("記録の整理が停止（要確認）")
     else if Attention.unseen then Some("記録の整理で隔離したファイルあり（要確認）")
-    else if Maintenance.SafeMode.active then Some("異常終了が続いたため、自動のまとめ・同期を停止中")
+    else if Maintenance.SafeMode.active then Some("異常終了が続いたため、記録の整理と同期を停止中")
     else if crashes == 0 && !stalled then None
-    else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止がありました")
-    else if crashes > 0 then Some(s"直近24時間に異常終了が ${crashes} 回ありました")
-    else Some("記録が保存されない時間がありました")
+    else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止あり")
+    else if crashes > 0 then Some(s"直近24時間に異常終了 ${crashes} 回")
+    else Some("記録が保存されなかった時間あり")
 
   def openDiagnostics(c: Context): PendingIntent =
     PendingIntent.getActivity(c, 3,

@@ -218,7 +218,7 @@ class LoggerService extends Service:
       val p = plan
       val screen = pm.isInteractive
       val mode = Settings.mode.key
-      LoggerWrites.submit(1, raw = false, "電池")(_.insertBattery(now, pct, charging, screen, mode, p.map(_.describe).getOrElse("")))
+      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(now, pct, charging, screen, mode, p.map(_.describe).getOrElse("")))
       // A read: on the UI's I/O thread, not the logger's write path.
       AshidoriApp.io.execute { () =>
         drain = DrainEstimator.screenOffDrain(db.battery(now - 4 * 3_600_000L), now)
@@ -370,7 +370,7 @@ class LoggerService extends Service:
     recorder.foreach { r =>
       r.stop()
       val end = System.currentTimeMillis()
-      LoggerWrites.submit(1, raw = false, "生データの区間")(_.insertGnssSession(r.startedAt, end, "", r.reason))
+      LoggerWrites.submit(1, raw = false, WriteKind.RawSessions)(_.insertGnssSession(r.startedAt, end, "", r.reason))
     }
     recorder = None
     LoggerState.onMain { LoggerState.detailFile = None }
@@ -482,7 +482,7 @@ class LoggerService extends Service:
       if now - lastStatusSaved >= 10_000 then
         lastStatusSaved = now
         val acc = LoggerState.lastFix.filter(f => now - f.time < 30_000).map(_.accuracy).getOrElse(Float.NaN)
-        LoggerWrites.submit(1, raw = false, "GNSS の状態")(_.insertGnssStatus(snap, env, acc))
+        LoggerWrites.submit(1, raw = false, WriteKind.GnssStatus)(_.insertGnssStatus(snap, env, acc))
       if env != before then evaluate(force = true)
       LoggerState.changed()
 
@@ -591,7 +591,7 @@ class LoggerService extends Service:
       pendingFixes.clear()
       pendingMotion.clear()
       LoggerWrites.fixes(fs)
-      if ms.nonEmpty then LoggerWrites.submit(ms.size, raw = false, "動き")(_.insertMotion(ms))
+      if ms.nonEmpty then LoggerWrites.submit(ms.size, raw = false, WriteKind.Motion)(_.insertMotion(ms))
     else if !handler.hasCallbacks(flushLater) then handler.postDelayed(flushLater, LoggerService.FlushMs)
 
   private val flushLater: Runnable = () => flush(force = true)

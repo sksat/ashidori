@@ -20,7 +20,7 @@ import ashidori.core.*
   *
   * When: not at app start. While charging and idle, or else from 30 minutes
   * after the main process started (time to make a backup first), or at once
-  * when the user asks (「記録をまとめ直す」). A job runs for at most
+  * when the user asks (「記録を再整理」). A job runs for at most
   * [[BudgetMs]] and is rescheduled if there is more to do.
   *
   * State shared between the processes lives in files under
@@ -62,7 +62,7 @@ object Maintenance:
     val extras = PersistableBundle()
     extras.putBoolean("manual", true)
     c.getSystemService(classOf[JobScheduler]).schedule(job(JobManual).setExtras(extras).setOverrideDeadline(0).build())
-    Progress.set("開始を待っています")
+    Progress.set("開始待ち")
 
   @volatile private var repairAsked = 0L
 
@@ -91,7 +91,7 @@ object Maintenance:
     extras.putString("repair", "manual")
     extras.putBoolean("manual", true)
     c.getSystemService(classOf[JobScheduler]).schedule(job(JobRepair).setExtras(extras).setOverrideDeadline(0).build())
-    Progress.set("修復の開始を待っています")
+    Progress.set("修復の開始待ち")
 
   /** Runs a repair (auto or manual, see above). Call in the maintenance
     * process, off the main thread.
@@ -193,7 +193,7 @@ object Maintenance:
 
   /** Set when the main process crashed repeatedly ([[CrashLoop]]): neither
     * maintenance nor sync runs on its own until the app is updated, or the
-    * user resumes it (each on its own: 「記録をまとめ直す」, 「同期を再開」 in
+    * user resumes it (each on its own: 「記録を再整理」, 「同期を再開」 in
     * 端末診断). Jobs already queued are cancelled, and check it again when
     * they start.
     */
@@ -264,23 +264,23 @@ object Maintenance:
             if log then
               Guard.put(d, state)
               LifeLog.add(LifeKind.ArchiveSkip,
-                s"$d: まとめに${state.attempts}回失敗したため保留（データは端末内に保持。充電中・アプリ更新後・「記録をまとめ直す」で再試行）")
+                s"$d: 整理に${state.attempts}回失敗したため保留（データは端末内に保持。充電中・アプリ更新後・「記録を再整理」で再試行）")
           case CompactionGuard.Decision.Run(next, retry) =>
             val before = Guard.get(d)
             // On disk before the work: if the process dies in it, the next
             // run sees the attempt.
             Guard.put(d, next)
             Complete.clear(d)
-            if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していたまとめを再試行")
+            if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していた整理を再試行")
             val t0 = System.currentTimeMillis()
             try
               val r = archive.compactDay(db, d, stop, line => Progress.set(line), until = deadline, portionMs = portionMs)
-              if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 詳細ログのうち ${r.unconverted} 行は変換できないため端末内に残す")
+              if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 生データのうち ${r.unconverted} 行は変換できないため端末内に残す")
               if r.done then
                 Guard.clear(d)
                 Complete.mark(d)
                 val s = (System.currentTimeMillis() - t0) / 1000
-                if s >= 60 || retry then LifeLog.add(LifeKind.Archive, s"$d: まとめ完了（詳細ログ ${r.lines} 行・${s}秒）")
+                if s >= 60 || retry then LifeLog.add(LifeKind.Archive, s"$d: 整理完了（生データ ${r.lines} 行・${s}秒）")
               else
                 // Stopped or out of time: not a failure; the rest is done next time.
                 before.fold(Guard.clear(d))(Guard.put(d, _))
@@ -289,10 +289,10 @@ object Maintenance:
               case e: OutOfMemoryError =>
                 // The day's buffers are unreachable by now; this process
                 // stays usable for the log line.
-                LifeLog.add(LifeKind.Note, s"$d: まとめでメモリ不足（データは端末内に保持）")
+                LifeLog.add(LifeKind.Note, s"$d: 整理でメモリ不足（データは端末内に保持）")
                 Log.w(s"archiving $d: out of memory", e)
               case NonFatal(e) =>
-                LifeLog.add(LifeKind.Note, s"$d: まとめに失敗（データは端末内に保持）: ${LifeLog.describe(e)}")
+                LifeLog.add(LifeKind.Note, s"$d: 整理に失敗（データは端末内に保持）: ${LifeLog.describe(e)}")
                 Log.w(s"archiving $d failed; kept in SQLite", e)
       if !halt() then
         try archive.mergeMonths(db, LocalDate.now(AshidoriApp.zone), halt)
