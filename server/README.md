@@ -113,9 +113,9 @@ Worker の変数（`wrangler.jsonc` の `vars`）は次のとおり。CI では 
 | GET | `/admin/checkins` | 共有チェックインの一覧（変更の新しい順に 200 件。`user`・`userStatus` 付き。削除済みは含まない） |
 | POST | `/admin/checkins/:id/delete` | 共有チェックインを削除する（内容を消し、削除済みの記録だけを残す）。利用者は同じ local id で共有し直せない |
 
-## 簡易地図の配信
+## オフライン地図の配信
 
-アプリの簡易地図（端末内の地図）のデータを、GitHub Releases の代わりにこのサーバから配信できる。配信は任意である。同期を設定した端末は、`GET /v1/info` の `basemap` に自分の固定する版があればこのサーバから、なければ GitHub Releases から取得し、一方が失敗すると他方を試す。どちらから取得しても、アプリは自身に固定したサイズと sha256 で照合する。このため、サーバの運用者を信頼する必要はない。
+アプリのオフライン地図のデータを、GitHub Releases の代わりにこのサーバから配信できる。配信は任意である。同期を設定した端末は、`GET /v1/info` の `basemap` に自分の固定する版があればこのサーバから、なければ GitHub Releases から取得し、一方が失敗すると他方を試す。どちらから取得しても、アプリは自身に固定したサイズと sha256 で照合する。このため、サーバの運用者を信頼する必要はない。
 
 - `GET /basemap/:version/:file` が R2 の `basemap/<version>/<file>` を返す。認証は不要で、Cookie も設定しない。データは全利用者で同じで、国全体を含むため、要求から利用者の位置は分からない。
 - 返すのは `ashidori-basemap-<version>.zip`（アーカイブ）と `ashidori-basemap-<version>.json`（記述子）だけである。それ以外の名前と、存在しないオブジェクトには `404` を返す。`b/...` のバッチなど他のキーは読めない。
@@ -357,7 +357,7 @@ Rate Limiting binding の `namespace_id`（`wrangler.jsonc` の `ratelimits`）�
   - 保存と確定の間で処理が止まった場合に残るオブジェクトは、定期処理が R2 を少しずつ走査し、1 日以上たっても参照されていなければ削除する。走査の位置は `server_usage.orphan_sweep_after` に保存する。
 - **GET blob**: D1 のメタデータが参照するキーのオブジェクトだけを返す。マイグレーション 0005 より前に保存したバッチはメタデータにキーがなく（`r2_key` が NULL）、旧形式のキー `b/{deviceId}/{stream}/{seq 12 桁}` から返す。既存のオブジェクトは移動していない。
 - **admin**: GET・HEAD・OPTIONS 以外で、`Origin` ヘッダが別オリジンのリクエストと `Sec-Fetch-Site: cross-site` のリクエストは `403` で拒否する（CSRF 対策）。GET を対象外にするのは、Access のログイン後に `/admin/` へ戻るリダイレクトが cross-site になるためである。GET は状態を変えず、`/admin/*` は CORS ヘッダを返さないため、別オリジンのページは応答を読めない。
-- **セキュリティヘッダ**: 全レスポンスに付ける。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP（`default-src 'none'`、admin ページは nonce 付き）、`Cache-Control: no-store`（簡易地図の配信を除く）である。
+- **セキュリティヘッダ**: 全レスポンスに付ける。対象は `nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`、HSTS、CSP（`default-src 'none'`、admin ページは nonce 付き）、`Cache-Control: no-store`（オフライン地図の配信を除く）である。
 
 ### 既知の制限
 

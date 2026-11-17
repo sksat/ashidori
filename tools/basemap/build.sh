@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds the offline coarse basemap used when 「位置情報を外部サービスに送らない」
-# is on: vector tiles for Japan and a low-zoom world, a MapLibre style, glyphs
+# Builds the offline coarse basemap used when 「オンライン地図と地名検索」
+# is off: vector tiles for Japan and a low-zoom world, a MapLibre style, glyphs
 # for the non-CJK characters in the labels, and sprites.
 #
 #   tools/basemap/build.sh <work dir> [<output dir>]

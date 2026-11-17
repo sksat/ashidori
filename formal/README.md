@@ -6,7 +6,7 @@
 
 - 悪意あるサーバ管理者が位置ログを読めないこと（Tamarin による暗号モデル）
 - 並行処理、障害、再起動のもとで、登録、鍵、送信の状態が食い違わないこと（TLA+ と TLC による状態モデル）
-- 詳細ログの保存（[設計案](../docs/design/detail-log-format.md)）で、確定と削除の途中の障害がデータを失わせず、重複させないこと（TLA+）
+- 生データの保存（[設計案](../docs/design/detail-log-format.md)）で、確定と削除の途中の障害がデータを失わせず、重複させないこと（TLA+）
 
 暗号モデルはサーバを攻撃者とみなす。
 状態モデルはサーバが仕様どおりに動くと仮定し（status 取得のモデルだけは偽の一覧を出すサーバを含む）、通信路とクライアントの障害を網羅する。
@@ -63,8 +63,8 @@ CI では `.github/workflows/formal.yml` が、`formal/`、`docs/sync-protocol.m
 | `StatusRotation` | 保持数を超える偽の行で正しい status が押し出され続ける（F6） | `StatusLive`、`EveryListedTried`、`ReadWithinPasses` |
 | `SharedCheckin` | 古い取消の再送が再共有を消す。遅れた PUT が公開を復活させる | `LatestWins`、`StaleMeansSuperseded` |
 | `FeedResync` | フォロー解除後も表示が残る。新しくフォローした相手の過去分が欠ける | `NoMixedVersions`、`Converges` |
-| `DetailLog` | 詳細ログのジャーナル、断片、日の世代で、入力を消した後に出力が残っていない。やり直しや遅れたデータで二重に公開する。系列ごとの書き込みや捨てたサンプルの損失が報告されない。読む側が消えたファイルや食い違う一覧を読む | `Durability`、`NoDup`、`LossReported`、`LossOnlyUnsaved`、`ReaderOK`、`JournalsResolved` |
-| `DetailMigrate` | 詳細ログの移行で、rowid の再利用や時刻の範囲で別の行を消す。途中まで取り込まれた旧い形式のテキストを二重に移す | `Durability`、`NoDup` |
+| `DetailLog` | 生データのジャーナル、断片、日の世代で、入力を消した後に出力が残っていない。やり直しや遅れたデータで二重に公開する。系列ごとの書き込みや捨てたサンプルの損失が報告されない。読む側が消えたファイルや食い違う一覧を読む | `Durability`、`NoDup`、`LossReported`、`LossOnlyUnsaved`、`ReaderOK`、`JournalsResolved` |
+| `DetailMigrate` | 生データの移行で、rowid の再利用や時刻の範囲で別の行を消す。途中まで取り込まれた旧い形式のテキストを二重に移す | `Durability`、`NoDup` |
 
 ## 暗号モデル（`crypto/`）
 
@@ -379,7 +379,7 @@ rev のない DELETE は 400 で拒まれるので、操作には含めない。
 
 ### DetailLog
 
-詳細ログの保存の提案（[設計](../docs/design/detail-log-format.md)、アプリは未実装）のうち、ジャーナル、断片、日の世代、回復、読む側を検査する。
+生データの保存の提案（[設計](../docs/design/detail-log-format.md)、アプリは未実装）のうち、ジャーナル、断片、日の世代、回復、読む側を検査する。
 
 - 記録器は、作成したジャーナルの先頭に最初の `seq` を書き、ディレクトリを fsync してからサンプルを入れる。サンプルは隙間のない `seq` で届き、系列（奇数と偶数）ごとのバッファに入り、系列ごとに古いものから一部ずつ書かれる（系列をまたいで順が入れ替わる）。バッファはサンプルを捨てることがある。
 - 損失の範囲は、ファイルの走査だけで作る：最初の `seq` から最大の `seq` までの隙間と、最大の `seq` より後。確定は、全部の子と manifest とこの範囲を 1 回で台帳に書き、その後にだけジャーナルを消す。書き手が死んだジャーナルは、範囲を記録してから閉じる。

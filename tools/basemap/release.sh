@@ -30,7 +30,7 @@ build=$(field "$desc" build)
 
 notes="$dist/ashidori-basemap-$version.notes.md"
 cat > "$notes" <<EOF
-ashidori の簡易地図（端末内の地図）のデータ。アプリが初回にダウンロードし、sha256 を照合する。
+ashidori のオフライン地図のデータ。アプリが初回にダウンロードし、sha256 を照合する。
 
 - 版: $version（Protomaps Basemap $build の日次ビルドから作成）
 - ファイル: ashidori-basemap-$version.zip（$bytes バイト）
@@ -46,7 +46,7 @@ cat <<EOF
 gh release create 'basemap-$version' \\
   '$zip' \\
   '$desc' \\
-  --repo sksat/ashidori --title '簡易地図 $version' --notes-file '$notes' --latest=false
+  --repo sksat/ashidori --title 'オフライン地図 $version' --notes-file '$notes' --latest=false
 
 # Sync server (optional; run in server/, see server/README.md):
 pnpm exec wrangler r2 object put 'ashidori-blobs/basemap/$version/ashidori-basemap-$version.zip' \\
