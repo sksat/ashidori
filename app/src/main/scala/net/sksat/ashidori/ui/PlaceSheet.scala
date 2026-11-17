@@ -13,7 +13,9 @@ import Ui.*
 /** Details and corrections for one place, opened from a visit or the map.
   *
   * Order follows what users most often want: confirm or fix what the place
-  * is (candidates), then name/kind, then actions.
+  * is (candidates), then name/kind, then actions. Every change applies at
+  * once (a candidate, a kind, the name when typing ends) and the snackbar
+  * takes it back.
   */
 final class PlaceSheet(
     act: MainActivity,
@@ -56,13 +58,27 @@ final class PlaceSheet(
     nameInput.setText(place.name)
     nameInput.setHint("名前")
     nameInput.setSingleLine(true)
+    nameInput.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE)
+    // The name applies when typing ends: the keyboard's done, leaving the
+    // field, or closing the sheet.
+    nameInput.setOnEditorActionListener((v, action, _) =>
+      if action == android.view.inputmethod.EditorInfo.IME_ACTION_DONE then
+        applyName()
+        v.clearFocus()
+        act.getSystemService(classOf[android.view.inputmethod.InputMethodManager]).hideSoftInputFromWindow(v.getWindowToken, 0)
+      false)
+    nameInput.setOnFocusChangeListener((_, focused) => if !focused then applyName())
+    dialog.setOnDismissListener(_ => applyName(inSheet = false))
     kinds.setSingleSelection(true)
     for k <- Seq(PlaceKind.Home, PlaceKind.Work, PlaceKind.School) do
       val c = Chip(act, null, com.google.android.material.R.attr.chipStyle)
       c.setText(k.label)
       c.setCheckable(true)
       c.setChecked(place.kind == k)
-      c.setOnClickListener(_ => save(current.copy(kind = if c.isChecked then k else PlaceKind.Other)))
+      c.setOnClickListener { _ =>
+        val kind = if c.isChecked then k else PlaceKind.Other
+        save(current.copy(kind = kind), if kind == PlaceKind.Other then "種別を解除" else s"種別を${kind.label}に設定")
+      }
       kinds.addView(c)
 
     val actions = vbox()
@@ -81,7 +97,7 @@ final class PlaceSheet(
         candidates,
         spacer(12),
         text("名前と種別", 15f, bold = true),
-        hbox(nameInput.tap(_.setLayoutParams(weighted())), outlined("保存")(save(current.copy(name = nameInput.getText.toString.trim)))),
+        nameInput,
         kinds,
         spacer(8),
         actions,
@@ -94,6 +110,7 @@ final class PlaceSheet(
       20,
       12
     )
+    sheetRoot = root
     dialog.setContentView(scroll(root))
     Ui.fullHeight(dialog)
     dialog.show()
@@ -112,7 +129,7 @@ final class PlaceSheet(
     r.setGravity(android.view.Gravity.CENTER_VERTICAL)
     r.setMinimumHeight(dp(48))
     r.setBackgroundResource(android.R.drawable.list_selector_background)
-    r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id)))
+    r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id), s"名前を「${v.name}」に変更"))
     r
 
   /** Past check-ins nearby first, then OpenStreetMap venues from the venue
@@ -212,12 +229,28 @@ final class PlaceSheet(
       }
     }
 
-  private def save(p: Place): Unit =
+  /** The sheet's content, where its snackbars show. */
+  private var sheetRoot: View = null
+
+  /** Applies the typed name if it changed. */
+  private def applyName(inSheet: Boolean = true): Unit =
+    val name = nameInput.getText.toString.trim
+    if name != current.name then
+      save(current.copy(name = name), if name.isEmpty then "名前を削除" else s"名前を「$name」に変更", inSheet)
+
+  /** Applies a change at once; the snackbar's 取り消し restores the place as it was. */
+  private def save(p: Place, message: String, inSheet: Boolean = true): Unit =
+    val before = current
+    showPlace(p)
+    Edits.updatePlace(act, before, p, message, () => act.runOnUiThread(() => onChanged()),
+      anchor = Option(sheetRoot).filter(_ => inSheet && dialog.isShowing),
+      undone = () => showPlace(before))
+
+  /** Shows `p` as the current state of the place. */
+  private def showPlace(p: Place): Unit =
     current = p
     title.setText(p.displayName)
-    nameInput.setText(p.name)
-    AshidoriApp.io.execute { () =>
-      AshidoriApp.db.updatePlace(p)
-      TimelineRepo.invalidate()
-      act.runOnUiThread(() => onChanged())
-    }
+    if nameInput.getText.toString.trim != p.name then nameInput.setText(p.name)
+    for i <- 0 until kinds.getChildCount do
+      val c = kinds.getChildAt(i).asInstanceOf[Chip]
+      c.setChecked(c.getText.toString == p.kind.label)
