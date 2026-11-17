@@ -64,7 +64,8 @@ object TimelineRepo:
     }
 
     val corrected = TimelineBuilder.applyOverrides(linked, db.modeOverrides(dayStart - Margin, dayEnd + Margin))
-    val segs = Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty)
+    // A day that is all 記録なし (the phone off from the day before to the day after) is a day without a record.
+    val segs = Stats.shown(Stats.splitByDay(corrected, zone).getOrElse(date, Vector.empty))
     val steps = db.steps(dayStart, dayEnd)
     DayTimeline(date, segs, Stats.day(date, segs, steps), places, db.checkIns(dayStart, dayEnd), suggest(segs, places))
 

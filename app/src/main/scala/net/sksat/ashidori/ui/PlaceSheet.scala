@@ -77,7 +77,7 @@ final class PlaceSheet(
       c.setChecked(place.kind == k)
       c.setOnClickListener { _ =>
         val kind = if c.isChecked then k else PlaceKind.Other
-        save(current.copy(kind = kind), if kind == PlaceKind.Other then "種別を解除" else s"種別を${kind.label}に設定")
+        save(PlaceEdit.kind(current, kind), if kind == PlaceKind.Other then "種別を解除" else s"種別を${kind.label}に設定")
       }
       kinds.addView(c)
 
@@ -129,7 +129,7 @@ final class PlaceSheet(
     r.setGravity(android.view.Gravity.CENTER_VERTICAL)
     r.setMinimumHeight(dp(48))
     r.setBackgroundResource(android.R.drawable.list_selector_background)
-    r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id), s"名前を「${v.name}」に変更"))
+    r.setOnClickListener(_ => save(PlaceEdit.rename(current, v.name, Some(v.id)), Edits.renameMessage(v.name)))
     r
 
   /** Past check-ins nearby first, then OpenStreetMap venues from the venue
@@ -235,22 +235,25 @@ final class PlaceSheet(
   /** Applies the typed name if it changed. */
   private def applyName(inSheet: Boolean = true): Unit =
     val name = nameInput.getText.toString.trim
-    if name != current.name then
-      save(current.copy(name = name), if name.isEmpty then "名前を削除" else s"名前を「$name」に変更", inSheet)
+    if name != current.name then save(PlaceEdit.rename(current, name), Edits.renameMessage(name), inSheet)
 
-  /** Applies a change at once; the snackbar's 取り消し restores the place as it was. */
-  private def save(p: Place, message: String, inSheet: Boolean = true): Unit =
-    val before = current
-    showPlace(p)
-    Edits.updatePlace(act, before, p, message, () => act.runOnUiThread(() => onChanged()),
+  /** Applies one change at once; the snackbar's 取り消し takes back only that
+    * change (other changes made meanwhile stay).
+    */
+  private def save(edit: PlaceEdit, message: String, inSheet: Boolean = true): Unit =
+    showPlace(edit.applyTo(current))
+    Edits.updatePlace(act, place.id, edit, message, () => act.runOnUiThread(() => onChanged()),
       anchor = Option(sheetRoot).filter(_ => inSheet && dialog.isShowing),
-      undone = () => showPlace(before))
+      done = showPlace, undone = showPlace)
 
-  /** Shows `p` as the current state of the place. */
+  /** Shows `p` as the current state of the place. A name being typed and
+    * not applied yet stays in its field.
+    */
   private def showPlace(p: Place): Unit =
+    val typing = nameInput.getText.toString.trim != current.name
     current = p
     title.setText(p.displayName)
-    if nameInput.getText.toString.trim != p.name then nameInput.setText(p.name)
+    if !typing && nameInput.getText.toString.trim != p.name then nameInput.setText(p.name)
     for i <- 0 until kinds.getChildCount do
       val c = kinds.getChildAt(i).asInstanceOf[Chip]
       c.setChecked(c.getText.toString == p.kind.label)

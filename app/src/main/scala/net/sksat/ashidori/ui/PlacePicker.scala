@@ -48,8 +48,12 @@ final class PlacePicker(act: MainActivity, place: Place, visit: Option[Visit], o
     slp.setMargins(dp(16), dp(8), dp(16), 0)
     search.setLayoutParams(slp)
     status.setPadding(dp(20), dp(4), dp(20), dp(4))
+    val grab = BottomSheetDragHandleView(act)
+    grab.setMinimumHeight(0)
+    grab.setPadding(0, dp(14), 0, dp(6))
+    grab.setLayoutParams(LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
     val root = vbox(
-      BottomSheetDragHandleView(act),
+      grab,
       padded(text("場所を選択", 18f, bold = true), 20, 4),
       list,
       status,
@@ -87,8 +91,8 @@ final class PlacePicker(act: MainActivity, place: Place, visit: Option[Visit], o
     list.addView(current)
     // The typed name as it is, when no venue has it.
     if q.nonEmpty && !vs.exists(_._1.name == q) then
-      list.addView(row("✎", s"「$q」", "この名前にする", "")(choose(q, "")))
-    for (v, d) <- vs do list.addView(row("📍", v.name, v.category, fmtDistance(d))(choose(v.name, v.id)))
+      list.addView(row("✎", s"「$q」", "この名前にする", "")(choose(q, None)))
+    for (v, d) <- vs do list.addView(row("📍", v.name, v.category, fmtDistance(d))(choose(v.name, Some(v.id))))
     status.setText(if vs.isEmpty && q.isEmpty then "近くに候補なし" else "")
     status.setVisibility(if status.getText.length == 0 then View.GONE else View.VISIBLE)
 
@@ -102,10 +106,9 @@ final class PlacePicker(act: MainActivity, place: Place, visit: Option[Visit], o
         act.runOnUiThread(() => if my == generation then showVenues(found, q))
       }
 
-  private def choose(name: String, externalId: String): Unit =
+  private def choose(name: String, externalId: Option[String]): Unit =
     dialog.dismiss()
-    val after = place.copy(name = name, externalId = externalId)
-    Edits.updatePlace(act, place, after, s"場所を「$name」に変更", onChanged)
+    Edits.updatePlace(act, place.id, PlaceEdit.rename(place, name, externalId), s"場所を「$name」に変更", onChanged)
 
   private def row(icon: String, title: String, sub: String, trailing: String, chosen: Boolean = false)(onClick: => Unit): View =
     val ic = text(icon, 16f)

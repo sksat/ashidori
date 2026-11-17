@@ -118,6 +118,9 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit, onSelect:
   /** The shown view of an item, e.g. to scroll it into sight. */
   def viewOf(key: String): Option[View] = shown.get(key).filter(_.isAttachedToWindow)
 
+  /** Selects an item before its day is shown (a recreated activity). */
+  def restoreSelection(key: String): Unit = selected = Some(key)
+
   /** Drops the selection (another day is shown). */
   def clearSelection(): Unit =
     selected.flatMap(shown.get).foreach(_.setSelected(false))
@@ -234,7 +237,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit, onSelect:
           third.setText(s"${third.getText}・${fmtDuration(v.durationMs)}")
         place.foreach { p =>
           suggestion.foreach { s =>
-            actions.addView(actionChip(s"「$s」にする")(Edits.renamePlace(act, p, p.copy(name = s), () => changed(tl))))
+            actions.addView(actionChip(s"「$s」にする")(Edits.updatePlace(act, p.id, PlaceEdit.rename(p, s), Edits.renameMessage(s), () => changed(tl))))
           }
           actions.addView(actionChip("✎ 編集", "場所を編集")(PlacePicker(act, p, Some(v), () => changed(tl)).show()))
           actions.addView(actionChip("場所を見る")(PlaceSheet(act, p, Some(v), () => changed(tl), Some(d => act.openDay(d))).show()))
@@ -283,46 +286,54 @@ object Edits:
       .setAction("取り消し", _ => undo)
       .show()
 
-  /** Sets the leg's mode; 取り消し puts back the correction it replaced (or none). */
+  /** Sets the leg's mode, for the whole leg (also across midnight).
+    * 取り消し writes the correction it replaced, or the inferred mode: a new
+    * row that sync carries like any other (a deleted row would not reach
+    * the web viewer), and that leaves the leg as built.
+    */
   def changeMode(act: MainActivity, l: Leg, m: TransportMode, changed: () => Unit): Unit =
+    val (s, e) = (l.wholeStart, l.wholeEnd)
     AshidoriApp.io.execute { () =>
-      val before = AshidoriApp.db.modeOverride(l.start, l.end)
-      AshidoriApp.db.setModeOverride(l.start, l.end, m)
+      val back = AshidoriApp.db.modeOverride(s, e).getOrElse(l.autoMode)
+      AshidoriApp.db.setModeOverride(s, e, m)
       changed()
       act.runOnUiThread { () =>
         snackbar(act.snackbarAnchor, s"移動手段を${m.label}に変更") {
           AshidoriApp.io.execute { () =>
-            before match
-              case Some(b) => AshidoriApp.db.setModeOverride(l.start, l.end, b)
-              case None    => AshidoriApp.db.deleteModeOverride(l.start, l.end)
+            AshidoriApp.db.setModeOverride(s, e, back)
             changed()
           }
         }
       }
     }
 
-  /** Saves a place (name, kind or the venue it is); 取り消し restores `before`
-    * (then `undone` runs on the main thread).
+  /** Applies one change to the place as stored now; 取り消し takes back only
+    * that field, and only while it still holds what was set (a later change
+    * stays). `done` and `undone` get the stored place, on the main thread.
     */
-  def updatePlace(act: MainActivity, before: Place, after: Place, message: String, changed: () => Unit,
-                  anchor: Option[View] = None, undone: () => Unit = () => ()): Unit =
-    if after != before then
+  def updatePlace(act: MainActivity, placeId: Long, edit: PlaceEdit, message: String, changed: () => Unit,
+                  anchor: Option[View] = None, done: Place => Unit = _ => (), undone: Place => Unit = _ => ()): Unit =
+    def stored() = AshidoriApp.db.places().find(_.id == placeId)
+    if !edit.isNoop then
       AshidoriApp.io.execute { () =>
-        AshidoriApp.db.updatePlace(after)
-        TimelineRepo.invalidate()
-        changed()
-        act.runOnUiThread { () =>
-          snackbar(anchor.getOrElse(act.snackbarAnchor), message) {
-            AshidoriApp.io.execute { () =>
-              AshidoriApp.db.updatePlace(before)
-              TimelineRepo.invalidate()
-              changed()
-              act.runOnUiThread(() => undone())
+        stored().foreach { now =>
+          val after = edit.applyTo(now)
+          AshidoriApp.db.updatePlace(after)
+          TimelineRepo.invalidate()
+          changed()
+          act.runOnUiThread { () =>
+            done(after)
+            snackbar(anchor.getOrElse(act.snackbarAnchor), message) {
+              AshidoriApp.io.execute { () =>
+                for now <- stored(); back <- edit.revert(now) do
+                  AshidoriApp.db.updatePlace(back)
+                  TimelineRepo.invalidate()
+                  changed()
+                  act.runOnUiThread(() => undone(back))
+              }
             }
           }
         }
       }
 
-  def renamePlace(act: MainActivity, before: Place, after: Place, changed: () => Unit, anchor: Option[View] = None,
-                  undone: () => Unit = () => ()): Unit =
-    updatePlace(act, before, after, if after.name.isEmpty then "名前を削除" else s"名前を「${after.name}」に変更", changed, anchor, undone)
+  def renameMessage(name: String): String = if name.isEmpty then "名前を削除" else s"名前を「$name」に変更"
