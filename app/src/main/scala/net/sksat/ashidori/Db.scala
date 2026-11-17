@@ -62,7 +62,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Version 7: battery readings beyond the percentage, and the logger's
     * state spans ([[EnergyState]]). Only adds what is missing.
     */
-  private def addEnergy(db: SQLiteDatabase): Unit = DbSchema.toV7(columns(db, "battery")).foreach(db.execSQL)
+  private def addEnergy(db: SQLiteDatabase): Unit =
+    DbSchema.toV7(columns(db, "battery"), columns(db, "energy_state")).foreach(db.execSQL)
 
   /** Version 8: vertical accuracy and MSL altitude of fixes, and barometric
     * pressure ([[Elevation]]). Only adds what is missing.
@@ -282,47 +283,52 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("env", e.env)
     cv
 
-  /** Closes the open span(s) at `end` (split at local midnight) and opens
-    * one for `next` from `end`, if given. One transaction.
-    *
-    * A span is closed by deleting its open row and inserting the closed
-    * one(s) with new rowids, never by an update ([[DbSchema.archivable]]).
+  /** Applies a record of the logger's state changes ([[EnergyLog]]): in
+    * one transaction with the open rows and the checkpoint it reads. A
+    * closed or replaced open row is deleted and inserted anew with new
+    * rowids, never updated ([[DbSchema.archivable]]).
     */
-  def switchEnergyState(end: Long, next: Option[EnergyState]): Unit = tx { db =>
-    for (rowid, span) <- openEnergy() do
-      val parts = EnergySpan.splitDays(span.copy(end = math.max(span.start, end)), AshidoriApp.zone)
-      db.delete("energy_state", "rowid=? AND end IS NULL", Array(rowid.toString))
-      var id = claimRowids(db, "energy_state", parts.size)
-      for p <- parts do
-        val cv = energyValues(p.state)
-        cv.put("rowid", java.lang.Long.valueOf(id))
-        id += 1
-        cv.put("start", java.lang.Long.valueOf(p.start))
-        cv.put("end", java.lang.Long.valueOf(p.end))
-        db.insertOrThrow("energy_state", null, cv)
-    next.foreach { st =>
-      val cv = energyValues(st)
-      cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "energy_state", 1)))
-      cv.put("start", java.lang.Long.valueOf(end))
-      db.insertOrThrow("energy_state", null, cv)
+  def applyEnergy(r: SmallRecord.Energy): Unit = tx { db =>
+    val open = openEnergy()
+    EnergyLog.apply(open.map(_._2), energyCheckpoint(), r, AshidoriApp.zone, deletedRanges()).foreach { ch =>
+      if ch.replaceOpen then
+        for (rowid, _) <- open do db.delete("energy_state", "rowid=? AND end IS NULL", Array(rowid.toString))
+        var id = claimRowids(db, "energy_state", ch.insert.size)
+        for row <- ch.insert do
+          val cv = energyValues(row.state)
+          cv.put("rowid", java.lang.Long.valueOf(id))
+          id += 1
+          cv.put("start", java.lang.Long.valueOf(row.start))
+          row.end.foreach(e => cv.put("end", java.lang.Long.valueOf(e)))
+          cv.put("end_unknown", java.lang.Integer.valueOf(if row.endUnknown then 1 else 0))
+          db.insertOrThrow("energy_state", null, cv)
+      val c = ch.checkpoint
+      db.execSQL("INSERT OR REPLACE INTO energy_checkpoint(id, token, seq, confirmed_at) VALUES(0, ?, ?, ?)",
+        Array[AnyRef](c.token, java.lang.Long.valueOf(c.seq), java.lang.Long.valueOf(c.confirmedAt)))
     }
   }
 
-  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env"
-  private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan =
+  /** Ranges deleted by the user: nothing is written into them again. */
+  def deletedRanges(): Vector[(Long, Long)] = Vector.empty
+
+  def energyCheckpoint(): Option[EnergyCheckpoint] =
+    query("SELECT token, seq, confirmed_at FROM energy_checkpoint WHERE id=0")(c =>
+      EnergyCheckpoint(c.getString(0), c.getLong(1), c.getLong(2))).headOption
+
+  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown"
+  private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan = rowOf(c, at).span.copy(end = end)
+  private def rowOf(c: Cursor, at: Int): EnergyRow =
     def s(i: Int) = Option(c.getString(at + i)).getOrElse("")
-    EnergySpan(c.getLong(at), end, EnergyState(c.getInt(at + 2) != 0, c.getLong(at + 3), s(4), c.getInt(at + 5) != 0,
-      c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)))
+    EnergyRow(c.getLong(at), Option.when(!c.isNull(at + 1))(c.getLong(at + 1)),
+      EnergyState(c.getInt(at + 2) != 0, c.getLong(at + 3), s(4), c.getInt(at + 5) != 0,
+        c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)),
+      !c.isNull(at + 13) && c.getInt(at + 13) != 0)
 
-  /** Spans not closed yet: normally the current one; more after the process was killed. */
-  private def openEnergy(): Vector[(Long, EnergySpan)] =
+  /** Rows not closed yet: normally the current one; more after the process was killed. */
+  private def openEnergy(): Vector[(Long, EnergyRow)] =
     query(s"SELECT rowid,$energyCols FROM energy_state WHERE end IS NULL ORDER BY start") { c =>
-      (c.getLong(0), energyOf(c, 1, c.getLong(1)))
+      (c.getLong(0), rowOf(c, 1))
     }
-
-  /** When the latest battery reading in SQLite was taken (0 = none). */
-  def lastBatteryTime(): Long =
-    query("SELECT MAX(time) FROM battery")(c => if c.isNull(0) then 0L else c.getLong(0)).head
 
   /** Readings and state spans since `from` for the energy analysis; the open span ends `now`. */
   def energyData(from: Long, now: Long): (Vector[BatteryReading], Vector[EnergySpan]) =
@@ -331,7 +337,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         hotRows(Archive.Battery, from, Long.MaxValue).map(r => Archive.batteryOf(r.toIndexedSeq))
       val spans = AshidoriApp.archive.read(Archive.EnergyStates, from, Long.MaxValue).map(Archive.energyOf) ++
         hotRows(Archive.EnergyStates, from, Long.MaxValue).map(r => Archive.energyOf(r.toIndexedSeq)) ++
-        openEnergy().map(_._2).filter(_.start < now).map(_.copy(end = now))
+        openEnergy().map(_._2).filter(_.start < now).map(_.span.copy(end = now))
       (readings.distinctBy(_.time).sortBy(_.time), spans.distinctBy(_.start).sortBy(_.start))
     }
 
@@ -606,13 +612,16 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   // --- GNSS status history ------------------------------------------------------
 
   def insertGnssStatus(s: GnssSnapshot, env: Environment, acc: Float): Unit =
+    insertGnssStatusRow(s.time, s.visible, s.used, s.top4Cn0, s.l5, env.toString, acc)
+
+  def insertGnssStatusRow(time: Long, visible: Int, used: Int, top4: Double, l5: Int, env: String, acc: Float): Unit =
     val cv = ContentValues()
-    cv.put("time", java.lang.Long.valueOf(s.time))
-    cv.put("visible", java.lang.Integer.valueOf(s.visible))
-    cv.put("used", java.lang.Integer.valueOf(s.used))
-    cv.put("top4", java.lang.Double.valueOf(s.top4Cn0))
-    cv.put("l5", java.lang.Integer.valueOf(s.l5))
-    cv.put("env", env.toString)
+    cv.put("time", java.lang.Long.valueOf(time))
+    cv.put("visible", java.lang.Integer.valueOf(visible))
+    cv.put("used", java.lang.Integer.valueOf(used))
+    cv.put("top4", java.lang.Double.valueOf(top4))
+    cv.put("l5", java.lang.Integer.valueOf(l5))
+    cv.put("env", env)
     nanToNull(cv, "acc", acc)
     tx { db =>
       cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "gnss_status", 1)))
@@ -667,6 +676,28 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   def legacyDone(file: String): Unit = w.delete("legacy_import", "file=?", Array(file))
+
+  /** Runs `f` (inserts of a spilled batch) and marks `key` imported, in one
+    * transaction ([[SmallOverflow]]).
+    */
+  def importMarked(key: String)(f: => Unit): Unit = tx { db =>
+    f
+    db.execSQL("INSERT OR REPLACE INTO legacy_import(file, lines) VALUES(?, 1)", Array[AnyRef](key))
+  }
+
+  /** MSL altitudes computed after their fixes were saved ([[MslAltitude]]).
+    * A fix already archived (or deleted) is left as it is.
+    */
+  def updateFixMsl(vs: Seq[(Long, Double, Float)]): Unit = tx { db =>
+    val st = db.compileStatement("UPDATE fixes SET msl=?, msl_acc=? WHERE time=? AND msl IS NULL")
+    try
+      for (t, m, a) <- vs if !m.isNaN do
+        st.bindDouble(1, m)
+        if a.isNaN then st.bindNull(2) else st.bindDouble(2, a.toDouble)
+        st.bindLong(3, t)
+        st.executeUpdateDelete()
+    finally st.close()
+  }
 
   /** Raw lines of [from, to) in insertion order (the export of days not
     * archived yet).

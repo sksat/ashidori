@@ -38,45 +38,70 @@ object LoggerWrites:
   // again in this process.
   private lazy val stall = WriteStall.Alert(WriteStall.Monitor(Alerts.restoredStall()), Alerts.StallEffects)
 
-  /** Queues `write` (of `rows` rows) for the database. Raw batches carry
-    * their lines, so they can be spilled to a file.
+  /** Queues `write` (of `rows` rows) for the database. A batch that cannot
+    * be saved (the queue is full, or SQLite still refuses it after the
+    * retries) is kept in a file and imported later: raw batches by their
+    * `lines` ([[Overflow]]), small ones by `spill` ([[SmallOverflow]]).
+    * Only a batch that cannot be kept that way either is lost (counted).
     */
-  def submit(rows: Int, raw: Boolean, kind: WriteKind, lines: Seq[(Long, String)] = Nil)(write: Db => Unit): Unit =
+  def submit(rows: Int, raw: Boolean, kind: WriteKind, lines: Seq[(Long, String)] = Nil,
+             spill: Option[() => Unit] = None)(write: Db => Unit): Unit =
     val now = SystemClock.uptimeMillis()
     val what = kind.label
+    /** To a file instead; false if there is no way or it failed (then counted lost). */
+    def keep(why: String): Boolean =
+      if raw && lines.nonEmpty || spill.isDefined then
+        try
+          if raw && lines.nonEmpty then Overflow.spill(lines) else spill.get()
+          backlog.synchronized(backlog.spill(rows))
+          true
+        catch case NonFatal(e) =>
+          Log.w(s"spilling $rows $what failed", e)
+          lostNow(rows, s"$what（$why、退避にも失敗: ${LifeLog.describe(e)}）")
+          false
+      else
+        lostNow(rows, s"$what（$why）")
+        false
     backlog.synchronized(backlog.offer(rows, raw, kind.key, now)) match
       case None =>
-        if raw && lines.nonEmpty then
-          // Over the cap: to a file, imported later (Overflow).
-          try
-            Overflow.spill(lines)
-            backlog.synchronized(backlog.spill(lines.size))
-          catch case NonFatal(e) =>
-            Log.w(s"spilling $rows $what failed", e)
-            lostNow(rows, s"$what（退避にも失敗: ${LifeLog.describe(e)}）")
-        else lostNow(rows, s"$what（書き込み待ちが上限）")
+        keep("書き込み待ちが上限")
         note()
       case Some(id) =>
         exec.execute { () =>
+          var failed = false
           var lost = false
           try
             debugFailWrite(kind)
             commit(write)
           catch
             case NonFatal(e) =>
-              lost = true
+              failed = true
               Log.w(s"saving $what failed", e)
-              lostNow(rows, s"$what: ${LifeLog.describe(e)}")
+              lost = !keep(LifeLog.describe(e))
           finally
             val waited = SystemClock.uptimeMillis() - now
             if waited > 1000 then Log.i(s"write of $rows $what took $waited ms from hand-over")
-            backlog.synchronized(backlog.done(id, rows, raw, SystemClock.uptimeMillis(), lost))
+            backlog.synchronized(backlog.done(id, rows, raw, SystemClock.uptimeMillis(), lost, failed))
             note()
-          if !lost then Overflow.importSome(() => backlog.synchronized(backlog.pending))
+          if !failed then importOverflow()
         }
 
+  /** A batch of small rows, kept in a file if it cannot be saved now.
+    * `onSaved` runs on the write thread once it is committed (not when it
+    * went to a file).
+    */
+  def small(r: SmallRecord, onSaved: () => Unit = () => ()): Unit =
+    submit(r.rows, raw = false, r.kind, spill = Some(() => SmallOverflow.spill(r))) { db =>
+      SmallOverflow.apply(db, r)
+      onSaved()
+    }
+
+  private def importOverflow(): Unit =
+    Overflow.importSome(() => backlog.synchronized(backlog.pending))
+    SmallOverflow.importSome(() => backlog.synchronized(backlog.pending))
+
   def fixes(fs: Seq[Fix]): Unit =
-    if fs.nonEmpty then submit(fs.size, raw = false, WriteKind.Fixes)(_.insertFixes(fs))
+    if fs.nonEmpty then small(SmallRecord.Fixes(fs))
 
   def rawLines(batch: Seq[(Long, String)]): Unit =
     submit(batch.size, raw = true, WriteKind.RawLines, batch)(_.insertRawLines(batch))
@@ -137,7 +162,7 @@ object LoggerWrites:
     */
   def markStart(): Unit =
     lastCommitUptime = math.max(lastCommitUptime, SystemClock.uptimeMillis())
-    exec.execute(() => Overflow.importSome(() => backlog.synchronized(backlog.pending)))
+    exec.execute(() => importOverflow())
 
   /** Called now and then while logging: reports (once) when nothing was
     * committed for longer than the plan explains, or when a batch has been

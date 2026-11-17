@@ -8,17 +8,25 @@ import ashidori.core.*
   * ([[EnergyModel]]). Used on the logger thread; rows are saved through
   * [[LoggerWrites]], the logger's own write path.
   *
+  * State changes are kept until stored ([[EnergyTracker]]): every record
+  * handed over carries all changes not confirmed yet, so one that is lost
+  * is covered by the next, and the table applies each change once
+  * ([[EnergyLog]]). [[heartbeat]] confirms the current state now and then;
+  * the time of the last confirmation is where the next process closes what
+  * this one leaves open.
+  *
   * Nothing here wakes the device: a reading is taken when the state changes
   * (the logger or the system is awake then anyway) and by the logger's own
   * 5-minute sampling. Screen and charger changes come from broadcasts the
   * system sends while awake.
   */
 final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, onChange: () => Unit):
-  private var state: Option[EnergyState] = None
+  private val tracker = EnergyTracker(EnergyTracker.newToken(System.currentTimeMillis()))
   /** Screen and charger as last broadcast. */
   var screenOn: Boolean = true
   var plugged: Boolean = false
   private var registered = false
+  private var lostNoted = 0L
 
   private val receiver = new BroadcastReceiver:
     override def onReceive(c: Context, i: Intent): Unit =
@@ -30,13 +38,12 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
         case _                                => ()
       onChange()
 
-  /** Closes spans a killed process left open (at its last battery reading),
-    * then listens for screen and charger changes.
+  /** Listens for screen and charger changes. What a previous process left
+    * open is closed by this one's first record ([[EnergyLog]]).
     */
   def start(interactive: Boolean): Unit =
     screenOn = interactive
     plugged = sticky().exists(i => i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) > 0) || bm.isCharging
-    LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(db => db.switchEnergyState(db.lastBatteryTime(), None))
     if !registered then
       val f = IntentFilter()
       Seq(Intent.ACTION_SCREEN_ON, Intent.ACTION_SCREEN_OFF, Intent.ACTION_POWER_CONNECTED, Intent.ACTION_POWER_DISCONNECTED)
@@ -48,17 +55,26 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, o
     if registered then
       scala.util.Try(ctx.unregisterReceiver(receiver))
       registered = false
-    if state.isDefined then
-      state = None
-      LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(_.switchEnergyState(now, None))
+    if tracker.update(now, None) then submit(now)
 
   /** Records a new span and a battery reading when the state changed. */
   def update(now: Long, st: EnergyState, plan: String): Unit =
-    if !state.contains(st) then
-      state = Some(st)
-      val r = reading(now, st.screenOn)
-      LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(_.switchEnergyState(now, Some(st)))
-      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(r, plan))
+    if tracker.update(now, Some(st)) then
+      LoggerWrites.small(SmallRecord.Battery(reading(now, st.screenOn), plan))
+      submit(now)
+
+  /** The current state still holds at `now`: stored as the checkpoint, with
+    * any change not confirmed yet. Called with the 5-minute battery reading.
+    */
+  def heartbeat(now: Long): Unit = if tracker.current.isDefined || tracker.unconfirmed > 0 then submit(now)
+
+  private def submit(now: Long): Unit =
+    val r = tracker.record(now)
+    val upTo = r.transitions.lastOption.map(_.seq)
+    LoggerWrites.small(r, () => upTo.foreach(tracker.confirmed))
+    if tracker.dropped > lostNoted then
+      LifeLog.add(LifeKind.Note, s"記録の状態の変化 ${tracker.dropped - lostNoted} 件を保存できず")
+      lostNoted = tracker.dropped
 
   private def sticky(): Option[Intent] =
     scala.util.Try(Option(ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED)))

@@ -56,12 +56,12 @@ class DbMigrationSuite extends munit.FunSuite:
   private def migrate(db: File): Unit =
     // As SQLiteOpenHelper runs onUpgrade(6, 8): one transaction.
     def tx(sql: Seq[String]) = run(db, ("BEGIN" +: sql :+ "COMMIT").map(_ + ";").mkString("\n"))
-    tx(DbSchema.toV7(columns(db, "battery")))
+    tx(DbSchema.toV7(columns(db, "battery"), columns(db, "energy_state")))
     tx(DbSchema.toV8(columns(db, "fixes")))
 
   private def create(db: File): Unit =
     run(db, v6)
-    run(db, DbSchema.toV7(columns(db, "battery")).map(_ + ";").mkString("\n"))
+    run(db, DbSchema.toV7(columns(db, "battery"), columns(db, "energy_state")).map(_ + ";").mkString("\n"))
     run(db, DbSchema.toV8(columns(db, "fixes")).map(_ + ";").mkString("\n"))
 
   test("a 0.21.0 database migrates to version 8 with every row kept, and matches a new one") {
@@ -85,14 +85,14 @@ class DbMigrationSuite extends munit.FunSuite:
     // The same tables as a database created new.
     val fresh = tempDb()
     create(fresh)
-    for t <- Seq("fixes", "battery", "energy_state", "pressure") do
+    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure") do
       assertEquals(tableInfo(db, t), tableInfo(fresh, t), t)
     assertEquals(run(db, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;"),
       run(fresh, "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name;"))
 
     // Running a step again (a pre-release database had part of it) changes nothing.
     migrate(db)
-    for t <- Seq("fixes", "battery", "energy_state", "pressure") do
+    for t <- Seq("fixes", "battery", "energy_state", "energy_checkpoint", "pressure") do
       assertEquals(tableInfo(db, t), tableInfo(fresh, t), t)
 
     // New rows after the migration take rowids above the old ones.

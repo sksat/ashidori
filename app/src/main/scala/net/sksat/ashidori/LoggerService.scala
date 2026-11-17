@@ -225,7 +225,8 @@ class LoggerService extends Service:
       lastBatterySample = now
       val p = plan
       val reading = energy.reading(now, pm.isInteractive)
-      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(reading, p.map(_.describe).getOrElse("")))
+      LoggerWrites.small(SmallRecord.Battery(reading, p.map(_.describe).getOrElse("")))
+      energy.heartbeat(now)
       // A read: on the UI's I/O thread, not the logger's write path.
       AshidoriApp.io.execute { () =>
         // Never fails the logger's process (rule C; and anything else).
@@ -397,7 +398,7 @@ class LoggerService extends Service:
     recorder.foreach { r =>
       r.stop()
       val end = System.currentTimeMillis()
-      LoggerWrites.submit(1, raw = false, WriteKind.RawSessions)(_.insertGnssSession(r.startedAt, end, "", r.reason))
+      LoggerWrites.small(SmallRecord.RawSession(r.startedAt, end, "", r.reason))
     }
     recorder = None
     LoggerState.onMain { LoggerState.detailFile = None }
@@ -513,7 +514,7 @@ class LoggerService extends Service:
       if now - lastStatusSaved >= 10_000 then
         lastStatusSaved = now
         val acc = LoggerState.lastFix.filter(f => now - f.time < 30_000).map(_.accuracy).getOrElse(Float.NaN)
-        LoggerWrites.submit(1, raw = false, WriteKind.GnssStatus)(_.insertGnssStatus(snap, env, acc))
+        LoggerWrites.small(SmallRecord.GnssStatus(snap.time, snap.visible, snap.used, snap.top4Cn0, snap.l5, env.toString, acc))
       if env != before then evaluate(force = true)
       LoggerState.changed()
 
@@ -622,7 +623,7 @@ class LoggerService extends Service:
       pendingFixes.clear()
       pendingMotion.clear()
       LoggerWrites.fixes(fs)
-      if ms.nonEmpty then LoggerWrites.submit(ms.size, raw = false, WriteKind.Motion)(_.insertMotion(ms))
+      if ms.nonEmpty then LoggerWrites.small(SmallRecord.Motion(ms))
     else if !handler.hasCallbacks(flushLater) then handler.postDelayed(flushLater, LoggerService.FlushMs)
 
   private val flushLater: Runnable = () => flush(force = true)

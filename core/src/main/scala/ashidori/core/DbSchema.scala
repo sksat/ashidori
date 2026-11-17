@@ -27,11 +27,19 @@ object DbSchema:
   /** Version 7: the logger's state spans ([[EnergyState]]). The open span
     * (the current state) has a NULL `end`; it is closed by replacing its
     * row with the closed one(s), never by an update (see [[archivable]]).
+    * `end_unknown` 1: the state was last confirmed at `end` ([[EnergyLog]]).
     */
   val CreateEnergyState: String =
     """CREATE TABLE IF NOT EXISTS energy_state(start INTEGER NOT NULL, end INTEGER, gnss INTEGER,
       |gnss_interval_ms INTEGER, provider TEXT, detail INTEGER, still INTEGER, screen_on INTEGER, charging INTEGER,
-      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT)""".stripMargin
+      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT, end_unknown INTEGER NOT NULL DEFAULT 0)""".stripMargin
+
+  /** Version 7: the last state change applied and when the state was last
+    * confirmed and stored ([[EnergyCheckpoint]]). One row; not archived.
+    */
+  val CreateEnergyCheckpoint: String =
+    """CREATE TABLE IF NOT EXISTS energy_checkpoint(id INTEGER PRIMARY KEY CHECK(id=0), token TEXT NOT NULL,
+      |seq INTEGER NOT NULL, confirmed_at INTEGER NOT NULL)""".stripMargin
 
   /** Version 8: the vertical accuracy of `alt` and the MSL altitude of fixes. */
   val FixColumns: Seq[(String, String)] = Seq("alt_acc" -> "REAL", "msl" -> "REAL", "msl_acc" -> "REAL")
@@ -39,10 +47,16 @@ object DbSchema:
   /** Version 8: barometric pressure ([[PressureSample]]). */
   val CreatePressure: String = "CREATE TABLE IF NOT EXISTS pressure(time INTEGER NOT NULL, hpa REAL NOT NULL)"
 
-  /** From version 6 to 7. `battery`: the columns `battery` has now. */
-  def toV7(battery: Set[String]): Seq[String] =
+  /** From version 6 to 7. `battery`, `energyState`: the columns the tables
+    * have now (none: the table does not exist).
+    */
+  def toV7(battery: Set[String], energyState: Set[String] = Set.empty): Seq[String] =
     BatteryColumns.filterNot((n, _) => battery(n)).map((n, t) => s"ALTER TABLE battery ADD COLUMN $n $t") ++
-      Seq(CreateEnergyState, "CREATE INDEX IF NOT EXISTS energy_state_start ON energy_state(start)")
+      Seq(CreateEnergyState, "CREATE INDEX IF NOT EXISTS energy_state_start ON energy_state(start)") ++
+      // A pre-release build created the table without it.
+      Option.when(energyState.nonEmpty && !energyState("end_unknown"))(
+        "ALTER TABLE energy_state ADD COLUMN end_unknown INTEGER NOT NULL DEFAULT 0") ++
+      Seq(CreateEnergyCheckpoint)
 
   /** From version 7 to 8. `fixes`: the columns `fixes` has now. */
   def toV8(fixes: Set[String]): Seq[String] =

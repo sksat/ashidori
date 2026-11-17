@@ -52,7 +52,7 @@ final class PressureRecorder(sm: SensorManager, handler: Handler):
     if pending.nonEmpty then
       val ps = pending.toVector
       pending.clear()
-      LoggerWrites.submit(ps.size, raw = false, WriteKind.Pressure)(_.insertPressure(ps))
+      LoggerWrites.small(SmallRecord.Pressure(ps))
 
   private val writeNow: Runnable = () => write()
 

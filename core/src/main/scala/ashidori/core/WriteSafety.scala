@@ -12,6 +12,7 @@ enum WriteKind(val key: String, val label: String):
   case RawSessions extends WriteKind("raw_sessions", "生データの区間")
   case EnergyState extends WriteKind("energy_state", "記録の状態")
   case Pressure extends WriteKind("pressure", "気圧")
+  case FixMsl extends WriteKind("fix_msl", "海抜高度")
 
 object WriteKind:
   def fromKey(k: String): Option[WriteKind] = values.find(_.key == k)
@@ -98,17 +99,20 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
       queued(nextId) = (kind, now)
       Some(nextId)
 
-  /** A raw batch over the cap went to a file instead. */
+  /** A batch over the cap, or one SQLite refused, went to a file instead. */
   def spill(rows: Int): Unit =
     spilled += rows
     totalSpilled += rows
 
-  /** A queued batch left the queue: committed, or given up (`lost`). */
-  def done(id: Long, rows: Int, raw: Boolean, now: Long, lost: Boolean = false): Unit =
+  /** A queued batch left the queue: committed, or given up (`lost`), or
+    * not committed but kept in a file (`failed` alone): its kind counts as
+    * not saved until a batch of it is.
+    */
+  def done(id: Long, rows: Int, raw: Boolean, now: Long, lost: Boolean = false, failed: Boolean = false): Unit =
     if raw then pendingRaw -= rows else pendingOther -= rows
     queued.remove(id).foreach { (kind, t) =>
       slowest = math.max(slowest, now - t)
-      if lost then failedSince.getOrElseUpdate(kind, t)
+      if lost || failed then failedSince.getOrElseUpdate(kind, t)
       else
         failedSince.remove(kind)
         savedAt(kind) = now
@@ -128,7 +132,7 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
       val parts = Seq(
         Option.when(lostOther > 0)(s"位置・動きなど ${lostOther} 行を保存できず"),
         Option.when(lostRaw > 0)(s"生データ ${lostRaw} 行を保存できず"),
-        Option.when(spilled > 0)(s"生データ ${spilled} 行をファイルに退避"),
+        Option.when(spilled > 0)(s"${spilled} 行をファイルに退避"),
         Option.when(slowest >= slowMs)(s"保存待ち最大 ${slowest / 1000} 秒"),
         Some(s"待ち $pending 行")
       ).flatten
