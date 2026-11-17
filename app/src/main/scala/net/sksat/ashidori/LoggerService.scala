@@ -681,7 +681,9 @@ class LoggerService extends Service:
 
   /** A status for people (「バランス・歩行・衛星・10 秒間隔」), not the log format of describe. */
   private def statusText(p: SamplingPlan): String =
-    s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"
+    // Still with positioning off: one phrase, so 「静止」 is not said twice and 「停止」 is not read as recording stopped.
+    if p.source == LocationSource.Passive then s"${p.effectiveMode.label}・静止中のため測位停止"
+    else s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"
 
 object LoggerService:
   /** Request codes of every PendingIntent in the app, in one place so that

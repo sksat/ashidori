@@ -126,7 +126,7 @@ final class PositioningPanel(act: MainActivity):
     case "gps"                => "衛星"
     case "fused" | "network"  => "Wi-Fi・基地局"
     case Pdr.Provider         => "歩数と向きから推定"
-    case "passive"            => "他アプリの測位"
+    case "passive"            => "他アプリが取得"
     case "sim"                => "シミュレーション"
     case other                => other
 
@@ -296,7 +296,8 @@ object PositioningPanel:
     val how = p.source match
       case LocationSource.Gnss    => s"衛星・${every(p.intervalMs)}"
       case LocationSource.Network => s"Wi-Fi・基地局・${every(p.intervalMs)}"
-      case LocationSource.Passive => "他アプリの測位のみ"
+      // No positioning of our own while still; only positions other apps obtain arrive.
+      case LocationSource.Passive => "静止中のため停止"
     how + (if p.rawGnss then "・生データ記録中" else "")
 
   /** Why the state is what it is, first part: the mode actually in effect
