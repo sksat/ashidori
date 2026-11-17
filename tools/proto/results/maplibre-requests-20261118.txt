@@ -1,0 +1,131 @@
+== ofm-direct
+      1 event rendered-fully
+      1 event style-loaded
+      5 req kind=glyphs tok=NONE at=- cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 req kind=sprite-json@2x tok=NONE at=- cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 req kind=sprite-png@2x tok=NONE at=- cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      1 req kind=style tok=T1 at=query cond=- url=https://tiles.openfreemap.org/styles/liberty?ashidori-t=T1
+      1 req kind=tilejson tok=NONE at=- cond=- url=https://tiles.openfreemap.org/planet
+      7 req kind=vector-tile tok=NONE at=- cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      5 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      1 resp kind=style code=200 url=https://tiles.openfreemap.org/styles/liberty
+      1 resp kind=tilejson code=200 url=https://tiles.openfreemap.org/planet
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== ofm-url
+      1 event style-loaded
+      1 req kind=glyphs tok=T1 at=query cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf?ashidori-t=T1
+      1 req kind=sprite-json@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T1
+      1 req kind=sprite-png@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T1
+      1 req kind=tilejson tok=T1 at=query cond=- url=https://tiles.openfreemap.org/planet?ashidori-t=T1
+      7 req kind=vector-tile tok=NONE at=- cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      1 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      1 resp kind=tilejson code=200 url=https://tiles.openfreemap.org/planet
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== ofm-tiles
+      1 event rendered-fully
+      1 event style-loaded
+      5 req kind=glyphs tok=T1 at=query cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf?ashidori-t=T1
+      1 req kind=sprite-json@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T1
+      1 req kind=sprite-png@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T1
+      7 req kind=vector-tile tok=T1 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T1
+      5 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== ofm-path
+      1 event style-loaded
+      4 req kind=glyphs tok=T1 at=path cond=- url=https://tiles.openfreemap.org/ashidori-t/T1/fonts/{fontstack}/{range}.pbf
+      1 req kind=sprite-json@2x tok=T1 at=path cond=- url=https://tiles.openfreemap.org/ashidori-t/T1/sprites/ofm_f384/ofm@2x.json
+      1 req kind=sprite-png@2x tok=T1 at=path cond=- url=https://tiles.openfreemap.org/ashidori-t/T1/sprites/ofm_f384/ofm@2x.png
+      7 req kind=vector-tile tok=T1 at=path cond=- url=https://tiles.openfreemap.org/ashidori-t/T1/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      2 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== gsi-query
+      1 event rendered-fully
+      1 event style-loaded
+     11 req kind=raster-tile tok=T1 at=query cond=- url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png?ashidori-t=T1
+     11 resp kind=raster-tile code=200 url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png
+== cache-1-T1
+      1 event rendered-fully
+      1 event style-loaded
+      5 req kind=glyphs tok=T1 at=query cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf?ashidori-t=T1
+      1 req kind=sprite-json@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T1
+      1 req kind=sprite-png@2x tok=T1 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T1
+      7 req kind=vector-tile tok=T1 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T1
+      5 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== cache-2-T1
+      1 event rendered-fully
+      1 event style-loaded
+== cache-3-T2
+      1 event style-loaded
+      5 req kind=glyphs tok=T2 at=query cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf?ashidori-t=T2
+      1 req kind=sprite-json@2x tok=T2 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T2
+      1 req kind=sprite-png@2x tok=T2 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T2
+      7 req kind=vector-tile tok=T2 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T2
+      5 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== cache-4-T1-rejected
+      1 event rendered-fully
+      1 event style-loaded
+== gcache-1-T1
+      1 event rendered-fully
+      1 event style-loaded
+     11 req kind=raster-tile tok=T1 at=query cond=- url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png?ashidori-t=T1
+     11 resp kind=raster-tile code=200 url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png
+== gcache-2-T1
+      1 event rendered-fully
+      1 event style-loaded
+     11 req kind=raster-tile tok=T1 at=query cond=If-None-Match url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png?ashidori-t=T1
+     11 resp kind=raster-tile code=304 url=https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png
+== reject-http403
+      1 event style-loaded
+      1 reject kind=sprite-json@2x tok=T3 fail=http403 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 reject kind=sprite-png@2x tok=T3 fail=http403 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+     19 reject kind=vector-tile tok=T3 fail=http403 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      1 req kind=sprite-json@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T3
+      1 req kind=sprite-png@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T3
+     19 req kind=vector-tile tok=T3 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T3
+== reject-http404
+      1 event rendered-fully
+      1 event style-loaded
+      1 reject kind=sprite-json@2x tok=T3 fail=http404 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 reject kind=sprite-png@2x tok=T3 fail=http404 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 reject kind=vector-tile tok=T3 fail=http404 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      1 req kind=sprite-json@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T3
+      1 req kind=sprite-png@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T3
+      7 req kind=vector-tile tok=T3 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T3
+== reject-mid
+      1 event rendered-fully
+      1 event style-loaded
+      8 reject kind=vector-tile tok=T4 fail=http403 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      5 req kind=glyphs tok=T4 at=query cond=- url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf?ashidori-t=T4
+      1 req kind=sprite-json@2x tok=T4 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T4
+      1 req kind=sprite-png@2x tok=T4 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T4
+     15 req kind=vector-tile tok=T4 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T4
+      5 resp kind=glyphs code=200 url=https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf
+      1 resp kind=sprite-json@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 resp kind=sprite-png@2x code=200 url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+      7 resp kind=vector-tile code=200 url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+== reject-io2-full
+      1 event style-loaded
+      1 reject kind=sprite-json@2x tok=T3 fail=io url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json
+      1 reject kind=sprite-png@2x tok=T3 fail=io url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png
+     22 reject kind=vector-tile tok=T3 fail=io url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf
+      1 req kind=sprite-json@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=T3
+      1 req kind=sprite-png@2x tok=T3 at=query cond=- url=https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.png?ashidori-t=T3
+     22 req kind=vector-tile tok=T3 at=query cond=- url=https://tiles.openfreemap.org/planet/20261115_080022_pt/{z}/{x}/{y}.pbf?ashidori-t=T3
+== attr2-item-1415
+      2 startActivity action=android.intent.action.VIEW data=https://openfreemap.org
+== attr-item-1415
+      2 startActivity action=android.intent.action.VIEW data=https://www.openmaptiles.org/
