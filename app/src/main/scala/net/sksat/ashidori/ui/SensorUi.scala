@@ -90,19 +90,28 @@ object SensorUi:
       bg.setColor(b)
       chipView.setTextColor(f)
       reason.setText(why)
-      // Waiting (e.g. searching for satellites) pulses, so it reads as in progress.
-      if tone == Tone.Waiting then
+      // Waiting (e.g. searching for satellites) pulses, so it reads as in
+      // progress; only while on screen (the card's refresh calls set again).
+      if tone == Tone.Waiting && chipView.isAttachedToWindow then
         if pulse == null then
           pulse = android.animation.ObjectAnimator.ofFloat(chipView, "alpha", 1f, 0.45f)
           pulse.setDuration(900)
           pulse.setRepeatCount(android.animation.ValueAnimator.INFINITE)
           pulse.setRepeatMode(android.animation.ValueAnimator.REVERSE)
           pulse.start()
-      else if pulse != null then
+      else stopPulse()
+
+    /** Ends the pulse: the screen is hidden or the view left the window. */
+    def stopPulse(): Unit =
+      if pulse != null then
         pulse.cancel()
         pulse = null
-        chipView.setAlpha(1f)
+      chipView.setAlpha(1f)
     private var pulse: android.animation.ObjectAnimator = null
+    chipView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener:
+      def onViewAttachedToWindow(v: View): Unit = ()
+      def onViewDetachedFromWindow(v: View): Unit = stopPulse()
+    )
 
   /** A label, its value and how old the value is, in fixed columns. */
   final class ValueRow(label: String)(using c: Ctx):

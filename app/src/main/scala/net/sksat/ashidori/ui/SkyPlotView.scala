@@ -41,6 +41,11 @@ final class SkyPlotView(c: Context) extends View(c):
 
   def update(s: Vector[SatSignal]): Unit =
     sats = s
+    // The bearings and elevations drawn on the canvas, for screen readers.
+    val bySat = s.groupBy(x => (x.constellation, x.svid))
+    val used = bySat.count(_._2.exists(_.usedInFix))
+    setContentDescription(
+      s"衛星の配置。上が北、右が東。外周が仰角 0°、内側の円が 30° と 60°、中心が真上。衛星 ${bySat.size} 機、使用 $used 機")
     invalidate()
 
   override def onMeasure(w: Int, h: Int): Unit =

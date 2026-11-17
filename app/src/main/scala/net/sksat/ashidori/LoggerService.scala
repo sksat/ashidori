@@ -119,7 +119,9 @@ class LoggerService extends Service:
         // without 「常に許可」, this throws SecurityException (Android 14+).
         // Uncaught, it crashed the process, the sticky restart a second later
         // crashed again, and the OS gave up on the app until it was opened.
-        try startForeground(NotificationId, notification("記録を開始中"), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+        // Every start command (also a refresh or a burst) re-posts the
+        // notification: keep the status once there is a plan.
+        try startForeground(NotificationId, notification(plan.fold("記録を開始中")(statusText)), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         catch case e: Exception =>
           LifeLog.add(LifeKind.ForegroundFailed, s"${if sticky then "自動再起動" else action.split('.').last}: ${LifeLog.describe(e)}")
           LifeLog.notifyStopped(this, "バックグラウンドから再開できませんでした")
@@ -618,7 +620,9 @@ class LoggerService extends Service:
   private def openLogger(confirmStop: Boolean): PendingIntent =
     PendingIntent.getActivity(
       this,
-      if confirmStop then 4 else 3,
+      // Distinct from each other and from LifeLog's 再開 (4): extras do not
+      // tell PendingIntents apart, so a shared code would overwrite them.
+      if confirmStop then 5 else 3,
       Intent(this, classOf[MainActivity]).putExtra(MainActivity.ExtraOpenLogger, true)
         .putExtra(MainActivity.ExtraConfirmStop, confirmStop).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
       PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT
@@ -626,9 +630,11 @@ class LoggerService extends Service:
 
   private def updateNotification(p: SamplingPlan): Unit =
     val nm = getSystemService(classOf[android.app.NotificationManager])
-    // A status for people (「バランス・歩行・衛星・10 秒間隔」), not the log format of describe.
-    nm.notify(NotificationId,
-      notification(s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"))
+    nm.notify(NotificationId, notification(statusText(p)))
+
+  /** A status for people (「バランス・歩行・衛星・10 秒間隔」), not the log format of describe. */
+  private def statusText(p: SamplingPlan): String =
+    s"${p.effectiveMode.label}・${estimator.current.label}・${ui.PositioningPanel.sourceState(p)}"
 
 object LoggerService:
   val ActionStart = "net.sksat.ashidori.START"

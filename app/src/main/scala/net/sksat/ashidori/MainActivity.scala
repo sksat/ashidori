@@ -432,7 +432,8 @@ class MainActivity extends AppCompatActivity:
     // background could not recover from (the "記録停止"
     // notification leads here). On every resume, not only in onCreate: the
     // activity may have outlived the service.
-    if Settings.onboarded && Settings.loggingEnabled && !LoggerState.running && granted(Manifest.permission.ACCESS_FINE_LOCATION) then
+    // The same permission check as the service: approximate location suffices.
+    if Settings.onboarded && Settings.loggingEnabled && !LoggerState.running && LoggerService.hasLocationPermission(this) then
       LoggerService.send(this, LoggerService.ActionStart)
     AshidoriApp.io.execute(() => LifeLog.checkState("アプリを表示"))
     maps.foreach(_.onResume())

@@ -162,6 +162,7 @@ final class SensorPanel(act: MainActivity):
   def onHide(): Unit =
     shown = false
     main.removeCallbacks(tick)
+    state.stopPulse()
     updateActive()
 
   // --- live display lifecycle: registered while the status tab is shown,

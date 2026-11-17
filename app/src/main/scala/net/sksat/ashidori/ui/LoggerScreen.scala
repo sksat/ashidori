@@ -45,6 +45,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private given Ctx = act
   override val title = "ステータス"
   private val timeFmt = DateTimeFormatter.ofPattern("M/d HH:mm")
+  private val sinceFmt = DateTimeFormatter.ofPattern("M月d日 H:mm")
+  /** 「3時間12分前から」, or from a day on the start itself: 「10月20日 14:05 から」. */
+  private def sinceText(since: Long): String =
+    val ago = System.currentTimeMillis() - since
+    if ago < 24 * 3_600_000L then s"${fmtDuration(ago)}前から"
+    else s"${Instant.ofEpochMilli(since).atZone(AshidoriApp.zone).format(sinceFmt)} から"
 
   // --- recorder header: REC badge with elapsed time, and the stop button ---
   private val recDot =
@@ -121,7 +127,9 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     * confirmation, so a stray tap cannot end it.
     */
   def confirmStop(): Unit =
-    if LoggerState.running then
+    // Also right after the start, before the service reports running: the
+    // saved wish to record is what stopping changes.
+    if LoggerState.running || Settings.loggingEnabled then
       com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
         .setTitle("記録を停止しますか")
         .setMessage("停止中の移動と滞在は記録されません。")
@@ -347,7 +355,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     status.setTextColor(color(if running then attr.onSurface else attr.onSurfaceVariant))
     val since = Settings.loggingSince
     elapsed.setText(
-      if running && since > 0 then s"${fmtDuration(System.currentTimeMillis() - since)}前から・${LoggerState.plan.map(_.effectiveMode).getOrElse(Settings.mode).label}"
+      if running && since > 0 then s"${sinceText(since)}・${LoggerState.plan.map(_.effectiveMode).getOrElse(Settings.mode).label}"
       else if running then LoggerState.plan.map(_.effectiveMode).getOrElse(Settings.mode).label
       else "")
     recDot.getBackground.asInstanceOf[android.graphics.drawable.GradientDrawable]
@@ -375,6 +383,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     // Indoors the note keeps its room in every mode (最高精度 has none);
     // elsewhere it does not appear.
     indoorNote.setText(plan.flatMap(PositioningPanel.indoorNote).fold("")("ⓘ " + _))
+    // Its room stays while empty, but only a note with text is a target.
+    val hasNote = indoorNote.getText.length > 0
+    indoorNote.setClickable(hasNote)
+    indoorNote.setImportantForAccessibility(
+      if hasNote then View.IMPORTANT_FOR_ACCESSIBILITY_YES else View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    indoorNote.setContentDescription(if hasNote then s"${indoorNote.getText.toString.stripPrefix("ⓘ ")}。タップで屋外判定の予定" else null)
     indoorNote.setVisibility(
       if plan.isDefined && LoggerState.environment == Environment.Indoor || indoorNote.getText.length > 0 then View.VISIBLE
       else View.GONE)

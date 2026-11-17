@@ -149,6 +149,7 @@ final class PositioningPanel(act: MainActivity):
   def onHide(): Unit =
     shown = false
     main.removeCallbacks(tick)
+    state.stopPulse()
   SensorUi.onPause(act)(onHide())
 
   /** A fix older than this says little about now. */
