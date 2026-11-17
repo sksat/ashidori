@@ -51,6 +51,23 @@ object ArchiveSnapshot:
   * [[ArchiveUpload.Progress]] with each part's outbox row.
   */
 object ArchiveUpload:
+  /** The archive file of an upload mark (`<reg>|up:<file>`, `upgen:`,
+    * `uppart:`, `upbytes:`), if `name` is one.
+    */
+  def markFile(name: String): Option[String] =
+    val i = name.indexOf('|')
+    val rest = if i < 0 then "" else name.drop(i + 1)
+    val j = rest.indexOf(':')
+    Option.when(j > 0 && Set("up", "upgen", "uppart", "upbytes")(rest.take(j)))(rest.drop(j + 1)).filter(_.endsWith(".parquet"))
+
+  /** Whether a part of a file covering `period` ([from, to)), sealed at
+    * `sealedAt`, may hold rows of a deleted range: one not cut out of the
+    * files yet (`pending`), or deleted at or after the part was sealed.
+    * `ranges`: (from, to, deleted at, pending).
+    */
+  def heldByDeletion(period: (Long, Long), sealedAt: Long, ranges: Seq[(Long, Long, Long, Boolean)]): Boolean =
+    val (a, b) = period
+    ranges.exists((x, y, at, pending) => x < b && y > a && (pending || at >= sealedAt))
   /** Archive files are sent in parts of at most this size, one batch each. */
   val PartSize: Int = 3 * 1024 * 1024
 

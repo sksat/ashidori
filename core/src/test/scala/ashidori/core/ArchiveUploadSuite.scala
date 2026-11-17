@@ -34,6 +34,21 @@ class ArchiveUploadSuite extends munit.FunSuite:
       part = ArchiveUpload.nextPart(snap, p, partSize)
     (out.toByteArray, p)
 
+  test("a part of a file with a deleted range: held while the range is not cut, or if sealed before the deletion") {
+    val day = (1000L, 2000L)
+    // Pending (not cut yet): held, whenever it was sealed.
+    assert(ArchiveUpload.heldByDeletion(day, sealedAt = 5000, Seq((1500L, 1600L, 4000L, true))))
+    // Cut: a part sealed before the deletion is held, one sealed after (from the cut file) is sent.
+    assert(ArchiveUpload.heldByDeletion(day, sealedAt = 3000, Seq((1500L, 1600L, 4000L, false))))
+    assert(!ArchiveUpload.heldByDeletion(day, sealedAt = 5000, Seq((1500L, 1600L, 4000L, false))))
+    // Another day: not held.
+    assert(!ArchiveUpload.heldByDeletion(day, sealedAt = 3000, Seq((2000L, 2600L, 4000L, true))))
+    assertEquals(ArchiveUpload.markFile("reg1|upgen:pressure/2026-11-15.parquet"), Some("pressure/2026-11-15.parquet"))
+    assertEquals(ArchiveUpload.markFile("reg1|up:fixes/2026-10.parquet"), Some("fixes/2026-10.parquet"))
+    assertEquals(ArchiveUpload.markFile("reg1|rev:places"), None)
+    assertEquals(ArchiveUpload.markFile("reg1|seq:archive"), None)
+  }
+
   tmp.test("a file replaced while it is uploaded: every part comes from the version opened (R1)") { dir =>
     val f = File(dir, "2026-10-01.parquet")
     val v1 = Array.tabulate[Byte](10)(_.toByte)

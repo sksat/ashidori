@@ -462,12 +462,21 @@ object Uploader:
     * it with `progress` in one small transaction. Returns the seq and blob.
     */
   private def enqueue(run: SyncRun, cls: String, stream: String, plain: Array[Byte], progress: Seq[(String, Long)],
-                      remove: Seq[String] = Nil): (Long, Array[Byte]) =
+                      remove: Seq[String] = Nil, file: Option[String] = None): (Long, Array[Byte]) =
     val db = AshidoriApp.db
     val seq = db.nextSeq(run.reg, stream)
     val blob = Crypto.seal(run.keys, Crypto.aad(run.deviceId, stream, seq), plain)
-    db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove)
+    db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove, file)
     (seq, blob)
+
+  /** Whether a part of archive file `file` (`<table>/<name>`), sealed at
+    * `sealedAt`, may hold rows of a range the user deleted: the range is
+    * not cut out of the files yet, or was deleted after the part was sealed.
+    * Read fresh each time (a deletion may come while a run goes on).
+    */
+  def heldByDeletion(file: String, sealedAt: Long): Boolean =
+    val ranges = AshidoriApp.db.deletedRangesNow()
+    ranges.nonEmpty && AshidoriApp.archive.periodOf(file.split('/').last).exists(ArchiveUpload.heldByDeletion(_, sealedAt, ranges))
 
   /** Stores the cut-over record C (gzipped plaintext) for upload, as the next
     * `authcut` batch of this device. On disk when it returns; sent by
@@ -544,7 +553,6 @@ object Uploader:
     var sent = 0
     def key(kind: String, t: ashidori.core.Archive.TableDef, name: String) = s"${run.reg}|$kind:${t.name}/$name"
     val files = for t <- tables; f <- AshidoriApp.archive.archivedFiles(t) yield (t, f)
-    val pendingDeletions = db.archiveDeletionsPending().map((_, a, b) => (a, b))
     val it = files.iterator
     var full = false
     while it.hasNext && !full do
@@ -560,9 +568,10 @@ object Uploader:
       val inProgress = !isMonth && scala.util.Try(java.time.LocalDate.parse(name.take(10))).toOption.exists(d =>
         !net.sksat.ashidori.Maintenance.Complete.is(d) &&
           AshidoriApp.db.hasHotRows(AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1)))) ||
-        // A range the user deleted that is not cut out of this file yet:
-        // sent once it is (as a new generation), never with those rows.
-        AshidoriApp.archive.periodOf(name).exists((a, b) => pendingDeletions.exists((x, y) => x < b && y > a))
+        // A range the user deleted that is not cut out of this file yet
+        // (read fresh for each file): sent once it is (as a new
+        // generation), never with those rows.
+        heldByDeletion(s"${t.name}/$name", Long.MaxValue)
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
         if inProgress then None
@@ -588,6 +597,9 @@ object Uploader:
                 if ArchiveUpload.complete(p, snap.size) then db.updateSync(Seq(handed), Seq(genKey, partKey, bytesKey))
                 else throw IllegalStateException(s"${t.name}/$name: ${p.bytes} bytes enqueued of ${snap.size}")
                 done = true
+              // A deletion came meanwhile: this version of the file is not sent.
+              case Some(_) if heldByDeletion(s"${t.name}/$name", Long.MaxValue) =>
+                done = true
               case Some(_) if db.outboxBytes(run.reg, cls) > MaxOutboxBytes =>
                 Log.w(s"outbox over ${MaxOutboxBytes >> 20} MiB: archive upload paused")
                 full = true
@@ -596,9 +608,10 @@ object Uploader:
                   "part" -> ujson.Num(part.index.toDouble), "parts" -> ujson.Num(part.parts.toDouble),
                   "data" -> java.util.Base64.getEncoder.encodeToString(part.data))))
                 // nextPart checked that the last part completes this generation.
-                if part.last then enqueue(run, cls, "archive", plain, Seq(handed), Seq(genKey, partKey, bytesKey))
+                val f = Some(s"${t.name}/$name")
+                if part.last then enqueue(run, cls, "archive", plain, Seq(handed), Seq(genKey, partKey, bytesKey), f)
                 else enqueue(run, cls, "archive", plain,
-                  Seq(genKey -> snap.generation, partKey -> part.next.part, bytesKey -> part.next.bytes))
+                  Seq(genKey -> snap.generation, partKey -> part.next.part, bytesKey -> part.next.bytes), file = f)
                 p = part.next
                 sent += flush(run, cls)
                 done = part.last
@@ -633,6 +646,13 @@ object Uploader:
         // Sealed for another device id: it would not decrypt. Never sent.
         Log.w(s"dropping outbox ${e.stream}/${e.seq} of another device")
         db.deleteOutbox(e.id)
+      else if e.file.exists(heldByDeletion(_, e.createdAt)) then
+        // A part of an archive file sealed before a range of it was deleted
+        // (or before it was cut): never sent. The cut file goes out as a new
+        // generation; seqs may have gaps.
+        Log.i(s"outbox ${e.stream}/${e.seq} (${e.file.get}) held by a deletion: not sent")
+        db.deleteOutbox(e.id)
+        db.forgetUpload(e.file.get)
       else
         run.client.putBatch(e.stream, e.seq, db.outboxBlob(e.id))
         db.deleteOutbox(e.id)
