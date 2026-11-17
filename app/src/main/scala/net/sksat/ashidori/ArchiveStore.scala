@@ -67,17 +67,22 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def read(t: Archive.TableDef, from: Long, to: Long): Vector[IndexedSeq[Any]] =
     filesFor(t, from, to).flatMap { f =>
-      orEmpty(Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
+      val shown = visible(t, from, to)
+      orEmpty(Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).flatMap(shown).toVector))
     }.toVector.sortBy(ArchiveMerge.key)
 
-  /** In [from, to), and not in a range the user deleted (whose rows a file
-    * may still hold until [[deleteRange]] has cut it).
+  /** A row as shown: in [from, to), and without what a range the user
+    * deleted holds (a file may still have it until [[deleteRange]] has cut
+    * it): a row in such a range is not shown, a state span crossing one is
+    * cut at its edges ([[ArchiveCut.cutRow]]).
     */
-  private def inWindow(from: Long, to: Long): IndexedSeq[Any] => Boolean =
+  private def visible(t: Archive.TableDef, from: Long, to: Long): IndexedSeq[Any] => Seq[IndexedSeq[Any]] =
     val deleted = scala.util.Try(AshidoriApp.db.deletedRanges()).getOrElse(Vector.empty)
     r =>
       val k = ArchiveMerge.key(r)
-      k >= from && k < to && Deletion.kept(deleted, k)
+      if k < from || k >= to then Nil
+      else if deleted.isEmpty then Seq(r)
+      else deleted.foldLeft(Seq(r))((rs, d) => rs.flatMap(ArchiveCut.cutRow(t, _, d._1, d._2)))
 
   /** Archived rows of `t` in [from, to) in time order, read a row group at
     * a time (for exports of the large raw tables). Close the iterator's
@@ -85,7 +90,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def stream(t: Archive.TableDef, from: Long, to: Long): (Iterator[IndexedSeq[Any]], () => Unit) =
     val readers = filesFor(t, from, to).flatMap(f => orEmpty(None)(Some(Archive.open(t, f.getPath))))
-    val sorted = readers.map(_.rowsBetween(from, to).filter(inWindow(from, to)))
+    val shown = visible(t, from, to)
+    // A state span cut at a deleted range may start later than the next
+    // one: a file of them (small) is put in order again.
+    def ordered(it: Iterator[IndexedSeq[Any]]) =
+      if t == Archive.EnergyStates then it.toVector.sortBy(ArchiveMerge.key).iterator else it
+    val sorted = readers.map(r => ordered(r.rowsBetween(from, to).flatMap(shown)))
       .foldLeft(Iterator.empty[IndexedSeq[Any]])((a, b) => mergeSorted(a, b))
     (sorted, () => readers.foreach(r => Try(r.close())))
 
@@ -93,8 +103,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   def lastRow(t: Archive.TableDef): Option[IndexedSeq[Any]] =
     archivedFiles(t).lastOption.flatMap { f =>
       orEmpty(None)(Using.resource(Archive.open(t, f.getPath)) { r =>
-        val keep = inWindow(Long.MinValue, Long.MaxValue)
-        if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.filter(keep).toSeq.lastOption
+        val shown = visible(t, Long.MinValue, Long.MaxValue)
+        if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.flatMap(shown).toSeq.sortBy(ArchiveMerge.key).lastOption
       })
     }
 

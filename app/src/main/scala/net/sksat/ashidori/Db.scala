@@ -219,7 +219,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if v.isNaN then cv.putNull(k) else cv.put(k, java.lang.Double.valueOf(v))
 
   def insertFixes(fs0: Iterable[Fix]): Unit = tx { db =>
-    val fs = fs0.filter(f => kept(f.time))
+    val del = deletedIn(db)
+    val fs = fs0.filter(f => Deletion.kept(del, f.time))
     val cv = ContentValues()
     var id = claimRowids(db, "fixes", fs.size)
     for f <- fs do
@@ -242,7 +243,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   def insertMotion(ws0: Iterable[MotionWindow], src: String = null): Unit = tx { db =>
-    val ws = ws0.filter(m => kept(m.start))
+    val del = deletedIn(db)
+    val ws = ws0.filter(m => Deletion.kept(del, m.start))
     val cv = ContentValues()
     var id = claimRowids(db, "motion", ws.size)
     for m <- ws do
@@ -258,7 +260,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       db.insertOrThrow("motion", null, cv)
   }
 
-  def insertBattery(b: BatteryReading, plan: String): Unit = if kept(b.time) then
+  def insertBattery(b: BatteryReading, plan: String): Unit =
     val cv = ContentValues()
     cv.put("time", java.lang.Long.valueOf(b.time))
     cv.put("pct", java.lang.Integer.valueOf(b.pct))
@@ -273,8 +275,9 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if !b.tempC.isNaN then cv.put("temp_c", java.lang.Double.valueOf(b.tempC.toDouble))
     b.plug.foreach(cv.put("plug", _))
     tx { db =>
-      cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "battery", 1)))
-      db.insertOrThrow("battery", null, cv)
+      if Deletion.kept(deletedIn(db), b.time) then
+        cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "battery", 1)))
+        db.insertOrThrow("battery", null, cv)
     }
 
   private def energyValues(e: EnergyState): ContentValues =
@@ -313,7 +316,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
           |FROM energy_state WHERE end IS NULL AND boot<?""".stripMargin, b) { c =>
           (rowOf(c, 1).copy(id = c.getLong(0)), Option.when(!c.isNull(17))(c.getLong(17)))
         }
-    val ch = EnergyLog.apply(EnergyLog.Before(tail, cp, newest, olderOpen), r, AshidoriApp.zone, deletedRanges())
+    val ch = EnergyLog.apply(EnergyLog.Before(tail, cp, newest, olderOpen), r, AshidoriApp.zone, deletedIn(db))
     for id <- ch.remove do db.delete("energy_state", "rowid=?", Array(id.toString))
     insertEnergyRows(db, ch.insert)
     val c = ch.checkpoint
@@ -362,8 +365,17 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     w.execSQL("UPDATE deleted_range SET archived_at=? WHERE rowid=?",
       Array[AnyRef](java.lang.Long.valueOf(System.currentTimeMillis()), java.lang.Long.valueOf(rowid)))
 
-  /** Whether time `t` lies outside every deleted range. */
-  private def kept(t: Long): Boolean = Deletion.kept(deletedRanges(), t)
+  /** The deleted ranges as they are now, read in the write transaction `db`
+    * that is about to insert (no cache: a range the other process added a
+    * moment ago counts). The write path's decision; [[deletedRanges]] is
+    * only for reads.
+    */
+  private def deletedIn(db: SQLiteDatabase): Vector[(Long, Long)] =
+    Using.resource(db.rawQuery("SELECT start, end FROM deleted_range", null)) { c =>
+      val b = Vector.newBuilder[(Long, Long)]
+      while c.moveToNext() do b += ((c.getLong(0), c.getLong(1)))
+      b.result()
+    }
 
   private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown,boot,seq"
   private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan = rowOf(c, at).span.copy(end = end)
@@ -391,16 +403,18 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       (readings.distinctBy(_.time).sortBy(_.time), spans.distinctBy(_.start).sortBy(_.start))
     }
 
-  def insertGnssSession(start: Long, end: Long, file: String, reason: String): Unit =
+  def insertGnssSession(start: Long, end: Long, file: String, reason: String): Unit = tx { db =>
     // Without the deleted ranges (a session cut short is zero length: kept if outside them).
-    val parts = if end > start then Deletion.cut(deletedRanges(), start, end) else Seq((start, end)).filter(p => kept(p._1))
+    val del = deletedIn(db)
+    val parts = if end > start then Deletion.cut(del, start, end) else Seq((start, end)).filter(p => Deletion.kept(del, p._1))
     for (s, e) <- parts do
       val cv = ContentValues()
       cv.put("start", java.lang.Long.valueOf(s))
       cv.put("end", java.lang.Long.valueOf(e))
       cv.put("file", file)
       cv.put("reason", reason)
-      w.insertOrThrow("gnss_sessions", null, cv)
+      db.insertOrThrow("gnss_sessions", null, cv)
+  }
 
   private def query[A](sql: String, args: Any*)(row: Cursor => A): Vector[A] =
     Using.resource(r.rawQuery(sql, args.map(_.toString).toArray)) { c =>
@@ -483,7 +497,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       c.getString(at + 7), c.getInt(at + 8), flt(c, at + 9), dbl(c, at + 10), flt(c, at + 11))
 
   def insertPressure(ps0: Iterable[PressureSample]): Unit = tx { db =>
-    val ps = ps0.filter(p => kept(p.time))
+    val del = deletedIn(db)
+    val ps = ps0.filter(p => Deletion.kept(del, p.time))
     val st = db.compileStatement("INSERT INTO pressure(rowid, time, hpa) VALUES(?, ?, ?)")
     try
       var id = claimRowids(db, "pressure", ps.size)
@@ -700,7 +715,6 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     insertGnssStatusRow(s.time, s.visible, s.used, s.top4Cn0, s.l5, env.toString, acc)
 
   def insertGnssStatusRow(time: Long, visible: Int, used: Int, top4: Double, l5: Int, env: String, acc: Float): Unit =
-    if !kept(time) then return
     val cv = ContentValues()
     cv.put("time", java.lang.Long.valueOf(time))
     cv.put("visible", java.lang.Integer.valueOf(visible))
@@ -710,8 +724,9 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("env", env)
     nanToNull(cv, "acc", acc)
     tx { db =>
-      cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "gnss_status", 1)))
-      db.insertOrThrow("gnss_status", null, cv)
+      if Deletion.kept(deletedIn(db), time) then
+        cv.put("rowid", java.lang.Long.valueOf(claimRowids(db, "gnss_status", 1)))
+        db.insertOrThrow("gnss_status", null, cv)
     }
 
   def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] = AshidoriApp.archive.reading(Archive.GnssStatus) {
@@ -735,7 +750,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   def insertRawLines(lines: Iterable[(Long, String)]): Unit = tx(insertRaw(_, lines))
 
   private def insertRaw(db: SQLiteDatabase, lines0: Iterable[(Long, String)]): Unit =
-    val lines = if deletedRanges().isEmpty then lines0 else lines0.filter(l => kept(l._1))
+    val del = deletedIn(db)
+    val lines = if del.isEmpty then lines0 else lines0.filter(l => Deletion.kept(del, l._1))
     val st = db.compileStatement("INSERT INTO raw_lines(rowid, time, line) VALUES(?, ?, ?)")
     try
       var id = claimRowids(db, "raw_lines", lines.size)
@@ -792,7 +808,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     def dayOver(t: Long) =
       java.time.Instant.ofEpochMilli(t).atZone(zone).toLocalDate.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
     try
-      for (t, m, a) <- vs if !m.isNaN && kept(t) && now < dayOver(t) + Db.MslLateMs do
+      val del = deletedIn(db)
+      for (t, m, a) <- vs if !m.isNaN && Deletion.kept(del, t) && now < dayOver(t) + Db.MslLateMs do
         st.bindLong(1, t)
         st.bindDouble(2, m)
         if a.isNaN then st.bindNull(3) else st.bindDouble(3, a.toDouble)
