@@ -1,13 +1,19 @@
 package net.sksat.ashidori.ui
 
-import android.graphics.{Bitmap, Canvas, Paint}
-import android.os.{Handler, Looper}
-import java.util.concurrent.{Executors, ExecutorService}
+import android.graphics.{Bitmap, Canvas, Paint, Rect, RectF}
+import android.os.{Bundle, Handler, Looper}
+import android.view.{MotionEvent, View}
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
+import androidx.customview.widget.ExploreByTouchHelper
+import java.util.concurrent.{Executors, ExecutorService, RejectedExecutionException}
 import java.util.concurrent.atomic.AtomicInteger
+import org.maplibre.android.geometry.LatLng as MLatLng
 import org.maplibre.android.maps.{MapLibreMap, Style}
 import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.{Property, PropertyFactory, SymbolLayer}
 import org.maplibre.android.style.sources.GeoJsonSource
+import org.maplibre.geojson.Point
 import scala.jdk.CollectionConverters.*
 import scala.util.Try
 import net.sksat.ashidori.{Log, VenueData}
@@ -21,9 +27,14 @@ import ashidori.core.{LatLng, VenueMapLayer}
   *
   * When the camera comes to rest (debounced), the venues of the view and a
   * margin around it are read off the main thread and replace the layer's
-  * GeoJSON. The layer lies under the basemap's own POIs and place labels,
-  * so those win a collision. Not interactive yet: there is no venue sheet
-  * to open (the check-in sheet would check in, which a tap must not do).
+  * GeoJSON; a move drops an answer still on its way ([[gen]]). The venue
+  * data being installed or removed asks again ([[refresh]]). The layer lies
+  * under the basemap's own POIs and place labels, so those win a collision.
+  *
+  * The drawn venues are also virtual views of [[accessibilityView]] (an
+  * overlay of the map), so that TalkBack reads their names and kinds. Not
+  * interactive yet: there is no venue sheet to open (the check-in sheet
+  * would check in, which a tap must not do).
   */
 final class VenueLayer(ctx: android.content.Context):
   import VenueLayer.*
@@ -32,14 +43,21 @@ final class VenueLayer(ctx: android.content.Context):
   private var target: Option[(MapLibreMap, Style)] = None
   /** Draws the Protomaps light sprite's icons (the offline style has them). */
   private var sprite = false
-  /** The map whose camera this layer listens to. */
-  private var listening: MapLibreMap = null
-  /** Raised by every request and detach: an older answer is dropped. */
+  /** The map whose camera this layer listens to, and its listeners (removed by [[detach]]). */
+  private var listening: Option[(MapLibreMap, MapLibreMap.OnCameraMoveStartedListener, MapLibreMap.OnCameraIdleListener)] = None
+  /** Raised by every request, camera move and detach: an older answer is dropped. */
   private val gen = AtomicInteger()
   /** What the source holds now, so an unchanged answer is not laid out again. */
   private var shown = Empty
   private val main = Handler(Looper.getMainLooper)
   private val fetch: Runnable = () => request()
+  private var destroyed = false
+  /** One background thread per map: queries never pile up on the main thread. */
+  private val worker: ExecutorService = Executors.newSingleThreadExecutor { r =>
+    val t = Thread(() => { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "ashidori-venue-map")
+    t.setDaemon(true)
+    t
+  }
 
   /** Adds the layer to a style that has just loaded, under its POIs and
     * place labels, or else under `below` (the map's own layers).
@@ -47,13 +65,14 @@ final class VenueLayer(ctx: android.content.Context):
     */
   def attach(m: MapLibreMap, style: Style, sprite: Boolean, below: String): Unit =
     detach()
-    // A symbol layer in a style without fonts draws nothing at all (not
-    // even its icons): a raster map without the offline map's fonts, or
-    // the canvas without a base map. Then the layer is left out.
-    val t0 = System.nanoTime()
-    val fonts = Glyphs.findFirstIn(style.getJson).nonEmpty
-    if fonts then add(m, style, sprite, below)
-    Log.d(f"venues: map layer ${if fonts then "added" else "left out (no fonts)"} in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
+    if !destroyed then
+      // A symbol layer in a style without fonts draws nothing at all (not
+      // even its icons): a raster map without the offline map's fonts, or
+      // the canvas without a base map. Then the layer is left out.
+      val t0 = System.nanoTime()
+      val fonts = Glyphs.findFirstIn(style.getJson).nonEmpty
+      if fonts then add(m, style, sprite, below)
+      Log.d(f"venues: map layer ${if fonts then "added" else "left out (no fonts)"} in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
 
   private def add(m: MapLibreMap, style: Style, sprite: Boolean, below: String): Unit =
     this.sprite = sprite
@@ -84,21 +103,46 @@ final class VenueLayer(ctx: android.content.Context):
         PropertyFactory.textHaloWidth(1f))
     style.addLayerBelow(layer, anchor)
     target = Some((m, style))
-    if listening ne m then
-      listening = m
-      m.addOnCameraMoveStartedListener(_ => if listening eq m then main.removeCallbacks(fetch))
-      m.addOnCameraIdleListener(() => if listening eq m then schedule(DebounceMs))
+    val moved: MapLibreMap.OnCameraMoveStartedListener = _ =>
+      // The answer for the old range would show it mid-move.
+      gen.incrementAndGet()
+      main.removeCallbacks(fetch)
+    val idle: MapLibreMap.OnCameraIdleListener = () =>
+      schedule(DebounceMs)
+      accessibilityChanged()
+    m.addOnCameraMoveStartedListener(moved)
+    m.addOnCameraIdleListener(idle)
+    listening = Some((m, moved, idle))
     schedule(0)
 
-  /** The style is going away (a new one loads, or the map view is dropped). */
+  /** The style is going away (a new one loads, or the map view is dropped):
+    * nothing of it, nor of its map, is kept.
+    */
   def detach(): Unit =
     target = None
     gen.incrementAndGet()
     main.removeCallbacks(fetch)
+    main.removeCallbacks(nodesChanged)
+    listening.foreach { (m, moved, idle) =>
+      m.removeOnCameraMoveStartedListener(moved)
+      m.removeOnCameraIdleListener(idle)
+    }
+    listening = None
+    shown = Empty
+    accessibilityChanged()
+
+  /** The venue data was installed or removed: reads the view again (an empty layer without it). */
+  def refresh(): Unit = if target.nonEmpty then schedule(0)
+
+  /** The map is gone for good: listeners, queued work and the thread end. */
+  def destroy(): Unit =
+    detach()
+    destroyed = true
+    worker.shutdownNow()
 
   private def schedule(delayMs: Long): Unit =
     main.removeCallbacks(fetch)
-    main.postDelayed(fetch, delayMs)
+    if !destroyed then main.postDelayed(fetch, delayMs)
 
   /** Reads the venues of the view off the main thread and shows them. */
   private def request(): Unit = target.foreach { (m, style) =>
@@ -113,7 +157,7 @@ final class VenueLayer(ctx: android.content.Context):
       val (s, w, n, e) = (b.getLatSouth - dLat, b.getLonWest - dLon, b.getLatNorth + dLat, b.getLonEast + dLon)
       val centre = LatLng(cam.target.getLatitude, cam.target.getLongitude)
       val withSprite = sprite
-      worker.execute { () =>
+      try worker.execute { () =>
         if gen.get == g then
           val t0 = System.nanoTime()
           val found = VenueData.index().flatMap(ix =>
@@ -122,10 +166,11 @@ final class VenueLayer(ctx: android.content.Context):
           val items = found.fold(Vector.empty)(VenueMapLayer.select(_, zoom, centre, Cap))
           val json = geoJson(items, withSprite)
           val t2 = System.nanoTime()
-          Log.d(f"venues: map z$zoom%.1f ${found.fold(0)(_.size)} found, ${items.size} drawn; " +
+          Log.d(f"venues: map z$zoom%.1f ${found.fold(0)(_.size)} found, ${items.size} selected; " +
             f"query ${(t1 - t0) / 1e6}%.1f ms, select ${(t2 - t1) / 1e6}%.1f ms")
           main.post(() => if gen.get == g then show(style, json))
       }
+      catch case _: RejectedExecutionException => () // destroyed meanwhile
   }
 
   private def show(style: Style, json: String): Unit =
@@ -135,7 +180,74 @@ final class VenueLayer(ctx: android.content.Context):
         src.setGeoJson(json)
         shown = json
         Log.d(f"venues: map source set in ${(System.nanoTime() - t0) / 1e6}%.1f ms (main), ${json.length} chars")
+        // Once drawn (a frame or two later), the drawn venues change.
+        main.removeCallbacks(nodesChanged)
+        main.postDelayed(nodesChanged, 500)
       }
+
+  // ---- accessibility: the drawn venues as virtual views ----
+
+  /** A drawn venue: what is read, and where it is on the map. */
+  private final case class Node(text: String, at: Rect)
+  /** The drawn venues as last read; None: to be read when asked. */
+  private var nodes: Option[Vector[Node]] = Some(Vector.empty)
+  private val nodesChanged: Runnable = () => accessibilityChanged()
+
+  private def accessibilityChanged(): Unit =
+    nodes = None
+    helper.invalidateRoot()
+
+  /** The venues the map draws now (after collisions), top to bottom, at
+    * most [[MaxNodes]]. Read only when an accessibility service asks.
+    */
+  private def currentNodes: Vector[Node] = nodes.getOrElse {
+    val read = target.fold(Vector.empty[Node]) { (m, _) =>
+      val box = RectF(0, 0, accessibilityView.getWidth.toFloat, accessibilityView.getHeight.toFloat)
+      val half = (24 * ctx.getResources.getDisplayMetrics.density).toInt
+      Try(m.queryRenderedFeatures(box, LayerId).asScala.toVector).getOrElse(Vector.empty).flatMap { f =>
+        (f.geometry(), Option(Try(f.getStringProperty("name")).getOrElse(null))) match
+          case (p: Point, Some(name)) =>
+            val s = m.getProjection.toScreenLocation(MLatLng(p.latitude, p.longitude))
+            val kind = Option(Try(f.getStringProperty("kind")).getOrElse(null)).filter(_.nonEmpty)
+            val r = Rect(s.x.toInt - half, s.y.toInt - half, s.x.toInt + half, s.y.toInt + half)
+            if r.intersect(0, 0, accessibilityView.getWidth, accessibilityView.getHeight) then
+              Some(Node(kind.fold(name)(k => s"$name、$k"), r))
+            else None
+          case _ => None
+      }.distinctBy(_.text).sortBy(n => (n.at.centerY / (2 * half), n.at.centerX)).take(MaxNodes)
+    }
+    nodes = Some(read)
+    read
+  }
+
+  /** Over the map, under its controls: holds the venues as virtual views.
+    * It takes no touches, so the map's gestures are unchanged.
+    */
+  val accessibilityView: View =
+    val v = new View(ctx):
+      override def dispatchHoverEvent(e: MotionEvent): Boolean = helper.dispatchHoverEvent(e) || super.dispatchHoverEvent(e)
+    v.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES)
+    v
+
+  private lazy val helper: ExploreByTouchHelper = new ExploreByTouchHelper(accessibilityView):
+    override def getVirtualViewAt(x: Float, y: Float): Int =
+      val i = currentNodes.indexWhere(_.at.contains(x.toInt, y.toInt))
+      if i >= 0 then i else ExploreByTouchHelper.INVALID_ID
+    override def getVisibleVirtualViews(ids: java.util.List[Integer]): Unit =
+      currentNodes.indices.foreach(i => ids.add(i))
+    override def onPopulateNodeForVirtualView(id: Int, node: AccessibilityNodeInfoCompat): Unit =
+      currentNodes.lift(id) match
+        case Some(n) =>
+          node.setContentDescription(n.text)
+          node.setBoundsInParent(n.at)
+        case None =>
+          // Gone since it was listed: an empty node where the helper asks one.
+          node.setContentDescription("")
+          node.setBoundsInParent(Rect(0, 0, 1, 1))
+    override def onPerformActionForVirtualView(id: Int, action: Int, args: Bundle): Boolean = false
+  ViewCompat.setAccessibilityDelegate(accessibilityView, helper)
+
+  // ---- drawing ----
 
   /** The font of the style's own labels (its glyphs have it), the regular one if there is one. */
   private def font(layers: Seq[org.maplibre.android.style.layers.Layer]): Array[String] =
@@ -160,6 +272,12 @@ object VenueLayer:
   val LayerId = "venue-symbols"
   /** Features drawn at most (the closest to the centre, by rank). */
   val Cap = 1_200
+  /** The GeoJSON at most (chars, about bytes for Latin names, a third for Japanese). */
+  val MaxGeoJsonChars = 256 * 1024
+  /** A name longer than this is cut (with "…"): labels wrap at 8 ems anyway. */
+  val MaxNameChars = 48
+  /** Virtual views for accessibility at most. */
+  val MaxNodes = 100
   /** Read around the view, in parts of its size on each side, so a short pan shows them at once. */
   val Margin = 0.25
   val DebounceMs = 200L
@@ -170,30 +288,41 @@ object VenueLayer:
     */
   private val LabelLayer = "(?i)(^|[-_])(pois?|places?)([-_]|$)".r
   private val Glyphs = "\"glyphs\"\\s*:\\s*\"[^\"]".r
+  /** A label that is only a raw tag value (no Japanese label): not read. */
+  private val RawTag = "[a-z_]+".r
 
   private def dotId(g: VenueMapLayer.Group) = s"venue-dot-${g.key}"
 
-  /** One background thread for every map: queries never pile up on the main thread. */
-  private lazy val worker: ExecutorService = Executors.newSingleThreadExecutor { r =>
-    val t = Thread(() => { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "ashidori-venue-map")
-    t.setDaemon(true)
-    t
-  }
+  private def cut(s: String): String =
+    if s.codePointCount(0, s.length) <= MaxNameChars then s
+    else s.substring(0, s.offsetByCodePoints(0, MaxNameChars - 1)) + "…"
 
+  /** The items as GeoJSON, in their order, until [[MaxGeoJsonChars]]. */
   def geoJson(items: Seq[VenueMapLayer.Item], sprite: Boolean): String =
-    if items.isEmpty then Empty
-    else
-      val features = ujson.Arr.from(items.map { i =>
-        val st = i.style
-        ujson.Obj(
-          "type" -> "Feature",
-          "geometry" -> ujson.Obj("type" -> "Point", "coordinates" -> ujson.Arr(i.venue.lon, i.venue.lat)),
-          "properties" -> ujson.Obj(
-            "name" -> i.venue.name,
-            "img" -> (if sprite && st.icon.nonEmpty then st.icon else dotId(st.group)),
-            "color" -> st.group.color,
-            "mz" -> st.minZoom,
-            "r" -> st.rank,
-            "rc" -> st.rankClose))
-      })
-      ujson.write(ujson.Obj("type" -> "FeatureCollection", "features" -> features))
+    val sb = StringBuilder(Empty.length + items.size * 160)
+    sb ++= """{"type":"FeatureCollection","features":["""
+    val it = items.iterator
+    var first = true
+    var full = false
+    while !full && it.hasNext do
+      val i = it.next()
+      val st = i.style
+      val kind = Some(i.venue.category).filterNot(c => c.isEmpty || RawTag.matches(c)).getOrElse("")
+      val f = ujson.write(ujson.Obj(
+        "type" -> "Feature",
+        "geometry" -> ujson.Obj("type" -> "Point", "coordinates" -> ujson.Arr(i.venue.lon, i.venue.lat)),
+        "properties" -> ujson.Obj(
+          "name" -> cut(i.venue.name),
+          "kind" -> kind,
+          "img" -> (if sprite && st.icon.nonEmpty then st.icon else dotId(st.group)),
+          "color" -> st.group.color,
+          "mz" -> st.minZoom,
+          "r" -> st.rank,
+          "rc" -> st.rankClose)))
+      if sb.length + f.length + 3 > MaxGeoJsonChars then full = true
+      else
+        if !first then sb += ','
+        sb ++= f
+        first = false
+    sb ++= "]}"
+    sb.toString

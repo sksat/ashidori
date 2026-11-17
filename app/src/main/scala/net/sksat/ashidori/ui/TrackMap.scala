@@ -279,6 +279,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   /** Map plus overlay controls; screens add this instead of `mapView`. */
   val view: FrameLayout =
     val f = FrameLayout(act)
+    // The venues for TalkBack, over the map view (added under this at index 0).
+    f.addView(venues.accessibilityView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     // Explicit wrap sizes: as default (match_parent) children of a wrapping
     // column they collapsed to the 1 px width of the spacer.
     val gap = Ui.dp(8)(using act)
@@ -509,6 +511,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
 
   // The basemap was downloaded or deleted: draw the map with or without it
   // (or a new version of it). Progress only updates the card.
+  // The venue data was downloaded or deleted: the layer reads the view again.
+  private val stopVenues = VenueDownload.listen(() => venues.refresh())
+
   private val stopBasemap = BasemapDownload.listen { () =>
     val usesBasemap = shown.exists {
       case Outcome.Draw(s) => s == MapStyle.Offline || s.basemapFonts
@@ -870,6 +875,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   def onSaveInstanceState(b: Bundle): Unit = if mapView != null then mapView.onSaveInstanceState(b)
   def onDestroy(): Unit =
     stopBasemap()
+    stopVenues()
     stopObserving()
     // The grant ends with the view; the surface's consent stays.
     Settings.gate.revoke(this)
@@ -877,6 +883,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     // A closed detailed view no longer allows the network.
     MapStyle.applyNetworkPolicy(act)
     dropMapView()
+    venues.destroy()
 
 object TrackMap:
   /** Where the camera should go; while the map is not ready only the last one is kept. */
