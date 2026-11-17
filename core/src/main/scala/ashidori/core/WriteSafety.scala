@@ -186,12 +186,16 @@ object WriteStall:
     private var anySave = restored.exists(_.isEmpty)
 
     /** Some(true): report the stall now; Some(false): it is over now.
-      * `unsaved`: kinds not saved now (waiting or failed); `saved`: per kind,
+      * `unsaved`: kinds not saved now (anything of them waiting or failed,
+      * however recently): a kind is resolved only when it has none.
+      * `adding`: the kinds the alert takes in (unsaved for a while, see
+      * [[stalledKinds]]; all of `unsaved` if not given); `saved`: per kind,
       * when it was last saved in this process (uptime).
       */
     def update(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String] = Set.empty,
-               saved: Map[String, Long] = Map.empty): Option[Boolean] =
+               saved: Map[String, Long] = Map.empty, adding: Option[Set[String]] = None): Option[Boolean] =
       val stalled = noCommit || unsavedTooLong
+      val taken = adding.getOrElse(unsaved)
       def add(ks: Set[String]) =
         for k <- ks if !since.contains(k) do since += k -> saved.get(k)
       def resolved(k: String) =
@@ -200,11 +204,11 @@ object WriteStall:
         reported = true
         anySave = false
         since = Map.empty
-        add(unsaved)
+        add(taken)
         kinds = since.keySet
         Some(true)
       else if reported then
-        add(unsaved)
+        add(taken)
         since = since.filterNot((k, _) => resolved(k))
         kinds = since.keySet
         if anySave && saved.nonEmpty then anySave = false
@@ -244,15 +248,28 @@ object WriteStall:
     /** Some(true): raised now; Some(false): cleared now (`onChange` is told,
       * once per change).
       */
-    def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Map[String, Long])
+    def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Map[String, Long],
+              adding: Option[Set[String]] = None)
              (onChange: Boolean => Unit = _ => ()): Option[Boolean] = synchronized {
-      val change = monitor.update(noCommit, unsavedTooLong, unsaved, saved)
+      val change = monitor.update(noCommit, unsavedTooLong, unsaved, saved, adding)
       change.foreach { up =>
         if up then shown = false
         onChange(up)
       }
       reconcile()
       change
+    }
+
+    /** A check of the logger's queue as it is now (`now`: uptime), as the
+      * app makes it. Kinds unsaved for a while ([[stalledKinds]]) are taken
+      * in; a kind is taken off only with nothing of it waiting or failed,
+      * however recent. `onChange` also gets the oldest unsaved (kind, since).
+      */
+    def checkBacklog(backlog: WriteBacklog, noCommit: Boolean, now: Long)
+                    (onChange: (Boolean, Option[(String, Long)]) => Unit = (_, _) => ()): Option[Boolean] = synchronized {
+      val (oldest, unsaved, saved) = backlog.synchronized((backlog.oldestUnsaved, backlog.unsavedSince, backlog.savedTimes))
+      check(noCommit, queuedTooLong(oldest.map(_._2), now), unsaved.keySet, saved, Some(stalledKinds(unsaved, now)))(
+        up => onChange(up, oldest))
     }
 
     /** The notification and the state on disk as the monitor says. */
@@ -267,8 +284,9 @@ object WriteStall:
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)
 
-  /** A kind unsaved for at least this long is named by the alert (one
-    * check apart): a batch merely in the queue at a check is not.
+  /** A kind unsaved for at least this long is taken in by the alert (one
+    * check apart): a batch merely in the queue at a check is not. Taking a
+    * kind off asks for nothing of it unsaved, however recent.
     */
   val KindMs: Long = 60_000L
 

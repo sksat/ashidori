@@ -155,6 +155,62 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(m.update(noCommit = false, unsavedTooLong = false, Set.empty, Map("fixes" -> 5L)), Some(false))
   }
 
+  test("stall alert (as the app checks it): a kind failing again within a minute of a save is not taken off; nor across a restart") {
+    val fx = FakeEffects()
+    val b = WriteBacklog()
+    val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    def check(a: WriteStall.Alert, b: WriteBacklog, now: Long) = a.checkBacklog(b, noCommit = false, now)()
+    // Positions fail and stay unsaved: notified, positions kept on disk.
+    val f = b.offer(5, raw = false, "fixes", now = 0L).get
+    b.done(f, 5, raw = false, now = 10L, lost = true)
+    val t = WriteStall.OldestMs + 1_000
+    assertEquals(check(alert, b, t), Some(true))
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // Positions saved once, then failing again; no check in between.
+    val ok = b.offer(5, raw = false, "fixes", now = t + 1_000).get
+    b.done(ok, 5, raw = false, now = t + 1_010)
+    val again = b.offer(5, raw = false, "fixes", now = t + 2_000).get
+    b.done(again, 5, raw = false, now = t + 2_010, lost = true)
+    // Checked within a minute of the new failure: up, positions kept.
+    assertEquals(check(alert, b, t + 30_000), None)
+    assert(alert.monitor.reported)
+    assert(fx.shown)
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // A restart right after: restored from disk, a new queue (nothing saved yet).
+    val b2 = WriteBacklog()
+    val after = WriteStall.Alert(WriteStall.Monitor(fx.disk), fx)
+    assertEquals(check(after, b2, 5_000L), None)
+    assert(after.monitor.reported)
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // Positions saved after the restart, nothing of them unsaved: over.
+    val ok2 = b2.offer(5, raw = false, "fixes", now = 6_000L).get
+    b2.done(ok2, 5, raw = false, now = 6_010L)
+    assertEquals(check(after, b2, 7_000L), Some(false))
+    assertEquals(fx.disk, None)
+  }
+
+  test("stall alert (as the app checks it): a kind waiting in the queue is not taken in, but is not taken off while it waits") {
+    val fx = FakeEffects()
+    val b = WriteBacklog()
+    val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    val f = b.offer(5, raw = false, "fixes", now = 0L).get
+    b.done(f, 5, raw = false, now = 10L, lost = true)
+    // A battery batch queued a second before the check: not taken in.
+    val bt = b.offer(1, raw = false, "battery", now = WriteStall.OldestMs)
+    assertEquals(alert.checkBacklog(b, noCommit = false, WriteStall.OldestMs + 1_000)(), Some(true))
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // Positions saved, but a batch of them waits (seconds old) at the check: kept.
+    val ok = b.offer(5, raw = false, "fixes", now = WriteStall.OldestMs + 2_000).get
+    b.done(ok, 5, raw = false, now = WriteStall.OldestMs + 2_010)
+    b.done(bt.get, 1, raw = false, now = WriteStall.OldestMs + 2_020)
+    val waiting = b.offer(5, raw = false, "fixes", now = WriteStall.OldestMs + 2_500).get
+    assertEquals(alert.checkBacklog(b, noCommit = false, WriteStall.OldestMs + 3_000)(), None)
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // Saved with nothing waiting: over.
+    b.done(waiting, 5, raw = false, now = WriteStall.OldestMs + 3_500)
+    assertEquals(alert.checkBacklog(b, noCommit = false, WriteStall.OldestMs + 4_000)(), Some(false))
+  }
+
   test("stall alert: a kind is named once unsaved for a minute, not for a batch merely in the queue") {
     val b = WriteBacklog()
     val f = b.offer(5, raw = false, "fixes", now = 0L).get

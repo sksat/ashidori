@@ -147,14 +147,13 @@ object LoggerWrites:
   def checkStall(plan: Option[SamplingPlan]): Unit =
     val threshold = WriteStall.thresholdMs(plan.map(_.intervalMs).getOrElse(0L), plan.map(_.maxBatchDelayMs).getOrElse(0L))
     val now = SystemClock.uptimeMillis()
-    // Per kind: a position batch that failed or waits stays visible however
-    // many battery rows are saved meanwhile.
-    val (oldest, unsaved, saved) = backlog.synchronized(
-      (backlog.oldestUnsaved, WriteStall.stalledKinds(backlog.unsavedSince, now), backlog.savedTimes))
     val noCommit = WriteStall.stalled(lastCommitUptime, now, threshold)
-    // Cleared only once every kind is saved again (not by any write); one
-    // check at a time, a failed notification or save tried again.
-    stall.check(noCommit, WriteStall.queuedTooLong(oldest.map(_._2), now), unsaved, saved) { up =>
+    // Per kind: a position batch that failed or waits stays visible however
+    // many battery rows are saved meanwhile. Cleared only once every kind
+    // it names is saved again with nothing of it unsaved (not by any
+    // write); one check at a time, a failed notification or save tried
+    // again (WriteStall.Alert.checkBacklog).
+    stall.checkBacklog(backlog, noCommit, now) { (up, oldest) =>
       if up then
         val detail =
           if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
