@@ -20,7 +20,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.BACKUP --es file name.zip  backup into the external files dir
   *   ... -a ashidori.debug.RESCUE --es file name.zip  rescue backup (files as they are) likewise
   *   ... -a ashidori.debug.QUARANTINE_EXPORT --es file name.zip  quarantined files likewise
-  *   ... -a ashidori.debug.REPAIR                     「まとめを修復」 (a job)
+  *   ... -a ashidori.debug.REPAIR                     「整理を修復」 (a job)
   *   ... -a ashidori.debug.REPAIR_NOW                 the same outside JobScheduler (DebugMaintenanceService)
   *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
   *

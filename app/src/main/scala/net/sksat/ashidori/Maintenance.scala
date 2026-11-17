@@ -83,7 +83,7 @@ object Maintenance:
           js.schedule(job(JobRepair).setExtras(extras).setOverrideDeadline(0).build())
       }.failed.foreach(e => Log.w("scheduling the archive repair failed", e))
 
-  /** 「まとめを修復」: resolves an unfinished commit table by table,
+  /** 「整理を修復」: resolves an unfinished commit table by table,
     * quarantining files that do not verify ([[CommitRepair]]).
     */
   def repairNow(c: Context): Unit =
@@ -101,19 +101,19 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
-      Progress.set(if manual then "修復を開始しました" else "未完了のまとめを確認しています")
+      Progress.set(if manual then "修復を開始しました" else "未完了の整理を確認しています")
       val result =
         try
           if manual then
-            if archive.repairNow(db, l => Progress.set(l)) then "修復しました" else "未完了のまとめはありません"
+            if archive.repairNow(db, l => Progress.set(l)) then "修復しました" else "未完了の整理はありません"
           else
             archive.recover(db)
-            "未完了のまとめはありません"
+            "未完了の整理はありません"
         catch
-          case _: ArchiveStore.CommitStuck => "自動では解決できません（「まとめを修復」で解決）"
+          case _: ArchiveStore.CommitStuck => "自動では解決できません（「整理を修復」で解決）"
           case NonFatal(e) =>
             Log.w("archive repair failed", e)
-            LifeLog.add(LifeKind.ArchiveRepair, s"まとめの修復に失敗（記録は端末内に保持）: ${LifeLog.describe(e)}")
+            LifeLog.add(LifeKind.ArchiveRepair, s"整理の修復に失敗（記録は端末内に保持）: ${LifeLog.describe(e)}")
             s"修復できませんでした: ${LifeLog.describe(e)}"
       Progress.set(result, running = false)
       // Archiving stopped while the commit was unfinished: queued again.

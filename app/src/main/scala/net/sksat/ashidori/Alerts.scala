@@ -103,8 +103,8 @@ object Alerts:
   def issue(now: Long = System.currentTimeMillis()): Option[String] =
     val crashes = recentCrashes(now)
     val stalled = now - lastStall < DayMs || prefs.getBoolean("stallUp", false)
-    if CommitStatus.stuck().isDefined then Some("記録のまとめが停止（要確認）")
-    else if Attention.unseen then Some("記録のまとめで隔離したファイルあり（要確認）")
+    if CommitStatus.stuck().isDefined then Some("記録の整理が停止（要確認）")
+    else if Attention.unseen then Some("記録の整理で隔離したファイルあり（要確認）")
     else if Maintenance.SafeMode.active then Some("異常終了が続いたため、自動のまとめ・同期を停止中")
     else if crashes == 0 && !stalled then None
     else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止がありました")

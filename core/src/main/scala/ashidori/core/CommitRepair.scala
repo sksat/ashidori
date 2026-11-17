@@ -35,7 +35,7 @@ import ashidori.core.CommitIntent.{Check, OnDisk, Prev, Recovery, Target}
   * the first change the record is marked as being repaired ([[Ops.begin]]):
   * recovery then goes on with the repair ([[resume]]). Run automatically,
   * it resolves only when nothing has to be quarantined and the record is
-  * not of 0.21.0; otherwise it waits for the user (「まとめを修復」).
+  * not of 0.21.0; otherwise it waits for the user (「整理を修復」).
   */
 object CommitRepair:
   /** Where one table of the commit stands. */
@@ -209,10 +209,10 @@ object CommitRepair:
             ops.log(s"${s.target.path}: 隔離（$why）。行は端末内に保持" + (if only then "。以前の記録はこのファイルにのみ残る" else ""))
           case Action.DropTmp(false) =>
             ops.dropTmp(s.target.path)
-            ops.log(s"${s.target.path}: 置き換え前のため一時ファイルを削除。行は端末内に保持し、次回まとめ直す")
+            ops.log(s"${s.target.path}: 置き換え前のため一時ファイルを削除。行は端末内に保持し、次回の整理で作り直す")
           case Action.DropTmp(true) =>
             ops.setAsideTmp(s.target, "置き換え前の一時ファイル（以前の版を確認できない）")
-            ops.log(s"${s.target.path}: 置き換え前。一時ファイルを隔離し、行は端末内に保持し、次回まとめ直す")
+            ops.log(s"${s.target.path}: 置き換え前。一時ファイルを隔離し、行は端末内に保持し、次回の整理で作り直す")
           case Action.DeleteRows => ()
       val verified = steps.collect { case s if s.action == Action.DeleteRows => s.target }
       if verified.nonEmpty then
@@ -222,7 +222,7 @@ object CommitRepair:
         ops.log(s"${verified.map(_.path).mkString("、")}: 検証済み（${verified.map(_.rows).sum} 行、端末内の行をすべて照合）。" +
           s"重複していた $n 行を端末内から削除")
       ops.clearIntent()
-      ops.log("未完了のまとめの記録を消去")
+      ops.log("未完了の整理の記録を消去")
       Result.Resolved(steps)
 
   /** Checks a published file against its target: the footer's rows (and,
@@ -240,7 +240,7 @@ object CommitRepair:
     try
       if footerRows != t.rows then return Left(s"フッタの行数 $footerRows（記録は ${t.rows}）")
       t.check.foreach { c =>
-        if c.carried + c.added != footerRows then return Left(s"行数 $footerRows が以前の ${c.carried} とまとめた ${c.added} の和でない")
+        if c.carried + c.added != footerRows then return Left(s"行数 $footerRows が以前の ${c.carried} と区切りの ${c.added} の和でない")
       }
       val wanted = mutable.HashMap.empty[Long, mutable.Set[Long]]
       for c <- t.check; (k, h) <- c.samples do wanted.getOrElseUpdate(k, mutable.Set.empty) += h
@@ -266,8 +266,8 @@ object CommitRepair:
       for c <- t.check do
         if c.range.isDefined && c.range != range then return Left(s"時刻の範囲 ${range.getOrElse("-")}（記録は ${c.range.get}）")
         for (a, b) <- c.addedRange do
-          if range.forall((l, h) => l > a || h < b) then return Left("まとめた行の時刻の範囲が含まれない")
-      if wanted.nonEmpty then return Left(s"まとめた行のうち ${wanted.values.map(_.size).sum} 行が見つからない")
+          if range.forall((l, h) => l > a || h < b) then return Left("区切りの行の時刻の範囲が含まれない")
+      if wanted.nonEmpty then return Left(s"区切りの行のうち ${wanted.values.map(_.size).sum} 行が見つからない")
       chunk.map(_.missing).filter(_ > 0) match
         case Some(m) => Left(s"端末内の $m 行がファイルにない")
         case None    => Right(())

@@ -336,7 +336,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * A commit that cannot be finished ([[CommitIntent.Recovery.Stuck]]) is
     * resolved table by table ([[CommitRepair]]) in the maintenance process
     * (it reads whole files): automatically where no file has to be
-    * quarantined, and also quarantining when `manual` (「まとめを修復」).
+    * quarantined, and also quarantining when `manual` (「整理を修復」).
     * Until it is resolved this throws [[CommitStuck]]: nothing reads or
     * commits its tables; the rows are all still in SQLite.
     */
@@ -393,11 +393,11 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         repair(db, intent, manual, progress)
     result match
       case CommitRepair.Result.Resolved(_) =>
-        LifeLog.add(LifeKind.Archive, s"中断されたまとめを解決（${if manual then "まとめを修復" else "自動"}）")
+        LifeLog.add(LifeKind.Archive, s"中断された整理を解決（${if manual then "整理を修復" else "自動"}）")
       case CommitRepair.Result.NeedsUser(steps) =>
         intentText.foreach(CommitStatus.mark(_, steps))
         LifeLog.add(LifeKind.ArchiveRepair,
-          "中断されたまとめを自動では解決できない（記録は端末内に保持、まとめを停止。端末診断の「まとめを修復」で解決）")
+          "中断された整理を自動では解決できない（記録は端末内に保持、整理を停止。端末診断の「整理を修復」で解決）")
         throw CommitStuck()
 
   /** Removes the commit record, durably. */
@@ -414,10 +414,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     val intent =
       if recorded.files.forall(_.check.isDefined) then recorded
       else
-        progress("未完了のまとめの記録を補っています")
+        progress("未完了の整理の記録を補っています")
         val full = completeChecks(db, recorded)
         Maintenance.write(intentFile, CommitIntent.encode(full))
-        LifeLog.add(LifeKind.ArchiveRepair, "未完了のまとめの記録（0.21.0 の形式）を端末内の行から補完")
+        LifeLog.add(LifeKind.ArchiveRepair, "未完了の整理の記録（0.21.0 の形式）を端末内の行から補完")
         full
     val qdir = File(root, s"$QuarantineDir/${CommitRepair.id(intent)}")
     def move(from: File, to: File): Unit =
@@ -545,7 +545,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         t.copy(check = Some(s.check(CommitIntent.Prev.Unknown, carried = t.rows - s.count, added = s.count, range = None)))
     })
 
-  /** 「まとめを修復」 (in the maintenance process): finishes or resolves an
+  /** 「整理を修復」 (in the maintenance process): finishes or resolves an
     * unfinished commit, quarantining what does not verify. Returns whether
     * there was one.
     */
@@ -742,7 +742,7 @@ object ArchiveStore:
 
   /** An unfinished commit is not resolved yet: its tables are neither read
     * nor archived until it is (by the maintenance process, asked for at
-    * once, or by 「まとめを修復」 when it waits for the user).
+    * once, or by 「整理を修復」 when it waits for the user).
     */
   final class CommitStuck extends IllegalStateException("an interrupted archive commit cannot be finished")
 

@@ -55,16 +55,16 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val maintainButton = outlined("記録をまとめ直す")(runMaintenance())
   // An archive commit that could not be finished, and files a repair
   // quarantined: shown only then.
-  private val repairTitle = text("記録のまとめ（要確認）", 16f, bold = true, colorAttr = attr.error)
+  private val repairTitle = text("記録の整理（要確認）", 16f, bold = true, colorAttr = attr.error)
   private val repairText = text("", 14f)
   private val rescueButton = button("救出用バックアップ", tonal = true)(startBackup(Backup.Mode.Rescue))
   private val exportQuarantineButton = outlined("隔離したファイルを書き出す")(startBackup(Backup.Mode.Quarantine))
-  private val repairButton = outlined("まとめを修復")(confirmRepair())
+  private val repairButton = outlined("整理を修復")(confirmRepair())
   private val seenButton = outlined("確認済みにする")(acknowledge())
   private val repairCard = card(
     repairTitle,
     repairText,
-    caption("救出用バックアップは、まとめの途中のファイルと記録を含め、端末内のファイルをそのまま ZIP にまとめます。"),
+    caption("救出用バックアップは、整理の途中のファイルと記録を含め、端末内のファイルをそのまま ZIP に入れます。"),
     spacer(8),
     rescueButton,
     exportQuarantineButton,
@@ -171,8 +171,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         syncRow.setValue(if syncStopped then "停止中" else "動作")
         syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))
         archiveRow.setSubtitle(
-          if stuck.isDefined then "途中で中断したまとめを自動では完了できません（記録は端末内に保持）"
-          else if pendingCommit then "途中で中断したまとめがあります（自動で完了します）"
+          if stuck.isDefined then "途中で中断した整理を自動では完了できません（記録は端末内に保持）"
+          else if pendingCommit then "途中で中断した整理があります（自動で完了します）"
           else if safe then "異常終了が続いたため停止中（「記録をまとめ直す」で再開）"
           else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
           else "充電中、または起動の30分後に自動で行います")
@@ -196,12 +196,12 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     repairCard.setVisibility(if show then View.VISIBLE else View.GONE)
     val lines =
       stuck.map(ls => "記録は端末内に保持し、記録を続けています。" +: ls)
-        .orElse(Option.when(pendingCommit)(Seq("途中で中断したまとめがあります。自動で完了します。"))).toSeq.flatten ++
+        .orElse(Option.when(pendingCommit)(Seq("途中で中断した整理があります。自動で完了します。"))).toSeq.flatten ++
       Option.when(attention.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
       attention.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残ります" else "")) ++
       Option.when(attention.nonEmpty)("隔離したファイルは救出用バックアップと「隔離したファイルを書き出す」に含みます。").toSeq
     repairText.setText(lines.mkString("\n"))
-    repairTitle.setText(if stuck.isDefined then "記録のまとめが停止（要確認）" else "記録のまとめ（要確認）")
+    repairTitle.setText(if stuck.isDefined then "記録の整理が停止（要確認）" else "記録の整理（要確認）")
     repairButton.setVisibility(if pendingCommit then View.VISIBLE else View.GONE)
     seenButton.setVisibility(if attention.exists(!_.seen) then View.VISIBLE else View.GONE)
     exportQuarantineButton.setVisibility(if attention.nonEmpty then View.VISIBLE else View.GONE)
@@ -230,8 +230,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
 
   private def confirmRepair(): Unit =
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
-      .setTitle("まとめを修復")
-      .setMessage("途中で中断したまとめを表ごとに解決します。置き換え済みで検証できた表は、端末内に重複して残る行を削除します。" +
+      .setTitle("整理を修復")
+      .setMessage("途中で中断した整理を表ごとに解決します。置き換え済みで検証できた表は、端末内に重複して残る行を削除します。" +
         "検証できないファイルは隔離し、削除しません。先に救出用バックアップを書き出すことを勧めます。")
       .setPositiveButton("修復する", (_, _) => {
         backupLine = None
@@ -272,7 +272,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
           catch
             case _: ArchiveStore.CommitStuck =>
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
-              "未完了のまとめがあるため書き出せません（救出用バックアップを使用）"
+              "未完了の整理があるため書き出せません（救出用バックアップを使用）"
             case e: Throwable =>
               Log.w("backup failed", e)
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
