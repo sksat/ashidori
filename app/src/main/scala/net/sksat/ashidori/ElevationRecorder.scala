@@ -8,7 +8,8 @@ import scala.collection.mutable.ArrayBuffer
 import ashidori.core.*
 
 /** Barometric pressure for the elevation estimate ([[Elevation]]). Used on
-  * the logger thread; writes go to [[AshidoriApp.io]].
+  * the logger thread; rows are saved through [[LoggerWrites]], the logger's
+  * own write path, as soon as a delivered batch is in.
   *
   * The barometer is a non-wakeup sensor read at 1 Hz with a long report
   * latency: the sensor hub keeps the readings and hands them over when the
@@ -17,13 +18,13 @@ import ashidori.core.*
   * while still it is 60 s. [[PressureDecimator]] thins what is stored.
   * No permission is needed.
   */
-final class PressureRecorder(sm: SensorManager, handler: Handler, db: Db):
+final class PressureRecorder(sm: SensorManager, handler: Handler):
   private val sensor: Option[Sensor] =
     Option(sm.getDefaultSensor(Sensor.TYPE_PRESSURE, false)).orElse(Option(sm.getDefaultSensor(Sensor.TYPE_PRESSURE)))
       .filterNot(_.isWakeUpSensor)
   private val decimator = PressureDecimator()
+  /** Samples not handed over yet: at most one delivered batch. */
   private val pending = ArrayBuffer.empty[PressureSample]
-  private var lastWrite = 0L
   /** Report latency registered, µs; -1 = not registered. */
   private var latencyUs = -1
   private var moving = false
@@ -48,20 +49,24 @@ final class PressureRecorder(sm: SensorManager, handler: Handler, db: Db):
     write()
 
   private def write(): Unit =
-    lastWrite = System.currentTimeMillis()
     if pending.nonEmpty then
       val ps = pending.toVector
       pending.clear()
-      AshidoriApp.io.execute(() => scala.util.Try(db.insertPressure(ps)).failed.foreach(e => Log.w("pressure insert", e)))
+      LoggerWrites.submit(ps.size, raw = false, WriteKind.Pressure)(_.insertPressure(ps))
+
+  private val writeNow: Runnable = () => write()
 
   private val listener = new SensorEventListener:
     override def onAccuracyChanged(sensor: Sensor, accuracy: Int): Unit = ()
     override def onSensorChanged(e: SensorEvent): Unit =
       val now = System.currentTimeMillis()
       val wall = now - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000
-      decimator.add(wall, e.values(0), moving).foreach(pending += _)
-      // A batch arrives at once: write once it is in, not per reading.
-      if pending.size >= 120 || (pending.nonEmpty && now - lastWrite >= 60_000) then write()
+      decimator.add(wall, e.values(0), moving).foreach { s =>
+        pending += s
+        // A batch is delivered in one go: hand it over right after its last
+        // reading (the next message on this thread), not per reading.
+        if !handler.hasCallbacks(writeNow) then handler.post(writeNow)
+      }
 
 /** Altitude above mean sea level for fixes (Android 14+).
   *

@@ -53,9 +53,9 @@ class LoggerService extends Service:
   private var lastBatterySample = 0L
   private var drain = Double.NaN
   /** Battery readings and state spans for the energy analysis. */
-  private lazy val energy = EnergyRecorder(this, bm, db, handler, () => plan.foreach(energyUpdate))
+  private lazy val energy = EnergyRecorder(this, bm, handler, () => plan.foreach(energyUpdate))
   /** Barometer and MSL altitude for the elevation estimate. */
-  private lazy val pressure = PressureRecorder(sm, handler, db)
+  private lazy val pressure = PressureRecorder(sm, handler)
   private lazy val mslAltitude = MslAltitude(this)
 
   private var plan: Option[SamplingPlan] = None

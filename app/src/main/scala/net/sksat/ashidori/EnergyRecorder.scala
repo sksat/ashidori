@@ -5,15 +5,15 @@ import android.os.{BatteryManager, Handler}
 import ashidori.core.*
 
 /** Battery readings and the logger's state spans, for the energy analysis
-  * ([[EnergyModel]]). Used on the logger thread; writes go to
-  * [[AshidoriApp.io]].
+  * ([[EnergyModel]]). Used on the logger thread; rows are saved through
+  * [[LoggerWrites]], the logger's own write path.
   *
   * Nothing here wakes the device: a reading is taken when the state changes
   * (the logger or the system is awake then anyway) and by the logger's own
   * 5-minute sampling. Screen and charger changes come from broadcasts the
   * system sends while awake.
   */
-final class EnergyRecorder(ctx: Context, bm: BatteryManager, db: Db, handler: Handler, onChange: () => Unit):
+final class EnergyRecorder(ctx: Context, bm: BatteryManager, handler: Handler, onChange: () => Unit):
   private var state: Option[EnergyState] = None
   /** Screen and charger as last broadcast. */
   var screenOn: Boolean = true
@@ -36,8 +36,7 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, db: Db, handler: Ha
   def start(interactive: Boolean): Unit =
     screenOn = interactive
     plugged = sticky().exists(i => i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) > 0) || bm.isCharging
-    AshidoriApp.io.execute(() => scala.util.Try(db.switchEnergyState(db.lastBatteryTime(), None)).failed
-      .foreach(e => Log.w("closing energy spans", e)))
+    LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(db => db.switchEnergyState(db.lastBatteryTime(), None))
     if !registered then
       val f = IntentFilter()
       Seq(Intent.ACTION_SCREEN_ON, Intent.ACTION_SCREEN_OFF, Intent.ACTION_POWER_CONNECTED, Intent.ACTION_POWER_DISCONNECTED)
@@ -51,17 +50,15 @@ final class EnergyRecorder(ctx: Context, bm: BatteryManager, db: Db, handler: Ha
       registered = false
     if state.isDefined then
       state = None
-      AshidoriApp.io.execute(() => db.switchEnergyState(now, None))
+      LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(_.switchEnergyState(now, None))
 
   /** Records a new span and a battery reading when the state changed. */
   def update(now: Long, st: EnergyState, plan: String): Unit =
     if !state.contains(st) then
       state = Some(st)
       val r = reading(now, st.screenOn)
-      AshidoriApp.io.execute { () =>
-        db.switchEnergyState(now, Some(st))
-        db.insertBattery(r, plan)
-      }
+      LoggerWrites.submit(1, raw = false, WriteKind.EnergyState)(_.switchEnergyState(now, Some(st)))
+      LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(r, plan))
 
   private def sticky(): Option[Intent] =
     scala.util.Try(Option(ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED)))

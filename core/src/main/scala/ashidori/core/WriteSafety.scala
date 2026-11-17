@@ -10,6 +10,8 @@ enum WriteKind(val key: String, val label: String):
   case GnssStatus extends WriteKind("gnss_status", "GNSS の状態")
   case RawLines extends WriteKind("raw_lines", "生データ")
   case RawSessions extends WriteKind("raw_sessions", "生データの区間")
+  case EnergyState extends WriteKind("energy_state", "記録の状態")
+  case Pressure extends WriteKind("pressure", "気圧")
 
 object WriteKind:
   def fromKey(k: String): Option[WriteKind] = values.find(_.key == k)
