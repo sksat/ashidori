@@ -34,7 +34,9 @@ object LoggerWrites:
   /** Wall time of the last commit (0: none in this process). */
   @volatile var lastCommitAt = 0L
   @volatile private var lastCommitUptime = SystemClock.uptimeMillis()
-  private val stall = WriteStall.Monitor()
+  // An alert raised before a restart stays until saving is seen to work
+  // again in this process.
+  private lazy val stall = WriteStall.Monitor(Alerts.restoredStall())
 
   /** Queues `write` (of `rows` rows) for the database. Raw batches carry
     * their lines, so they can be spilled to a file.
@@ -135,16 +137,16 @@ object LoggerWrites:
     val now = SystemClock.uptimeMillis()
     // Per kind: a position batch that failed or waits stays visible however
     // many battery rows are saved meanwhile.
-    val oldest = backlog.synchronized(backlog.oldestUnsaved)
+    val (oldest, unsaved, saved) = backlog.synchronized((backlog.oldestUnsaved, backlog.unsavedSince.keySet, backlog.savedKinds))
     val noCommit = WriteStall.stalled(lastCommitUptime, now, threshold)
     // Cleared only once every kind is saved again (not by any write).
-    stall.synchronized(stall.update(noCommit, WriteStall.queuedTooLong(oldest.map(_._2), now))) match
+    stall.synchronized(stall.update(noCommit, WriteStall.queuedTooLong(oldest.map(_._2), now), unsaved, saved)) match
       case Some(true) =>
         val detail =
           if noCommit then s"${(now - lastCommitUptime) / 60_000}分間、記録が保存されていません"
           else s"${oldest.get._1}が${(now - oldest.get._2) / 60_000}分前から保存されていません"
         LifeLog.add(LifeKind.WriteStall, s"$detail（待ち $pending 行）")
-        Alerts.stall()
+        Alerts.stall(unsaved)
       case Some(false) =>
         LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
         Alerts.clearStall()

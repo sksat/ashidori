@@ -27,6 +27,13 @@ import ashidori.core.Archive
   * Files are streamed through a fixed buffer, never parsed: memory stays
   * flat whatever their size. The database and the text are deflated at the
   * fastest level; Parquet files are compressed already and stored.
+  *
+  * 「救出用バックアップ」 ([[writeRescue]]) works while an unfinished
+  * commit stops the normal one ([[ArchiveStore.CommitStuck]]): it takes the
+  * same copy of the database, but holds the locks without finishing the
+  * commit, and stores every file as it is: the whole archive (with tmp
+  * files and quarantined files), the commit record and the other state of
+  * `files/maintenance/`, and all overflow files.
   */
 object Backup:
   /** Free space kept for the logger while a backup runs (hours of 全力ログ). */
@@ -39,7 +46,13 @@ object Backup:
   /** Writes the backup to `uri`; `progress(done, total)` in bytes now and
     * then. Returns the bytes read. Call off the main thread.
     */
-  def write(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long =
+  def write(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long = writeZip(c, uri, progress, rescue = false)
+
+  /** 「救出用バックアップ」: as [[write]], with every file as it is (see above). */
+  def writeRescue(c: Context, uri: Uri, progress: (Long, Long) => Unit): Long = writeZip(c, uri, progress, rescue = true)
+
+  // One at a time: they share the copy of the database.
+  private def writeZip(c: Context, uri: Uri, progress: (Long, Long) => Unit, rescue: Boolean): Long = synchronized {
     val archive = AshidoriApp.archive
     val db = AshidoriApp.db
     val dir = File(c.getNoBackupFilesDir, "backup")
@@ -53,7 +66,8 @@ object Backup:
     // overflow files (stored as they are), and room for the logger.
     def size(f: File): Long = if f.isDirectory then Option(f.listFiles()).toSeq.flatten.map(size).sum else f.length
     val db0 = dbPath.length + File(dbPath.getPath + "-wal").length
-    val need = db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin
+    val need = db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin +
+      (if rescue then size(Maintenance.dir) else 0L)
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量が足りません（${need >> 20} MB 必要）")
     // While it runs: stop before the logger has no room left.
@@ -61,22 +75,36 @@ object Backup:
       if dir.getUsableSpace < LoggingMargin then
         throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB を切ったため中断しました（記録の領域を残すため）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
+    def walk(f: File): Seq[File] =
+      if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)
+      else if f.isFile then Seq(f)
+      else Nil
+    def under(dir: File, f: File) = dir.toPath.relativize(f.toPath).toString
+    val quarantine = File(archive.root, ArchiveStore.QuarantineDir)
     try
-      archive.reading(Archive.All*) {
+      // The rescue holds the locks without finishing an unfinished commit
+      // (which may be what cannot be done).
+      def collect(): Unit =
         // No overflow file is imported (and deleted) meanwhile: each one is
         // either in the copy with its import mark, or in the ZIP unimported.
         val overflow = LoggerWrites.Overflow
         overflow.lock.lock()
         try
           db.snapshotTo(snapshot)
-          for f <- Option(overflow.dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(_.getName) do
-            opened += (("files/overflow/" + f.getName, f, FileInputStream(f)))
+          for f <- walk(overflow.dir) if rescue || f.getName.endsWith(".txt") do
+            opened += (("files/overflow/" + under(overflow.dir, f), f, FileInputStream(f)))
         finally overflow.lock.unlock()
-        def walk(f: File): Seq[File] =
-          if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk) else Seq(f)
-        for f <- walk(archive.root) if f.getName.endsWith(".parquet") do
-          opened += (("files/archive/" + archive.root.toPath.relativize(f.toPath).toString, f, FileInputStream(f)))
-      }
+        // Files a repair quarantined are kept whole (they may hold the only
+        // copy of some rows); the rescue takes everything as it is.
+        for f <- walk(archive.root) if rescue || f.getName.endsWith(".parquet") || f.toPath.startsWith(quarantine.toPath) do
+          if !f.getName.startsWith(".lock-") then
+            opened += (("files/archive/" + under(archive.root, f), f, FileInputStream(f)))
+        if rescue then
+          // Small state files, some rewritten meanwhile (progress): one
+          // gone since the listing is skipped.
+          for f <- walk(Maintenance.dir); in <- Try(FileInputStream(f)).toOption do
+            opened += (("files/maintenance/" + under(Maintenance.dir, f), f, in))
+      if rescue then archive.holding(Archive.All*)(collect()) else archive.reading(Archive.All*)(collect())
       val log = File(c.getFilesDir, "lifecycle.log")
       val total = snapshot.length + opened.map(_._2.length).sum + log.length
       var done = 0L
@@ -131,20 +159,40 @@ object Backup:
               progress(done, total)
           zip.closeEntry()
         Using.resource(FileInputStream(snapshot))(in => copy(in, "databases/ashidori.db", System.currentTimeMillis()))
-        for (name, f, in) <- opened do stored(f, in, name)
+        // A tmp file or a state file may still change (a commit or a run
+        // writing it): deflated in one pass, so its CRC is that of what was
+        // read; the others are complete and stored as they are.
+        for (name, f, in) <- opened do
+          if rescue && (name.endsWith(".tmp") || name.startsWith("files/maintenance/") || name.startsWith("files/overflow/")) then
+            copy(in, name, f.lastModified())
+          else stored(f, in, name)
         if log.exists then Using.resource(FileInputStream(log))(in => copy(in, "files/lifecycle.log", log.lastModified()))
         val about =
-          s"""ashidori backup
+          s"""ashidori ${if rescue then "rescue backup (files as they are)" else "backup"}
              |app ${BuildInfo.versionName} (${BuildInfo.versionCode})
              |written ${java.time.Instant.now()}
              |databases/ashidori.db: SQLite, a consistent copy (VACUUM INTO)
              |files/archive/<table>/<YYYY-MM[-DD]>.parquet: archived days and months
+             |files/archive/quarantine/<commit>/<table>/<file>: files a repair moved aside (may hold the only copy of some rows)
              |files/overflow/raw-*.txt: raw lines not in the database yet (time TAB line)
              |files/lifecycle.log: lifecycle log (no positions)
-             |""".stripMargin
+             |""".stripMargin + (if !rescue then "" else
+            s"""files/archive/**/*.tmp: new versions written by an unfinished archive commit
+               |files/maintenance/commit: the unfinished commit's record (files to replace, rows to delete)
+               |files/maintenance/commit-stuck, attention: the repair's state
+               |commit-status.txt: the state when this was written
+               |""".stripMargin)
         zip.putNextEntry(ZipEntry("ashidori-backup.txt"))
         zip.write(about.getBytes(UTF_8))
         zip.closeEntry()
+        if rescue then
+          val status = CommitStatus.stuck().fold(
+            if archive.commitPending then "unfinished commit recorded (not known to be stuck)\n" else "no unfinished commit\n")(
+            ls => ("waiting for the user:" +: ls).mkString("", "\n", "\n")) +
+            Attention.all().map(e => s"quarantined ${e.path} -> ${e.quarantined} onlyCopy=${e.onlyCopy} ${e.why}\n").mkString
+          zip.putNextEntry(ZipEntry("commit-status.txt"))
+          zip.write(status.getBytes(UTF_8))
+          zip.closeEntry()
         zip.finish()
         zip.flush()
       }
@@ -153,3 +201,4 @@ object Backup:
     finally
       opened.foreach(o => Try(o._3.close()))
       snapshot.delete()
+  }

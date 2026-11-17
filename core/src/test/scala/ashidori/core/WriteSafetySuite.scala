@@ -94,3 +94,34 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(check(t + 40), Some(false))
     assertEquals(check(t + 50), None)
   }
+
+  test("stall alert across a restart: cleared once each kind it named is saved again, not before") {
+    // Raised before the restart, for positions and raw lines.
+    val m = WriteStall.Monitor(restored = Some(Set("位置", "詳細ログ")))
+    assert(m.reported)
+    // After the restart nothing is stalled, but only battery rows were saved.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池", "位置")), None)
+    assert(m.reported)
+    // Every kind it named saved again: over.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池", "位置", "詳細ログ")), Some(false))
+    assertEquals(m.kinds, Set.empty[String])
+    // Raised again in this process: the kinds unsaved now are kept.
+    assertEquals(m.update(noCommit = false, unsavedTooLong = true, unsaved = Set("動き"), saved = Set("位置")), Some(true))
+    assertEquals(m.kinds, Set("動き"))
+    // In the same process it clears as before (not waiting for a save of each kind).
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
+  }
+
+  test("stall alert found only by its notification (0.21.0): cleared after a save, while nothing is stalled") {
+    val m = WriteStall.Monitor(restored = Some(Set.empty))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false), None)
+    // Still stalled after a save: kept.
+    assertEquals(m.update(noCommit = true, unsavedTooLong = false, saved = Set("電池")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("電池")), Some(false))
+    // Nothing restored: as before.
+    val fresh = WriteStall.Monitor()
+    assert(!fresh.reported)
+    assertEquals(fresh.update(noCommit = false, unsavedTooLong = false), None)
+  }
+

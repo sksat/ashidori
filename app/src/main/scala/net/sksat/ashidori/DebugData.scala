@@ -59,6 +59,50 @@ object DebugData:
     (odd.size, late.size)
 
   /** Inserts `hours` of lines from `startMinute` (10:00) of `day`. Returns the lines. */
+  /** Per raw table of `day`: rows in its archive file, rows of it still in
+    * SQLite (raw lines that convert), and distinct rows of both together
+    * (a row in both is a duplicate); then the raw lines that do not
+    * convert. Reads the files without the locks (also while a commit is
+    * unfinished). Holds a hash per row.
+    */
+  def audit(day: LocalDate): Seq[String] =
+    val db = AshidoriApp.db
+    val root = AshidoriApp.archive.root
+    val from = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
+    val to = day.plusDays(1).atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli
+    val hot = scala.collection.mutable.Map.empty[String, Long].withDefaultValue(0L)
+    val hashes = scala.collection.mutable.Map.empty[String, scala.collection.mutable.HashSet[Long]]
+    def set(t: String) = hashes.getOrElseUpdate(t, scala.collection.mutable.HashSet.empty[Long])
+    var unconverted = 0L
+    var at = ArchiveMerge.Cursor(from, Long.MinValue)
+    var more = true
+    while more do
+      val lines = db.rawLinesAfter(from, to, Long.MaxValue, at, 4000)
+      if lines.isEmpty then more = false
+      else
+        for (_, time, line) <- lines do
+          Archive.parse(line, time) match
+            case Right((t, row)) =>
+              hot(t.name) += 1
+              set(t.name) += ArchiveMerge.hash(row)
+            case Left(_) => unconverted += 1
+        at = ArchiveMerge.Cursor(lines.last._2, lines.last._1)
+    val out = for t <- Archive.RawTables yield
+      val f = java.io.File(root, Archive.dayFile(t, day))
+      var n = 0L
+      val read =
+        if !f.exists then scala.util.Success(())
+        else scala.util.Try(scala.util.Using.resource(ashidori.core.parquet.ParquetReader.open(f.getPath)) { r =>
+          r.rowIterator.foreach { row =>
+            n += 1
+            set(t.name) += ArchiveMerge.hash(row)
+          }
+        })
+      val bad = read.failed.toOption.fold("")(e => s" UNREADABLE after $n rows (${e.getClass.getSimpleName})")
+      val distinct = hashes.get(t.name).map(_.size.toLong).getOrElse(0L)
+      s"$day ${t.name} archive=$n sqlite=${hot(t.name)} total=${n + hot(t.name)} distinct=$distinct$bad"
+    out :+ s"$day unconverted=$unconverted commitPending=${AshidoriApp.archive.commitPending}"
+
   def insertRaw(day: LocalDate, hours: Double, startMinute: Int = 600): Long =
     val db = AshidoriApp.db
     val start = day.atStartOfDay(AshidoriApp.zone).toInstant.toEpochMilli + startMinute * 60_000L

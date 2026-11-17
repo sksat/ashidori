@@ -51,8 +51,25 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   dataStatus.setEllipsize(android.text.TextUtils.TruncateAt.END)
   @volatile private var backupRunning = false
   private var backupLine: Option[String] = None
-  private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup())
+  private val backupButton = button("バックアップを書き出す", tonal = true)(startBackup(rescue = false))
   private val maintainButton = outlined("記録をまとめ直す")(runMaintenance())
+  // An archive commit that could not be finished, and files a repair
+  // quarantined: shown only then.
+  private val repairTitle = text("記録のまとめ（要確認）", 16f, bold = true, colorAttr = attr.error)
+  private val repairText = text("", 14f)
+  private val rescueButton = button("救出用バックアップ", tonal = true)(startBackup(rescue = true))
+  private val repairButton = outlined("まとめを修復")(confirmRepair())
+  private val seenButton = outlined("確認済みにする")(acknowledge())
+  private val repairCard = card(
+    repairTitle,
+    repairText,
+    caption("救出用バックアップは、まとめの途中のファイルと記録を含め、端末内のファイルをそのまま ZIP にまとめます。"),
+    spacer(8),
+    rescueButton,
+    repairButton,
+    seenButton
+  )
+  repairCard.setVisibility(View.GONE)
   private val ticker = Handler(Looper.getMainLooper)
   private val tick: Runnable = () => { showDataStatus(); ticker.postDelayed(tick, 1000) }
 
@@ -61,6 +78,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       vbox(
         sectionHeader("記録の保存"),
         listGroup(savedRow, crashRow, pendingRow, kindRow, archiveRow, syncRow),
+        repairCard,
         card(
           text("記録データ", 16f, bold = true),
           caption("バックアップは記録を端末内の形式のまま ZIP にまとめます。地図と施設データは含みません。"),
@@ -126,6 +144,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val safe = Maintenance.SafeMode.maintenanceStopped
       val syncStopped = Maintenance.SafeMode.syncStopped
       val lost = LoggerWrites.Losses.total + LoggerWrites.Losses.uncounted
+      val pendingCommit = AshidoriApp.archive.commitPending
+      val stuck = CommitStatus.stuck()
+      val attention = Attention.all()
       act.runOnUiThread { () =>
         savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
         val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
@@ -148,17 +169,38 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         syncRow.setValue(if syncStopped then "停止中" else "動作")
         syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))
         archiveRow.setSubtitle(
-          if safe then "異常終了が続いたため停止中（「記録をまとめ直す」で再開）"
+          if stuck.isDefined then "途中で中断したまとめを自動では完了できません（記録は端末内に保持）"
+          else if pendingCommit then "途中で中断したまとめがあります（自動で完了します）"
+          else if safe then "異常終了が続いたため停止中（「記録をまとめ直す」で再開）"
           else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
           else "充電中、または起動の30分後に自動で行います")
-        archiveRow.setValue(if safe then "停止中" else if skipped.nonEmpty then "保留あり" else "自動")
-        archiveRow.value.setTextColor(color(if safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
+        archiveRow.setValue(
+          if stuck.isDefined then "停止（要確認）" else if pendingCommit then "未完了" else if safe then "停止中"
+          else if skipped.nonEmpty then "保留あり" else "自動")
+        archiveRow.value.setTextColor(color(if stuck.isDefined || safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
+        showRepair(pendingCommit, stuck, attention)
         savingText = s"saving=lastFix:${fix.map(full).getOrElse("none")} crashes24h=$crashes pending=$pending " +
-          s"safeMode=$safe syncStopped=$syncStopped lost=$lost skipped=${skipped.mkString(",")}"
+          s"safeMode=$safe syncStopped=$syncStopped lost=$lost skipped=${skipped.mkString(",")} " +
+          s"commitPending=$pendingCommit stuck=${stuck.map(_.mkString("[", "; ", "]")).getOrElse("no")} " +
+          s"quarantined=${attention.map(e => s"${e.path}->${e.quarantined}${if e.onlyCopy then "(only copy)" else ""}").mkString(",")}"
       }
     }
 
   private var savingText = ""
+
+  /** The card of an unfinished commit and of quarantined files. */
+  private def showRepair(pendingCommit: Boolean, stuck: Option[Seq[String]], attention: Seq[Attention.Entry]): Unit =
+    val show = pendingCommit || attention.nonEmpty
+    repairCard.setVisibility(if show then View.VISIBLE else View.GONE)
+    val lines =
+      stuck.map(ls => "記録は端末内に保持し、記録を続けています。" +: ls)
+        .orElse(Option.when(pendingCommit)(Seq("途中で中断したまとめがあります。自動で完了します。"))).toSeq.flatten ++
+      Option.when(attention.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
+      attention.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残ります" else ""))
+    repairText.setText(lines.mkString("\n"))
+    repairTitle.setText(if stuck.isDefined then "記録のまとめが停止（要確認）" else "記録のまとめ（要確認）")
+    repairButton.setVisibility(if pendingCommit then View.VISIBLE else View.GONE)
+    seenButton.setVisibility(if attention.exists(!_.seen) then View.VISIBLE else View.GONE)
 
   private def showDataStatus(): Unit =
     val line = backupLine.orElse {
@@ -169,25 +211,57 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     dataStatus.setText(line.getOrElse(" "))
     val maintaining = Maintenance.Progress.get().exists(_._2)
     backupButton.setEnabled(!backupRunning)
+    rescueButton.setEnabled(!backupRunning)
     maintainButton.setEnabled(!maintaining)
+    repairButton.setEnabled(!maintaining)
+    // A repair or maintenance run just ended: the card follows.
+    if maintaining != wasMaintaining then
+      wasMaintaining = maintaining
+      if !maintaining then showSaving()
 
   private def mb(b: Long) = f"${b / 1e6}%.0f MB"
 
-  private def startBackup(): Unit =
-    act.createZip(Backup.defaultName()) { uri =>
+  private var wasMaintaining = false
+
+  private def confirmRepair(): Unit =
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("まとめを修復")
+      .setMessage("途中で中断したまとめを表ごとに解決します。置き換え済みで検証できた表は、端末内に重複して残る行を削除します。" +
+        "検証できないファイルは隔離し、削除しません。先に救出用バックアップを書き出すことを勧めます。")
+      .setPositiveButton("修復する", (_, _) => {
+        backupLine = None
+        Maintenance.repairNow(act)
+        showDataStatus()
+      })
+      .setNegativeButton("キャンセル", null)
+      .show()
+
+  private def acknowledge(): Unit =
+    AshidoriApp.io.execute { () =>
+      Try(Attention.acknowledge()).failed.foreach(e => Log.w("acknowledging quarantined files failed", e))
+      act.runOnUiThread(() => showSaving())
+    }
+
+  private def startBackup(rescue: Boolean): Unit =
+    val name = if rescue then Backup.defaultName().replace("backup", "rescue") else Backup.defaultName()
+    act.createZip(name) { uri =>
       backupRunning = true
       backupLine = Some("書き出しの準備をしています")
       showDataStatus()
       Thread(() =>
         val result =
           try
-            val n = Backup.write(act, uri, (done, total) =>
+            val report = (done: Long, total: Long) =>
               act.runOnUiThread { () =>
                 backupLine = Some(s"書き出し中… ${mb(done)} / ${mb(total)}")
                 showDataStatus()
-              })
-            s"書き出しました（${mb(n)}）"
+              }
+            val n = if rescue then Backup.writeRescue(act, uri, report) else Backup.write(act, uri, report)
+            s"${if rescue then "救出用バックアップを" else ""}書き出しました（${mb(n)}）"
           catch
+            case _: ArchiveStore.CommitStuck =>
+              Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
+              "記録のまとめが停止しているため書き出せません（救出用バックアップを使用）"
             case e: Throwable =>
               Log.w("backup failed", e)
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))

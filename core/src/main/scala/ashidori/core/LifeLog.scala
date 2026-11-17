@@ -31,6 +31,8 @@ enum LifeKind(val key: String, val label: String, val problem: Boolean = false):
   /** Archiving finished days (a separate process). */
   case Archive extends LifeKind("archive", "記録の整理")
   case ArchiveSkip extends LifeKind("archiveskip", "記録の整理を保留", problem = true)
+  /** An unfinished commit that recovery could not finish, and its repair. */
+  case ArchiveRepair extends LifeKind("archiverepair", "記録の整理の修復", problem = true)
   /** Logging on, but nothing reached the database for too long. */
   case WriteStall extends LifeKind("stall", "記録の保存が停止", problem = true)
   /** Repeated crashes: optional background work switched off. */

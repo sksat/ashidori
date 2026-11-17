@@ -544,6 +544,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       query(s"SELECT rowid, time, line FROM raw_lines WHERE rowid IN (${ids.mkString(",")})")(c => (c.getLong(0), c.getLong(1), c.getString(2)))
     }.toVector
 
+  /** One chunk of the raw lines of a compaction portion (see
+    * [[countRawPortion]]) after `cursor`: (rowid, time, line).
+    */
+  def rawPortionLines(from: Long, to: Long, maxRowid: Long, after: ArchiveMerge.Cursor, upTo: ArchiveMerge.Cursor,
+                      cursor: ArchiveMerge.Cursor, limit: Int): Vector[(Long, Long, String)] =
+    val (sql, args) = ArchiveSql.rawPortionAfter(from, to, maxRowid, after, upTo, cursor, limit)
+    query(sql, args*)(c => (c.getLong(0), c.getLong(1), c.getString(2)))
+
   /** The raw lines a compaction portion read: after `after` (where it
     * started) up to `upTo`, of [from, to) and rowid <= `maxRowid`.
     */

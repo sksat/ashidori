@@ -18,6 +18,13 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.CRASH                      crash the main process
   *   ... -a ashidori.debug.THREADS                    log every thread's stack
   *   ... -a ashidori.debug.BACKUP --es file name.zip  backup into the external files dir
+  *   ... -a ashidori.debug.RESCUE --es file name.zip  rescue backup (files as they are) likewise
+  *   ... -a ashidori.debug.REPAIR                     「まとめを修復」 (a job)
+  *   ... -a ashidori.debug.REPAIR_NOW                 the same outside JobScheduler (DebugMaintenanceService)
+  *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
+  *
+  * A commit that recovery cannot finish: create `files/maintenance/stuck-delete-tmp`
+  * (or `stuck-corrupt-tmp`) with run-as, then archive (see ArchiveStore.debugBreakRest).
   */
 class DebugReceiver extends BroadcastReceiver:
   override def onReceive(c: Context, intent: Intent): Unit =
@@ -67,6 +74,19 @@ class DebugReceiver extends BroadcastReceiver:
             Log.i(s"backup done: $n bytes to $f")
           catch case e: Throwable => Log.e("backup failed", e)
         , "ashidori-backup").start()
+      case "ashidori.debug.RESCUE" =>
+        val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("rescue.zip"))
+        Thread(() =>
+          try
+            val n = Backup.writeRescue(c, android.net.Uri.fromFile(f), (d, t) => Log.i(s"rescue $d / $t"))
+            Log.i(s"rescue done: $n bytes to $f")
+          catch case e: Throwable => Log.e("rescue failed", e)
+        , "ashidori-rescue").start()
+      case "ashidori.debug.REPAIR" => Maintenance.repairNow(c)
+      case "ashidori.debug.REPAIR_NOW" => c.startService(Intent(c, classOf[DebugMaintenanceService]).putExtra("repair", true))
+      case "ashidori.debug.AUDIT" =>
+        val ago = intent.getIntExtra("daysAgo", 1)
+        Thread(() => DebugData.audit(LocalDate.now(AshidoriApp.zone).minusDays(ago)).foreach(l => Log.i(s"audit $l")), "ashidori-audit").start()
       case other => Log.w(s"debug receiver: unknown action $other")
 
 /** Debug builds only (declared in the debug manifest, in the `:maintenance`
@@ -77,8 +97,11 @@ class DebugMaintenanceService extends android.app.Service:
   override def onBind(i: Intent): android.os.IBinder = null
   override def onStartCommand(i: Intent, flags: Int, id: Int): Int =
     if (getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 then
+      val repair = i != null && i.getBooleanExtra("repair", false)
       Thread(() =>
-        try while Maintenance.run(manual = true, () => false) do ()
+        try
+          if repair then Maintenance.repair(manual = true)
+          else while Maintenance.run(manual = true, () => false) do ()
         finally stopSelf(id)
       , "ashidori-maintenance").start()
     android.app.Service.START_NOT_STICKY

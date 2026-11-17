@@ -10,12 +10,36 @@ package ashidori.core
   * file is either in place (the expected row count and size) or still
   * waiting as its verified tmp file; otherwise it drops the record, and
   * the rows stay in SQLite for the next run (which merges them again).
+  *
+  * When some files were published and the rest cannot be (a tmp file gone
+  * or damaged), the record stays ([[Recovery.Stuck]]) until
+  * [[CommitRepair]] resolves it table by table. For that each target also
+  * records what its new file must hold ([[Check]]). Records of 0.21.0 have
+  * no check; the repair completes it from SQLite first.
   */
 final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete)
 
 object CommitIntent:
   /** An archive file (relative to the archive root) and its new version. */
-  final case class Target(path: String, rows: Long, size: Long)
+  final case class Target(path: String, rows: Long, size: Long, check: Option[Check] = None)
+
+  /** What the file a commit replaces held before it. */
+  enum Prev:
+    /** No file. */
+    case Absent
+    /** (rows in its footer, size). */
+    case File(rows: Long, size: Long)
+    /** Not recorded (a record of 0.21.0, completed by the repair). */
+    case Unknown
+
+  /** What the new version of a file holds, for verifying it once published
+    * ([[CommitRepair.verify]]): the rows carried over from the previous
+    * file and the rows of this commit's chunk (`carried + added` = its
+    * footer's rows), the time range of the whole file and of the chunk, and
+    * a few rows of the chunk as (time, [[ArchiveMerge.hash]]).
+    */
+  final case class Check(prev: Prev, carried: Long, added: Long, range: Option[(Long, Long)],
+                         addedRange: Option[(Long, Long)], samples: Seq[(Long, Long)])
 
   enum Delete:
     /** Rows of a small table in [from, to) with rowid <= max. */
@@ -56,8 +80,33 @@ object CommitIntent:
     case _           => throw IllegalArgumentException(s"cursor $s")
   private def longs(s: String) = if s.isEmpty then Nil else s.split(',').toSeq.map(_.toLong)
 
+  private def range(r: Option[(Long, Long)]) = r.fold("-")((a, b) => s"$a:$b")
+  private def rangeOf(s: String) = if s == "-" then None else
+    s.split(':') match
+      case Array(a, b) => Some((a.toLong, b.toLong))
+      case _           => throw IllegalArgumentException(s"range $s")
+
+  private def encodeCheck(c: Check): String =
+    val prev = c.prev match
+      case Prev.Absent     => "-"
+      case Prev.Unknown    => "?"
+      case Prev.File(r, s) => s"$r:$s"
+    Seq("v2", prev, c.carried, c.added, range(c.range), range(c.addedRange),
+      c.samples.map((t, h) => s"$t:$h").mkString(",")).mkString("\t")
+
+  private def decodeCheck(a: Seq[String]): Check =
+    val prev = a(0) match
+      case "-" => Prev.Absent
+      case "?" => Prev.Unknown
+      case p   => rangeOf(p).map(Prev.File(_, _)).get
+    val samples = if a(5).isEmpty then Nil else a(5).split(',').toSeq.map(s => rangeOf(s).get)
+    Check(prev, a(1).toLong, a(2).toLong, rangeOf(a(3)), rangeOf(a(4)), samples)
+
+  /** A file line is `file path rows size`, then the check (if any) after
+    * `v2`: 0.21.0 reads the first four fields and ignores the rest.
+    */
   def encode(i: CommitIntent): String =
-    val files = i.files.map(t => s"file\t${t.path}\t${t.rows}\t${t.size}")
+    val files = i.files.map(t => s"file\t${t.path}\t${t.rows}\t${t.size}" + t.check.fold("")(c => "\t" + encodeCheck(c)))
     val delete = i.delete match
       case Delete.Hot(t, f, to, m)          => s"hot\t$t\t$f\t$to\t$m"
       case Delete.Raw(f, to, m, a, u, kept) => s"raw\t$f\t$to\t$m\t${cursor(a)}\t${cursor(u)}\t${kept.mkString(",")}"
@@ -71,7 +120,9 @@ object CommitIntent:
     if !lines.lastOption.contains("end") then None
     else
       scala.util.Try {
-        val files = lines.filter(_.startsWith("file\t")).map(_.split('\t')).map(a => Target(a(1), a(2).toLong, a(3).toLong))
+        val files = lines.filter(_.startsWith("file\t")).map(_.split("\t", -1)).map { a =>
+          Target(a(1), a(2).toLong, a(3).toLong, Option.when(a.length > 4 && a(4) == "v2")(decodeCheck(a.toSeq.drop(5))))
+        }
         val d = lines.filterNot(l => l.startsWith("file\t") || l == "end").head.split("\t", -1)
         val delete = d(0) match
           case "hot"   => Delete.Hot(d(1), d(2).toLong, d(3).toLong, d(4).toLong)

@@ -36,3 +36,18 @@ class CommitIntentSuite extends munit.FunSuite:
     // nor undone; the record stays.
     assertEquals(recovery(raw, Map(a -> OnDisk(None, Some((10, 77))), b -> OnDisk(Some((200, 3000)), None))), Recovery.Stuck)
   }
+
+  test("checks round-trip after the four fields 0.21.0 reads; its records still decode") {
+    val c = Check(Prev.File(40, 4000), 40, 960, Some((-5L, 99L)), Some((10L, 99L)), Seq((10L, -77L), (99L, 12345L)))
+    val i = raw.copy(files = Seq(raw.files(0).copy(check = Some(c)), raw.files(1).copy(check = Some(c.copy(prev = Prev.Absent,
+      range = None, samples = Nil))), Target("nmea/2026-10-19.parquet", 3, 30, Some(c.copy(prev = Prev.Unknown)))))
+    assertEquals(decode(encode(i)), Some(i))
+    // As 0.21.0 read a file line: the path, rows and size are where they were.
+    for (l, t) <- encode(i).linesIterator.filter(_.startsWith("file\t")).toSeq.zip(i.files) do
+      val a = l.split('\t')
+      assertEquals((a(1), a(2).toLong, a(3).toLong), (t.path, t.rows, t.size))
+    // A record written by 0.21.0.
+    val old = "file\timu/2026-10-19.parquet\t1000\t5000\nraw\t10\t20\t99\t10:-9223372036854775808\t15:42\t3,7\nend\n"
+    assertEquals(decode(old), Some(raw.copy(files = Seq(raw.files(0)))))
+  }
+

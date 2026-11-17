@@ -185,9 +185,14 @@ object ArchiveMerge:
           else decoded = reader.readGroup(next).rowIterator.buffered
           next += 1
 
+    /** Pushed rows written (not dropped as a repeat). */
+    var added = 0L
+
     def push(r: Row): Unit =
       upTo(key(r), all = false)
+      val before = distinct.written
       distinct(r)
+      added += distinct.written - before
 
     def finish(): Unit = upTo(Long.MaxValue, all = true)
 

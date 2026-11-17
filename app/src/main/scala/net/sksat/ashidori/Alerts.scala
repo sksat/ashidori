@@ -63,12 +63,30 @@ object Alerts:
       LifeLog.add(LifeKind.SafeMode,
         s"異常終了が続いたため、記録のまとめと同期を停止（記録は継続。アプリの更新か「記録をまとめ直す」で再開）")
 
-  def stall(): Unit =
-    prefs.edit().putLong("stallAt", System.currentTimeMillis()).apply()
+  /** Raises the stall alert; `kinds`: those not saved now. The alert is
+    * kept on disk ([[restoredStall]]).
+    */
+  def stall(kinds: Set[String]): Unit =
+    prefs.edit().putLong("stallAt", System.currentTimeMillis()).putBoolean("stallUp", true)
+      .putStringSet("stallKinds", kinds.asJava).commit()
     notify(StallId, "記録が保存されていません（端末診断で確認）")
 
   def clearStall(): Unit =
     Try(ctx.getSystemService(classOf[NotificationManager]).cancel(StallId))
+    prefs.edit().putBoolean("stallUp", false).remove("stallKinds").commit()
+
+  /** A stall alert raised before this process started and not cleared: the
+    * kinds it named. An alert of 0.21.0 (not kept on disk) is found by its
+    * notification, still posted, and names no kind.
+    */
+  def restoredStall(): Option[Set[String]] =
+    val posted = Try(ctx.getSystemService(classOf[NotificationManager]).getActiveNotifications.exists(_.getId == StallId))
+      .getOrElse(false)
+    if prefs.getBoolean("stallUp", false) then
+      // Gone with a reboot (or swiped away): shown again while unresolved.
+      if !posted then notify(StallId, "記録が保存されていません（端末診断で確認）")
+      Some(Option(prefs.getStringSet("stallKinds", null)).map(_.asScala.toSet).getOrElse(Set.empty))
+    else Option.when(posted)(Set.empty[String])
 
   def lastStall: Long = prefs.getLong("stallAt", 0L)
 
@@ -77,8 +95,10 @@ object Alerts:
     */
   def issue(now: Long = System.currentTimeMillis()): Option[String] =
     val crashes = recentCrashes(now)
-    val stalled = now - lastStall < DayMs
-    if Maintenance.SafeMode.active then Some("異常終了が続いたため、自動のまとめ・同期を停止中")
+    val stalled = now - lastStall < DayMs || prefs.getBoolean("stallUp", false)
+    if CommitStatus.stuck().isDefined then Some("記録のまとめが停止（要確認）")
+    else if Attention.unseen then Some("記録のまとめで隔離したファイルあり（要確認）")
+    else if Maintenance.SafeMode.active then Some("異常終了が続いたため、自動のまとめ・同期を停止中")
     else if crashes == 0 && !stalled then None
     else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止がありました")
     else if crashes > 0 then Some(s"直近24時間に異常終了が ${crashes} 回ありました")

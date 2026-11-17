@@ -31,6 +31,7 @@ object Maintenance:
   private val JobIdle = 0x7a5d0001
   private val JobDelayed = 0x7a5d0002
   private val JobManual = 0x7a5d0003
+  private val JobRepair = 0x7a5d0004
   val MinUptimeMs: Long = 30 * 60_000L
   /** Below JobScheduler's 10 minutes, so a job ends on its own. */
   val BudgetMs: Long = 8 * 60_000L
@@ -62,6 +63,62 @@ object Maintenance:
     extras.putBoolean("manual", true)
     c.getSystemService(classOf[JobScheduler]).schedule(job(JobManual).setExtras(extras).setOverrideDeadline(0).build())
     Progress.set("開始を待っています")
+
+  @volatile private var repairAsked = 0L
+
+  /** An unfinished commit cannot be finished (seen in the main process):
+    * the maintenance process resolves it now where it can do so safely
+    * ([[ArchiveStore.recover]]), not 30 minutes later. At most once an hour
+    * from one process.
+    */
+  def requestRepair(): Unit =
+    val now = SystemClock.elapsedRealtime()
+    if !SafeMode.maintenanceStopped && (repairAsked == 0L || now - repairAsked > 3_600_000L) then
+      repairAsked = now
+      Try {
+        val js = ctx.getSystemService(classOf[JobScheduler])
+        if js.getPendingJob(JobRepair) == null then
+          val extras = PersistableBundle()
+          extras.putString("repair", "auto")
+          js.schedule(job(JobRepair).setExtras(extras).setOverrideDeadline(0).build())
+      }.failed.foreach(e => Log.w("scheduling the archive repair failed", e))
+
+  /** 「まとめを修復」: resolves an unfinished commit table by table,
+    * quarantining files that do not verify ([[CommitRepair]]).
+    */
+  def repairNow(c: Context): Unit =
+    val extras = PersistableBundle()
+    extras.putString("repair", "manual")
+    extras.putBoolean("manual", true)
+    c.getSystemService(classOf[JobScheduler]).schedule(job(JobRepair).setExtras(extras).setOverrideDeadline(0).build())
+    Progress.set("修復の開始を待っています")
+
+  /** Runs a repair (auto or manual, see above). Call in the maintenance
+    * process, off the main thread.
+    */
+  def repair(manual: Boolean): Unit =
+    if !running.compareAndSet(false, true) then return
+    try
+      val db = AshidoriApp.db
+      val archive = AshidoriApp.archive
+      Progress.set(if manual then "修復を開始しました" else "未完了のまとめを確認しています")
+      val result =
+        try
+          if manual then
+            if archive.repairNow(db, l => Progress.set(l)) then "修復しました" else "未完了のまとめはありません"
+          else
+            archive.recover(db)
+            "未完了のまとめはありません"
+        catch
+          case _: ArchiveStore.CommitStuck => "自動では解決できません（「まとめを修復」で解決）"
+          case NonFatal(e) =>
+            Log.w("archive repair failed", e)
+            LifeLog.add(LifeKind.ArchiveRepair, s"まとめの修復に失敗（記録は端末内に保持）: ${LifeLog.describe(e)}")
+            s"修復できませんでした: ${LifeLog.describe(e)}"
+      Progress.set(result, running = false)
+      // Archiving stopped while the commit was unfinished: queued again.
+      if !archive.commitPending then schedule(ctx)
+    finally running.set(false)
 
   // --- progress (written by the maintenance process, shown by the UI) ---------------------
 
@@ -154,7 +211,7 @@ object Maintenance:
     def set(c: Context): Unit =
       Try(write(maintenanceFile, build().toString))
       Try(write(syncFile, build().toString))
-      Try(Seq(JobIdle, JobDelayed, JobManual).foreach(c.getSystemService(classOf[JobScheduler]).cancel))
+      Try(Seq(JobIdle, JobDelayed, JobManual, JobRepair).foreach(c.getSystemService(classOf[JobScheduler]).cancel))
       Try(net.sksat.ashidori.sync.SyncScheduler.cancelAll(c))
 
     private def reset(): Unit = Try(write(resetFile, System.currentTimeMillis().toString))
@@ -254,12 +311,18 @@ class ArchiveJobService extends JobService:
   override def onStartJob(params: JobParameters): Boolean =
     stopped = false
     val manual = params.getExtras.getBoolean("manual", false)
+    val repair = Option(params.getExtras.getString("repair"))
     // Switched off after repeated crashes (a job queued before): not run.
     if Maintenance.SafeMode.maintenanceStopped && !manual then return false
     val t = Thread(() =>
       Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
       val left =
-        try Maintenance.run(manual, () => stopped)
+        try
+          repair match
+            case Some(_) =>
+              Maintenance.repair(manual)
+              false
+            case None => Maintenance.run(manual, () => stopped)
         catch
           case e: Throwable =>
             Log.w("maintenance failed", e)

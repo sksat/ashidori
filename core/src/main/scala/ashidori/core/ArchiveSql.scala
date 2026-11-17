@@ -46,6 +46,15 @@ object ArchiveSql:
     ("time>=? AND time<? AND rowid<=? AND (time>? OR (time=? AND rowid>?)) AND (time<? OR (time=? AND rowid<=?))",
       Seq(from, to, max, after.time, after.time, after.rowid, upTo.time, upTo.time, upTo.rowid))
 
+  /** The raw lines of a portion ([[rawPortion]]) after `cursor`, in (time,
+    * rowid) order, `limit` of them: rowid, time, line.
+    */
+  def rawPortionAfter(from: Long, to: Long, max: Long, after: ArchiveMerge.Cursor, upTo: ArchiveMerge.Cursor,
+                      cursor: ArchiveMerge.Cursor, limit: Int): (String, Seq[Long]) =
+    val (where, args) = rawPortion(from, to, max, after, upTo)
+    (s"SELECT rowid, time, line FROM raw_lines WHERE $where AND (time>? OR (time=? AND rowid>?)) ORDER BY time, rowid LIMIT ?",
+      args ++ Seq(cursor.time, cursor.time, cursor.rowid, limit.toLong))
+
   /** `where` but not these rowids (lines that were not archived). */
   def except(where: String, rowids: Seq[Long]): String =
     if rowids.isEmpty then where else where + rowids.mkString(" AND rowid NOT IN (", ",", ")")

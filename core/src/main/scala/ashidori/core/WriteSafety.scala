@@ -44,6 +44,9 @@ final class WriteBacklog(maxRaw: Int = WriteBacklog.MaxRawRows, maxOther: Int = 
   /** The oldest of [[unsavedSince]]: (kind, since). */
   def oldestUnsaved: Option[(String, Long)] = unsavedSince.minByOption(_._2)
 
+  /** Kinds saved at least once in this process. */
+  def savedKinds: Set[String] = savedAt.keySet.toSet
+
   /** When data of `kind` was last saved (uptime), if in this process. */
   def lastSaved(kind: String): Option[Long] = savedAt.get(kind)
 
@@ -134,15 +137,35 @@ object WriteStall:
   /** The stall alert's state: raised when either condition holds, cleared
     * only when both are resolved (every kind saved again), not by any write
     * that succeeds.
+    *
+    * The app keeps the alert on disk ([[kinds]] while [[reported]]): an
+    * alert raised before a restart is `restored` and cleared only once each
+    * kind it named has been saved after the restart (some kind, if it named
+    * none), as well as nothing being stalled now.
     */
-  final class Monitor:
-    var reported = false
+  final class Monitor(restored: Option[Set[String]] = None):
+    var reported: Boolean = restored.isDefined
+    /** The kinds not saved when the alert was raised. */
+    var kinds: Set[String] = restored.getOrElse(Set.empty)
+    private var carried = restored.isDefined
 
-    /** Some(true): report the stall now; Some(false): it is over now. */
-    def update(noCommit: Boolean, unsavedTooLong: Boolean): Option[Boolean] =
+    /** Some(true): report the stall now; Some(false): it is over now.
+      * `unsaved`: kinds not saved now; `saved`: kinds saved since the start.
+      */
+    def update(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String] = Set.empty,
+               saved: Set[String] = Set.empty): Option[Boolean] =
       val stalled = noCommit || unsavedTooLong
-      if stalled && !reported then { reported = true; Some(true) }
-      else if !stalled && reported then { reported = false; Some(false) }
+      def savedAgain = !carried || (if kinds.isEmpty then saved.nonEmpty else kinds.subsetOf(saved))
+      if stalled && !reported then
+        reported = true
+        carried = false
+        kinds = unsaved
+        Some(true)
+      else if !stalled && reported && savedAgain then
+        reported = false
+        carried = false
+        kinds = Set.empty
+        Some(false)
       else None
 
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
