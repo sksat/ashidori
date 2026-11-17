@@ -56,7 +56,16 @@ final class SkyPlotView(c: Context) extends View(c):
     canvas.drawLine(cx - r, cy, cx + r, cy, grid)
     canvas.drawLine(cx, cy - r, cx, cy + r, grid)
     label.setColor(Ui.color(Ui.attr.onSurfaceVariant))
+    // Bearings outside the horizon ring, elevations on the rings
+    // (outer 0°, then 30°, 60°; the center is straight up).
     canvas.drawText("N", cx, cy - r - Ui.dp(2), label)
+    canvas.drawText("S", cx, cy + r + Ui.dp(10), label)
+    canvas.drawText("E", cx + r + Ui.dp(7), cy + Ui.dp(3), label)
+    canvas.drawText("W", cx - r - Ui.dp(7), cy + Ui.dp(3), label)
+    label.setTextAlign(Paint.Align.LEFT)
+    for (f, deg) <- Seq((2f / 3, "30°"), (1f / 3, "60°")) do
+      canvas.drawText(deg, cx + Ui.dp(2), cy - r * f - Ui.dp(2), label)
+    label.setTextAlign(Paint.Align.CENTER)
     // Group signals of the same satellite (L1 + L5) into one marker.
     val bySat = sats.groupBy(s => (s.constellation, s.svid))
     for ((const, svid), sigs) <- bySat do

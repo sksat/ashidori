@@ -81,9 +81,9 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
         page(
           "ashidori へようこそ",
           Seq(
-            "訪れた場所と移動を自動で記録し、あとから1日ずつ振り返れます。",
-            "記録はこの端末の中に保存されます。サーバへの同期は任意で、使う場合も端末で暗号化してから送るので、サーバ側からは中身を読めません。",
-            "静止中は GNSS を止めるなど、電池をなるべく使わないように動きます。"
+            "訪れた場所と移動を自動で記録します。",
+            "記録はこの端末に保存します。サーバ同期を使う場合も、サーバの管理者は記録を読めません。",
+            "電池の消費を抑えて記録します。"
           ),
           "はじめる" -> (() => next())
         )
@@ -100,7 +100,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
         }
         page(
           "記録モードを選ぶ",
-          Seq("位置を記録する間隔と、電池の使い方の組み合わせです。あとから「ステータス」画面でいつでも変えられ、必要なときだけ「全力ログ」にすることもできます。"),
+          Seq("「ステータス」画面でいつでも変更できます。"),
           "次へ" -> (() => {
             opts.find(_._2.isChecked).foreach((m, _) => Settings.mode = m)
             next()
@@ -131,12 +131,9 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
       case Step.Background =>
         page(
           "画面を閉じていても記録する",
-          Seq(
-            "アプリを閉じている間も記録を続けるには、位置情報を「常に許可」にする必要があります。",
-            "次に開く設定画面で「常に許可」を選んで戻ってきてください。"
-          ),
+          Seq("アプリを閉じている間の記録には、位置情報の「常に許可」が必要です。"),
           "設定を開く" -> (() => act.requestPermissions(Seq(Manifest.permission.ACCESS_BACKGROUND_LOCATION))(() => afterRequest(Step.Background))),
-          Some("あとで（アプリを開いている間だけ記録）" -> (() => next()))
+          Some("あとで" -> (() => next()))
         )
       case Step.Battery =>
         page(
@@ -154,7 +151,7 @@ final class OnboardingScreen(act: MainActivity, permissionsOnly: Boolean, onFini
     if done(s) then next()
     else
       val note = s match
-        case Step.Location   => "位置情報がないと記録できません。あとで「ステータス」画面から許可できます。"
+        case Step.Location   => "位置情報がないと記録できません。"
         case Step.Background => "アプリを開いている間だけ記録します。あとで設定から変更できます。"
         case Step.Activity   => "歩数と移動手段の判定の精度が下がります。"
         case _               => "あとで設定から変更できます。"

@@ -12,7 +12,7 @@ import ashidori.core.DownloadFailure
 object BasemapUi:
   /** Shown wherever the download is offered. */
   val PrivacyNote =
-    "地図データは国全体をまとめて取得するため、位置情報は送信しません。「位置情報を外部サービスに送らない」がオンでも取得します。"
+    "全域を一括で取得（位置は送信しません）"
 
   def percent(done: Long, total: Long): Int = if total <= 0 then 0 else (done * 100 / total).toInt
 
@@ -79,13 +79,13 @@ object BasemapUi:
 
   /** Heading of the card on a map without a base map: why it has none. */
   def cardTitle(st: BasemapStatus): String = st match
-    case BasemapStatus.Unavailable => "このビルドでは簡易地図を利用できません"
-    case BasemapStatus.Missing => "簡易地図は未取得です"
-    case BasemapStatus.Installed(_, _) => "簡易地図のデータを読み込めません"
-    case BasemapStatus.Waiting(false) => "簡易地図は Wi-Fi 接続時に取得します"
-    case BasemapStatus.Waiting(true) => "簡易地図のダウンロード待ち"
-    case BasemapStatus.Running(d, t, _) => s"簡易地図をダウンロード中 ${percent(d, t)}%"
-    case f: BasemapStatus.Failed => s"簡易地図を取得できません（${f.failure.shortLabel}）"
+    case BasemapStatus.Unavailable => "このビルドではオフライン地図を利用できません"
+    case BasemapStatus.Missing => "オフライン地図は未取得"
+    case BasemapStatus.Installed(_, _) => "オフライン地図を読み込めません"
+    case BasemapStatus.Waiting(false) => "オフライン地図は Wi-Fi 接続時に取得"
+    case BasemapStatus.Waiting(true) => "オフライン地図のダウンロード待ち"
+    case BasemapStatus.Running(d, t, _) => s"オフライン地図をダウンロード中 ${percent(d, t)}%"
+    case f: BasemapStatus.Failed => s"オフライン地図を取得できません（${f.failure.shortLabel}）"
 
   /** Whether that card offers the download (or a retry) now. */
   def offersDownload(st: BasemapStatus): Boolean = st match
@@ -132,7 +132,7 @@ object BasemapUi:
     else
       MaterialAlertDialogBuilder(act)
         .setTitle("モバイルデータ通信でダウンロードしますか")
-        .setMessage(s"簡易地図のデータ（${Basemap.sizeLabel}）を取得します。Wi-Fi を待つ場合は「Wi-Fi 接続時」を選択してください。")
+        .setMessage(s"オフライン地図のデータ（${Basemap.sizeLabel}）")
         .setPositiveButton("ダウンロード", (_, _) => BasemapDownload.start(act, allowMetered = true))
         .setNegativeButton("Wi-Fi 接続時", (_, _) => BasemapDownload.start(act, allowMetered = false))
         .setNeutralButton("キャンセル", null)
@@ -142,7 +142,7 @@ object BasemapUi:
   def showDialog(act: MainActivity): Unit =
     val st = BasemapDownload.status
     val body = Seq(
-      "端末内で表示する地図（日本はズーム 10、全世界はズーム 5 まで）のデータです。取得するまで、地図には経路と滞在地のみを表示します。",
+      "日本はズーム 10、全世界はズーム 5 まで",
       "",
       "状態: " + statusLine(st)
     ) ++ failureLines(st) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote)
@@ -164,8 +164,8 @@ object BasemapUi:
 
   private def confirmDelete(act: MainActivity): Unit =
     MaterialAlertDialogBuilder(act)
-      .setTitle("簡易地図を削除しますか")
-      .setMessage("削除すると、地図には経路と滞在地のみを表示します。設定からいつでも再取得できます。")
+      .setTitle("オフライン地図を削除しますか")
+      .setMessage("地図には経路と滞在地のみを表示します。")
       .setPositiveButton("削除", (_, _) => BasemapDownload.delete(act))
       .setNegativeButton("キャンセル", null)
       .show()

@@ -15,12 +15,12 @@ import ashidori.core.BaseMapPolicy.Outcome
 enum MapStyle(val key: String, val label: String, val note: String):
   case Offline extends MapStyle("offline", "オフライン地図", "通信なし")
   case Standard extends MapStyle("ofm-liberty", "標準", "OpenStreetMap（OpenFreeMap）")
-  case Light extends MapStyle("ofm-positron", "シンプル", "淡い配色で経路が見やすい（OpenFreeMap）")
+  case Light extends MapStyle("ofm-positron", "シンプル", "淡色（OpenFreeMap）")
   case GsiStd extends MapStyle("gsi-std", "地理院 標準", "国土地理院の標準地図")
-  case GsiPale extends MapStyle("gsi-pale", "地理院 淡色", "国土地理院の淡色地図。経路が目立つ")
+  case GsiPale extends MapStyle("gsi-pale", "地理院 淡色", "国土地理院")
   case GsiPhoto extends MapStyle("gsi-photo", "航空写真", "国土地理院のシームレス空中写真")
-  case GsiRelief extends MapStyle("gsi-relief", "色別標高", "国土地理院。高さを色で表示（ズーム15まで）")
-  case Custom extends MapStyle("custom", "カスタム", "XYZ タイルの URL を指定")
+  case GsiRelief extends MapStyle("gsi-relief", "色別標高", "国土地理院（ズーム15まで）")
+  case Custom extends MapStyle("custom", "カスタム", "XYZ タイル")
 
   /** Identifies what a snapshot of this map shows: the offline map changes
     * when its data is downloaded or deleted.

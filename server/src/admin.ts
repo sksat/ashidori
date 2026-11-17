@@ -164,7 +164,7 @@ ${limitsText}
 <section><h2>招待</h2>
 <p>${modeText}</p>
 <p><label>有効期限 <select id="ttl"><option value="1">1 日</option><option value="${INVITE_DEFAULT_DAYS}" selected>${INVITE_DEFAULT_DAYS} 日</option><option value="30">30 日</option></select></label> <button id="invite">招待を作成</button></p>
-<p class="note">招待は 1 回限りの登録リンクです。招待された人がアプリで開き、ユーザ名を決めて登録します。</p>
+<p class="note">招待は 1 回限りの登録リンクです。</p>
 <div id="issued" hidden><div class="row"><div id="qr"></div><div><p id="for"></p><p id="code"></p><p id="exp"></p>
 <p>登録リンク: <code id="link"></code> <button id="copy">コピー</button></p></div></div>
 <p id="howto" class="note"></p></div>
@@ -284,14 +284,14 @@ $("invite").onclick = async () => {
   const body = await api("/admin/invites", { ttlDays: Number($("ttl").value) });
   if (!body) return;
   show("招待", body.code, body.expiresAt, location.origin + "/pair#i=" + body.code,
-    "招待する人に登録リンクを渡します。アプリの「QR コードを読み取る」でこの QR コードを読み取るか、アプリのある端末でリンクを開くと、新しく登録する画面になります。");
+    "招待する人にこのリンクまたは QR コードを渡します。");
   load();
 };
 async function issuePairing(u) {
   const body = await api("/admin/users/" + encodeURIComponent(u.id) + "/pairing");
   if (!body) return;
   show(who(u) + " のペアリングコード", body.code, body.expiresAt, location.origin + "/pair#c=" + body.code,
-    "この利用者の端末を追加します。アプリで QR コードを読み取るか、リンクを開くと、サーバとコードが入力されます。登録後、その端末に復旧コードを入力します。復旧コードは QR コードとリンクに含まれません。");
+    "この利用者の端末を追加します。登録後、その端末に復旧コードの入力が必要です。");
 }
 $("copy").onclick = async () => {
   try {

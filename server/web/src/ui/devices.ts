@@ -104,7 +104,7 @@ export function renderDevices(ctx: Ctx, main: HTMLElement): void {
     "section",
     { class: "card", "aria-labelledby": "dl-h" },
     h("div", { class: "cardhead" }, h("h2", { id: "dl-h", class: "grow" }, "端末"), refresh),
-    ids.length ? h("ul", { class: "devlist" }, rows) : h("div", { class: "empty" }, icon("phone"), h("b", null, "端末の状態はまだありません"), h("span", null, "アプリで同期すると、ここに表示されます。")),
+    ids.length ? h("ul", { class: "devlist" }, rows) : h("div", { class: "empty" }, icon("phone"), h("b", null, "端末の状態はまだありません")),
   );
 
   const sess = ctx.session;
@@ -153,7 +153,6 @@ export function renderDevices(ctx: Ctx, main: HTMLElement): void {
     h(
       "div",
       { class: "zone danger" },
-      h("p", null, "このブラウザから鍵を消去し、登録を取り消します。"),
       h(
         "button",
         {

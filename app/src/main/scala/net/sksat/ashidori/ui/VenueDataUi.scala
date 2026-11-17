@@ -9,10 +9,10 @@ import net.sksat.ashidori.*
   */
 object VenueDataUi:
   val PrivacyNote =
-    "施設データは日本全体をまとめて取得するため、位置情報は送信しません。端末内での施設の検索も送信しません。"
+    "日本全域を一括で取得（位置は送信しません）"
 
   def statusLine(st: BasemapStatus): String = st match
-    case BasemapStatus.Installed(v, _) if VenueData.broken => s"読み込めません（v$v、再取得してください）"
+    case BasemapStatus.Installed(v, _) if VenueData.broken => s"読み込めません（v$v）"
     case _ => BasemapUi.pinnedStatusLine(st)
 
   /** Settings row: status and size (not with a failure: one line). */
@@ -31,7 +31,7 @@ object VenueDataUi:
     else
       MaterialAlertDialogBuilder(act)
         .setTitle("モバイルデータ通信でダウンロードしますか")
-        .setMessage(s"施設データ（${VenueData.sizeLabel}）を取得します。Wi-Fi を待つ場合は「Wi-Fi 接続時」を選択してください。")
+        .setMessage(s"施設データ（${VenueData.sizeLabel}）")
         .setPositiveButton("ダウンロード", (_, _) => go(true))
         .setNegativeButton("Wi-Fi 接続時", (_, _) => go(false))
         .setNeutralButton("キャンセル", null)
@@ -44,7 +44,7 @@ object VenueDataUi:
       case BasemapStatus.Installed(_, _) => VenueData.dateLabel.map("データ: OpenStreetMap " + _)
       case _ => None
     val body = Seq(
-      "チェックインの候補となる日本の施設（OpenStreetMap）のデータです。端末内で検索するため、通信できない場所でも候補を表示します。",
+      "チェックインの候補となる施設（日本・OpenStreetMap）",
       "",
       "状態: " + statusLine(st)
     ) ++ BasemapUi.failureLines(st) ++ date ++ BasemapUi.sourceLine(st) ++ Option(VenueData.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++
@@ -69,7 +69,7 @@ object VenueDataUi:
   private def confirmDelete(act: MainActivity): Unit =
     MaterialAlertDialogBuilder(act)
       .setTitle("施設データを削除しますか")
-      .setMessage("削除すると、チェックインの候補は過去の場所と保存済みの施設のみになります。近くの施設の検索は、これまでどおり「最新を取得」を押したときだけ行い、そのとき位置情報を送信します。設定からいつでも再取得できます。")
+      .setMessage("チェックインの候補は、過去の場所と保存済みの施設のみになります。")
       .setPositiveButton("削除", (_, _) => VenueDownload.delete(act))
       .setNegativeButton("キャンセル", null)
       .show()

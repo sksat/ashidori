@@ -100,6 +100,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val indoorNote =
     val t = stableCaption(PositioningPanel.indoorNoteVariants.map("ⓘ " + _))
     t.setPadding(0, dp(6), 0, 0)
+    t.setOnClickListener(_ =>
+      com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+        .setTitle("屋外判定")
+        .setMessage(PositioningPanel.indoorProbeSchedule)
+        .setPositiveButton("閉じる", null)
+        .show())
     t
   /** Shown only while stopped. Recording is meant to stay on; the user
     * normally just changes the mode.
@@ -114,8 +120,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     val b = button("■  停止") {
       com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
         .setTitle("記録を停止しますか")
-        .setMessage("停止している間の移動や滞在は残りません。電池を節約したいだけなら「省電力」モードがおすすめです。")
-        .setNegativeButton("やめる", null)
+        .setMessage("停止中の移動と滞在は記録されません。")
+        .setNegativeButton("キャンセル", null)
         .setNeutralButton("省電力にする", (_, _) => selectMode(LoggingMode.Eco))
         .setPositiveButton("停止する", (_, _) => {
           Settings.loggingEnabled = false
@@ -256,8 +262,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
         card(text("記録モード", 16f, bold = true), spacer(8), modeRow, modeInfo)
       ) ++ panel.views ++ Seq(sensorPanel.view) ++ Seq(
         card(
-          text("詳細ログ", 16f, bold = true),
-          caption("衛星の電波と IMU の生データ（解析用）"),
+          { val t = text("生データ記録", 16f, bold = true); t.setLayoutParams(weighted())
+            hbox(t, chip("開発者向け", color(attr.surfaceContainerHigh), color(attr.onSurfaceVariant))) },
           spacer(6),
           detailText,
           detailSchedule,

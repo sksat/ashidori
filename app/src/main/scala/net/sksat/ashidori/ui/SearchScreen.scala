@@ -81,12 +81,7 @@ final class SearchScreen(act: MainActivity) extends Screen:
   private def render(): Unit =
     val q = input.getText.toString.trim.toLowerCase
     results.removeAllViews()
-    if q.isEmpty then
-      results.addView(padded(vbox(
-        text("自分の記録から探します", 15f, bold = true),
-        caption("・場所の名前や地域（例: 渋谷）… その場所に行った日の一覧\n・チェックイン先（例: スターバックス）\n・日付（例: 10/5、2026/9/1）… その日を開く")
-      ), 16, 12))
-      return
+    // An empty query shows the frequent places and recent check-ins.
     // A typed date jumps straight to that day.
     q match
       case DatePattern(y, m, d) =>

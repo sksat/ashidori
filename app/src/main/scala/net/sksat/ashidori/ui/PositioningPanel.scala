@@ -74,8 +74,7 @@ final class PositioningPanel(act: MainActivity):
       LoggerService.send(act, LoggerService.ActionBurst)
     }
   }
-  private val skyHelp = caption("中心＝真上・外周＝地平線　● 使用中　◎ L5 も受信")
-  private val barsHelp = caption("信号強度（C/N0）の強い順・薄い棒は測位に未使用")
+  private val skyHelp = caption("● 使用中　◎ L5 も受信")
 
   private val history = GnssHistoryView(act)
   private val historyNote = oneLine(tabular(caption("")))
@@ -91,8 +90,7 @@ final class PositioningPanel(act: MainActivity):
     SensorUi.legendItem(v, label)
   private val satellites = card(
     text("衛星測位", 16f, bold = true),
-    caption("GNSS 受信機"),
-    SensorUi.section("いま"),
+    SensorUi.section("現在"),
     state.view,
     fixRow.view,
     usedRow.view,
@@ -103,13 +101,16 @@ final class PositioningPanel(act: MainActivity):
     skyHelp,
     spacer(6),
     bars,
-    barsHelp,
+    hbox(
+      swatch(color(attr.onSurfaceVariant), "測位に使用"),
+      swatch((color(attr.onSurfaceVariant) & 0x00ffffff) | 0x6e000000, "未使用")
+    ),
     spacer(6),
     wake,
     SensorUi.section("履歴", rangeGroup),
     hbox(
-      swatch(color(attr.primary), "使用衛星数（棒）"),
-      swatch(color(attr.tertiary), "信号強度（線）", line = true)
+      swatch(color(attr.primary), "使用衛星数"),
+      swatch(color(attr.tertiary), "信号強度", line = true)
     ),
     hbox(swatch(color(attr.secondaryContainer), "屋内")),
     spacer(4),
@@ -195,7 +196,7 @@ final class PositioningPanel(act: MainActivity):
     val how = LoggerState.plan.filter(_ => running).fold("")(PositioningPanel.sourceState)
     if !running then state.set("記録停止中", SensorUi.Tone.Off, "")
     else if on then state.set("受信中", SensorUi.Tone.Active, how)
-    else if gnssOn then state.set("捕捉中", SensorUi.Tone.Waiting, "屋外では通常数十秒以内")
+    else if gnssOn then state.set("探索中", SensorUi.Tone.Waiting, "")
     else if LoggerState.environment == Environment.Indoor then
       state.set("停止中（屋内）", SensorUi.Tone.Off, s"$how・移動開始時に再確認")
     else if LoggerState.motion == MotionState.Stationary then
@@ -291,11 +292,13 @@ object PositioningPanel:
   val ModeNoteSample: String = "「バランス」で動作中: 充電中のため1段階上げ"
 
   private def indoorText(gnss: Boolean): String =
-    val head =
-      if gnss then "屋外判定のため衛星で測位中"
-      else "屋内のため Wi-Fi・基地局で測位"
-    head + s"（屋外判定: 移動開始時・移動中${SamplingPolicy.IndoorProbeMovingEveryMs / 60_000}分ごと・" +
-      s"静止中${SamplingPolicy.IndoorProbeStillEveryMs / 60_000}分ごと）"
+    if gnss then "屋外判定のため衛星で測位中"
+    else "屋内のため Wi-Fi・基地局で測位"
+
+  /** When satellites are tried indoors, for the ⓘ on the indoor note. */
+  def indoorProbeSchedule: String =
+    s"移動開始時・移動中 ${SamplingPolicy.IndoorProbeMovingEveryMs / 60_000} 分間隔・" +
+      s"静止中 ${SamplingPolicy.IndoorProbeStillEveryMs / 60_000} 分間隔"
 
   /** Second part: how positions are checked while indoors. */
   def indoorNote(p: SamplingPlan): Option[String] =

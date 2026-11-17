@@ -96,10 +96,10 @@ final class DataScreen(act: MainActivity) extends Screen:
         ),
         spacer(6),
         listGroup(
-          format("Timeline.json", "Google マップのタイムライン互換。滞在と移動")(exportAs("json")),
-          format("GPX", "経路と滞在地。地図アプリや GIS で開けます")(exportAs("gpx")),
-          format("記録データ（Parquet・zip）", "位置・動き・電池・衛星の状態・詳細ログ（GNSS 生データ・IMU）を表ごとに")(exportAs("parquet")),
-          format("GNSS ログ（GnssLogger 形式・zip）", "詳細ログを GnssLogger のテキスト形式で。解析ツール向け")(exportAs("gnsslog"))
+          format("Timeline.json", "Google マップのタイムライン互換")(exportAs("json")),
+          format("GPX", "経路と滞在地")(exportAs("gpx")),
+          format("記録データ（Parquet・zip）", "位置・動き・電池・衛星の状態・生データ")(exportAs("parquet")),
+          format("GNSS ログ（GnssLogger 形式・zip）", "衛星の生データ。解析ツール向け")(exportAs("gnsslog"))
         ),
         supportingText("非公開のチェックインは含めません。"),
         sectionHeader("インポート"),
@@ -169,7 +169,7 @@ final class DataScreen(act: MainActivity) extends Screen:
     }
 
   private def importFile(uri: Uri): Unit =
-    showStatus("読み込み中…（大きなファイルは時間がかかります）")
+    showStatus("読み込み中…")
     AshidoriApp.io.execute { () =>
       val r = Try {
         val json = Using.resource(act.getContentResolver.openInputStream(uri))(in => String(in.readAllBytes(), StandardCharsets.UTF_8))

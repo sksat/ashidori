@@ -340,7 +340,7 @@ function fillList(ctx: Ctx, list: HTMLElement): void {
     replace(
       list,
       today,
-      h("div", { class: "empty" }, icon("history"), h("b", null, "まだ記録がありません"), h("span", null, "アプリで同期すると、ここに表示されます。")),
+      h("div", { class: "empty" }, icon("history"), h("b", null, "まだ記録がありません")),
     );
     return;
   }

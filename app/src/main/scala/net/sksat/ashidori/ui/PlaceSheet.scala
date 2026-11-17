@@ -78,7 +78,6 @@ final class PlaceSheet(
         sub,
         spacer(12),
         text("近くの候補", 15f, bold = true),
-        caption("正しい場所を選ぶと、この場所の名前になります。"),
         candidates,
         spacer(12),
         text("名前と種別", 15f, bold = true),
@@ -105,10 +104,12 @@ final class PlaceSheet(
 
   private def fmt(t: Long) = Instant.ofEpochMilli(t).atZone(AshidoriApp.zone).format(timeFmt)
 
+  /** A candidate, and at its end what a tap does (like the timeline's 「「X」にする」). */
   private def candidateRow(v: Venue, sub: String): View =
-    val t = text(v.name, 15f)
+    val t = vbox(oneLine(text(v.name, 15f)), oneLine(caption(sub)))
     t.setLayoutParams(weighted())
-    val r = hbox(t, caption(sub))
+    val r = hbox(t, chip("名前にする", color(attr.primaryContainer), color(attr.onPrimaryContainer)))
+    r.setGravity(android.view.Gravity.CENTER_VERTICAL)
     r.setMinimumHeight(dp(48))
     r.setBackgroundResource(android.R.drawable.list_selector_background)
     r.setOnClickListener(_ => save(current.copy(name = v.name, externalId = v.id)))
@@ -147,8 +148,8 @@ final class PlaceSheet(
         for (v, d) <- fromIndex do candidateRows.addView(candidateRow(v, s"${v.category}・${d.round}m"))
         val shown = past ++ fromIndex ++ showSaved(past ++ fromIndex, saved)
         setStatus(
-          if offline == VenueData.Lookup.Broken then "施設データを読み込めません。設定から再取得してください。"
-          else if shown.isEmpty then "近くに候補がありません"
+          if offline == VenueData.Lookup.Broken then "施設データを読み込めません"
+          else if shown.isEmpty then "近くに候補なし"
           else "")
         latestButton(shown)
       }
@@ -165,7 +166,7 @@ final class PlaceSheet(
     lazy val once: View = outlined("オンラインで検索（位置を送信）") {
       candidates.removeView(once)
       searchOnline(shown)
-    }
+    }.tap(b => tint(b, color(attr.tertiaryContainer), color(attr.onTertiaryContainer)))
     candidates.addView(once)
 
   /** OpenStreetMap venues near the place: sends its position to the server,

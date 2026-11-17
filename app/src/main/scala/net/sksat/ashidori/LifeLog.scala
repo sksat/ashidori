@@ -166,9 +166,11 @@ object LifeLog:
         PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT)
       nm.notify(StoppedId, Notification.Builder(c, ChannelAlerts)
         .setSmallIcon(R.drawable.ic_notification)
-        .setContentTitle("記録が止まっています")
-        .setContentText(s"タップすると再開します（$why）")
+        .setContentTitle("記録停止")
+        .setContentText(why)
         .setContentIntent(open)
+        // Opening the app restarts recording; the button says so without a caption.
+        .addAction(Notification.Action.Builder(null, "再開", open).build())
         .setAutoCancel(true)
         .build())
     catch case ex: Exception => Log.w("stopped notification", ex)

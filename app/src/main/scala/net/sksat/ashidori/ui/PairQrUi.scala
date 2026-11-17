@@ -60,7 +60,15 @@ object PairQrUi:
     else
       act.requestPermissions(Seq(Manifest.permission.CAMERA)) { () =>
         if act.granted(Manifest.permission.CAMERA) then scanner(act, prompt, other, parse, onFound)
-        else toast("カメラの使用が許可されていません。Android の設定で許可できます")
+        else
+          // Where to allow it, as an action rather than a sentence.
+          com.google.android.material.snackbar.Snackbar
+            .make(act.findViewById(android.R.id.content), "カメラの使用が許可されていません",
+              com.google.android.material.snackbar.BaseTransientBottomBar.LENGTH_LONG)
+            .setAction("設定を開く", _ => act.startActivity(
+              android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.parse(s"package:${act.getPackageName}"))))
+            .show()
       }
 
   private def scanner[A](act: MainActivity, prompt: String, other: String, parse: String => Option[A], onFound: A => Unit): Unit =

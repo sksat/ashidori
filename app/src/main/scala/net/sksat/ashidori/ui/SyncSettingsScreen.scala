@@ -236,16 +236,14 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
             if r.toOption.contains("open") then next.addView(startChoice(u, next))
             else
               next.addView(pairingCodeInput(u, None))
-              next.addView(caption("このサーバに新しく登録するには、サーバの管理者から受け取った招待のリンクを開くか、その QR コードを読み取ります。"))
+              next.addView(caption("招待リンクが必要です"))
         }
     }
     // A scanned link goes through the same checks as an opened one.
     val scan = action(outlined("QR コードを読み取る")(PairQrUi.scan(act, allowHttp = debuggable)(openLink)))
     card(
       text("1. 端末を登録", 16f, bold = true),
-      caption("招待または登録リンクの QR コードを読み取るか、同期先のサーバの URL を入力します。"),
       scan,
-      caption("カメラを使います。映像は端末内で処理し、送信しません。"),
       spacer(8),
       caption("サーバの URL"),
       url,
@@ -263,12 +261,11 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
         next.removeAllViews()
         next.addView(newAccountInput(u, None))
       }),
-      caption("このサーバに新しく登録し、この端末で暗号化の鍵を作ります。"),
       outlined("この端末を追加") {
         next.removeAllViews()
         next.addView(pairingCodeInput(u, None))
       },
-      caption("登録済みの端末で発行したペアリングコードと、復旧コードを入力します。")
+      caption("ペアリングコードと復旧コードが必要")
     )
 
   /** 「新しく登録」: the username only, then the account (with `invite`, or
@@ -298,8 +295,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     vbox(
       spacer(8),
       text("新しく登録", 15f, bold = true),
-      caption(if invite.isDefined then "招待のリンクから、このサーバに新しく登録します。登録先を確認してください。"
-        else "このサーバに新しく登録します。"),
+      (if invite.isDefined then caption("招待リンクから新しく登録します。登録先を確認してください。") else spacer(0)),
       caption("ユーザ名"),
       name,
       caption("英小文字・数字・_ の 3〜20 文字。ほかの利用者に表示されます。"),
@@ -321,8 +317,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     vbox(
       spacer(8),
       text("この端末を追加", 15f, bold = true),
-      caption(if fromLink.isDefined then "登録リンクからサーバとペアリングコードを入力しました。登録先を確認してから追加してください。"
-        else "登録済みの別の端末、またはサーバの管理者が発行したペアリングコードを入力します。"),
+      (if fromLink.isDefined then caption("登録リンクからサーバとペアリングコードを入力しました。登録先を確認してから追加してください。")
+        else spacer(0)),
       code,
       target(u),
       go
@@ -346,8 +342,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     }
     val head = Seq(
       text("1. 端末を登録", 16f, bold = true),
-      caption(if s.sending then "サーバに登録しています…"
-        else "登録の応答を受け取れていません。同じ内容でもう一度送ると、サーバで登録済みならその登録を使います。")
+      caption(if s.sending then "サーバに登録中…"
+        else "登録の応答を受信できませんでした。")
     )
     val detail = s.pending.toSeq.flatMap { p =>
       val what =
@@ -368,13 +364,11 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     if SyncConfig.newAccount then
       // Self-registered: no other device has a key, so only a new one makes sense.
       card((head ++ Seq(
-        caption("鍵を新しく作成し、表示される復旧コードを控えます。"),
-        action(button("新しい鍵を作る")(createKey()))
+        action(button("新しい鍵を作成")(createKey()))
       ))*)
     else
       card((head ++ Seq(
-        caption("最初の端末なら鍵を新しく作ります。2台目以降は、最初の端末で控えた復旧コードを入力します。"),
-        action(button("新しい鍵を作る（最初の端末）")(createKey())),
+        action(button("新しい鍵を作成（最初の端末）")(createKey())),
         action(outlined("復旧コードを入力（2台目以降）")(enterRecoveryCode()))
       ))*)
 
@@ -553,9 +547,9 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     card(
       text("通信", 16f, bold = true),
       sw("モバイル回線でも同期する", SyncConfig.mobileData)(SyncConfig.mobileData = _),
-      caption("位置・歩数・チェックインなどの小さなデータ。オフにすると Wi-Fi のときだけ送ります。"),
-      sw("生の GNSS ログは充電中だけ送る", SyncConfig.rawOnlyWhileCharging)(SyncConfig.rawOnlyWhileCharging = _),
-      caption("生ログは大きいので、常に Wi-Fi など従量制でない回線のときだけ送ります。")
+      caption("位置・歩数・チェックインなど"),
+      sw("生データは充電中のみ送信", SyncConfig.rawOnlyWhileCharging)(SyncConfig.rawOnlyWhileCharging = _),
+      caption("Wi-Fi など従量制でない回線でのみ送信")
     )
 
   private def devicesCard(): View =
@@ -581,10 +575,10 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
               if !revoked && !me then
                 row.addView(outlined("登録を取り消す") {
                   MaterialAlertDialogBuilder(act)
-                    .setTitle("この端末を失効しますか")
-                    .setMessage("失効した端末はサーバにアクセスできなくなります。端末をなくした場合は、あわせて鍵の作り直しも検討してください。")
-                    .setNegativeButton("やめる", null)
-                    .setPositiveButton("失効", (_, _) => async(client.request("POST", s"/v1/devices/$id/revoke", "{}".getBytes))(_ => load()))
+                    .setTitle("この端末の登録を取り消しますか")
+                    .setMessage("この端末は同期できなくなります。")
+                    .setNegativeButton("キャンセル", null)
+                    .setPositiveButton("取り消す", (_, _) => async(client.request("POST", s"/v1/devices/$id/revoke", "{}".getBytes))(_ => load()))
                     .show()
                 })
               row.setMinimumHeight(dp(48))
@@ -604,8 +598,8 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
       action(outlined("この端末の同期を解除") {
         MaterialAlertDialogBuilder(act)
           .setTitle("同期を解除しますか")
-          .setMessage("この端末から鍵と登録情報、同期の進み具合を消します。端末内の記録は残ります。もう一度登録すると、記録をすべて送り直します。")
-          .setNegativeButton("やめる", null)
+          .setMessage("端末内の記録は残ります。再登録すると、記録をすべて再送信します。")
+          .setNegativeButton("キャンセル", null)
           .setPositiveButton("解除", (_, _) => unpair())
           .show()
       })
@@ -624,7 +618,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
     val d = MaterialAlertDialogBuilder(act)
       .setTitle("別の端末を追加")
       .setView(scroll(padded(vbox(
-        caption("新しい端末の「QR コードを読み取る」でこの QR コードを読み取るか、登録リンクを開きます。サーバの URL とペアリングコードを入力しても登録できます。"),
+        caption("新しい端末で読み取ってください"),
         spacer(8),
         PairQrUi.image(link),
         spacer(8),
@@ -634,7 +628,7 @@ final class SyncSettingsScreen(act: MainActivity, link: Option[PairLink] = None)
         caption("ペアリングコード（10分間有効、1回のみ）"),
         codeView,
         spacer(12),
-        caption("登録後、新しい端末に復旧コードを入力します。復旧コードは QR コードと登録リンクに含まれません。")
+        caption("登録後、新しい端末に復旧コードを入力します。")
       ), 24, 8)))
       .setNeutralButton("コピー", null)
       .setNegativeButton("共有", null)

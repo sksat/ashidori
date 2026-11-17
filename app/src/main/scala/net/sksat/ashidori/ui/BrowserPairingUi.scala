@@ -179,7 +179,6 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
         val err = text("", 13f, colorAttr = attr.error)
         err.setVisibility(View.GONE)
         val content = vbox(
-          caption("ブラウザで表示されたコードを入力してください。"),
           code,
           err,
         )
@@ -309,8 +308,8 @@ final class BrowserPairingUi(act: MainActivity, onChanged: () => Unit):
         case Phase.Done(_, t) =>
           main.removeCallbacksAndMessages(null)
           timer.setText("")
-          body.addView(text("ブラウザで記録を見られるようになりました", 16f, bold = true))
-          body.addView(caption(s"期限は${ttlLabel(t)}です。この画面の「ブラウザでも見る」の一覧から、いつでも終了できます。"))
+          body.addView(text("ブラウザでの閲覧を承認しました", 16f, bold = true))
+          body.addView(caption(s"期限: ${ttlLabel(t)}"))
           setButtons(None, Some("閉じる" -> (() => close())))
         case Phase.Failed(reason) =>
           main.removeCallbacksAndMessages(null)

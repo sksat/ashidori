@@ -50,7 +50,7 @@ body{font-family:system-ui,sans-serif;max-width:32rem;margin:2rem auto;padding:0
 <p id="code"></p>
 </div>
 <div id="invite" hidden>
-<p>このサーバへの招待です。アプリで開き、ユーザ名を決めて新しく登録します。招待は 1 回のみ使用できます。</p>
+<p>このサーバへの招待です（1 回のみ有効）</p>
 </div>
 <p><a id="open" href="#">アプリで開く</a></p>
 <p id="note" class="note"></p>
@@ -73,7 +73,7 @@ if (c || i) {
   if (c) {
     $("code").textContent = code.slice(0, 4) + "-" + code.slice(4);
     $("pairing").hidden = false;
-    $("note").textContent = "アプリで登録先を確認してから登録します。登録後、復旧コードを入力します。復旧コードはこのリンクと QR コードに含まれません。";
+    $("note").textContent = "登録後、アプリで復旧コードを入力します。";
   } else {
     $("title").textContent = "ashidori 招待";
     document.title = "ashidori 招待";

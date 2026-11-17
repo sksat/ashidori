@@ -20,10 +20,9 @@ import Ui.*
   * `withIndex` when the venue index ([[VenueData]]) is.
   */
 enum VenueError(val message: String, val withCache: String, val withIndex: String) extends Exception(message):
-  case Offline extends VenueError("オフライン: よく行く場所と過去のチェックイン先を表示しています。",
-    "オフライン: 保存済みの施設を表示しています。", "オフライン: 端末内の施設データを表示しています。")
-  case ServerBusy extends VenueError("検索サーバがすべて応答しません。名前でチェックインできます。",
-    "検索サーバがすべて応答しません。保存済みの施設を表示中です。", "検索サーバがすべて応答しません。端末内のデータを表示中です。")
+  case Offline extends VenueError("オフライン: よく行く場所と過去のチェックイン先", "オフライン", "オフライン")
+  case ServerBusy extends VenueError("検索サーバが応答しません",
+    "検索サーバが応答しません（保存済みを表示）", "検索サーバが応答しません（施設データを表示）")
 
 /** Online venue search on OpenStreetMap (Overpass), shared by the
   * check-in sheet and the place sheet. It runs only when the user presses
@@ -147,18 +146,17 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val search = EditText(act)
   search.setHint("施設を検索、または名前を入力")
   search.setSingleLine(true)
-  private val NoLocation = "現在地を取得できませんでした。名前を入力してチェックインできます。"
-  private val NoVenues = "施設を取得できませんでした。名前を入力してチェックインできます。"
-  private val NoVenuesSaved = "施設を取得できませんでした。保存済みの施設を表示しています。"
-  private val NoVenuesIndex = "施設を取得できませんでした。端末内のデータを表示中です。"
-  private val LocalOnly = "過去の場所とチェックイン先のみを表示しています。"
-  private val IndexBroken = "施設データを読み込めません。設定から再取得してください。"
+  private val NoLocation = "現在地を取得できません"
+  private val NoVenues = "施設を取得できません"
+  private val NoVenuesSaved = "施設を取得できません（保存済みを表示）"
+  private val NoVenuesIndex = "施設を取得できません（施設データを表示）"
+  private val LocalOnly = "過去の場所とチェックイン先のみ"
+  private val IndexBroken = "施設データを読み込めません"
   private def savedFrom(hit: VenueCache.Hit) =
     s"保存済みの施設（${CheckInSheet.age(System.currentTimeMillis() - hit.fetchedAt)}に取得）"
   private def fromIndex(date: Option[String]) =
-    s"端末内の施設データ${date.fold("")(d => s"（$d）")}を表示しています。"
-  private def latestFrom(server: String) = s"最新の施設を取得しました（OpenStreetMap、$server）。"
-  private val SendNote = "「最新を取得」を押すと、位置情報を OpenStreetMap のサーバに送信します。"
+    s"施設データ${date.fold("")(d => s"（$d）")}"
+  private def latestFrom(server: String) = s"OpenStreetMap から取得（$server）"
   /** As tall as its longest message, empty or not, so the candidates below
     * stay where they are as the search goes on.
     */
@@ -172,7 +170,8 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
     * the exception, so it has the tertiary (warning) colours.
     */
   private val searchOnce =
-    val b = outlined("最新を取得（位置情報を送信）")(here.foreach(searchOnline))
+    val b = outlined("オンラインで検索（位置を送信）")(here.foreach(searchOnline))
+    tint(b, color(attr.tertiaryContainer), color(attr.onTertiaryContainer))
     b.setVisibility(View.GONE)
     b
 
@@ -181,7 +180,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   private val comment = EditText(act)
   comment.setHint("コメント")
   private val priv = MaterialSwitch(act)
-  priv.setText("非公開にする（エクスポートや共有に含めない）")
+  priv.setText("🔒 非公開")
   priv.setMinHeight(dp(48))
   private var selected: Option[Venue] = None
   private var composeHost: View = null

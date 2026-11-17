@@ -204,9 +204,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     val offer = noMapCard.getVisibility == android.view.View.VISIBLE
     detailButton.setVisibility(if Settings.blockExternalLocation && !offer then android.view.View.VISIBLE else android.view.View.GONE)
     val online = Settings.gate.consent(surface).flatMap(MapStyle.fromConsent).fold("")(_.label)
-    // The second line says, before and after the choice, that it is kept for
-    // this map (also after a restart) until switched back; two lines either
-    // way, so the button keeps its height.
+    // After the choice, the button itself shows that it holds (its colour and
+    // a second line); two lines' room either way, so it keeps its height.
+    detailButton.setMinLines(2)
     detailButton.setText(
       if !detailedFlag then TrackMap.DetailLabel
       // Back to the offline map, or to none when it is not downloaded.
@@ -595,7 +595,6 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       snapshotters.foreach { s => s.cancel(); MapStyle.untrack(s) }
     }
     val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
-    if block then head.addView(Ui.caption("簡易地図以外は、表示する範囲の地図をサーバから取得します。" + TrackMap.KeptNote))
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
     dialog.show()
 
@@ -613,19 +612,23 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     credit.setText(credit0)
     credit.setSingleLine(true)
     val body = Ui.padded(Ui.vbox(
-      Ui.caption("{z} {x} {y} を含むラスタータイルの URL。API キーが必要なサービスは URL にキーを含めてください。利用規約と出典表記はサービスに従ってください。"),
+      Ui.caption("{z} {x} {y} を含むラスタータイルの URL"),
       url, credit
     ), 20, 8)
-    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+    val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
       .setTitle("カスタム地図")
       .setView(body)
-      .setNegativeButton("やめる", null)
-      .setPositiveButton("使う", (_, _) => {
-        val u = url.getText.toString.trim
-        if MapStyle.setCustom(u, credit.getText.toString) then choose(MapStyle.Custom)
-        else android.widget.Toast.makeText(act, "{z} {x} {y} を含む http(s) の URL を、空白や改行を含めずに入力してください", android.widget.Toast.LENGTH_LONG).show()
-      })
+      .setNegativeButton("キャンセル", null)
+      .setPositiveButton("適用", null)
       .show()
+    // A bad URL keeps the dialog open with the error on the field.
+    dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
+      val u = url.getText.toString.trim
+      if MapStyle.setCustom(u, credit.getText.toString) then
+        dialog.dismiss()
+        choose(MapStyle.Custom)
+      else url.setError("URL の形式が正しくありません")
+    }
 
   /** Runs `f` now, or once a style has loaded, replacing an earlier queued `kind`. */
   private def withStyle(kind: String)(f: (MapLibreMap, Style) => Unit): Unit =
@@ -804,14 +807,9 @@ object TrackMap:
 
   val DefaultLine = "#006B5B"
   /** The explicit request for this view's online map (setting on). */
-  val DetailLabel = "この範囲を詳しい地図で表示（位置情報を送信）"
-  /** How long a consent lasts and how to undo it, in one line (both consent
-    * actions show it before they are used: the picker's heading, the buttons).
-    */
-  val KeptNote = "この地図では、簡易地図に戻すまで（再起動後も）選んだ地図を表示します。"
-  /** Second line of the detail buttons, before the choice and while it holds. */
-  val KeptLine = "簡易地図に戻すまで、この地図で保ちます（再起動後も）"
-  val KeptOnLine = "この地図で保っています（再起動後も）"
+  val DetailLabel = "オンライン地図で表示（表示範囲を送信）"
+  /** Second line of the detail button while the choice holds. */
+  val KeptOnLine = "再起動後も継続"
 
   /** A label with a smaller second line. */
   def twoLines(first: String, second: String): CharSequence =

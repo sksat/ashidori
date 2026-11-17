@@ -67,7 +67,8 @@ final class SensorPanel(act: MainActivity):
     t
 
   private val liveBlock: View =
-    val note = oneLine(caption("表示中だけ受信"))
+    // The blinking dot says it is live; the gap pushes the window to the end.
+    val note = View(act)
     note.setLayoutParams(weighted())
     val bar = hbox(liveDot(), note, caption("直近10秒"))
     bar.setPadding(0, dp(8), 0, dp(6))

@@ -198,7 +198,6 @@ function introStep(): HTMLElement {
     "section",
     { class: "card ppanel" },
     heading(STEPS[0]),
-    h("p", null, "このブラウザで記録を見るには、表示する QR コードをアプリで読み取り、アプリで承認します。"),
     h("div", { class: "formact" }, h("button", { class: "btn primary", type: "button", onclick: () => begin() }, "QR コードを表示")),
   );
 }
@@ -324,7 +323,7 @@ function doneStep(ctx: Ctx, v: Extract<View, { k: "done" }>): HTMLElement {
 const ENDED: Record<EndReason, [string, string]> = {
   mismatch: ["中止しました", "確認コードが一致しなかったため、中止しました。一時的な鍵は破棄しました。"],
   aborted: ["中止されました", "アプリまたはサーバで中止されました。一時的な鍵は破棄しました。"],
-  expired: ["時間切れです", "10 分以内に完了しなかったため、中止しました。一時的な鍵は破棄しました。"],
+  expired: ["時間切れです", "10 分以内に完了しなかったため、中止しました。"],
   failed: ["登録できませんでした", "受け取った内容を確認できなかったため、中止しました。一時的な鍵は破棄しました。"],
   cancelled: ["中止しました", "一時的な鍵は破棄しました。"],
 };
