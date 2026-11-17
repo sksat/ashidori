@@ -213,6 +213,11 @@ object WriteStall:
     */
   final class Alert(val monitor: Monitor, fx: Effects):
     private var shown = false
+    // The state on disk is not known to match (a store failed, or none was
+    // made in this process): stored again at the next check. A store that
+    // failed may still have changed what `stored` reads (SharedPreferences
+    // updates its memory before commit() fails), so that is not trusted.
+    private var dirty = true
 
     /** Some(true): raised now; Some(false): cleared now (`onChange` is told,
       * once per change).
@@ -231,7 +236,7 @@ object WriteStall:
     /** The notification and the state on disk as the monitor says. */
     def reconcile(): Unit = synchronized {
       val want = Option.when(monitor.reported)(monitor.kinds)
-      if fx.stored != want then fx.store(want)
+      if dirty || fx.stored != want then dirty = !fx.store(want)
       if want.isDefined then
         if !shown && (fx.posted || fx.post()) then shown = true
       else if fx.posted then fx.cancel()

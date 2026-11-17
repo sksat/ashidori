@@ -147,6 +147,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val pendingCommit = AshidoriApp.archive.commitPending
       val stuck = CommitStatus.stuck()
       val attention = Attention.all()
+      val quarantined = Attention.quarantineBytes()
       act.runOnUiThread { () =>
         savedRow.setValue(fix.map(t => s"${stamp(t)}（${fmtDuration(now - t)}前）").getOrElse("なし"))
         val stale = Settings.loggingEnabled && fix.forall(now - _ > 3 * 3_600_000L)
@@ -178,7 +179,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
           if stuck.isDefined then "停止（要確認）" else if pendingCommit then "未完了" else if safe then "停止中"
           else if skipped.nonEmpty then "保留あり" else "自動")
         archiveRow.value.setTextColor(color(if stuck.isDefined || safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
-        showRepair(pendingCommit, stuck, attention)
+        showRepair(pendingCommit, stuck, attention, quarantined)
         savingText = s"saving=lastFix:${fix.map(full).getOrElse("none")} crashes24h=$crashes pending=$pending " +
           s"safeMode=$safe syncStopped=$syncStopped lost=$lost skipped=${skipped.mkString(",")} " +
           s"commitPending=$pendingCommit stuck=${stuck.map(_.mkString("[", "; ", "]")).getOrElse("no")} " +
@@ -189,8 +190,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private var savingText = ""
 
   /** The card of an unfinished commit and of quarantined files. */
-  private def showRepair(pendingCommit: Boolean, stuck: Option[Seq[String]], attention: Seq[Attention.Entry]): Unit =
-    val show = pendingCommit || attention.nonEmpty
+  private def showRepair(pendingCommit: Boolean, stuck: Option[Seq[String]], attention: Seq[Attention.Entry], quarantined: Long): Unit =
+    val show = pendingCommit || attention.nonEmpty || quarantined > 0
     repairCard.setVisibility(if show then View.VISIBLE else View.GONE)
     // Files that may hold rows found nowhere else are listed; the tmp files
     // of interrupted commits whose previous version is intact are counted.
@@ -203,6 +204,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       Option.when(listed.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
       listed.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残る可能性があります" else "")) ++
       Option.when(quiet.nonEmpty)(s"整理途中の一時ファイル ${quiet.size} 件（以前の版が残っているもの）").toSeq ++
+      Option.when(quarantined > 0)(f"隔離したファイル 合計 ${quarantined / 1e6}%.1f MB（自動では削除しません）").toSeq ++
       Option.when(attention.nonEmpty)("取り出すには「隔離したファイルを書き出す」か救出用バックアップを使います。").toSeq
     repairText.setText(lines.mkString("\n"))
     repairTitle.setText(if stuck.isDefined then "記録の整理が停止（要確認）" else "記録の整理（要確認）")

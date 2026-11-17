@@ -91,6 +91,16 @@ class DebugReceiver extends BroadcastReceiver:
             Log.i(s"quarantine export done: $n bytes to $f")
           catch case e: Throwable => Log.e("quarantine export failed", e)
         , "ashidori-quarantine-export").start()
+      case "ashidori.debug.READ" =>
+        // What the app's readers show of a day (through ArchiveStore.reading).
+        val ago = intent.getIntExtra("daysAgo", 1)
+        Thread(() =>
+          val d = LocalDate.now(AshidoriApp.zone).minusDays(ago)
+          val (a, b) = (AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1)))
+          val fixes = AshidoriApp.db.fixes(a, b)
+          val pending = AshidoriApp.archive.commitPending
+          Log.i(s"read $d fixes=${fixes.size} distinct=${fixes.map(f => (f.time, f.lat, f.lon)).distinct.size} pending=$pending")
+        , "ashidori-read").start()
       case "ashidori.debug.REPAIR" => Maintenance.repairNow(c)
       case "ashidori.debug.REPAIR_NOW" => c.startService(Intent(c, classOf[DebugMaintenanceService]).putExtra("repair", true))
       case "ashidori.debug.AUDIT" =>

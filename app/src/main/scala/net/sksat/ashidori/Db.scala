@@ -267,8 +267,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   /** Positions in [from, to): archived days from Parquet, recent ones from SQLite. */
   def fixes(from: Long, to: Long): Vector[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
-    (AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf) ++ hotFixes(from, to)).sortBy(_.time)
+    once("fixes", AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf) ++ hotFixes(from, to))(f =>
+      Archive.fixRow(f).toIndexedSeq).sortBy(_.time)
   }
+
+  /** `xs` with equal rows once, while an unfinished commit of `table` has
+    * two copies of some rows read (ArchiveStore.dedupe, rule C).
+    */
+  private def once[A](table: String, xs: Vector[A])(row: A => IndexedSeq[Any]): Vector[A] =
+    if AshidoriApp.archive.dedupe(table) then CommitRepair.distinctRows(xs)(row) else xs
 
   def hotFixes(from: Long, to: Long): Vector[Fix] =
     val (x, xa) = notPending("fixes")
@@ -287,7 +294,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }.headOption
 
   def motion(from: Long, to: Long): Vector[MotionWindow] = AshidoriApp.archive.reading(Archive.Motion) {
-    (AshidoriApp.archive.read(Archive.Motion, from, to).map(Archive.motionOf) ++ hotMotion(from, to)).sortBy(_.start)
+    once("motion", AshidoriApp.archive.read(Archive.Motion, from, to).map(Archive.motionOf) ++ hotMotion(from, to))(m =>
+      Archive.motionRow(m).toIndexedSeq).sortBy(_.start)
   }
 
   private def hotMotion(from: Long, to: Long): Vector[MotionWindow] =
@@ -297,15 +305,17 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
 
   def steps(from: Long, to: Long): Int = AshidoriApp.archive.reading(Archive.Motion) {
+    if AshidoriApp.archive.dedupe("motion") then motion(from, to).map(_.steps).sum
+    else
     AshidoriApp.archive.read(Archive.Motion, from, to).map(r => Option(r(4)).map(_.asInstanceOf[Int]).getOrElse(0)).sum +
       { val (x, xa) = notPending("motion")
         query(s"SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?$x", (Seq(from, to) ++ xa)*)(_.getInt(0)).head }
   }
 
   def battery(from: Long): Vector[DrainEstimator.Sample] = AshidoriApp.archive.reading(Archive.Battery) {
-    AshidoriApp.archive.read(Archive.Battery, from, Long.MaxValue).map { r =>
+    once("battery", AshidoriApp.archive.read(Archive.Battery, from, Long.MaxValue).map { r =>
       DrainEstimator.Sample(r(0).asInstanceOf[Long], r(1).asInstanceOf[Int], r(2) == 1, r(3) == 1)
-    } ++ hotBattery(from)
+    } ++ hotBattery(from))(b => IndexedSeq(b.time, b.pct, b.charging, b.screenOn))
   }
 
   private def hotBattery(from: Long): Vector[DrainEstimator.Sample] =
@@ -431,7 +441,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val archived = AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf)
       .filter(f => !f.hasAccuracy || f.accuracy < 100)
       .groupBy(_.time / bucketMs).values.map(_.minBy(_.time)).toVector
-    (archived ++ hotFixesSampled(from, to, bucketMs)).sortBy(_.time)
+    val all = (archived ++ hotFixesSampled(from, to, bucketMs)).sortBy(_.time)
+    if AshidoriApp.archive.dedupe("fixes") then all.groupBy(_.time / bucketMs).values.map(_.minBy(_.time)).toVector.sortBy(_.time) else all
   }
 
   private def hotFixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
@@ -480,12 +491,12 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
 
   def gnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] = AshidoriApp.archive.reading(Archive.GnssStatus) {
-    AshidoriApp.archive.read(Archive.GnssStatus, from, Long.MaxValue).map { r =>
+    once("gnss_status", AshidoriApp.archive.read(Archive.GnssStatus, from, Long.MaxValue).map { r =>
       def i(k: Int) = Option(r(k)).map(_.asInstanceOf[Int]).getOrElse(0)
       (GnssSnapshot(r(0).asInstanceOf[Long], i(1), i(2), Option(r(3)).map(_.asInstanceOf[Double]).getOrElse(0.0), i(4)),
         scala.util.Try(Environment.valueOf(r(5).toString)).getOrElse(Environment.Unknown),
         Option(r(6)).map(_.asInstanceOf[Float]).getOrElse(Float.NaN))
-    } ++ hotGnssStatus(from)
+    } ++ hotGnssStatus(from))((g, e, a) => IndexedSeq(g.time, g.visible, g.used, g.top4Cn0, g.l5, e.toString, a))
   }
 
   private def hotGnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =

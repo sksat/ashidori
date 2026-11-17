@@ -139,10 +139,14 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(WriteKind.label("unknown"), "unknown")
   }
 
-  /** The notification and its state on disk, with failures to inject. */
+  /** The notification and its state on disk, with failures to inject. Like
+    * SharedPreferences, a store whose commit() fails still changes what is
+    * read back (`kept`), not what is on disk (`disk`).
+    */
   final class FakeEffects extends WriteStall.Effects:
     var shown = false
     var kept: Option[Set[String]] = None
+    var disk: Option[Set[String]] = None
     var failPost = 0
     var failCancel = 0
     var failStore = 0
@@ -155,7 +159,10 @@ class WriteSafetySuite extends munit.FunSuite:
     def post() = effect { if failPost > 0 then { failPost -= 1; false } else { shown = true; true } }
     def cancel() = effect { if failCancel > 0 then { failCancel -= 1; false } else { shown = false; true } }
     def stored = effect(kept)
-    def store(state: Option[Set[String]]) = effect { if failStore > 0 then { failStore -= 1; false } else { kept = state; true } }
+    def store(state: Option[Set[String]]) = effect {
+      kept = state
+      if failStore > 0 then { failStore -= 1; false } else { disk = state; true }
+    }
 
   test("stall alert: a save or cancel that failed is made good at the next check, either side") {
     val fx = FakeEffects()
@@ -164,7 +171,10 @@ class WriteSafetySuite extends munit.FunSuite:
     fx.failStore = 1
     assertEquals(alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)(), Some(true))
     assert(fx.shown)
-    assertEquals(fx.kept, None)
+    // In memory it reads as stored; on disk it is not: stored again until
+    // a commit works.
+    assertEquals(fx.kept, Some(Set("fixes")))
+    assertEquals(fx.disk, None)
     // Saving works again before the next check: the alert clears, and the
     // notification goes even though the raise was only partly done.
     fx.failCancel = 1
@@ -173,11 +183,12 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))(), None)
     assert(!fx.shown)
     assertEquals(fx.kept, None)
+    assertEquals(fx.disk, None)
     // Raised, the post fails and then works; kept on disk with its kinds.
     fx.failPost = 1
     alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
     assert(!fx.shown)
-    assertEquals(fx.kept, Some(Set("raw_lines")))
+    assertEquals(fx.disk, Some(Set("raw_lines")))
     alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
     assert(fx.shown)
     // Dismissed by the user while still up: not posted again.
@@ -209,6 +220,26 @@ class WriteSafetySuite extends munit.FunSuite:
     alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
     assertEquals(fx.shown, alert.monitor.reported)
     assertEquals(fx.kept.isDefined, alert.monitor.reported)
+    assertEquals(fx.disk.isDefined, alert.monitor.reported)
+  }
+
+  test("stall alert: a store that failed after changing memory (SharedPreferences) is made again until it lands") {
+    val fx = FakeEffects()
+    val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    fx.failStore = 2
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    // Memory says stored; the disk does not. The next checks store again.
+    assertEquals((fx.kept, fx.disk), (Some(Set("fixes")), None))
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    assertEquals(fx.disk, None)
+    alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)()
+    assertEquals(fx.disk, Some(Set("fixes")))
+    // Cleared: the same for the cleared state.
+    fx.failStore = 1
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    assertEquals((fx.kept, fx.disk), (None, Some(Set("fixes"))))
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    assertEquals(fx.disk, None)
   }
 
   test("stall kinds kept by an earlier build (labels) read as the keys") {

@@ -135,9 +135,14 @@ object CommitRepair:
       * stops at a record of raw lines.
       */
     def begin(): Unit
+    /** Stores in the record that these published files passed the full
+      * check (readers then leave their chunk's rows in SQLite out).
+      */
+    def markVerified(paths: Set[String]): Unit
     /** Records the attention mark of the tmp file of `t` (`alert`: shown to
       * the user, it may hold the only copy of some rows), then moves it to
-      * quarantine, if it exists.
+      * quarantine ([[SafeMove]]): if it exists, or if it was moved and the
+      * move may not be durable yet.
       */
     def setAsideTmp(t: Target, why: String, alert: Boolean): Unit
     /** Records the attention mark of `path`, then moves the file to
@@ -162,12 +167,12 @@ object CommitRepair:
 
   def tableOf(path: String): String = path.takeWhile(_ != '/')
 
-  /** Names a commit (its quarantine directory): the same before and after
-    * its record is completed with checks or marked as being repaired.
+  /** Names a commit: the same before and after its record is completed
+    * with checks or marked as being repaired.
     */
   def id(i: CommitIntent): String =
     val crc = java.util.zip.CRC32()
-    val bare = i.copy(files = i.files.map(_.copy(check = None)), repairing = false)
+    val bare = i.copy(files = i.files.map(_.copy(check = None)), repairing = false, repairTag = "", verified = Set.empty)
     crc.update(CommitIntent.encode(bare).getBytes(java.nio.charset.StandardCharsets.UTF_8))
     f"${crc.getValue}%08x"
 
@@ -191,12 +196,17 @@ object CommitRepair:
     */
   def run(i: CommitIntent, ops: Ops, manual: Boolean, recovering: Boolean = false): Result =
     val steps = plan(i, ops)
-    // B: the mark first; then A: every tmp file out of the way.
+    // B: the mark first; then A: every tmp file out of the way (also each
+    // one a cut-short run moved: its move made durable).
     ops.begin()
-    for s <- steps if ops.tmpExists(s.target.path) do
+    for s <- steps do
+      val there = ops.tmpExists(s.target.path)
       val alert = tmpMayBeOnlyCopy(s)
       ops.setAsideTmp(s.target, if alert then "整理途中の一時ファイル（以前の記録を含む可能性あり）" else "整理途中の一時ファイル", alert)
-      ops.log(s"${s.target.path}: 整理途中の一時ファイルを隔離（削除しない）")
+      if there then ops.log(s"${s.target.path}: 整理途中の一時ファイルを隔離（削除しない）")
+    // Readers leave chunk rows out only for files that passed the full check.
+    val passed = steps.collect { case s if s.action == Action.DeleteRows => s.target.path }.toSet
+    if passed.nonEmpty then ops.markVerified(passed)
     // Automatically: never move a data file (one moved by an earlier repair
     // is only marked again), and not a stuck record of 0.21.0.
     if !manual && ((legacy(i) && !recovering) ||
@@ -230,14 +240,40 @@ object CommitRepair:
     * cannot be told apart by a query: a reader of the raw tables waits
     * (「整理待ち」) instead.
     */
-  final case class ReadExclusion(hot: Map[String, (Long, Long, Long)], files: Set[String], raw: Boolean)
+  final case class ReadExclusion(hot: Map[String, (Long, Long, Long)], files: Set[String], raw: Boolean,
+                                 dedupe: Set[String] = Set.empty)
 
+  /** Only a new file that is in place and passed the repair's full check
+    * (recorded in the record: `verified`) has the chunk's rows left out of
+    * SQLite: a file not (yet) checked might lack some. Then both copies are
+    * read and equal rows shown once (`dedupe`), so nothing that has a good
+    * copy is hidden.
+    */
   def exclusion(i: CommitIntent, published: String => Boolean): ReadExclusion =
-    val done = i.files.filter(t => published(t.path)).map(t => tableOf(t.path)).toSet
+    val tables = i.files.map(t => tableOf(t.path)).toSet
+    val done = i.files.filter(t => published(t.path) && i.verified.contains(t.path)).map(t => tableOf(t.path)).toSet
     i.delete match
-      case Delete.Hot(t, from, to, max) => ReadExclusion(if done(t) then Map(t -> (from, to, max)) else Map.empty, Set.empty, raw = false)
-      case Delete.Files(ps)             => ReadExclusion(Map.empty, ps.filter(p => done(tableOf(p))).toSet, raw = false)
-      case _                            => ReadExclusion(Map.empty, Set.empty, raw = true)
+      case Delete.Hot(t, from, to, max) =>
+        ReadExclusion(if done(t) then Map(t -> (from, to, max)) else Map.empty, Set.empty, raw = false, tables -- done)
+      case Delete.Files(ps) =>
+        ReadExclusion(Map.empty, ps.filter(p => done(tableOf(p))).toSet, raw = false, tables -- done)
+      case _ => ReadExclusion(Map.empty, Set.empty, raw = true)
+
+  /** `xs` without repeats of an equal row (by [[ArchiveMerge.hash]], then
+    * value), in their order: what a reader shows while two copies of some
+    * rows are read.
+    */
+  def distinctRows[A](xs: Seq[A])(row: A => Row): Vector[A] =
+    val seen = mutable.HashMap.empty[Long, List[Row]]
+    xs.iterator.filter { x =>
+      val r = row(x)
+      val h = ArchiveMerge.hash(r)
+      val same = seen.getOrElse(h, Nil)
+      if same.exists(ArchiveMerge.same(_, r)) then false
+      else
+        seen(h) = r :: same
+        true
+    }.toVector
 
   /** Checks a published file against its target: the footer's rows (and,
     * when recorded, previous + chunk rows), every row group decodes to as
@@ -427,3 +463,34 @@ object RowBag:
   /** A portion is at most [[ArchiveStore]]'s 2 million lines. */
   val Cap = 2_000_000
   final class TooLarge(cap: Int) extends RuntimeException(s"more than $cap rows to compare")
+
+/** A move that never replaces a file (rule A of [[CommitRepair]]): `to` is
+  * made a hard link of `from` (refused if `to` is another file), the file
+  * and its directory synced, then `from` removed and its directory synced.
+  * Repeated after it was cut short anywhere, it completes the same move:
+  * with `from` gone and `to` there, `to` and both directories are synced
+  * again. `crash` marks the points between steps (for tests).
+  */
+object SafeMove:
+  import java.nio.file.{Files, FileAlreadyExistsException, LinkOption, Path}
+
+  def move(from: Path, to: Path, ensureDir: Path => Unit, syncFile: Path => Unit, syncDir: Path => Unit,
+           crash: String => Unit = _ => ()): Boolean =
+    val there = Files.exists(from, LinkOption.NOFOLLOW_LINKS)
+    val moved = Files.exists(to, LinkOption.NOFOLLOW_LINKS)
+    if !there && !moved then false
+    else
+      ensureDir(to.getParent)
+      if there then
+        if moved then
+          if !Files.isSameFile(from, to) then throw FileAlreadyExistsException(to.toString)
+        else Files.createLink(to, from)
+        crash("linked")
+      syncFile(to)
+      syncDir(to.getParent)
+      if there then
+        Files.delete(from)
+        crash("unlinked")
+      syncDir(from.getParent)
+      true
+

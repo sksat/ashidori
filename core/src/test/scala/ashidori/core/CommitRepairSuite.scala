@@ -89,6 +89,9 @@ class CommitRepairSuite extends munit.FunSuite:
         step()
         if !record.exists(_.repairing) then trail += "begin"
         record = record.map(_.copy(repairing = true))
+      def markVerified(paths: Set[String]) =
+        step()
+        record = record.map(r => r.copy(verified = r.verified ++ paths))
       def setAsideTmp(t: Target, why: String, alert: Boolean) =
         if tmp.contains(t.path) then
           step()
@@ -482,28 +485,147 @@ class CommitRepairSuite extends munit.FunSuite:
           (files.map(_._1), d(0))
         }.toOption
 
-  test("readers during an unfinished commit (rule C): the rows the new file holds are left out of SQLite, once") {
+  test("readers during an unfinished commit (rule C): chunk rows left out only for a file that passed the full check") {
     val battery = CommitIntent(Seq(Target("battery/2026-11-10.parquet", 31, 317)), Delete.Hot("battery", 100, 200, 9))
-    // New file in place: the chunk's rows in SQLite are left out.
-    assertEquals(exclusion(battery, _ => true), ReadExclusion(Map("battery" -> (100L, 200L, 9L)), Set.empty, raw = false))
+    // In place but not checked: nothing left out, equal rows shown once.
+    assertEquals(exclusion(battery, _ => true), ReadExclusion(Map.empty, Set.empty, raw = false, Set("battery")))
+    // In place and checked (recorded in the record): the chunk's rows in SQLite are left out.
+    val checked = battery.copy(verified = Set("battery/2026-11-10.parquet"))
+    assertEquals(exclusion(checked, _ => true), ReadExclusion(Map("battery" -> (100L, 200L, 9L)), Set.empty, raw = false))
     // Not (or no longer) in place: SQLite is read whole.
-    assertEquals(exclusion(battery, _ => false), ReadExclusion(Map.empty, Set.empty, raw = false))
-    // A month file in place: its day files are left out.
+    assertEquals(exclusion(checked, _ => false).hot, Map.empty[String, (Long, Long, Long)])
+    // A month file in place and checked: its day files are left out; not checked: kept.
     val month = CommitIntent(Seq(Target("fixes/2026-10.parquet", 9, 90)), Delete.Files(Seq("fixes/2026-10-01.parquet")))
-    assertEquals(exclusion(month, _ => true).files, Set("fixes/2026-10-01.parquet"))
-    assertEquals(exclusion(month, _ => false).files, Set.empty[String])
+    assertEquals(exclusion(month.copy(verified = Set("fixes/2026-10.parquet")), _ => true).files, Set("fixes/2026-10-01.parquet"))
+    assertEquals(exclusion(month, _ => true).files, Set.empty[String])
     // Raw lines: readers that cannot leave them out wait.
     assert(exclusion(CommitIntent(Nil, Delete.Ids(Seq(1))), _ => true).raw)
-    // Read as the app does (archive rows ++ SQLite rows not left out): each row once.
-    val w = World(Seq("battery"), Map("battery" -> Vector(r(1, "b0"))), Map("battery" -> (100L until 130L).map(t => r(t, s"b$t")).toVector),
+  }
+
+  /** What a reader shows of `w`'s battery table: the file in place and
+    * SQLite as ArchiveStore.reading and Db do (rule C).
+    */
+  private def readBattery(w: World): Vector[Row] =
+    val t = w.intent.files.head
+    val ex = w.record.map(i => exclusion(i, p => w.dest.get(p).exists(f => (f.footer, f.size) == (t.rows, t.size))))
+      .getOrElse(ReadExclusion(Map.empty, Set.empty, raw = false))
+    val hot = w.sqlite("battery").filterNot(r => ex.hot.get("battery").exists((f, to, _) => ArchiveMerge.key(r) >= f && ArchiveMerge.key(r) < to))
+    val f = w.dest.get(w.path("battery"))
+    // A file that does not decode reads as nothing (the reader skips it).
+    val archived = f.filterNot(_.decodeFails).map(_.rows).getOrElse(Vector.empty)
+    val all = archived ++ hot
+    if ex.dedupe("battery") then distinctRows(all)(identity) else all
+
+  test("readers: every row once, unpublished, published unchecked, checked, after the deletion") {
+    val chunkRows = (100L until 130L).map(t => r(t, s"b$t")).toVector
+    val w = World(Seq("battery"), Map("battery" -> Vector(r(1, "b0"))), Map("battery" -> chunkRows),
       delete = Delete.Hot("battery", 100, 200, 99))
-    for published <- Seq(false, true) do
-      if published then w.renamed("battery")
-      val ex = exclusion(w.record.get, p => w.dest.get(p).exists(f => (f.footer, f.size) == (w.intent.files.head.rows, w.intent.files.head.size)))
-      val hot = w.sqlite("battery").filterNot(r => ex.hot.get("battery").exists((f, t, _) => ArchiveMerge.key(r) >= f && ArchiveMerge.key(r) < t))
-      val read = w.dest.get(w.path("battery")).map(_.rows).getOrElse(Vector.empty) ++ hot
-      assertEquals(read.size, read.distinct.size, s"published=$published")
-      assertEquals(read.toSet, (Vector(r(1, "b0")) ++ (100L until 130L).map(t => r(t, s"b$t")) :+ r(9_000, "battery-later")).toSet)
+    val every = (Vector(r(1, "b0")) ++ chunkRows :+ r(9_000, "battery-later")).toSet
+    def check(when: String) =
+      val read = readBattery(w)
+      assertEquals(read.size, read.distinct.size, when)
+      assertEquals(read.toSet, every, when)
+    check("not published")
+    w.renamed("battery")
+    check("published, not checked")
+    w.record = w.record.map(_.copy(verified = Set(w.path("battery"))))
+    check("published and checked")
+    w.sqlite("battery") = w.sqlite("battery").filterNot(chunkRows.contains)
+    check("chunk rows deleted")
+  }
+
+  test("readers: a replaced file damaged with the same count and size hides no row that SQLite still has") {
+    val chunkRows = (100L until 130L).map(t => r(t, s"b$t")).toVector
+    for damage <- Seq("decode", "values") do
+      val w = World(Seq("battery"), Map("battery" -> Vector(r(1, "b0"))), Map("battery" -> chunkRows),
+        delete = Delete.Hot("battery", 100, 200, 99))
+      w.renamed("battery")
+      val f = w.dest(w.path("battery"))
+      w.dest(w.path("battery")) =
+        if damage == "decode" then f.copy(decodeFails = true)
+        else f.copy(rows = f.rows.map(r => IndexedSeq(r(0), "garbage")))
+      // Automatic repair: it does not verify, nothing deleted, not marked checked.
+      assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser], damage)
+      assertEquals(w.record.get.verified, Set.empty[String], damage)
+      val read = readBattery(w)
+      // Every chunk row of SQLite, exactly once.
+      for row <- chunkRows do assertEquals(read.count(_ == row), 1, s"$damage $row")
+      assert(read.contains(r(9_000, "battery-later")))
+      // By hand: the file is quarantined, the rows stay; readers see SQLite.
+      assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved], damage)
+      assert(w.quarantine.contains(w.path("battery")), damage)
+      for row <- chunkRows do assertEquals(readBattery(w).count(_ == row), 1, s"$damage after $row")
+  }
+
+  test("distinct rows: equal rows once (NaN like null), others kept, in order") {
+    val xs = Vector(r(1, "a"), r(1, "a"), r(2, "b"), IndexedSeq(3L, Double.NaN), IndexedSeq(3L, null), r(1, "c"))
+    assertEquals(distinctRows(xs)(identity).map(_.toString), Vector(r(1, "a"), r(2, "b"), IndexedSeq(3L, Double.NaN), r(1, "c")).map(_.toString))
+  }
+
+  // --- moves that never replace a file -------------------------------------------------------
+
+  private def tmpDir() = java.nio.file.Files.createTempDirectory("move")
+  private def writeFile(p: java.nio.file.Path, text: String) =
+    java.nio.file.Files.createDirectories(p.getParent)
+    java.nio.file.Files.writeString(p, text)
+
+  final case class Synced(files: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty, dirs: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty)
+  private def moveWith(from: java.nio.file.Path, to: java.nio.file.Path, s: Synced, crash: String => Unit = _ => ()) =
+    SafeMove.move(from, to, p => java.nio.file.Files.createDirectories(p), p => s.files += p.toString, p => s.dirs += p.toString, crash)
+
+  test("safe move: the file and both directories synced; never over another file") {
+    val d = tmpDir()
+    val a = d.resolve("imu/x.parquet.tmp")
+    val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
+    writeFile(a, "tmp")
+    val s = Synced()
+    assert(moveWith(a, q, s))
+    assert(!java.nio.file.Files.exists(a))
+    assertEquals(java.nio.file.Files.readString(q), "tmp")
+    assertEquals(s.files.toSeq, Seq(q.toString))
+    assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString))
+    // Another file where it would go: refused, both kept.
+    writeFile(a, "another")
+    intercept[java.nio.file.FileAlreadyExistsException](moveWith(a, q, Synced()))
+    assertEquals(java.nio.file.Files.readString(q), "tmp")
+    assertEquals(java.nio.file.Files.readString(a), "another")
+    // Nothing to move.
+    assert(!moveWith(d.resolve("none"), d.resolve("q/none"), Synced()))
+  }
+
+  test("safe move: cut short after the link or after the removal, the retry completes it and syncs the copy") {
+    for point <- Seq("linked", "unlinked") do
+      val d = tmpDir()
+      val a = d.resolve("imu/x.parquet.tmp")
+      val q = d.resolve("quarantine/c1-aaaa/imu/x.parquet.tmp")
+      writeFile(a, "tmp")
+      intercept[Crash](moveWith(a, q, Synced(), at => if at == point then throw Crash()))
+      val s = Synced()
+      assert(moveWith(a, q, s), point)
+      assert(!java.nio.file.Files.exists(a), point)
+      assertEquals(java.nio.file.Files.readString(q), "tmp")
+      // The retry syncs the moved file and both directories, whatever was left.
+      assertEquals(s.files.toSeq, Seq(q.toString), point)
+      assertEquals(s.dirs.toSet, Set(q.getParent.toString, a.getParent.toString), point)
+  }
+
+  test("a chunk archived again and cut short again: each repair moves to its own directory, the earlier copy kept") {
+    val d = tmpDir()
+    val i = CommitIntent(Seq(Target("imu/x.parquet", 10, 100)), Delete.Ids(Seq(1)))
+    val first = i.copy(repairTag = "aaaa1111")
+    val second = i.copy(repairTag = "bbbb2222")
+    assertEquals(id(first), id(second))
+    def dir(c: CommitIntent) = d.resolve(s"quarantine/${id(c)}-${c.repairTag}")
+    writeFile(d.resolve("imu/x.parquet.tmp"), "first")
+    moveWith(d.resolve("imu/x.parquet.tmp"), dir(first).resolve("imu/x.parquet.tmp"), Synced())
+    writeFile(d.resolve("imu/x.parquet.tmp"), "second")
+    moveWith(d.resolve("imu/x.parquet.tmp"), dir(second).resolve("imu/x.parquet.tmp"), Synced())
+    assertEquals(java.nio.file.Files.readString(dir(first).resolve("imu/x.parquet.tmp")), "first")
+    assertEquals(java.nio.file.Files.readString(dir(second).resolve("imu/x.parquet.tmp")), "second")
+    // The tag and the files checked are kept with the record (0.21.0 reads past them).
+    val kept = second.copy(repairing = true, verified = Set("imu/x.parquet"))
+    assertEquals(CommitIntent.decode(CommitIntent.encode(kept)), Some(kept))
+    assertEquals(OldDecoder.decode(CommitIntent.encode(kept)).map(_._2), Some("ids"))
   }
 
   // --- verifying a real file -------------------------------------------------------------------

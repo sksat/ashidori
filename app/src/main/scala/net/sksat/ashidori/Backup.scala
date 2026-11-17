@@ -49,6 +49,8 @@ import ashidori.core.Archive
 object Backup:
   /** Free space kept for the logger while a backup runs (hours of 全力ログ). */
   val LoggingMargin: Long = 256L << 20
+  /** The least free space the quarantine export leaves (it asks for none). */
+  val QuarantineFloor: Long = 32L << 20
 
   enum Mode:
     case Normal, Rescue, Quarantine
@@ -85,16 +87,21 @@ object Backup:
     // overflow files (stored as they are), and room for the logger.
     def size(f: File): Long = if f.isDirectory then Option(f.listFiles()).toSeq.flatten.map(size).sum else f.length
     val db0 = dbPath.length + File(dbPath.getPath + "-wal").length
+    // The quarantine export reads local files (linked, taking no room) and
+    // writes to the destination picked: no room is asked for here, so it
+    // works when the device is low on space. While it runs it stops only at
+    // QuarantineFloor (the destination may be on this storage).
     val need =
-      if mode == Mode.Quarantine then size(quarantine) + LoggingMargin
+      if mode == Mode.Quarantine then 0L
       else db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin +
         (if rescue then size(Maintenance.dir) else 0L)
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量不足（${need >> 20} MB 必要）")
+    val floor = if mode == Mode.Quarantine then QuarantineFloor else LoggingMargin
     // While it runs: stop before the logger has no room left.
     def checkSpace(): Unit =
-      if dir.getUsableSpace < LoggingMargin then
-        throw java.io.IOException(s"空き容量が ${LoggingMargin >> 20} MB 未満のため中断（記録用の領域を確保）")
+      if dir.getUsableSpace < floor then
+        throw java.io.IOException(s"空き容量が ${floor >> 20} MB 未満のため中断（記録用の領域を確保）")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     // The files to write, hard-linked here under the locks (copied if a link
     // cannot be made): a file replaced or deleted afterwards (every writer

@@ -28,14 +28,23 @@ package ashidori.core
   * What a repair leaves of them reads to 0.21.0 as a commit to drop or to
   * finish, which then loses nothing, as a repair moves every tmp file
   * aside before anything else (see [[CommitRepair]]).
+  *
+  * `repairTag`: names this repair's quarantine directory, so that no move
+  * of one repair can meet a file of another (written with the marker).
+  * `verified`: published files that passed the full check of the repair
+  * ([[CommitRepair.verify]]); only for these do readers leave the chunk's
+  * rows in SQLite out. Both are lines after the deletion too.
   */
-final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete, repairing: Boolean = false)
+final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete, repairing: Boolean = false,
+                              repairTag: String = "", verified: Set[String] = Set.empty)
 
 object CommitIntent:
   /** The guard's pseudo table (see above). */
   val GuardDir = "repair-guard"
   /** The line marking a record as being repaired (after the deletion). */
   val RepairingLine = "repairing"
+  /** A line naming a published file that passed the repair's full check. */
+  val VerifiedLine = "verified"
 
   /** Whether a record being repaired gets the guard: a commit of raw lines. */
   def guarded(i: CommitIntent): Boolean = i.delete match
@@ -137,8 +146,9 @@ object CommitIntent:
     val guard = Option.when(i.repairing && guarded(i))(s"file\t$GuardDir/begun\t-1\t-1").toSeq
     // The marker after the deletion: 0.21.0 reads the first line that is
     // not a file line as the deletion, and nothing after it.
-    val marker = Option.when(i.repairing)(RepairingLine).toSeq
-    (((guard ++ files) :+ delete) ++ marker :+ "end").mkString("\n") + "\n"
+    val marker = Option.when(i.repairing)(if i.repairTag.isEmpty then RepairingLine else s"$RepairingLine\t${i.repairTag}").toSeq
+    val verified = i.verified.toSeq.sorted.map(p => s"$VerifiedLine\t$p")
+    (((guard ++ files) :+ delete) ++ marker ++ verified :+ "end").mkString("\n") + "\n"
 
   /** None for a record cut short (no `end`) or unknown. */
   def decode(s: String): Option[CommitIntent] =
@@ -150,11 +160,15 @@ object CommitIntent:
         val files = fileLines.map(_.split("\t", -1)).map { a =>
           Target(a(1), a(2).toLong, a(3).toLong, Option.when(a.length > 4 && a(4) == "v2")(decodeCheck(a.toSeq.drop(5))))
         }
-        val d = lines.filterNot(l => l.startsWith("file\t") || l == "end" || l == RepairingLine).head.split("\t", -1)
+        def extra(l: String) = l == RepairingLine || l.startsWith(RepairingLine + "\t") || l.startsWith(VerifiedLine + "\t")
+        val d = lines.filterNot(l => l.startsWith("file\t") || l == "end" || extra(l)).head.split("\t", -1)
         val delete = d(0) match
           case "hot"   => Delete.Hot(d(1), d(2).toLong, d(3).toLong, d(4).toLong)
           case "raw"   => Delete.Raw(d(1).toLong, d(2).toLong, d(3).toLong, cursorOf(d(4)), cursorOf(d(5)), longs(d(6)))
           case "ids"   => Delete.Ids(longs(d(1)))
           case "files" => Delete.Files(d.drop(1).toSeq)
-        CommitIntent(files, delete, repairing = guards.nonEmpty || lines.contains(RepairingLine))
+        val marker = lines.find(l => l == RepairingLine || l.startsWith(RepairingLine + "\t"))
+        CommitIntent(files, delete, repairing = guards.nonEmpty || marker.isDefined,
+          repairTag = marker.map(_.drop(RepairingLine.length).trim).getOrElse(""),
+          verified = lines.filter(_.startsWith(VerifiedLine + "\t")).map(_.drop(VerifiedLine.length + 1)).toSet)
       }.toOption

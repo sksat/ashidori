@@ -17,6 +17,10 @@ object Alerts:
   private val CrashId = 2001
   private val StallId = 2002
   val DayMs: Long = 24 * 3_600_000L
+  /** Quarantined files (never deleted automatically) above this: a warning. */
+  val QuarantineWarnBytes: Long = 512L << 20
+  /** Free space below this: a warning (the logger needs room). */
+  val LowSpaceBytes: Long = 512L << 20
 
   private def ctx: Context = AshidoriApp.app
   private def prefs = ctx.getSharedPreferences("alerts", Context.MODE_PRIVATE)
@@ -113,6 +117,8 @@ object Alerts:
     val stalled = now - lastStall < DayMs || prefs.getBoolean("stallUp", false)
     if CommitStatus.stuck().isDefined then Some("記録の整理が停止（要確認）")
     else if Attention.unseen then Some("記録の整理で隔離したファイルあり（要確認）")
+    else if Attention.quarantineBytes() > QuarantineWarnBytes then Some("隔離したファイルが大きい（要確認）")
+    else if ctx.getFilesDir.getUsableSpace < LowSpaceBytes then Some("端末の空き容量が少ない（要確認）")
     else if Maintenance.SafeMode.active then Some("異常終了が続いたため、記録の整理と同期を停止中")
     else if crashes == 0 && !stalled then None
     else if crashes > 0 && stalled then Some(s"異常終了 ${crashes} 回・保存の停止あり")

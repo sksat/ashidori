@@ -139,6 +139,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def hotExclusion(table: String): Option[(Long, Long, Long)] = Option(exclusionNow.get).flatMap(_.hot.get(table))
 
+  /** Within [[reading]]: a commit of `table` is unfinished and its new
+    * file did not pass the full check: both copies are read, equal rows
+    * shown once ([[CommitRepair.distinctRows]]).
+    */
+  def dedupe(table: String): Boolean = Option(exclusionNow.get).exists(_.dedupe.contains(table))
+
   /** Within [[reading]]: a commit of raw lines is unfinished. */
   def rawPending: Boolean = Option(exclusionNow.get).exists(_.raw)
 
@@ -435,25 +441,31 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     CommitStatus.clear()
 
   /** Where a repair of `intent` moves files: `quarantine/<commit id>/`. */
-  private def quarantineDir(intent: CommitIntent) = File(root, s"$QuarantineDir/${CommitRepair.id(intent)}")
+  /** This repair's quarantine directory: `quarantine/<commit id>-<repair
+    * tag>/`, the tag drawn for the repair and kept in its record, so no
+    * move of one repair can meet a file of another (a chunk archived and
+    * cut short again).
+    */
+  private def quarantineDir(intent: CommitIntent) =
+    File(root, s"$QuarantineDir/${CommitRepair.id(intent)}-${intent.repairTag}")
 
-  /** `from` to `to`, atomically and durably (both directories synced). */
-  private def moveDurably(from: File, to: File): Unit =
-    ensureDir(to.getParentFile)
-    java.nio.file.Files.move(from.toPath, to.toPath, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-    syncDir(to.getParentFile)
-    syncDir(from.getParentFile)
+  /** `from` to `to`, never replacing a file, durably ([[SafeMove]]): also a
+    * move a crash cut short (`from` gone, `to` there) is made durable.
+    * Whether there was anything to move.
+    */
+  private def moveDurably(from: File, to: File): Boolean =
+    SafeMove.move(from.toPath, to.toPath, p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile),
+      at => debugCrashPoint(s"crash-move-$at"))
 
   /** Moves the tmp file of `t` to quarantine (its attention mark first;
     * shown to the user if `alert`).
     */
-  private def setAside(intent: CommitIntent, t: CommitIntent.Target, why: String, alert: Boolean): Unit =
-    val q = File(File(quarantineDir(intent), t.path).getPath + ".tmp")
+  private def setAside(qdir: File, t: CommitIntent.Target, why: String, alert: Boolean): Unit =
+    val q = File(File(qdir, t.path).getPath + ".tmp")
     if tmpOf(t.path).exists then
       Attention.add(Attention.Entry(System.currentTimeMillis(), t.path + ".tmp", root.toPath.relativize(q.toPath).toString,
         alert, why, seen = !alert))
-      moveDurably(tmpOf(t.path), q)
-      debugCrashPoint("crash-after-first-move")
+    if moveDurably(tmpOf(t.path), q) then debugCrashPoint("crash-after-first-move")
 
   private def whole(path: String)(check: ParquetReader.FileReader => Either[String, Unit]): Either[String, Unit] =
     Try(ParquetReader.open(file(path).getPath)).fold(
@@ -463,15 +475,20 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   /** [[CommitRepair]] of a commit that cannot be finished, under its tables' locks. */
   private def repair(db: Db, recorded: CommitIntent, manual: Boolean, progress: String => Unit,
                      recovering: Boolean = false): CommitRepair.Result =
+    // This repair's tag (its quarantine directory), kept with its mark.
+    val tagged =
+      if recorded.repairTag.nonEmpty then recorded
+      else recorded.copy(repairTag = java.util.UUID.randomUUID().toString.take(8))
     // A record of 0.21.0 has no checks: completed from SQLite (which still
-    // holds every row of the commit) and stored before anything changes.
+    // holds every row of the commit) and stored, with the repair's mark (rule
+    // B), before anything changes. Completing it moves and deletes nothing.
     val intent =
-      if recorded.files.forall(_.check.isDefined) then recorded
+      if tagged.files.forall(_.check.isDefined) then tagged
       else
         progress("未完了の整理の記録を補っています")
-        val full = completeChecks(db, recorded)
+        val full = completeChecks(db, tagged).copy(repairing = true)
         Maintenance.write(intentFile, CommitIntent.encode(full))
-        LifeLog.add(LifeKind.ArchiveRepair, "未完了の整理の記録（0.21.0 の形式）を端末内の行から補完")
+        LifeLog.add(LifeKind.ArchiveRepair, "未完了の整理の記録（0.21.0 の形式）を端末内の行から補完し、修復を開始")
         full
     val qdir = quarantineDir(intent)
     def move(from: File, to: File): Unit = moveDurably(from, to)
@@ -505,20 +522,23 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       def quarantine(t: CommitIntent.Target, why: String, onlyCopy: Boolean) =
         val q = File(qdir, t.path)
         // A tmp file still there (it was moved first) goes too.
-        setAside(intent, t, why, alert = true)
+        setAside(qdir, t, why, alert = true)
         if file(t.path).exists then
           Attention.add(Attention.Entry(System.currentTimeMillis(), t.path, root.toPath.relativize(q.toPath).toString, onlyCopy, why))
-          move(file(t.path), q)
-          debugCrashPoint("crash-after-first-move")
-      def setAsideTmp(t: CommitIntent.Target, why: String, alert: Boolean) = setAside(intent, t, why, alert)
+        if moveDurably(file(t.path), q) then debugCrashPoint("crash-after-first-move")
+      def setAsideTmp(t: CommitIntent.Target, why: String, alert: Boolean) = setAside(qdir, t, why, alert)
       def begin() =
         // Rule B: durable before the first change (the record written whole,
-        // synced, its directory synced). With it the guard for 0.21.0 on a
-        // commit of raw lines (see CommitIntent).
+        // synced, its directory synced), with this repair's tag. With it the
+        // guard for 0.21.0 on a commit of raw lines (see CommitIntent).
         if !intentText.flatMap(CommitIntent.decode).exists(_.repairing) then
           Maintenance.write(intentFile, CommitIntent.encode(intent.copy(repairing = true)))
           LifeLog.add(LifeKind.ArchiveRepair, "中断された整理の修復を開始")
           debugCrashPoint("crash-after-begin")
+      def markVerified(paths: Set[String]) =
+        val now = intentText.flatMap(CommitIntent.decode).getOrElse(intent.copy(repairing = true))
+        if !paths.subsetOf(now.verified) then
+          Maintenance.write(intentFile, CommitIntent.encode(now.copy(verified = now.verified ++ paths)))
       def sync(paths: Seq[String]) =
         for p <- paths do
           syncFile(file(p))
@@ -563,7 +583,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       for p <- gone do
         Attention.add(Attention.Entry(System.currentTimeMillis(), p, root.toPath.relativize(File(qdir, p).toPath).toString,
           false, "月の整理に含まれた日のファイル", seen = true))
-        moveDurably(file(p), File(qdir, p))
+      // Every path (one moved before a crash too: its move made durable).
+      for p <- paths if tables(CommitRepair.tableOf(p)) do moveDurably(file(p), File(qdir, p))
       gone.size.toLong
 
   /** Every row of a commit's chunk still in SQLite (or in the day files of

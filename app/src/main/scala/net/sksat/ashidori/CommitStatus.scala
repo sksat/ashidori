@@ -106,6 +106,11 @@ object Attention:
 
   def unseen: Boolean = all().exists(!_.seen)
 
+  /** Total size of the quarantined files (archive/quarantine/). */
+  def quarantineBytes(): Long =
+    def size(f: File): Long = if f.isDirectory then Option(f.listFiles()).toSeq.flatten.map(size).sum else f.length
+    size(File(AshidoriApp.archive.root, ArchiveStore.QuarantineDir))
+
   /** "11/10 imu" for a path like `imu/2026-11-10.parquet`. */
   def label(e: Entry): String =
     val name = e.path.drop(e.path.indexOf('/') + 1).stripSuffix(".tmp").stripSuffix(".parquet")
