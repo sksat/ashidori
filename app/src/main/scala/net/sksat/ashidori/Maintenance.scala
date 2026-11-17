@@ -46,7 +46,7 @@ object Maintenance:
 
   /** Queues the automatic runs (idempotent: a pending job is kept). */
   def schedule(c: Context): Unit =
-    if SafeMode.maintenanceStopped then return
+    if SafeMode.maintenanceStopped || AshidoriApp.newerDatabase.isDefined then return
     val js = c.getSystemService(classOf[JobScheduler])
     if js.getPendingJob(JobIdle) == null then
       js.schedule(job(JobIdle).setRequiresCharging(true).setRequiresDeviceIdle(true).build())
@@ -240,6 +240,11 @@ object Maintenance:
     * work is left. Call in the maintenance process, off the main thread.
     */
   def run(manual: Boolean, stop: () => Boolean): Boolean =
+    // A database of a newer app version is never opened here (Db.onDowngrade):
+    // nothing to archive until the app is updated.
+    if AshidoriApp.newerDatabase.isDefined then
+      Progress.set("データベースが新しい版のため整理しない", running = false)
+      return false
     if !running.compareAndSet(false, true) then return false
     val deadline = System.currentTimeMillis() + BudgetMs
     val halt = () => stop() || System.currentTimeMillis() > deadline
@@ -323,6 +328,8 @@ class ArchiveJobService extends JobService:
     val repair = Option(params.getExtras.getString("repair"))
     // Switched off after repeated crashes (a job queued before): not run.
     if Maintenance.SafeMode.maintenanceStopped && !manual then return false
+    // A database of a newer app version: not opened (no repair either).
+    if AshidoriApp.newerDatabase.isDefined then return false
     val t = Thread(() =>
       Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
       val left =
