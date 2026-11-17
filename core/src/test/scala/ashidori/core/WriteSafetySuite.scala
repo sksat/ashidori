@@ -125,27 +125,6 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(fresh.update(noCommit = false, unsavedTooLong = false), None)
   }
 
-  test("stall alert: a change the app could not carry out (save or cancel failed) is tried again") {
-    val m = WriteStall.Monitor(restored = Some(Set("位置")))
-    // Saving works again, but cancelling the notification fails.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
-    m.failed()
-    assert(m.reported)
-    assertEquals(m.kinds, Set("位置"))
-    // Next check: cleared again, until it works.
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), Some(false))
-    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("位置")), None)
-    // Raising it: keeping it on disk failed, so it is raised again.
-    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), Some(true))
-    m.failed()
-    assert(!m.reported)
-    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), Some(true))
-    assertEquals(m.update(noCommit = true, unsavedTooLong = false, unsaved = Set("動き")), None)
-    // failed() with nothing just returned changes nothing.
-    m.failed()
-    assert(m.reported)
-  }
-
   test("write kinds: stable keys apart from the labels shown") {
     assertEquals(WriteKind.values.map(_.key).distinct.size, WriteKind.values.size)
     assertEquals(WriteKind.RawLines.key, "raw_lines")
@@ -160,27 +139,90 @@ class WriteSafetySuite extends munit.FunSuite:
     assertEquals(WriteKind.label("unknown"), "unknown")
   }
 
-  test("stall alert: checks from several threads never interleave a change and its rollback") {
+  /** The notification and its state on disk, with failures to inject. */
+  final class FakeEffects extends WriteStall.Effects:
+    var shown = false
+    var kept: Option[Set[String]] = None
+    var failPost = 0
+    var failCancel = 0
+    var failStore = 0
     val active = java.util.concurrent.atomic.AtomicInteger(0)
     val overlaps = java.util.concurrent.atomic.AtomicInteger(0)
-    val raises = java.util.concurrent.atomic.AtomicInteger(0)
-    def effect(ok: => Boolean): Boolean =
+    private def effect[A](a: => A): A =
       if active.incrementAndGet() > 1 then overlaps.incrementAndGet()
-      Thread.sleep(2)
-      try ok finally active.decrementAndGet()
-    // The first raise fails (its state not kept), the next ones work.
-    val alert = WriteStall.Alert(WriteStall.Monitor(), _ => effect(raises.incrementAndGet() > 1), () => effect(true))
-    val changes = java.util.concurrent.ConcurrentLinkedQueue[(Boolean, Boolean)]()
+      try a finally active.decrementAndGet()
+    def posted = effect(shown)
+    def post() = effect { if failPost > 0 then { failPost -= 1; false } else { shown = true; true } }
+    def cancel() = effect { if failCancel > 0 then { failCancel -= 1; false } else { shown = false; true } }
+    def stored = effect(kept)
+    def store(state: Option[Set[String]]) = effect { if failStore > 0 then { failStore -= 1; false } else { kept = state; true } }
+
+  test("stall alert: a save or cancel that failed is made good at the next check, either side") {
+    val fx = FakeEffects()
+    val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    // Raised: posted, but keeping it on disk fails.
+    fx.failStore = 1
+    assertEquals(alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)(), Some(true))
+    assert(fx.shown)
+    assertEquals(fx.kept, None)
+    // Saving works again before the next check: the alert clears, and the
+    // notification goes even though the raise was only partly done.
+    fx.failCancel = 1
+    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))(), Some(false))
+    assert(fx.shown, "the cancel failed")
+    assertEquals(alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))(), None)
+    assert(!fx.shown)
+    assertEquals(fx.kept, None)
+    // Raised, the post fails and then works; kept on disk with its kinds.
+    fx.failPost = 1
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    assert(!fx.shown)
+    assertEquals(fx.kept, Some(Set("raw_lines")))
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    assert(fx.shown)
+    // Dismissed by the user while still up: not posted again.
+    fx.shown = false
+    alert.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    assert(!fx.shown)
+    // After a restart, an alert kept on disk is shown again.
+    val again = WriteStall.Alert(WriteStall.Monitor(fx.kept), fx)
+    again.check(noCommit = true, unsavedTooLong = false, Set("raw_lines"), Set.empty)()
+    assert(fx.shown)
+  }
+
+  test("stall alert: checks from several threads never interleave with each other's effects") {
+    val fx = FakeEffects()
+    fx.failStore = 3
+    val alert = WriteStall.Alert(WriteStall.Monitor(), fx)
+    val changes = java.util.concurrent.ConcurrentLinkedQueue[Boolean]()
     val threads = (1 to 8).map(i => Thread(() =>
-      for _ <- 1 to 20 do
-        alert.check(noCommit = true, unsavedTooLong = false, Set("fixes"), Set.empty)((up, logged) => changes.add((up, logged)))
+      for j <- 1 to 50 do
+        val stalled = (j / 10) % 2 == 0
+        alert.check(noCommit = stalled, unsavedTooLong = false, if stalled then Set("fixes") else Set.empty, Set("fixes"))(changes.add(_))
     ))
     threads.foreach(_.start())
     threads.foreach(_.join())
-    assertEquals(overlaps.get, 0)
-    // Raised once in effect: the failed try logged, the retry that worked not again.
-    assertEquals(changes.toArray.toSeq, Seq((true, false), (true, true)))
-    assert(alert.monitor.reported)
-    assertEquals(raises.get, 2)
+    assertEquals(fx.overlaps.get, 0)
+    // Every change told once, alternating; the effects end as the monitor says.
+    val seq = changes.toArray.toSeq.map(_.asInstanceOf[Boolean])
+    assert(seq.sliding(2).forall(p => p.size < 2 || p(0) != p(1)), seq)
+    alert.check(noCommit = false, unsavedTooLong = false, Set.empty, Set("fixes"))()
+    assertEquals(fx.shown, alert.monitor.reported)
+    assertEquals(fx.kept.isDefined, alert.monitor.reported)
+  }
+
+  test("stall kinds kept by an earlier build (labels) read as the keys") {
+    assertEquals(WriteKind.fromStored("位置"), Some(WriteKind.Fixes))
+    assertEquals(WriteKind.fromStored("詳細ログ"), Some(WriteKind.RawLines))
+    assertEquals(WriteKind.fromStored("詳細ログの区間"), Some(WriteKind.RawSessions))
+    assertEquals(WriteKind.fromStored("GNSS の状態"), Some(WriteKind.GnssStatus))
+    assertEquals(WriteKind.fromStored("生データ"), Some(WriteKind.RawLines))
+    assertEquals(WriteKind.fromStored("raw_lines"), Some(WriteKind.RawLines))
+    assertEquals(WriteKind.fromStored("何か"), None)
+    // An alert restored with the migrated kinds clears only once they are saved.
+    val kinds = Set("位置", "詳細ログ").flatMap(WriteKind.fromStored).map(_.key)
+    val m = WriteStall.Monitor(Some(kinds))
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("battery", "fixes")), None)
+    assertEquals(m.update(noCommit = false, unsavedTooLong = false, saved = Set("fixes", "raw_lines")), Some(false))
   }
 

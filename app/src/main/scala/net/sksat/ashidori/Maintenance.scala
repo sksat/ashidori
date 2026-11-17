@@ -105,7 +105,9 @@ object Maintenance:
       val result =
         try
           if manual then
-            if archive.repairNow(db, l => Progress.set(l)) then "修復しました" else "未完了の整理はありません"
+            if !archive.repairNow(db, l => Progress.set(l)) then "未完了の整理はありません"
+            else if Attention.all().exists(!_.seen) then "修復しました（隔離したファイルの行は復元していません）"
+            else "修復しました"
           else
             val had = archive.commitPending
             archive.recover(db, progress = l => Progress.set(l))

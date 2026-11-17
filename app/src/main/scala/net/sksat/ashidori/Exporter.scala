@@ -93,6 +93,9 @@ object Exporter:
         // Archived days come back as rows (streamed, merged in time order);
         // days not archived yet are still raw lines.
         AshidoriApp.archive.reading(Archive.RawTables*) {
+          // Raw lines of an unfinished commit cannot be left out by a query
+          // (rule C): the export waits for it (shown as 「整理待ち」).
+          if AshidoriApp.archive.rawPending then throw ArchiveStore.Pending()
           val streams = Archive.RawTables.map(t => (t, AshidoriApp.archive.stream(t, a, b)))
           try
             val archived = streams.map((t, s) => s._1.map(r => (t, r)).map { case (t, r) => Vector[Any](r(0), Archive.lineOf(t, r)) })

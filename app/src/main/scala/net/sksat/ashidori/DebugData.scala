@@ -87,7 +87,11 @@ object DebugData:
               set(t.name) += ArchiveMerge.hash(row)
             case Left(_) => unconverted += 1
         at = ArchiveMerge.Cursor(lines.last._2, lines.last._1)
-    val out = for t <- Archive.RawTables yield
+    // The small tables: their rows in SQLite.
+    for t <- Seq(Archive.Fixes, Archive.Battery); row <- db.hotRows(t, from, to) do
+      hot(t.name) += 1
+      set(t.name) += ArchiveMerge.hash(row.toIndexedSeq)
+    val out = for t <- Archive.RawTables ++ Seq(Archive.Fixes, Archive.Battery) yield
       val f = java.io.File(root, Archive.dayFile(t, day))
       var n = 0L
       val read =
@@ -104,7 +108,8 @@ object DebugData:
     // Files a repair quarantined for this day: their rows, as far as they read.
     val quarantined =
       Option(java.io.File(root, ArchiveStore.QuarantineDir).listFiles()).toSeq.flatten.flatMap { c =>
-        Archive.RawTables.map(t => java.io.File(c, Archive.dayFile(t, day))).filter(_.exists)
+        (Archive.RawTables ++ Seq(Archive.Fixes, Archive.Battery)).map(t => java.io.File(c, Archive.dayFile(t, day)))
+          .flatMap(f => Seq(f, java.io.File(f.getPath + ".tmp"))).filter(_.exists)
       }.map { f =>
         var n = 0L
         val ok = scala.util.Try(scala.util.Using.resource(ashidori.core.parquet.ParquetReader.open(f.getPath))(_.rowIterator.foreach(_ => n += 1)))

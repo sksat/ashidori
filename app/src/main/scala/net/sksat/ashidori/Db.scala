@@ -255,13 +255,24 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   private def dbl(c: Cursor, i: Int): Double = if c.isNull(i) then Double.NaN else c.getDouble(i)
   private def flt(c: Cursor, i: Int): Float = if c.isNull(i) then Float.NaN else c.getFloat(i)
 
+  /** The rows of `table` a reader leaves out of SQLite while a commit of it
+    * is unfinished and its new file is in place (ArchiveStore.reading, rule
+    * C): `AND NOT (...)` and its arguments, or nothing.
+    */
+  private def notPending(table: String): (String, Seq[Any]) =
+    val col = Db.ArchivedTables(table)
+    AshidoriApp.archive.hotExclusion(table).fold(("", Seq.empty[Any])) { (f, t, m) =>
+      (s" AND NOT ($col>=? AND $col<? AND rowid<=?)", Seq(f, t, m))
+    }
+
   /** Positions in [from, to): archived days from Parquet, recent ones from SQLite. */
   def fixes(from: Long, to: Long): Vector[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
     (AshidoriApp.archive.read(Archive.Fixes, from, to).map(Archive.fixOf) ++ hotFixes(from, to)).sortBy(_.time)
   }
 
   def hotFixes(from: Long, to: Long): Vector[Fix] =
-    query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? ORDER BY time", from, to) { c =>
+    val (x, xa) = notPending("fixes")
+    query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<?$x ORDER BY time", (Seq(from, to) ++ xa)*) { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }
 
@@ -270,7 +281,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   private def hotLastFix(): Option[Fix] =
-    query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes ORDER BY time DESC LIMIT 1") { c =>
+    val (x, xa) = notPending("fixes")
+    query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*) { c =>
       Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8))
     }.headOption
 
@@ -279,13 +291,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   private def hotMotion(from: Long, to: Long): Vector[MotionWindow] =
-    query("SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? ORDER BY start", from, to) { c =>
+    val (x, xa) = notPending("motion")
+    query(s"SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<?$x ORDER BY start", (Seq(from, to) ++ xa)*) { c =>
       MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4))
     }
 
   def steps(from: Long, to: Long): Int = AshidoriApp.archive.reading(Archive.Motion) {
     AshidoriApp.archive.read(Archive.Motion, from, to).map(r => Option(r(4)).map(_.asInstanceOf[Int]).getOrElse(0)).sum +
-      query("SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?", from, to)(_.getInt(0)).head
+      { val (x, xa) = notPending("motion")
+        query(s"SELECT COALESCE(SUM(steps),0) FROM motion WHERE start>=? AND start<?$x", (Seq(from, to) ++ xa)*)(_.getInt(0)).head }
   }
 
   def battery(from: Long): Vector[DrainEstimator.Sample] = AshidoriApp.archive.reading(Archive.Battery) {
@@ -295,7 +309,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   private def hotBattery(from: Long): Vector[DrainEstimator.Sample] =
-    query("SELECT time,pct,charging,screen_on FROM battery WHERE time>=? ORDER BY time", from) { c =>
+    val (x, xa) = notPending("battery")
+    query(s"SELECT time,pct,charging,screen_on FROM battery WHERE time>=?$x ORDER BY time", (Seq(from) ++ xa)*) { c =>
       DrainEstimator.Sample(c.getLong(0), c.getInt(1), c.getInt(2) != 0, c.getInt(3) != 0)
     }
 
@@ -420,10 +435,10 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   private def hotFixesSampled(from: Long, to: Long, bucketMs: Long): Vector[Fix] =
+    val (x, xa) = notPending("fixes")
     query(
-      s"SELECT MIN(time), lat, lon FROM fixes WHERE time>=? AND time<? AND (acc IS NULL OR acc<100) GROUP BY time/$bucketMs ORDER BY 1",
-      from,
-      to
+      s"SELECT MIN(time), lat, lon FROM fixes WHERE time>=? AND time<? AND (acc IS NULL OR acc<100)$x GROUP BY time/$bucketMs ORDER BY 1",
+      (Seq(from, to) ++ xa)*
     )(c => Fix(c.getLong(0), c.getDouble(1), c.getDouble(2)))
 
   def firstFixTime(): Option[Long] =
@@ -474,7 +489,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
   private def hotGnssStatus(from: Long): Vector[(GnssSnapshot, Environment, Float)] =
-    query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? ORDER BY time", from) { c =>
+    val (x, xa) = notPending("gnss_status")
+    query(s"SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=?$x ORDER BY time", (Seq(from) ++ xa)*) { c =>
       (GnssSnapshot(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4)),
         scala.util.Try(Environment.valueOf(c.getString(5))).getOrElse(Environment.Unknown), flt(c, 6))
     }
@@ -610,25 +626,28 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * rows): read whole.
     */
   def hotRows(t: Archive.TableDef, from: Long, to: Long, maxRowid: Long = Long.MaxValue): Vector[Seq[Any]] =
+    if !Db.ArchivedTables.contains(t.name) then return Vector.empty
+    val (x, xa) = notPending(t.name)
+    val args = Seq[Any](from, to, maxRowid) ++ xa
     t match
       case Archive.Fixes =>
-        query("SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? AND rowid<=? ORDER BY time, rowid",
-          from, to, maxRowid) { c =>
+        query(s"SELECT time,lat,lon,acc,alt,speed,bearing,provider,sats FROM fixes WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
+          args*) { c =>
           Archive.fixRow(Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8)))
         }
       case Archive.Motion =>
-        query("SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? AND rowid<=? ORDER BY start, rowid",
-          from, to, maxRowid) { c =>
+        query(s"SELECT start,end,std,mean,steps FROM motion WHERE start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
+          args*) { c =>
           Archive.motionRow(MotionWindow(c.getLong(0), c.getLong(1), flt(c, 2), flt(c, 3), c.getInt(4)))
         }
       case Archive.Battery =>
-        query("SELECT time,pct,charging,screen_on,mode FROM battery WHERE time>=? AND time<? AND rowid<=? ORDER BY time, rowid",
-          from, to, maxRowid) { c =>
+        query(s"SELECT time,pct,charging,screen_on,mode FROM battery WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
+          args*) { c =>
           Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getInt(3), c.getString(4))
         }
       case Archive.GnssStatus =>
-        query("SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? AND time<? AND rowid<=? ORDER BY time, rowid",
-          from, to, maxRowid) { c =>
+        query(s"SELECT time,visible,used,top4,l5,env,acc FROM gnss_status WHERE time>=? AND time<? AND rowid<=?$x ORDER BY time, rowid",
+          args*) { c =>
           Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4), c.getString(5), flt(c, 6))
         }
       case _ => Vector.empty

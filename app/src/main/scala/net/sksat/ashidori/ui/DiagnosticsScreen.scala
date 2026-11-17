@@ -192,12 +192,18 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private def showRepair(pendingCommit: Boolean, stuck: Option[Seq[String]], attention: Seq[Attention.Entry]): Unit =
     val show = pendingCommit || attention.nonEmpty
     repairCard.setVisibility(if show then View.VISIBLE else View.GONE)
+    // Files that may hold rows found nowhere else are listed; the tmp files
+    // of interrupted commits whose previous version is intact are counted.
+    val (listed, quiet) = attention.partition(e => e.onlyCopy || !e.seen)
     val lines =
       stuck.map(ls => "記録は端末内に保持し、記録を続けています。" +: ls)
         .orElse(Option.when(pendingCommit)(Seq("途中で中断した整理があります。自動で完了します。"))).toSeq.flatten ++
-      Option.when(attention.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
-      attention.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残ります" else "")) ++
-      Option.when(attention.nonEmpty)("隔離したファイルは救出用バックアップと「隔離したファイルを書き出す」に含みます。").toSeq
+      Option.when(!pendingCommit && attention.nonEmpty)(
+        "記録の整理は再開しました。隔離したファイルの行は復元しません。タイムライン・書き出し・同期には含みません。").toSeq ++
+      Option.when(listed.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
+      listed.map(e => s"${Attention.label(e)}: ${e.why}" + (if e.onlyCopy then "。以前の記録はこのファイルにのみ残る可能性があります" else "")) ++
+      Option.when(quiet.nonEmpty)(s"整理途中の一時ファイル ${quiet.size} 件（以前の版が残っているもの）").toSeq ++
+      Option.when(attention.nonEmpty)("取り出すには「隔離したファイルを書き出す」か救出用バックアップを使います。").toSeq
     repairText.setText(lines.mkString("\n"))
     repairTitle.setText(if stuck.isDefined then "記録の整理が停止（要確認）" else "記録の整理（要確認）")
     repairButton.setVisibility(if pendingCommit then View.VISIBLE else View.GONE)
@@ -269,9 +275,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
               case Backup.Mode.Quarantine => Backup.writeQuarantine(act, uri, report)
             s"${label}書き出しました（${mb(n)}）"
           catch
-            case _: ArchiveStore.CommitStuck =>
+            case _: ArchiveStore.Pending =>
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))
-              "未完了の整理があるため書き出せません（救出用バックアップを使用）"
+              "整理待ちのため書き出せません（救出用バックアップを使用）"
             case e: Throwable =>
               Log.w("backup failed", e)
               Try(android.provider.DocumentsContract.deleteDocument(act.getContentResolver, uri))

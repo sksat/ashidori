@@ -2,47 +2,49 @@ package ashidori.core
 
 import scala.collection.mutable
 import ashidori.core.ArchiveMerge.Row
-import ashidori.core.CommitIntent.{Check, OnDisk, Prev, Recovery, Target}
+import ashidori.core.CommitIntent.{Check, Delete, OnDisk, Prev, Recovery, Target}
 
-/** Resolves an archive commit that recovery cannot finish
-  * ([[CommitIntent.Recovery.Stuck]]): some files were renamed into place,
-  * and the tmp file of another is gone or damaged.
+/** Resolves an archive commit a crash or failure left unfinished, table by
+  * table: one some of whose files were renamed into place while the tmp
+  * file of another is gone or damaged ([[CommitIntent.Recovery.Stuck]]),
+  * and also one the normal rules would finish or drop.
   *
   * Rows are deleted from SQLite only after every file of a commit is
   * published, so such a commit still holds everything: a published file has
   * the previous rows plus the chunk (which SQLite also still has), and a
-  * table whose tmp file is broken has its previous file and its rows in
-  * SQLite. Each table is resolved on its own:
+  * table not published has its previous file and its rows in SQLite.
   *
-  *  - published, and its file verifies against the record and holds every
-  *    chunk row still in SQLite (by a 64-bit hash of all columns, [[verify]]): the
-  *    file is synced and the chunk's rows of that table are deleted from
-  *    SQLite;
-  *  - not published, its previous file in place and read whole with the
-  *    recorded rows: the stray tmp file is deleted and its rows stay in
-  *    SQLite, for the next run to archive (a table without a previous file
-  *    likewise: its tmp holds only the chunk). If the previous version was
-  *    not recorded (0.21.0), the tmp file is moved to quarantine instead;
-  *  - anything else (a published file that does not verify, a previous
-  *    file that does not read whole, a file that is neither version): the
-  *    file and its tmp file are moved to quarantine, never deleted; the
-  *    rows stay in SQLite and the day is marked for attention. If they held
-  *    earlier rows, the quarantined files may be their only copy.
+  * Three rules (docs/recording.md):
+  *
+  *  A. A repair never deletes a data file. Every tmp file is moved to
+  *     quarantine (whether or not it is needed: that its content equals
+  *     what the other copies hold cannot be proven), so is a file that does
+  *     not verify. The only deletion is of the chunk's rows in SQLite of a
+  *     table whose published file holds every one of them ([[verify]]).
+  *     Recovered tmp files are never published: a table not published is
+  *     archived again from its previous file and SQLite by the next run.
+  *  B. Before its first change a repair marks the record ([[Ops.begin]]):
+  *     recovery then only continues the repair ([[resume]]), and 0.21.0
+  *     stops at a record of raw lines (see [[CommitIntent]]). The first
+  *     changes move the tmp files aside, so that 0.21.0, finding them gone,
+  *     cannot publish one.
+  *  C. (The app's readers never fail on a commit being repaired.)
   *
   * The record is removed only after every table is resolved. Each step is
   * idempotent, so a run cut short at any point is completed by the next
-  * one (a row already deleted from SQLite is no longer checked for). Before
-  * the first change the record is marked as being repaired ([[Ops.begin]]):
-  * recovery then goes on with the repair ([[resume]]). Run automatically,
-  * it resolves only when nothing has to be quarantined and the record is
-  * not of 0.21.0; otherwise it waits for the user (「整理を修復」).
+  * one (a row already deleted from SQLite is no longer checked for). Run
+  * automatically it moves the tmp files aside and resolves what needs no
+  * file to be quarantined, unless the record is a stuck one of 0.21.0;
+  * otherwise it waits for the user (「整理を修復」).
   */
 object CommitRepair:
   /** Where one table of the commit stands. */
   enum State:
     /** Its new version is in place (the recorded rows and size). */
     case Published
-    /** Its previous version is in place: nothing of the commit reached it. */
+    /** Its previous version is in place (or it had none): nothing of the
+      * commit reached it.
+      */
     case NotPublished
     /** Moved to quarantine by an earlier repair. */
     case Quarantined
@@ -50,40 +52,33 @@ object CommitRepair:
     case Unknown
 
   /** `dest`: (rows in the footer, or -1 if unreadable, and size) of the
-    * file, if it exists; `tmp`: its tmp file exists; `quarantined`: a
-    * repair moved it already.
+    * file, if it exists; `quarantined`: a repair moved it already.
     */
-  def classify(t: Target, dest: Option[(Long, Long)], tmp: Boolean, quarantined: Boolean): State =
+  def classify(t: Target, dest: Option[(Long, Long)], quarantined: Boolean): State =
     if dest.contains((t.rows, t.size)) then State.Published
     else if dest.isEmpty && quarantined then State.Quarantined
     else t.check.map(_.prev) match
       case Some(Prev.File(r, s)) => if dest.contains((r, s)) then State.NotPublished else State.Unknown
       case Some(Prev.Absent)     => if dest.isEmpty then State.NotPublished else State.Unknown
       // Not recorded (0.21.0): a readable file other than the new version
-      // is taken for the previous one (a rename is atomic). No file and a
-      // tmp file: the tmp file may hold the only copy of earlier rows.
-      case _ =>
-        dest match
-          case Some((rows, _)) => if rows >= 0 then State.NotPublished else State.Unknown
-          case None            => if tmp then State.Unknown else State.NotPublished
+      // is taken for the previous one (a rename is atomic).
+      case _ => if dest.forall(_._1 >= 0) then State.NotPublished else State.Unknown
 
   /** Whether the previous version of `t` was recorded (not a record of 0.21.0). */
   def previousKnown(t: Target): Boolean = t.check.exists(_.prev != Prev.Unknown)
 
-  /** What the repair does with one table. */
+  /** What the repair does with one table (besides moving its tmp file aside). */
   enum Action:
     /** Verified, every chunk row found in it: delete the chunk's rows of the
       * table from SQLite.
       */
     case DeleteRows
-    /** Not published, its previous file read whole: delete the stray tmp
-      * file, keep the rows. `setAside`: the previous version was not
-      * recorded (a record of 0.21.0), so the tmp file is moved to
-      * quarantine instead of deleted.
+    /** Not published, its previous file reads whole: keep the rows in
+      * SQLite (archived again by the next run).
       */
-    case DropTmp(setAside: Boolean)
-    /** Move the file and any tmp file to quarantine, keep the rows.
-      * `onlyCopy`: they hold earlier rows that may exist nowhere else.
+    case Keep
+    /** Move the file to quarantine, keep the rows. `onlyCopy`: it holds
+      * earlier rows that may exist nowhere else.
       */
     case Quarantine(why: String, onlyCopy: Boolean)
 
@@ -93,33 +88,36 @@ object CommitRepair:
   def holdsPrevious(t: Target): Boolean =
     t.check.forall(c => c.carried > 0 || c.prev != Prev.Absent)
 
-  /** The action for each table. A tmp file is deleted only when it cannot
-    * hold the only good copy of anything: the table had no file before (the
-    * tmp holds only the chunk, which SQLite has), or its previous file
-    * reads whole with the recorded rows.
+  /** The action for each table, and for its tmp file (if any) whether it
+    * may hold earlier rows that its previous file does not (the previous
+    * file is not shown intact): reads files, changes nothing.
     */
   def plan(i: CommitIntent, ops: Ops): Seq[Step] =
     i.files.map { t =>
-      val tmp = ops.tmpExists(t.path)
       val dest = ops.dest(t.path)
-      val st = classify(t, dest, tmp, ops.quarantined(t.path))
+      val st = classify(t, dest, ops.quarantined(t.path))
       val action = st match
         case State.Published =>
           ops.verify(t) match
             case Right(()) => Action.DeleteRows
             case Left(why) => Action.Quarantine(why, holdsPrevious(t))
         case State.NotPublished =>
-          t.check.map(_.prev) match
-            case Some(Prev.Absent) => Action.DropTmp(setAside = false)
-            case _ if dest.isEmpty && !tmp => Action.DropTmp(setAside = false)
-            case prev =>
-              ops.verifyPrevious(t) match
-                case Right(()) => Action.DropTmp(setAside = tmp && !prev.exists(_.isInstanceOf[Prev.File]))
-                case Left(why) => Action.Quarantine(s"以前の版が読めない（$why）", onlyCopy = true)
+          if dest.isEmpty then Action.Keep
+          else
+            ops.verifyPrevious(t) match
+              case Right(()) => Action.Keep
+              case Left(why) => Action.Quarantine(s"以前の版が読めない（$why）", onlyCopy = true)
         case State.Quarantined  => Action.Quarantine("隔離済み", holdsPrevious(t))
         case State.Unknown      => Action.Quarantine("以前の版でも新しい版でもない", holdsPrevious(t))
       Step(t, st, action)
     }
+
+  /** Whether the tmp file of a step may hold the only good copy of earlier
+    * rows: its table had a previous file that is not shown intact.
+    */
+  def tmpMayBeOnlyCopy(s: Step): Boolean = s.state match
+    case State.NotPublished => s.action != Action.Keep || !previousKnown(s.target)
+    case _                  => holdsPrevious(s.target)
 
   /** The side effects, each durable when it returns and idempotent. */
   trait Ops:
@@ -132,21 +130,20 @@ object CommitRepair:
     def verify(t: Target): Either[String, Unit]
     /** [[verifyWhole]] of the file in place (the previous version), if any. */
     def verifyPrevious(t: Target): Either[String, Unit]
-    /** Records the attention mark of `path`, then moves its tmp file and
-      * the file (whichever exist) to quarantine.
-      */
-    def quarantine(t: Target, why: String, onlyCopy: Boolean): Unit
-    /** Records the attention mark of `path`, then moves its tmp file (if
-      * any) to quarantine; the file itself stays.
-      */
-    def setAsideTmp(t: Target, why: String): Unit
-    /** Deletes `<path>.tmp` if it exists. */
-    def dropTmp(path: String): Unit
     /** Stores the record with `repairing` set (see [[CommitIntent]]): from
       * then on recovery only continues the repair ([[resume]]), and 0.21.0
-      * stops at it.
+      * stops at a record of raw lines.
       */
     def begin(): Unit
+    /** Records the attention mark of the tmp file of `t` (`alert`: shown to
+      * the user, it may hold the only copy of some rows), then moves it to
+      * quarantine, if it exists.
+      */
+    def setAsideTmp(t: Target, why: String, alert: Boolean): Unit
+    /** Records the attention mark of `path`, then moves the file to
+      * quarantine (its tmp file was moved already).
+      */
+    def quarantine(t: Target, why: String, onlyCopy: Boolean): Unit
     /** Syncs these files and their directories (a rename seen may not be durable yet). */
     def sync(paths: Seq[String]): Unit
     /** Deletes the chunk's rows of these tables (by name) from SQLite. */
@@ -157,8 +154,9 @@ object CommitRepair:
   enum Result:
     /** Every table resolved and the record removed. */
     case Resolved(steps: Seq[Step])
-    /** Automatic run: a file would be quarantined, or the record is of
-      * 0.21.0. Nothing was changed.
+    /** Automatic run: a file would be quarantined, or the record is a
+      * stuck one of 0.21.0. The tmp files are set aside; nothing else was
+      * changed.
       */
     case NeedsUser(steps: Seq[Step])
 
@@ -174,45 +172,44 @@ object CommitRepair:
     f"${crc.getValue}%08x"
 
   /** What recovery does with a commit record: once a repair began, only the
-    * repair goes on. It may have moved or deleted files the normal rules
-    * would misread (a quarantined file looks like a commit that published
-    * nothing, and dropping that deletes tmp files).
+    * repair goes on. It may have moved files the normal rules would
+    * misread (a quarantined file looks like a commit that published
+    * nothing).
     */
   def resume(i: CommitIntent, disk: Map[String, OnDisk]): Recovery =
     if i.repairing then Recovery.Stuck else CommitIntent.recovery(i, disk)
 
   /** Whether the record is of 0.21.0 (completed by guesswork: the previous
-    * files are unknown): resolved only by hand.
+    * files are unknown): resolved only by hand when stuck.
     */
   def legacy(i: CommitIntent): Boolean = i.files.exists(t => !previousKnown(t))
 
-  /** Resolves the commit `i`. `recovering`: it is one the normal rules
-    * would finish (its tmp files renamed already) or drop, which 0.21.0
-    * did on its own: then a record of 0.21.0 is resolved automatically too
-    * (rows are deleted only once found in full, tmp files whose previous
-    * version is unknown are set aside). A stuck record of 0.21.0 is
-    * resolved only by hand.
+  /** Resolves the commit `i` (see above). `recovering`: it is one the normal
+    * rules would finish or drop, which 0.21.0 did on its own: then a record
+    * of 0.21.0 is resolved automatically too (rows are deleted only once
+    * found in full).
     */
   def run(i: CommitIntent, ops: Ops, manual: Boolean, recovering: Boolean = false): Result =
     val steps = plan(i, ops)
-    // Automatically: never move a file (one moved by an earlier repair is
-    // only marked again), and not a stuck record of 0.21.0.
+    // B: the mark first; then A: every tmp file out of the way.
+    ops.begin()
+    for s <- steps if ops.tmpExists(s.target.path) do
+      val alert = tmpMayBeOnlyCopy(s)
+      ops.setAsideTmp(s.target, if alert then "整理途中の一時ファイル（以前の記録を含む可能性あり）" else "整理途中の一時ファイル", alert)
+      ops.log(s"${s.target.path}: 整理途中の一時ファイルを隔離（削除しない）")
+    // Automatically: never move a data file (one moved by an earlier repair
+    // is only marked again), and not a stuck record of 0.21.0.
     if !manual && ((legacy(i) && !recovering) ||
         steps.exists(s => s.action.isInstanceOf[Action.Quarantine] && s.state != State.Quarantined)) then
       Result.NeedsUser(steps)
     else
-      ops.begin()
       for s <- steps do
         s.action match
           case Action.Quarantine(why, only) =>
             ops.quarantine(s.target, why, only)
             ops.log(s"${s.target.path}: 隔離（$why）。行は端末内に保持" + (if only then "。以前の記録はこのファイルにのみ残る" else ""))
-          case Action.DropTmp(false) =>
-            ops.dropTmp(s.target.path)
-            ops.log(s"${s.target.path}: 置き換え前のため一時ファイルを削除。行は端末内に保持し、次回の整理で作り直す")
-          case Action.DropTmp(true) =>
-            ops.setAsideTmp(s.target, "置き換え前の一時ファイル（以前の版を確認できない）")
-            ops.log(s"${s.target.path}: 置き換え前。一時ファイルを隔離し、行は端末内に保持し、次回の整理で作り直す")
+          case Action.Keep =>
+            ops.log(s"${s.target.path}: 置き換え前。行は端末内に保持し、次回の整理で作り直す")
           case Action.DeleteRows => ()
       val verified = steps.collect { case s if s.action == Action.DeleteRows => s.target }
       if verified.nonEmpty then
@@ -225,6 +222,23 @@ object CommitRepair:
       ops.log("未完了の整理の記録を消去")
       Result.Resolved(steps)
 
+  /** What a reader of the archive leaves out while a commit of its tables
+    * is unfinished, so that it reads each row once (rule C): for a table
+    * whose new file is in place, the chunk's rows still in SQLite
+    * (`hot`: table → (from, to, max rowid)) and the day files a month file
+    * replaces (`files`). `raw`: a commit of raw lines, whose rows in SQLite
+    * cannot be told apart by a query: a reader of the raw tables waits
+    * (「整理待ち」) instead.
+    */
+  final case class ReadExclusion(hot: Map[String, (Long, Long, Long)], files: Set[String], raw: Boolean)
+
+  def exclusion(i: CommitIntent, published: String => Boolean): ReadExclusion =
+    val done = i.files.filter(t => published(t.path)).map(t => tableOf(t.path)).toSet
+    i.delete match
+      case Delete.Hot(t, from, to, max) => ReadExclusion(if done(t) then Map(t -> (from, to, max)) else Map.empty, Set.empty, raw = false)
+      case Delete.Files(ps)             => ReadExclusion(Map.empty, ps.filter(p => done(tableOf(p))).toSet, raw = false)
+      case _                            => ReadExclusion(Map.empty, Set.empty, raw = true)
+
   /** Checks a published file against its target: the footer's rows (and,
     * when recorded, previous + chunk rows), every row group decodes to as
     * many rows in time order, the time range of the file and of the chunk,
@@ -235,9 +249,7 @@ object CommitRepair:
     *
     * The rows carried over from the previous file are checked by count
     * only: once the new version is in place the previous one is gone. That
-    * is the best check left for a file already published; a tmp file is
-    * checked against its previous file before it is published
-    * ([[verifyPublish]]).
+    * is the best check left for a file already published.
     *
     * `expected`: when given, the file must hold exactly these rows as a
     * multiset ([[RowBag]]): each one at least once (equal rows are kept
@@ -289,14 +301,6 @@ object CommitRepair:
 
   /** Prefix of a check that was not made: too many rows to compare. */
   val TooLargeMark = "照合する行が多すぎる: "
-
-  /** Checks a tmp file before it is published over its previous file
-    * (finishing an interrupted commit): [[verify]], and as a multiset
-    * (`expected`) every row of the previous file (still in place) and every
-    * chunk row still in SQLite, and nothing else.
-    */
-  def verifyPublish(t: Target, footerRows: Long, rows: => Iterator[Row], expected: RowBag): Either[String, Unit] =
-    verify(t, footerRows, rows, None, Some(expected))
 
   /** Checks a file in place (the previous version of a table not
     * published): every row group decodes, in time order, to as many rows as

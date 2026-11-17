@@ -63,39 +63,45 @@ object Alerts:
       LifeLog.add(LifeKind.SafeMode,
         "異常終了が続いたため、記録の整理と同期を停止（記録は継続）")
 
-  /** Raises the stall alert; `kinds`: those not saved now. The alert is
-    * kept on disk ([[restoredStall]]).
-    */
-  def stall(kinds: Set[String]): Boolean =
-    val kept = prefs.edit().putLong("stallAt", System.currentTimeMillis()).putBoolean("stallUp", true)
-      .putStringSet("stallKinds", kinds.asJava).commit()
-    if !kept then Log.w("keeping the stall alert on disk failed")
-    notify(StallId, "記録の保存が停止") && kept
+  private def nm = ctx.getSystemService(classOf[NotificationManager])
 
-  /** Whether the notification is gone and that is on disk; if not, the
-    * caller tries again ([[WriteStall.Monitor.failed]]).
+  /** The stall alert's notification and its state on disk
+    * ([[WriteStall.Alert]] brings them to what its monitor says at every
+    * check). `stallKinds` holds WriteKind keys.
     */
-  def clearStall(): Boolean =
-    val cancelled = Try(ctx.getSystemService(classOf[NotificationManager]).cancel(StallId))
-    cancelled.failed.foreach(e => Log.w("cancelling the stall notification failed", e))
-    // Kept up on disk until the cancel worked: tried again after a restart too.
-    val kept = cancelled.isSuccess && prefs.edit().putBoolean("stallUp", false).remove("stallKinds").commit()
-    cancelled.isSuccess && kept
+  object StallEffects extends WriteStall.Effects:
+    def posted: Boolean = Try(nm.getActiveNotifications.exists(_.getId == StallId)).getOrElse(false)
+    def post(): Boolean = Alerts.notify(StallId, "記録の保存が停止")
+    def cancel(): Boolean =
+      val r = Try(nm.cancel(StallId))
+      r.failed.foreach(e => Log.w("cancelling the stall notification failed", e))
+      r.isSuccess
+    def stored: Option[Set[String]] =
+      Option.when(prefs.getBoolean("stallUp", false))(storedKinds)
+    def store(state: Option[Set[String]]): Boolean =
+      val e = prefs.edit()
+      state match
+        case Some(kinds) =>
+          if !prefs.getBoolean("stallUp", false) then e.putLong("stallAt", System.currentTimeMillis())
+          e.putBoolean("stallUp", true).putStringSet("stallKinds", kinds.asJava)
+        case None => e.putBoolean("stallUp", false).remove("stallKinds")
+      val ok = e.commit()
+      if !ok then Log.w("keeping the stall alert on disk failed")
+      ok
+
+  /** The kinds kept with the alert, as WriteKind keys (labels an earlier
+    * build kept are migrated; anything else is dropped).
+    */
+  private def storedKinds: Set[String] =
+    Option(prefs.getStringSet("stallKinds", null)).map(_.asScala.toSet).getOrElse(Set.empty)
+      .flatMap(k => WriteKind.fromStored(k).map(_.key))
 
   /** A stall alert raised before this process started and not cleared: the
     * kinds it named. An alert of 0.21.0 (not kept on disk) is found by its
     * notification, still posted, and names no kind.
     */
   def restoredStall(): Option[Set[String]] =
-    val posted = Try(ctx.getSystemService(classOf[NotificationManager]).getActiveNotifications.exists(_.getId == StallId))
-      .getOrElse(false)
-    if prefs.getBoolean("stallUp", false) then
-      // Gone with a reboot (or swiped away): shown again while unresolved.
-      if !posted then notify(StallId, "記録の保存が停止")
-      // Keys of WriteKind; anything else is dropped (then any save clears it).
-      Some(Option(prefs.getStringSet("stallKinds", null)).map(_.asScala.toSet).getOrElse(Set.empty)
-        .filter(k => WriteKind.fromKey(k).isDefined))
-    else Option.when(posted)(Set.empty[String])
+    StallEffects.stored.orElse(Option.when(StallEffects.posted)(Set.empty[String]))
 
   def lastStall: Long = prefs.getLong("stallAt", 0L)
 

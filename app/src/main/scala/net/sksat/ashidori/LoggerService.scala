@@ -221,7 +221,9 @@ class LoggerService extends Service:
       LoggerWrites.submit(1, raw = false, WriteKind.Battery)(_.insertBattery(now, pct, charging, screen, mode, p.map(_.describe).getOrElse("")))
       // A read: on the UI's I/O thread, not the logger's write path.
       AshidoriApp.io.execute { () =>
-        drain = DrainEstimator.screenOffDrain(db.battery(now - 4 * 3_600_000L), now)
+        // Never fails the logger's process (rule C; and anything else).
+        scala.util.Try(DrainEstimator.screenOffDrain(db.battery(now - 4 * 3_600_000L), now))
+          .fold(e => Log.w("battery history read failed", e), d => drain = d)
       }
 
     val speed = if now - lastSpeedAt < 60_000 then lastSpeed else Double.NaN

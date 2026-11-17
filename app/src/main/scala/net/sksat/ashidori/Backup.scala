@@ -30,7 +30,7 @@ import ashidori.core.Archive
   * fastest level; Parquet files are compressed already and stored.
   *
   * 「救出用バックアップ」 ([[writeRescue]]) works while an unfinished
-  * commit stops the normal one ([[ArchiveStore.CommitStuck]]): it takes the
+  * commit stops the normal one ([[ArchiveStore.Pending]]): it takes the
   * same copy of the database, but holds the locks without finishing the
   * commit, and stores every file as it is: the whole archive (with tmp
   * files and quarantined files), the commit record and the other state of
@@ -157,7 +157,13 @@ object Backup:
         // (which may be what cannot be done), and the lock of tmp writes: no
         // tmp file is taken half written. Only while the files are linked.
         case Mode.Rescue => archive.holdingTmps(archive.holding(Archive.All*)(collect()))
-        case Mode.Normal => archive.reading(Archive.All*)(collect())
+        case Mode.Normal =>
+          // A copy taken while a commit is unfinished would keep its rows
+          // twice without the record: 「整理待ち」 (the rescue backup works).
+          archive.reading(Archive.All*) {
+            if archive.anyPending then throw ArchiveStore.Pending()
+            collect()
+          }
         case Mode.Quarantine => archive.holdingTmps(collect())
       val log = File(c.getFilesDir, "lifecycle.log")
       val withDb = mode != Mode.Quarantine

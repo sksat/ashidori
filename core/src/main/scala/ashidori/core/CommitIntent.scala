@@ -18,17 +18,29 @@ package ashidori.core
   * no check; the repair completes it from SQLite first.
   *
   * `repairing`: a repair of it began ([[CommitRepair]]); recovery then only
-  * continues the repair. It is written as an extra file line naming
-  * [[GuardDir]], a table 0.21.0 does not know: 0.21.0 decodes the record
-  * but fails on that table's lock before it acts, so it keeps the record
-  * and stops (as for a stuck commit) instead of dropping it (which would
-  * delete tmp files a repair may still need).
+  * continues the repair. It is written as a line after the deletion,
+  * which 0.21.0 does not read. For a commit of raw lines ([[guarded]]) it
+  * is also written as a file line naming [[GuardDir]], a table 0.21.0 does
+  * not know: 0.21.0 decodes the record but fails on that table's lock
+  * before it acts, and every place 0.21.0 reads the raw tables catches
+  * that (as for its own stuck commits). The small tables are read by
+  * 0.21.0 on threads that do not catch it: their records get no guard.
+  * What a repair leaves of them reads to 0.21.0 as a commit to drop or to
+  * finish, which then loses nothing, as a repair moves every tmp file
+  * aside before anything else (see [[CommitRepair]]).
   */
 final case class CommitIntent(files: Seq[CommitIntent.Target], delete: CommitIntent.Delete, repairing: Boolean = false)
 
 object CommitIntent:
   /** The guard's pseudo table (see above). */
   val GuardDir = "repair-guard"
+  /** The line marking a record as being repaired (after the deletion). */
+  val RepairingLine = "repairing"
+
+  /** Whether a record being repaired gets the guard: a commit of raw lines. */
+  def guarded(i: CommitIntent): Boolean = i.delete match
+    case _: Delete.Raw | _: Delete.Ids => true
+    case _                             => false
 
   /** An archive file (relative to the archive root) and its new version. */
   final case class Target(path: String, rows: Long, size: Long, check: Option[Check] = None)
@@ -122,8 +134,11 @@ object CommitIntent:
       case Delete.Raw(f, to, m, a, u, kept) => s"raw\t$f\t$to\t$m\t${cursor(a)}\t${cursor(u)}\t${kept.mkString(",")}"
       case Delete.Ids(ids)                  => s"ids\t${ids.mkString(",")}"
       case Delete.Files(ps)                 => s"files\t${ps.mkString("\t")}"
-    val guard = Option.when(i.repairing)(s"file\t$GuardDir/begun\t-1\t-1").toSeq
-    ((guard ++ files) :+ delete :+ "end").mkString("\n") + "\n"
+    val guard = Option.when(i.repairing && guarded(i))(s"file\t$GuardDir/begun\t-1\t-1").toSeq
+    // The marker after the deletion: 0.21.0 reads the first line that is
+    // not a file line as the deletion, and nothing after it.
+    val marker = Option.when(i.repairing)(RepairingLine).toSeq
+    (((guard ++ files) :+ delete) ++ marker :+ "end").mkString("\n") + "\n"
 
   /** None for a record cut short (no `end`) or unknown. */
   def decode(s: String): Option[CommitIntent] =
@@ -135,11 +150,11 @@ object CommitIntent:
         val files = fileLines.map(_.split("\t", -1)).map { a =>
           Target(a(1), a(2).toLong, a(3).toLong, Option.when(a.length > 4 && a(4) == "v2")(decodeCheck(a.toSeq.drop(5))))
         }
-        val d = lines.filterNot(l => l.startsWith("file\t") || l == "end").head.split("\t", -1)
+        val d = lines.filterNot(l => l.startsWith("file\t") || l == "end" || l == RepairingLine).head.split("\t", -1)
         val delete = d(0) match
           case "hot"   => Delete.Hot(d(1), d(2).toLong, d(3).toLong, d(4).toLong)
           case "raw"   => Delete.Raw(d(1).toLong, d(2).toLong, d(3).toLong, cursorOf(d(4)), cursorOf(d(5)), longs(d(6)))
           case "ids"   => Delete.Ids(longs(d(1)))
           case "files" => Delete.Files(d.drop(1).toSeq)
-        CommitIntent(files, delete, repairing = guards.nonEmpty)
+        CommitIntent(files, delete, repairing = guards.nonEmpty || lines.contains(RepairingLine))
       }.toOption

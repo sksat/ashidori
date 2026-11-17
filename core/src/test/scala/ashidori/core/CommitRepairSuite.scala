@@ -21,8 +21,12 @@ class CommitRepairSuite extends munit.FunSuite:
 
   final class Crash extends RuntimeException("crash")
 
-  /** The archive files, tmp files, quarantine, SQLite and the commit record. */
-  final class World(tables: Seq[String], old: Map[String, Vector[Row]], chunk: Map[String, Vector[Row]], cap: Int = RowBag.Cap):
+  /** The archive files, tmp files, quarantine, SQLite and the commit record.
+    * Files are only ever moved between the maps (rule A): [[files]] counts
+    * them.
+    */
+  final class World(tables: Seq[String], old: Map[String, Vector[Row]], chunk: Map[String, Vector[Row]], cap: Int = RowBag.Cap,
+                    delete: Delete = Delete.Raw(0, 10_000, 99, ArchiveMerge.Cursor(0, 0), ArchiveMerge.Cursor(5_000, 50), Nil)):
     def path(t: String) = s"$t/2026-11-10.parquet"
     val dest = mutable.Map.empty[String, FakeFile]
     val tmp = mutable.Map.empty[String, FakeFile]
@@ -44,9 +48,12 @@ class CommitRepairSuite extends munit.FunSuite:
       val prev = if old(t).isEmpty then Prev.Absent else Prev.File(old(t).size, fileOf(old(t)).size)
       Target(path(t), f.footer, f.size, Some(s.check(prev, old(t).size, chunk(t).size,
         Some((newRows(t).map(ArchiveMerge.key).min, newRows(t).map(ArchiveMerge.key).max)))))
-    }, Delete.Raw(0, 10_000, 99, ArchiveMerge.Cursor(0, 0), ArchiveMerge.Cursor(5_000, 50), Nil))
+    }, delete)
     var record: Option[CommitIntent] = Some(intent)
     for t <- tables do tmp(path(t)) = fileOf(newRows(t))
+
+    /** Every file there is, wherever it is. */
+    def files: Int = dest.size + tmp.size + quarantine.size + quarantineTmp.size
 
     /** The commit renamed these tables' files, then stopped. */
     def renamed(ts: String*): Unit = for t <- ts do dest(path(t)) = tmp.remove(path(t)).get
@@ -57,6 +64,9 @@ class CommitRepairSuite extends munit.FunSuite:
 
     private def iter(f: FakeFile) =
       if f.decodeFails then f.rows.iterator.take(1) ++ Iterator(throw java.io.IOException("bad page")) else f.rows.iterator
+
+    /** The steps taken, in order (begin, moves, deletions, clear). */
+    val trail = mutable.ArrayBuffer.empty[String]
 
     val opsImpl: Ops = new Ops:
       def dest(p: String) = World.this.dest.get(p).map(f => (f.footer, f.size))
@@ -75,24 +85,25 @@ class CommitRepairSuite extends munit.FunSuite:
       def verifyPrevious(t: Target) = World.this.dest.get(t.path) match
         case None => Right(())
         case Some(f) => CommitRepair.verifyWhole(f.footer, iter(f), t.check.map(_.prev).collect { case Prev.File(r, _) => r })
-      def quarantine(t: Target, why: String, onlyCopy: Boolean) =
-        step()
-        attention.getOrElseUpdate(t.path, onlyCopy)
-        step()
-        tmp.remove(t.path).foreach(quarantineTmp(t.path) = _)
-        step()
-        World.this.dest.remove(t.path).foreach(World.this.quarantine(t.path) = _)
-      def setAsideTmp(t: Target, why: String) =
-        step()
-        attention.getOrElseUpdate(t.path + ".tmp", false)
-        step()
-        tmp.remove(t.path).foreach(quarantineTmp(t.path) = _)
-      def dropTmp(p: String) =
-        step()
-        tmp.remove(p)
       def begin() =
         step()
+        if !record.exists(_.repairing) then trail += "begin"
         record = record.map(_.copy(repairing = true))
+      def setAsideTmp(t: Target, why: String, alert: Boolean) =
+        if tmp.contains(t.path) then
+          step()
+          attention.getOrElseUpdate(t.path + ".tmp", alert)
+          step()
+          tmp.remove(t.path).foreach(quarantineTmp(t.path) = _)
+          trail += s"tmp ${t.path}"
+      def quarantine(t: Target, why: String, onlyCopy: Boolean) =
+        setAsideTmp(t, why, alert = true)
+        if World.this.dest.contains(t.path) then
+          step()
+          attention.getOrElseUpdate(t.path, onlyCopy)
+          step()
+          World.this.dest.remove(t.path).foreach(World.this.quarantine(t.path) = _)
+          trail += s"file ${t.path}"
       def sync(paths: Seq[String]) = step()
       def deleteRows(ts: Set[String]) =
         // Table by table (a crash may come between them).
@@ -102,41 +113,29 @@ class CommitRepairSuite extends munit.FunSuite:
           val before = sqlite(t).size
           sqlite(t) = sqlite(t).filterNot(chunk(t).contains)
           n += before - sqlite(t).size
+          trail += s"rows $t"
         n
       def clearIntent() =
         step()
         record = None
+        trail += "clear"
       def log(line: String) = World.this.log += line
 
-    /** Recovery of the record on disk, as the app does it: finish, drop, or
-      * repair (nothing if there is no record).
+    /** Recovery of the record on disk, as the app does it: every case
+      * through the repair (nothing if there is no record).
       */
     def repair(manual: Boolean): Option[Result] = record.map { i =>
       val disk = i.files.map(t => t.path -> OnDisk(dest.get(t.path).map(f => (f.footer, f.size)),
         tmp.get(t.path).map(f => (f.footer, f.size)))).toMap
       resume(i, disk) match
-        case Recovery.Finish(renames) =>
-          // Each tmp file checked against its previous file and the chunk's
-          // rows before it goes over the previous file (ArchiveStore).
-          val checked = renames.map { p =>
-            val table = CommitRepair.tableOf(p)
-            val t = i.files.find(_.path == p).get
-            val f = tmp(p)
-            p -> scala.util.Try {
-              val bag = RowBag(cap)
-              dest.get(p).foreach(_.rows.foreach(bag.add))
-              sqlite(table).filter(chunk(table).contains).foreach(bag.add)
-              bag
-            }.toEither.left.map(_ => CommitRepair.TooLargeMark).flatMap(bag => CommitRepair.verifyPublish(t, f.footer, iter(f), bag))
-          }
-          val bad = checked.collect { case (p, Left(why)) => p }
-          if bad.nonEmpty && !manual then Result.NeedsUser(Nil)
-          else
-            bad.foreach(p => quarantineTmp(p) = tmp.remove(p).get)
-            checked.collect { case (p, Right(())) => p }.foreach(p => dest(p) = tmp.remove(p).get)
-            CommitRepair.run(i, opsImpl, manual, recovering = true)
-        case Recovery.Drop => CommitRepair.run(i, opsImpl, manual, recovering = true)
+        case Recovery.Finish(_) | Recovery.Drop => CommitRepair.run(i, opsImpl, manual, recovering = true)
         case Recovery.Stuck => CommitRepair.run(i, opsImpl, manual)
+    }
+
+    /** What 0.21.0 would do with the record now (its recovery, as it was). */
+    def as021: Option[Recovery] = record.map { i =>
+      CommitIntent.recovery(i, i.files.map(t => t.path -> OnDisk(dest.get(t.path).map(f => (f.footer, f.size)),
+        tmp.get(t.path).map(f => (f.footer, f.size)))).toMap)
     }
 
     /** Each table's rows: in its archive file and in SQLite. */
@@ -152,7 +151,7 @@ class CommitRepairSuite extends munit.FunSuite:
     "imu" -> (100L until 160L).map(t => r(t, s"i$t")).toVector,
     "nmea" -> (100L until 120L).map(t => r(t, s"n$t")).toVector)
 
-  /** Every row of every table exactly once, between its file, SQLite and quarantine. */
+  /** Every row of every table, between its file, SQLite and quarantine. */
   private def assertComplete(w: World): Unit =
     for t <- tables do
       val all = w.rows(t) ++ w.quarantine.get(w.path(t)).map(_.rows).getOrElse(Vector.empty)
@@ -165,9 +164,16 @@ class CommitRepairSuite extends munit.FunSuite:
       val inFile = w.dest.get(w.path(t)).map(_.rows.toSet).getOrElse(Set.empty)
       assertEquals(w.sqlite(t).filter(inFile), Vector.empty, t)
 
+  /** Rule A: no data file is gone (moved only), and no tmp file is left
+    * where a commit could publish it.
+    */
+  private def assertNothingDeleted(w: World, files: Int): Unit =
+    assertEquals(w.files, files)
+
   test("all renamed: every table verifies, its chunk leaves SQLite, the record goes") {
     val w = World(tables, old, chunk)
     w.renamed(tables*)
+    val files = w.files
     val res = w.repair(manual = false).get
     assert(res.isInstanceOf[Result.Resolved], res)
     assertEquals(w.record, None)
@@ -176,31 +182,65 @@ class CommitRepairSuite extends munit.FunSuite:
       assertEquals(w.rows(t).size, old(t).size + chunk(t).size + 1)
     assertNoDuplicates(w)
     assertComplete(w)
+    assertNothingDeleted(w, files)
+    assertEquals(w.trail.head, "begin")
   }
 
-  test("some renamed, the rest's tmp missing or broken: published tables resolved, the others kept for the next run") {
+  test("some renamed, the rest's tmp missing or broken: tmp files set aside (never deleted), published tables resolved") {
     val w = World(tables, old, chunk)
     w.renamed("gnss_raw")
     w.tmp.remove(w.path("imu"))
     w.tmp(w.path("nmea")) = w.tmp(w.path("nmea")).copy(footer = -1)
-    assertEquals(CommitIntent.recovery(w.intent, tables.map(t => w.path(t) ->
-      OnDisk(w.dest.get(w.path(t)).map(f => (f.footer, f.size)), w.tmp.get(w.path(t)).map(f => (f.footer, f.size)))).toMap),
-      Recovery.Stuck)
+    assertEquals(w.as021, Some(Recovery.Stuck))
+    val files = w.files
     val steps = w.repair(manual = false).get match
       case Result.Resolved(s) => s
       case other => fail(s"$other")
     assertEquals(steps.map(s => (s.state, s.action)), Seq(
-      (State.Published, Action.DeleteRows), (State.NotPublished, Action.DropTmp(false)), (State.NotPublished, Action.DropTmp(false))))
+      (State.Published, Action.DeleteRows), (State.NotPublished, Action.Keep), (State.NotPublished, Action.Keep)))
     assertEquals(w.record, None)
+    // Rule A: the broken tmp is kept aside, not deleted.
     assertEquals(w.tmp.keySet.toSet, Set.empty[String])
+    assert(w.quarantineTmp.contains(w.path("nmea")))
+    assertNothingDeleted(w, files)
     // gnss_raw: in its file only; imu, nmea: old file intact, chunk still in SQLite.
     assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
     assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
     assertEquals(w.dest(w.path("imu")).rows, old("imu"))
-    assertEquals(w.dest.get(w.path("nmea")), None)
     assertNoDuplicates(w)
     assertComplete(w)
-    assert(w.log.last.contains("消去"), w.log)
+    // Rule B: the mark before the first move.
+    assertEquals(w.trail.take(2).toSeq, Seq("begin", s"tmp ${w.path("nmea")}"))
+  }
+
+  test("a commit that would be dropped or finished: its tmp files are set aside, never published nor deleted") {
+    // Nothing renamed, every tmp good (0.21.0: finish them all).
+    val w = World(tables, old, chunk)
+    assert(w.as021.exists(_.isInstanceOf[Recovery.Finish]))
+    val files = w.files
+    val good = w.tmp.toMap
+    assert(w.repair(manual = false).get.isInstanceOf[Result.Resolved])
+    assertEquals(w.quarantineTmp.toMap, good)
+    // The previous files stay; every row stays in SQLite for the next run.
+    for t <- tables do assertEquals(w.sqlite(t).size, chunk(t).size + 1)
+    assertEquals(w.dest.get(w.path("imu")).map(_.rows), Some(old("imu")))
+    assertNothingDeleted(w, files)
+    assertComplete(w)
+  }
+
+  test("previous file changed in value only (it reads whole), its good tmp: the tmp is kept, not deleted") {
+    val w = World(tables, old, chunk)
+    w.renamed("gnss_raw")
+    w.tmp.remove(w.path("nmea"))
+    // imu's previous file: same footer, size and order, other values.
+    val f = w.dest(w.path("imu"))
+    w.dest(w.path("imu")) = f.copy(rows = f.rows.map(r => IndexedSeq(r(0), "changed")))
+    val goodTmp = w.tmp(w.path("imu"))
+    val files = w.files
+    assert(w.repair(manual = false).get.isInstanceOf[Result.Resolved])
+    // The only good copy of imu's earlier rows is kept (in quarantine).
+    assertEquals(w.quarantineTmp.get(w.path("imu")), Some(goodTmp))
+    assertNothingDeleted(w, files)
   }
 
   test("a published file that does not verify: never moved automatically; quarantined by hand, rows kept") {
@@ -208,28 +248,61 @@ class CommitRepairSuite extends munit.FunSuite:
     w.renamed("gnss_raw", "imu")
     w.dest(w.path("imu")) = w.dest(w.path("imu")).copy(decodeFails = true)
     w.tmp.remove(w.path("nmea"))
-    val before = (w.dest.clone(), w.tmp.clone(), w.sqlite.clone())
-    // Automatically: nothing changes, as often as it is tried.
+    val files = w.files
+    val before = (w.dest.clone(), w.sqlite.clone())
+    // Automatically: no data file moved, no row deleted, as often as it is tried.
     for _ <- 1 to 3 do assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
-    assertEquals((w.dest, w.tmp, w.sqlite), before)
-    assertEquals(w.record, Some(w.intent))
+    assertEquals((w.dest, w.sqlite), before)
+    assert(w.record.exists(_.repairing))
     // By hand.
     assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
     assertEquals(w.record, None)
     assertEquals(w.dest.get(w.path("imu")), None)
-    // The quarantined file holds the previous rows (their only copy) and the chunk.
     assertEquals(w.quarantine(w.path("imu")).rows, (old("imu") ++ chunk("imu")).sortBy(ArchiveMerge.key))
-    assertEquals(w.attention.toMap, Map(w.path("imu") -> true))
+    assertEquals(w.attention.get(w.path("imu")), Some(true))
     assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
     assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
     assertNoDuplicates(w)
     assertComplete(w)
+    assertNothingDeleted(w, files)
+  }
+
+  test("a published file whose rows other than the samples differ: nothing deleted, kept for the user") {
+    val w = World(tables, old, chunk)
+    w.renamed(tables*)
+    val samples = w.intent.files.find(_.path == w.path("imu")).get.check.get.samples.map(_._1).toSet
+    val victim = chunk("imu").find(r => !samples(ArchiveMerge.key(r))).get
+    val f = w.dest(w.path("imu"))
+    w.dest(w.path("imu")) = f.copy(rows = f.rows.map(r => if r == victim then r(0).asInstanceOf[Long] +: IndexedSeq("forged") else r))
+    val steps = w.repair(manual = false).get match
+      case Result.NeedsUser(s) => s
+      case other => fail(s"$other")
+    assert(steps.exists(s => s.target.path == w.path("imu") && s.action.isInstanceOf[Action.Quarantine]), steps)
+    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
+    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
+    assert(w.sqlite("imu").contains(victim))
+    assert(w.quarantine.contains(w.path("imu")))
+    assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
+  }
+
+  test("not published, previous file damaged though its footer reads, tmp good: both kept") {
+    val w = World(tables, old, chunk)
+    w.renamed("gnss_raw")
+    w.tmp.remove(w.path("nmea"))
+    w.dest(w.path("imu")) = w.dest(w.path("imu")).copy(decodeFails = true)
+    val goodTmp = w.tmp(w.path("imu"))
+    assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
+    // The tmp is out of the way at once, kept, and shown to the user.
+    assertEquals(w.quarantineTmp.get(w.path("imu")), Some(goodTmp))
+    assertEquals(w.attention.get(w.path("imu") + ".tmp"), Some(true))
+    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
+    assert(w.quarantine.contains(w.path("imu")))
+    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
   }
 
   test("a file that is neither the previous nor the new version is quarantined, not trusted") {
     val w = World(tables, old, chunk)
     w.renamed("gnss_raw")
-    // imu: something else entirely (the footer does not read), its tmp gone.
     w.dest(w.path("imu")) = FakeFile(Vector.empty, -1, 3)
     w.tmp.remove(w.path("imu"))
     val steps = w.repair(manual = false).get match
@@ -241,7 +314,7 @@ class CommitRepairSuite extends munit.FunSuite:
     assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
   }
 
-  test("a crash at any step of a repair: the next run completes it with the same result") {
+  test("a crash at any step of a repair (the mark, each move, each deletion): the next run ends the same, nothing lost") {
     def scenario(): World =
       val w = World(tables, old, chunk)
       w.renamed("gnss_raw", "imu")
@@ -249,6 +322,7 @@ class CommitRepairSuite extends munit.FunSuite:
       w.tmp(w.path("nmea")) = w.tmp(w.path("nmea")).copy(footer = -1)
       w
     val clean = scenario()
+    val files = clean.files
     clean.repair(manual = true)
     def snapshot(w: World) = (w.dest.toMap, w.tmp.toMap, w.quarantine.toMap, w.quarantineTmp.toMap, w.sqlite.toMap,
       w.record, w.attention.toMap)
@@ -261,65 +335,175 @@ class CommitRepairSuite extends munit.FunSuite:
         try { w.repair(manual = true); false }
         catch case _: Crash => true
       if crashed then
-        // Cut short: nothing is lost meanwhile.
         assertComplete(w)
+        assertNothingDeleted(w, files)
+        // Rule B: once anything moved, the record says a repair began.
+        if w.quarantineTmp.nonEmpty || w.quarantine.nonEmpty then assert(w.record.exists(_.repairing), s"step $k")
         w.crashAt = -1
-        // Automatic runs in between change nothing more than they may.
         w.repair(manual = false)
         assertComplete(w)
         w.repair(manual = true)
         assertEquals(snapshot(w), snapshot(clean), s"crash at step $k")
         assertNoDuplicates(w)
       k += 1
-    assert(k > 6, s"only ${k - 1} steps")
-    // And once more on the stale record: nothing changes.
-    clean.record = Some(clean.intent)
-    val again = snapshot(clean).copy(_6 = None)
-    clean.repair(manual = true)
-    assertEquals(snapshot(clean), again)
+    assert(k > 8, s"only ${k - 1} steps")
   }
 
-  test("a record of 0.21.0 (no check): a readable file other than the new version is the previous one") {
-    val t = Target("imu/2026-11-10.parquet", 100, 1000)
-    assertEquals(classify(t, Some((100, 1000)), tmp = false, quarantined = false), State.Published)
-    assertEquals(classify(t, Some((40, 400)), tmp = true, quarantined = false), State.NotPublished)
-    assertEquals(classify(t, None, tmp = false, quarantined = false), State.NotPublished)
-    // No file but a tmp file: it may hold the only copy of earlier rows.
-    assertEquals(classify(t, None, tmp = true, quarantined = false), State.Unknown)
-    assertEquals(classify(t, Some((-1, 400)), tmp = false, quarantined = false), State.Unknown)
-    assertEquals(classify(t, None, tmp = false, quarantined = true), State.Quarantined)
-    val c = Check(Prev.File(40, 400), 40, 60, None, None, Nil)
-    assertEquals(classify(t.copy(check = Some(c)), Some((40, 400)), tmp = true, quarantined = false), State.NotPublished)
-    assertEquals(classify(t.copy(check = Some(c)), Some((41, 400)), tmp = true, quarantined = false), State.Unknown)
-    assertEquals(classify(t.copy(check = Some(c)), None, tmp = true, quarantined = false), State.Unknown)
-    assertEquals(classify(t.copy(check = Some(c.copy(prev = Prev.Absent))), None, tmp = true, quarantined = false), State.NotPublished)
-    assertEquals(classify(t.copy(check = Some(c.copy(prev = Prev.Absent))), Some((40, 400)), tmp = false, quarantined = false),
-      State.Unknown)
-    // Not identified: its tmp file is set aside, not deleted.
-    val w = World(Seq("imu"), Map("imu" -> Vector(r(11, "i0"))), Map("imu" -> Vector(r(100, "i100"))))
-    val legacyTarget = w.intent.files.head.copy(check = Some(c.copy(prev = Prev.Unknown)))
-    assertEquals(plan(CommitIntent(Seq(legacyTarget), Delete.Ids(Nil)), w.opsImpl).map(_.action), Seq(Action.DropTmp(setAside = true)))
-  }
-
-  test("once a repair began, recovery continues it: quarantining the last published file is not a commit to drop") {
-    val w = World(tables, old, chunk)
-    w.renamed("imu")
-    w.dest(w.path("imu")) = w.dest(w.path("imu")).copy(decodeFails = true)
-    w.tmp(w.path("gnss_raw")) = w.tmp(w.path("gnss_raw")).copy(footer = -1)
-    // Dies right after moving imu's file (begin, gnss_raw's tmp, then imu: mark, tmp, file).
-    w.crashAt = 6
+  test("once a repair began, recovery continues it: a quarantined file is not a commit to drop") {
+    def scenario() =
+      val w = World(tables, old, chunk)
+      w.renamed("imu")
+      w.dest(w.path("imu")) = w.dest(w.path("imu")).copy(decodeFails = true)
+      w.tmp(w.path("gnss_raw")) = w.tmp(w.path("gnss_raw")).copy(footer = -1)
+      w
+    // Die right after imu's file is moved.
+    val k = (1 to 30).find { k =>
+      val w = scenario()
+      w.crashAt = k
+      try { w.repair(manual = true); false }
+      catch case _: Crash => w.quarantine.contains(w.path("imu"))
+    }.get
+    val w = scenario()
+    w.crashAt = k
     intercept[Crash](w.repair(manual = true))
-    assert(w.quarantine.contains(w.path("imu")))
     assert(w.record.exists(_.repairing))
     // By the normal rules this now reads as a commit that published nothing.
+    assertEquals(w.as021, Some(Recovery.Drop))
     val disk = tables.map(t => w.path(t) -> OnDisk(w.dest.get(w.path(t)).map(f => (f.footer, f.size)),
       w.tmp.get(w.path(t)).map(f => (f.footer, f.size)))).toMap
-    assertEquals(CommitIntent.recovery(w.intent, disk), Recovery.Drop)
     assertEquals(resume(w.intent.copy(repairing = true), disk), Recovery.Stuck)
+    // And 0.21.0's drop would find no tmp file to delete: all set aside.
+    assertEquals(w.tmp.keySet.toSet, Set.empty[String])
     w.crashAt = -1
     assert(w.repair(manual = false).get.isInstanceOf[Result.Resolved])
     assertEquals(w.record, None)
     assertComplete(w)
+  }
+
+  test("0.21.0 after any step of a repair of a small table: it drops or finishes, losing nothing") {
+    // A commit of battery rows (one file; no guard: 0.21.0 reads that table
+    // on threads that do not catch the guard's exception).
+    def scenario(published: Boolean) =
+      val w = World(Seq("battery"), Map("battery" -> Vector(r(1, "b0"))), Map("battery" -> (100L until 130L).map(t => r(t, s"b$t")).toVector),
+        delete = Delete.Hot("battery", 0, 10_000, 99))
+      if published then w.renamed("battery")
+      w
+    for published <- Seq(false, true); k <- 1 to 12 do
+      val w = scenario(published)
+      val files = w.files
+      w.crashAt = k
+      val crashed = try { w.repair(manual = false); false } catch case _: Crash => true
+      if crashed then
+        // What 0.21.0 does with the record: drop (deleting tmp files, none
+        // left once moved) or finish (deleting the chunk's rows, which the
+        // published file holds); never stuck, never a tmp published.
+        w.as021 match
+          case Some(Recovery.Drop) =>
+            assert(w.tmp.isEmpty || w.trail.isEmpty, s"step $k: a tmp file 0.21.0 would delete is still there after a move")
+          case Some(Recovery.Finish(renames)) =>
+            assert(renames.isEmpty || w.trail.forall(_ == "begin"), s"step $k: 0.21.0 would publish a tmp file after a move")
+          case other => fail(s"step $k: $other")
+        assertNothingDeleted(w, files)
+        assert(!CommitIntent.encode(w.record.get).contains(CommitIntent.GuardDir))
+  }
+
+  test("a record of 0.21.0 (no check): a readable file other than the new version is the previous one") {
+    val t = Target("imu/2026-11-10.parquet", 100, 1000)
+    assertEquals(classify(t, Some((100, 1000)), quarantined = false), State.Published)
+    assertEquals(classify(t, Some((40, 400)), quarantined = false), State.NotPublished)
+    assertEquals(classify(t, None, quarantined = false), State.NotPublished)
+    assertEquals(classify(t, Some((-1, 400)), quarantined = false), State.Unknown)
+    assertEquals(classify(t, None, quarantined = true), State.Quarantined)
+    val c = Check(Prev.File(40, 400), 40, 60, None, None, Nil)
+    assertEquals(classify(t.copy(check = Some(c)), Some((40, 400)), quarantined = false), State.NotPublished)
+    assertEquals(classify(t.copy(check = Some(c)), Some((41, 400)), quarantined = false), State.Unknown)
+    assertEquals(classify(t.copy(check = Some(c)), None, quarantined = false), State.Unknown)
+    assertEquals(classify(t.copy(check = Some(c.copy(prev = Prev.Absent))), None, quarantined = false), State.NotPublished)
+    assertEquals(classify(t.copy(check = Some(c.copy(prev = Prev.Absent))), Some((40, 400)), quarantined = false), State.Unknown)
+  }
+
+  test("a record of 0.21.0 (no check): never resolved automatically when stuck; by hand only after every row is found") {
+    def legacy() =
+      val w = World(tables, old, chunk)
+      w.renamed("gnss_raw")
+      w.tmp.remove(w.path("imu"))
+      w.record = Some(w.intent.copy(files = w.intent.files.map(_.copy(check = None))))
+      w
+    val w = legacy()
+    for _ <- 1 to 2 do assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
+    assertEquals(w.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
+    // Its tmp files are out of the way (and shown: earlier rows unknown).
+    assert(w.quarantineTmp.contains(w.path("nmea")))
+    assertEquals(w.attention.get(w.path("nmea") + ".tmp"), Some(true))
+    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
+    assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
+    assertNoDuplicates(w)
+    assertComplete(w)
+    val v = legacy()
+    val f = v.dest(v.path("gnss_raw"))
+    v.dest(v.path("gnss_raw")) = f.copy(rows = f.rows.map(r => if r == chunk("gnss_raw")(7) then IndexedSeq(107L, "x") else r))
+    assert(v.repair(manual = true).get.isInstanceOf[Result.Resolved])
+    assertEquals(v.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
+    assert(v.quarantine.contains(v.path("gnss_raw")))
+  }
+
+  test("downgrade: a raw record being repaired stops 0.21.0 on its guard; a small table's record reads as before") {
+    val w = World(tables, old, chunk)
+    val marked = CommitIntent.encode(w.intent.copy(repairing = true))
+    assertEquals(CommitIntent.decode(marked), Some(w.intent.copy(repairing = true)))
+    assertEquals(id(w.intent.copy(repairing = true)), id(w.intent))
+    val (paths21, delete21) = OldDecoder.decode(marked).get
+    val tables21 = (paths21.map(_.takeWhile(_ != '/')) ++ Archive.RawTables.map(_.name))
+    assert(tables21.contains(CommitIntent.GuardDir))
+    // Its locks exist only for Archive.All: taking the guard's throws
+    // before it reads a file, deletes a tmp or removes the record.
+    val locks = Archive.All.map(t => t.name -> t).toMap
+    intercept[NoSuchElementException](tables21.distinct.sorted.foreach(locks(_)))
+    // A small table's record: the marker after the deletion, unseen by 0.21.0.
+    val hot = CommitIntent(Seq(Target("battery/2026-11-10.parquet", 31, 317)), Delete.Hot("battery", 0, 10, 9), repairing = true)
+    val text = CommitIntent.encode(hot)
+    assertEquals(CommitIntent.decode(text), Some(hot))
+    assertEquals(OldDecoder.decode(text), Some((Seq("battery/2026-11-10.parquet"), "hot")))
+  }
+
+  /** The record decoder of 0.21.0 (bce5e55, CommitIntent.decode), as it was. */
+  object OldDecoder:
+    def decode(s: String): Option[(Seq[String], String)] =
+      val lines = s.linesIterator.toVector
+      if !lines.lastOption.contains("end") then None
+      else
+        scala.util.Try {
+          val files = lines.filter(_.startsWith("file\t")).map(_.split('\t')).map(a => (a(1), a(2).toLong, a(3).toLong))
+          val d = lines.filterNot(l => l.startsWith("file\t") || l == "end").head.split("\t", -1)
+          require(Set("hot", "raw", "ids", "files")(d(0)))
+          d(0) match
+            case "hot" => (d(1), d(2).toLong, d(3).toLong, d(4).toLong)
+            case _     => ()
+          (files.map(_._1), d(0))
+        }.toOption
+
+  test("readers during an unfinished commit (rule C): the rows the new file holds are left out of SQLite, once") {
+    val battery = CommitIntent(Seq(Target("battery/2026-11-10.parquet", 31, 317)), Delete.Hot("battery", 100, 200, 9))
+    // New file in place: the chunk's rows in SQLite are left out.
+    assertEquals(exclusion(battery, _ => true), ReadExclusion(Map("battery" -> (100L, 200L, 9L)), Set.empty, raw = false))
+    // Not (or no longer) in place: SQLite is read whole.
+    assertEquals(exclusion(battery, _ => false), ReadExclusion(Map.empty, Set.empty, raw = false))
+    // A month file in place: its day files are left out.
+    val month = CommitIntent(Seq(Target("fixes/2026-10.parquet", 9, 90)), Delete.Files(Seq("fixes/2026-10-01.parquet")))
+    assertEquals(exclusion(month, _ => true).files, Set("fixes/2026-10-01.parquet"))
+    assertEquals(exclusion(month, _ => false).files, Set.empty[String])
+    // Raw lines: readers that cannot leave them out wait.
+    assert(exclusion(CommitIntent(Nil, Delete.Ids(Seq(1))), _ => true).raw)
+    // Read as the app does (archive rows ++ SQLite rows not left out): each row once.
+    val w = World(Seq("battery"), Map("battery" -> Vector(r(1, "b0"))), Map("battery" -> (100L until 130L).map(t => r(t, s"b$t")).toVector),
+      delete = Delete.Hot("battery", 100, 200, 99))
+    for published <- Seq(false, true) do
+      if published then w.renamed("battery")
+      val ex = exclusion(w.record.get, p => w.dest.get(p).exists(f => (f.footer, f.size) == (w.intent.files.head.rows, w.intent.files.head.size)))
+      val hot = w.sqlite("battery").filterNot(r => ex.hot.get("battery").exists((f, t, _) => ArchiveMerge.key(r) >= f && ArchiveMerge.key(r) < t))
+      val read = w.dest.get(w.path("battery")).map(_.rows).getOrElse(Vector.empty) ++ hot
+      assertEquals(read.size, read.distinct.size, s"published=$published")
+      assertEquals(read.toSet, (Vector(r(1, "b0")) ++ (100L until 130L).map(t => r(t, s"b$t")) :+ r(9_000, "battery-later")).toSet)
   }
 
   // --- verifying a real file -------------------------------------------------------------------
@@ -400,136 +584,6 @@ class CommitRepairSuite extends munit.FunSuite:
     assertNotEquals(id(i), id(i.copy(delete = Delete.Ids(Seq(1, 3)))))
   }
 
-  test("a published file whose rows other than the samples differ: nothing deleted, kept for the user") {
-    val w = World(tables, old, chunk)
-    w.renamed(tables*)
-    // One chunk row that is not a sample replaced by another (same time,
-    // same counts, same range): only the full comparison sees it.
-    val samples = w.intent.files.find(_.path == w.path("imu")).get.check.get.samples.map(_._1).toSet
-    val victim = chunk("imu").find(r => !samples(ArchiveMerge.key(r))).get
-    val f = w.dest(w.path("imu"))
-    w.dest(w.path("imu")) = f.copy(rows = f.rows.map(r => if r == victim then r(0).asInstanceOf[Long] +: IndexedSeq("forged") else r))
-    val steps = w.repair(manual = false).get match
-      case Result.NeedsUser(s) => s
-      case other => fail(s"$other")
-    assert(steps.exists(s => s.target.path == w.path("imu") && s.action.isInstanceOf[Action.Quarantine]), steps)
-    // Nothing changed automatically.
-    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
-    assertEquals(w.record, Some(w.intent))
-    // By hand: imu's file is quarantined (kept), its rows stay in SQLite.
-    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
-    assert(w.sqlite("imu").contains(victim))
-    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
-    assert(w.quarantine.contains(w.path("imu")))
-    assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
-  }
-
-  test("not published, previous file damaged though its footer reads, tmp good: the tmp is kept") {
-    val w = World(tables, old, chunk)
-    w.renamed("gnss_raw")
-    w.tmp.remove(w.path("nmea"))
-    // imu: the previous file's footer matches the record, its rows do not decode.
-    w.dest(w.path("imu")) = w.dest(w.path("imu")).copy(decodeFails = true)
-    val goodTmp = w.tmp(w.path("imu"))
-    val steps = w.repair(manual = false).get match
-      case Result.NeedsUser(s) => s
-      case other => fail(s"$other")
-    assertEquals(steps.find(_.target.path == w.path("imu")).map(_.state), Some(State.NotPublished))
-    assertEquals(w.tmp.get(w.path("imu")), Some(goodTmp))
-    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
-    // Both moved aside, nothing deleted; the rows stay in SQLite.
-    assertEquals(w.quarantineTmp.get(w.path("imu")), Some(goodTmp))
-    assert(w.quarantine.contains(w.path("imu")))
-    assertEquals(w.attention.get(w.path("imu")), Some(true))
-    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
-  }
-
-  test("a record of 0.21.0 (no check): never resolved automatically; by hand only after every row is found") {
-    def legacy() =
-      val w = World(tables, old, chunk)
-      w.renamed("gnss_raw")
-      w.tmp.remove(w.path("imu"))
-      w.record = Some(w.intent.copy(files = w.intent.files.map(_.copy(check = None))))
-      w
-    val w = legacy()
-    for _ <- 1 to 2 do assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
-    assertEquals(w.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
-    assert(w.tmp.contains(w.path("nmea")))
-    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
-    assertEquals(w.sqlite("gnss_raw"), Vector(r(9_000, "gnss_raw-later")))
-    // nmea: its previous version unknown, so its tmp is set aside, not deleted.
-    assert(w.quarantineTmp.contains(w.path("nmea")))
-    assertNoDuplicates(w)
-    assertComplete(w)
-    // A row of the published file differing from SQLite: nothing deleted.
-    val v = legacy()
-    val f = v.dest(v.path("gnss_raw"))
-    v.dest(v.path("gnss_raw")) = f.copy(rows = f.rows.map(r => if r == chunk("gnss_raw")(7) then IndexedSeq(107L, "x") else r))
-    assert(v.repair(manual = true).get.isInstanceOf[Result.Resolved])
-    assertEquals(v.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
-    assert(v.quarantine.contains(v.path("gnss_raw")))
-  }
-
-  test("downgrade: 0.21.0 decodes a record being repaired but stops on its guard table, keeping it") {
-    val w = World(tables, old, chunk)
-    val marked = CommitIntent.encode(w.intent.copy(repairing = true))
-    assertEquals(CommitIntent.decode(marked), Some(w.intent.copy(repairing = true)))
-    assertEquals(id(w.intent.copy(repairing = true)), id(w.intent))
-    // 0.21.0's decoder and the tables it locks (ArchiveStore.tablesOf of 0.21.0).
-    val old21 = OldDecoder.decode(marked).get
-    val tables21 = old21._1.map(_.takeWhile(_ != '/'))
-    assert(tables21.contains(CommitIntent.GuardDir))
-    // Its locks exist only for Archive.All: taking the guard's throws
-    // before it reads a file, deletes a tmp or removes the record.
-    val locks = Archive.All.map(t => t.name -> t).toMap
-    intercept[NoSuchElementException](tables21.distinct.sorted.foreach(locks(_)))
-  }
-
-  /** The record decoder of 0.21.0 (bce5e55, CommitIntent.decode), as it was. */
-  object OldDecoder:
-    def decode(s: String): Option[(Seq[String], String)] =
-      val lines = s.linesIterator.toVector
-      if !lines.lastOption.contains("end") then None
-      else
-        scala.util.Try {
-          val files = lines.filter(_.startsWith("file\t")).map(_.split('\t')).map(a => (a(1), a(2).toLong, a(3).toLong))
-          val d = lines.filterNot(l => l.startsWith("file\t") || l == "end").head.split("\t", -1)
-          require(Set("hot", "raw", "ids", "files")(d(0)))
-          (files.map(_._1), d(0))
-        }.toOption
-
-  test("finishing a commit: a tmp file with a damaged body (same count and size) never replaces the previous file") {
-    def scenario() =
-      val w = World(tables, old, chunk)
-      w.renamed("gnss_raw")
-      // imu's tmp: the right footer and size, one row changed.
-      val f = w.tmp(w.path("imu"))
-      w.tmp(w.path("imu")) = f.copy(rows = f.rows.map(r => if r == chunk("imu")(30) then IndexedSeq(130L, "zz") else r))
-      w
-    val w = scenario()
-    val oldImu = w.dest(w.path("imu"))
-    assert(w.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
-    // Automatically: nothing renamed, nothing deleted.
-    assertEquals(w.dest(w.path("imu")), oldImu)
-    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
-    assertEquals(w.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
-    // By hand: the damaged tmp is set aside; the previous file and the rows stay.
-    assert(w.repair(manual = true).get.isInstanceOf[Result.Resolved])
-    assertEquals(w.dest(w.path("imu")), oldImu)
-    assert(w.quarantineTmp.contains(w.path("imu")))
-    assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
-    // nmea's good tmp was published and its rows deleted, as gnss_raw's.
-    assertEquals(w.sqlite("nmea"), Vector(r(9_000, "nmea-later")))
-    assertNoDuplicates(w)
-    assertComplete(w)
-    // A tmp whose body fails to decode likewise.
-    val v = World(tables, old, chunk)
-    v.renamed("gnss_raw")
-    v.tmp(v.path("imu")) = v.tmp(v.path("imu")).copy(decodeFails = true)
-    assert(v.repair(manual = false).get.isInstanceOf[Result.NeedsUser])
-    assertEquals(v.dest(v.path("imu")), oldImu)
-  }
-
   test("multiset: a missing row and an extra copy of another do not cancel out; equal rows are kept once") {
     val t = Target("x", 4, 0)
     def bag(rows: Row*) =
@@ -538,19 +592,20 @@ class CommitRepairSuite extends munit.FunSuite:
       b
     val a = r(1, "a"); val b = r(2, "b"); val c = r(3, "c")
     // Expected a, b, c (and a again: equal rows, archived once).
-    assertEquals(verifyPublish(t.copy(rows = 3), 3, Iterator(a, b, c), bag(a, a, b, c)), Right(()))
+    assertEquals(verify(t.copy(rows = 3), 3, Iterator(a, b, c), None, Some(bag(a, a, b, c))), Right(()))
     // b missing, a twice: the count is right, the rows are not.
-    assert(verifyPublish(t.copy(rows = 4), 4, Iterator(a, a, a, c), bag(a, b, c)).isLeft)
-    assert(verifyPublish(t.copy(rows = 3), 3, Iterator(a, a, c), bag(a, b, c)).isLeft)
+    assert(verify(t.copy(rows = 4), 4, Iterator(a, a, a, c), None, Some(bag(a, b, c))).isLeft)
+    assert(verify(t.copy(rows = 3), 3, Iterator(a, a, c), None, Some(bag(a, b, c))).isLeft)
     // A row from nowhere.
-    assert(verifyPublish(t.copy(rows = 4), 4, Iterator(a, b, c, r(4, "d")), bag(a, b, c)).isLeft)
+    assert(verify(t.copy(rows = 4), 4, Iterator(a, b, c, r(4, "d")), None, Some(bag(a, b, c))).isLeft)
     // Repeats the sources had (an old file with a repeat, copied as stored).
-    assertEquals(verifyPublish(t.copy(rows = 4), 4, Iterator(a, a, b, c), bag(a, a, b, c)), Right(()))
+    assertEquals(verify(t.copy(rows = 4), 4, Iterator(a, a, b, c), None, Some(bag(a, a, b, c))), Right(()))
     // Published files: every chunk row at least once, repeats counted.
     val chunkBag = bag(b, b, c)
     assertEquals(verify(t.copy(rows = 3), 3, Iterator(a, b, c), Some(chunkBag)), Right(()))
     assert(verify(t.copy(rows = 2), 2, Iterator(a, b), Some(bag(b, b, c))).isLeft)
   }
+
 
   test("a cap on the rows compared: over it nothing is done automatically") {
     val small = RowBag(cap = 3)
@@ -567,4 +622,3 @@ class CommitRepairSuite extends munit.FunSuite:
     assertEquals(w.sqlite("imu").size, chunk("imu").size + 1)
     assertEquals(w.sqlite("gnss_raw").size, chunk("gnss_raw").size + 1)
   }
-

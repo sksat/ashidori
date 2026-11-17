@@ -50,8 +50,7 @@ object CommitStatus:
       case (State.Quarantined, _) => "隔離済み"
       case (State.Published, Action.Quarantine(why, _)) => s"置き換え済み・検証できない（$why）"
       case (State.NotPublished, Action.Quarantine(why, _)) => s"置き換え前・$why"
-      case (State.NotPublished, Action.DropTmp(true)) => "置き換え前（以前の版を確認できないため一時ファイルを隔離）"
-      case (State.NotPublished, _) => "置き換え前（一時ファイルは不要）"
+      case (State.NotPublished, _) => "置き換え前（行は端末内に保持）"
       case (_, Action.Quarantine(why, _)) => s"状態が不明（$why）"
       case _ => s.state.toString
     s"${s.target.path}: $what"
@@ -109,5 +108,5 @@ object Attention:
 
   /** "11/10 imu" for a path like `imu/2026-11-10.parquet`. */
   def label(e: Entry): String =
-    val name = e.path.drop(e.path.indexOf('/') + 1).stripSuffix(".parquet")
+    val name = e.path.drop(e.path.indexOf('/') + 1).stripSuffix(".tmp").stripSuffix(".parquet")
     s"${name.drop(5).replace('-', '/')} ${CommitRepair.tableOf(e.path)}"

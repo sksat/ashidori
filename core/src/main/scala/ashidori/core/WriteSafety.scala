@@ -13,6 +13,14 @@ enum WriteKind(val key: String, val label: String):
 
 object WriteKind:
   def fromKey(k: String): Option[WriteKind] = values.find(_.key == k)
+  /** A kind as kept with a stall alert: its key, or a label an earlier
+    * build kept (「位置」, 「詳細ログ」, ...).
+    */
+  def fromStored(s: String): Option[WriteKind] =
+    fromKey(s).orElse(values.find(_.label == s)).orElse(s match
+      case "詳細ログ"       => Some(RawLines)
+      case "詳細ログの区間" => Some(RawSessions)
+      case _                => None)
   /** The label of `key` (the key itself if unknown). */
   def label(key: String): String = fromKey(key).fold(key)(_.label)
 
@@ -164,8 +172,6 @@ object WriteStall:
     /** The kinds not saved when the alert was raised. */
     var kinds: Set[String] = restored.getOrElse(Set.empty)
     private var carried = restored.isDefined
-    // The state before the change `update` last returned.
-    private var before: Option[(Boolean, Set[String], Boolean)] = None
 
     /** Some(true): report the stall now; Some(false): it is over now.
       * `unsaved`: kinds not saved now; `saved`: kinds saved since the start.
@@ -174,7 +180,6 @@ object WriteStall:
                saved: Set[String] = Set.empty): Option[Boolean] =
       val stalled = noCommit || unsavedTooLong
       def savedAgain = !carried || (if kinds.isEmpty then saved.nonEmpty else kinds.subsetOf(saved))
-      before = Some((reported, kinds, carried))
       if stalled && !reported then
         reported = true
         carried = false
@@ -185,50 +190,52 @@ object WriteStall:
         carried = false
         kinds = Set.empty
         Some(false)
-      else
-        before = None
-        None
+      else None
 
-    /** The app could not carry out the change `update` just returned (post
-      * or cancel the notification, or keep its state on disk): back to the
-      * state before it, so the next update returns it again.
-      */
-    def failed(): Unit =
-      before.foreach { (r, k, c) =>
-        reported = r
-        kinds = k
-        carried = c
-      }
-      before = None
-
-  /** The alert with its side effects (the notification and its state on
-    * disk), one check at a time: a change and its rollback when an effect
-    * fails cannot interleave with another check. `raise(kinds)` and
-    * `clear()` return whether they took effect.
+  /** The alert's side effects: the notification and its state on disk.
+    * Each returns whether it took effect; a failure is made good at the
+    * next check ([[Alert.reconcile]]).
     */
-  final class Alert(val monitor: Monitor, raise: Set[String] => Boolean, clear: () => Boolean):
-    /** Some(true): raised now; Some(false): cleared now (each only when its
-      * effect worked; otherwise it is tried again at the next check).
-      * `retry`: this change was tried before and failed.
+  trait Effects:
+    def posted: Boolean
+    def post(): Boolean
+    def cancel(): Boolean
+    /** The alert kept on disk: the kinds it names while it is up. */
+    def stored: Option[Set[String]]
+    def store(state: Option[Set[String]]): Boolean
+
+  /** The alert with its side effects, one check at a time. The monitor
+    * decides whether it is up; every check then brings the notification
+    * and its state on disk to that, whatever an earlier check managed
+    * (a save that failed while the notification was posted, a cancel that
+    * failed, ...). A notification posted once since the alert was raised
+    * and then dismissed by the user is not posted again.
+    */
+  final class Alert(val monitor: Monitor, fx: Effects):
+    private var shown = false
+
+    /** Some(true): raised now; Some(false): cleared now (`onChange` is told,
+      * once per change).
       */
     def check(noCommit: Boolean, unsavedTooLong: Boolean, unsaved: Set[String], saved: Set[String])
-             (onChange: (Boolean, Boolean) => Unit = (_, _) => ()): Option[Boolean] = synchronized {
-      monitor.update(noCommit, unsavedTooLong, unsaved, saved) match
-        case Some(up) =>
-          val wasRetry = retrying
-          val ok = if up then raise(unsaved) else clear()
-          if ok then
-            retrying = false
-            onChange(up, wasRetry)
-            Some(up)
-          else
-            monitor.failed()
-            if !wasRetry then onChange(up, false)
-            retrying = true
-            None
-        case None => None
+             (onChange: Boolean => Unit = _ => ()): Option[Boolean] = synchronized {
+      val change = monitor.update(noCommit, unsavedTooLong, unsaved, saved)
+      change.foreach { up =>
+        if up then shown = false
+        onChange(up)
+      }
+      reconcile()
+      change
     }
-    private var retrying = false
+
+    /** The notification and the state on disk as the monitor says. */
+    def reconcile(): Unit = synchronized {
+      val want = Option.when(monitor.reported)(monitor.kinds)
+      if fx.stored != want then fx.store(want)
+      if want.isDefined then
+        if !shown && (fx.posted || fx.post()) then shown = true
+      else if fx.posted then fx.cancel()
+    }
 
   def queuedTooLong(unsavedSince: Option[Long], nowUptime: Long): Boolean =
     unsavedSince.exists(nowUptime - _ > OldestMs)
