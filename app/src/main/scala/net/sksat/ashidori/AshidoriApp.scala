@@ -21,10 +21,12 @@ class AshidoriApp extends Application:
     LifeLog.add(LifeKind.ProcessStart, s"記録=${if Settings.loggingEnabled then "オン" else "オフ"}")
     // A database of a newer version (the app was downgraded): nothing that
     // opens it starts; the screen and the logger say so (Db.NewerMessage).
-    AshidoriApp.newerDatabase.foreach { v =>
-      LifeLog.add(LifeKind.Note, s"データベースが新しい版（$v、この版は ${Db.Version}）のため開かない")
-      return
-    }
+    AshidoriApp.newerDatabase match
+      case Some(v) =>
+        NewerDatabase.notifyOnce(this, v)
+        return
+      // Opens again (updated): a notification an older build posted goes.
+      case None => NewerDatabase.clear(this)
     val nm = getSystemService(classOf[NotificationManager])
     nm.createNotificationChannel(
       NotificationChannel(AshidoriApp.ChannelLogging, "記録中", NotificationManager.IMPORTANCE_LOW)

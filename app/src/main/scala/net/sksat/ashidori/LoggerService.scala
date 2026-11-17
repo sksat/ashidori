@@ -117,7 +117,7 @@ class LoggerService extends Service:
         Settings.loggingEnabled = false
         stopSelf()
       case _ if AshidoriApp.newerDatabase.isDefined =>
-        LifeLog.notifyStopped(this, Db.NewerMessage)
+        NewerDatabase.notifyOnce(this, AshidoriApp.newerDatabase.get)
         stopReason = "newer-database"
         stopSelf()
         return Service.START_NOT_STICKY
@@ -697,6 +697,7 @@ object LoggerService:
     val Stop = 5
     /** The ongoing notification's ステータス. */
     val Status = 6
+    // 7: NewerDatabase.notifyOnce (a database of a newer version)
     // PendingIntent.getService
     /** The ongoing notification's 5分間 生データを記録. */
     val Burst = 1

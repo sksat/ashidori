@@ -16,6 +16,12 @@ import ashidori.core.LifeKind
 class LoggerWatchdog(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
   override def doWork(): ListenableWorker.Result =
     val c = getApplicationContext
+    // A database of a newer version: no restart, nothing that opens it, and
+    // the one notification (posted once, kept until the app is updated).
+    AshidoriApp.newerDatabase.foreach { v =>
+      NewerDatabase.notifyOnce(c, v)
+      return ListenableWorker.Result.success()
+    }
     val enabled = Settings.loggingEnabled
     val running = LoggerState.running
     LifeLog.checkState("定期確認")
