@@ -203,6 +203,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     * with the sheet raised past half it steps aside for the list.
     */
   private def liftFab(): Unit =
+    // The sheet or the button moved: what of the map is covered changed.
+    map.overlaysChanged()
     if dayOnly && view.getHeight > 0 && sheet.getTop > 0 then
       val covered = view.getHeight - sheet.getTop
       val half = (view.getHeight * 0.5).toInt

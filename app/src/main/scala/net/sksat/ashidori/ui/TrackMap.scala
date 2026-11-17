@@ -756,6 +756,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
     }
 
+  /** Views over the map moved without a layout (a sheet sliding, a button
+    * lifted): the venues read aloud are those still uncovered ([[VenueLayer.coversChanged]]).
+    */
+  def overlaysChanged(): Unit = venues.coversChanged()
+
   /** Where the camera is: centre and zoom (None before the map is ready). */
   def camera: Option[(LatLng, Double)] =
     mlMap.map(_.getCameraPosition).filter(_.target != null).map(c => (LatLng(c.target.getLatitude, c.target.getLongitude), c.zoom))

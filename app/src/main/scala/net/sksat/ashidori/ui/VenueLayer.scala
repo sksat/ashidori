@@ -314,7 +314,20 @@ final class VenueLayer(ctx: android.content.Context):
     val v = new View(ctx):
       override def dispatchHoverEvent(e: MotionEvent): Boolean = helper.dispatchHoverEvent(e) || super.dispatchHoverEvent(e)
     v.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES)
+    // Any layout in the window may move a view over the map.
+    val layout: android.view.ViewTreeObserver.OnGlobalLayoutListener = () => coversChanged()
+    v.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener:
+      override def onViewAttachedToWindow(w: View): Unit = w.getViewTreeObserver.addOnGlobalLayoutListener(layout)
+      override def onViewDetachedFromWindow(w: View): Unit = w.getViewTreeObserver.removeOnGlobalLayoutListener(layout))
     v
+
+  /** The views over the map moved or changed (a sliding sheet calls this
+    * on every frame): after [[CoversDebounceMs]] the venues are read again
+    * when asked, and a focused venue now covered loses the focus.
+    */
+  def coversChanged(): Unit =
+    main.removeCallbacks(nodesChanged)
+    if !destroyed then main.postDelayed(nodesChanged, CoversDebounceMs)
 
   private lazy val helper: ExploreByTouchHelper = new ExploreByTouchHelper(accessibilityView):
     override def getVirtualViewAt(x: Float, y: Float): Int =
@@ -367,6 +380,7 @@ object VenueLayer:
   /** Read around the view, in parts of its size on each side, so a short pan shows them at once. */
   val Margin = 0.25
   val DebounceMs = 200L
+  val CoversDebounceMs = 150L
   private val DefaultFont = "Noto Sans Regular"
   private val Empty = """{"type":"FeatureCollection","features":[]}"""
   /** Basemap layers whose labels go over the venues: POIs and place names
