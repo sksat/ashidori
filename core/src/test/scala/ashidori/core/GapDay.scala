@@ -12,7 +12,8 @@ import java.time.{LocalDate, ZoneId}
   *    5 km away: an underground ride (subway), a trip;
   *  - 20 min, 1 km, motion rows without steps (a phone on a table): 記録なし;
   *  - 20 min, 10 km, no motion rows (the phone off, at a subway's speed): 記録なし;
-  *  - 20 min, 10 km, the accelerometer recording (a tunnel): a trip.
+  *  - 20 min, 10 km, the accelerometer recording but no steps (the phone
+  *    still in a car): 記録なし (no strong evidence).
   * Stays of 30 min sit between them.
   */
 object GapDay:

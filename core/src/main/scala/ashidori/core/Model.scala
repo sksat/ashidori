@@ -191,6 +191,21 @@ final case class Trip(start: Long, end: Long, path: Vector[Fix], legs: Vector[Le
     if legs.isEmpty then TransportMode.Unknown
     else legs.maxBy(_.distanceM).mode
 
+/** A user's correction of the transport mode for `[start, end)` (the
+  * `overrides` stream). `device` and `seq` order corrections with the same
+  * `updatedAt`: the device id, then the device's change order (its
+  * `sync_rev`, which is also the order its rows are uploaded in).
+  */
+final case class ModeOverride(start: Long, end: Long, mode: TransportMode, updatedAt: Long = 0, device: String = "", seq: Long = 0)
+
+object ModeOverride:
+  /** The order in which corrections win, newest first: `updatedAt`, then the
+    * device id, then `seq`, all descending. The web viewer uses the same
+    * (`compareOverrides`). Last writer wins by the devices' clocks: a clock
+    * that is off can make an older correction win (a known limitation).
+    */
+  val newestFirst: Ordering[ModeOverride] = Ordering.by((o: ModeOverride) => (o.updatedAt, o.device, o.seq)).reverse
+
 /** A stretch without positions (記録なし) where the user went from `from` to
   * `to` but nothing says how: the phone was off, recording stopped, or the
   * signal was lost for long. Neither a stay nor a trip; it is shown as such

@@ -1,0 +1,66 @@
+{
+ "rows": [
+  {
+   "s": 1791241300000,
+   "e": 1791241795000,
+   "mode": "IN_BUS",
+   "updatedAt": 100,
+   "device": "dev-b",
+   "seq": 1
+  },
+  {
+   "s": 1791241300000,
+   "e": 1791241795000,
+   "mode": "IN_PASSENGER_VEHICLE",
+   "updatedAt": 100,
+   "device": "dev-a",
+   "seq": 7
+  },
+  {
+   "s": 1791252600000,
+   "e": 1791253030000,
+   "mode": "IN_BUS",
+   "updatedAt": 100,
+   "device": "dev-a",
+   "seq": 2
+  },
+  {
+   "s": 1791252600000,
+   "e": 1791253030000,
+   "mode": "IN_PASSENGER_VEHICLE",
+   "updatedAt": 100,
+   "device": "dev-a",
+   "seq": 5
+  },
+  {
+   "s": 1791255060000,
+   "e": 1791255295000,
+   "mode": "IN_TRAIN",
+   "updatedAt": 200,
+   "device": "dev-a",
+   "seq": 1
+  },
+  {
+   "s": 1791255060000,
+   "e": 1791255295000,
+   "mode": "IN_PASSENGER_VEHICLE",
+   "updatedAt": 100,
+   "device": "dev-b",
+   "seq": 9
+  }
+ ],
+ "expected": [
+  {
+   "start": 1791241300000,
+   "mode": "IN_BUS"
+  },
+  {
+   "start": 1791252600000,
+   "mode": "IN_PASSENGER_VEHICLE"
+  },
+  {
+   "start": 1791255060000,
+   "mode": "IN_TRAIN"
+  }
+ ]
+}

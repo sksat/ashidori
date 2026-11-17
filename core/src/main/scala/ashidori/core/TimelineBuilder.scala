@@ -269,7 +269,7 @@ object TimelineBuilder:
     val roughTime = iv.filter(i => i.gap || i.poor).map(_.dt).sum
     val silentTime = iv.filter(_.silent).map(_.dt).sum
     (Leg(start, end, mode, dist, m.steps, conf, mx, med, if dur > 0 then roughTime.toDouble / dur else 0.0),
-      isUnrecorded(mode, silentTime, dur, phoneOn = f.hasMotion, walked = walked(m.steps, m.cadence)))
+      isUnrecorded(mode, silentTime, dur, walked = walked(m.steps, m.cadence)))
 
   /** Steps that say the user walked: enough of them, at a walking rate
     * while the accelerometer was recording. Motion rows alone (a phone on
@@ -280,39 +280,43 @@ object TimelineBuilder:
   val MinWalkSteps = 30
   val MinWalkCadence = 10.0
 
-  /** A leg that is mostly a long silence is 記録なし, unless something besides
-    * its two ends says how the user moved. The speed between the ends alone
-    * is not enough: a phone switched off in a car gives a subway's speed too.
+  /** A leg that is mostly a long silence (15 min or more without a
+    * position while the place changed) is 記録なし unless there is strong
+    * evidence of how the user moved:
     *  - on foot: steps counted meanwhile ([[walked]]);
-    *  - in a vehicle (an underground ride, a tunnel): the accelerometer
-    *    recording meanwhile (`phoneOn`), so only positions were missing;
-    *  - a flight: its speed, which nothing else on the ground reaches.
-    * A low-confidence mode with such evidence stays a trip (shown as estimated).
+    *  - a flight: its speed, which nothing else reaches.
+    * The speed between the two ends is no evidence for anything else (a
+    * phone switched off in a car gives a subway's speed), and neither are
+    * motion rows (a phone lying still in a car records them too). A long
+    * underground ride is therefore 記録なし: honest, if less precise.
     */
-  def isUnrecorded(mode: TransportMode, silentMs: Long, durationMs: Long, phoneOn: Boolean, walked: Boolean): Boolean =
+  def isUnrecorded(mode: TransportMode, silentMs: Long, durationMs: Long, walked: Boolean): Boolean =
     silentMs > 0 && silentMs * 2 >= durationMs && (mode match
-      case TransportMode.Unknown                         => true
       case TransportMode.Flying                          => false
       case TransportMode.Walking | TransportMode.Running => !walked
-      case _                                             => !phoneOn)
+      case _                                             => true)
 
-  /** A user correction applies to a leg if they overlap by more than half;
-    * the first match wins (callers list the newest first). A correction to
-    * the inferred mode itself (取り消し) leaves the leg as built, so it is not
-    * marked [[Leg.corrected]] and keeps its confidence.
+  /** A user correction applies to every leg it overlaps by more than half
+    * (also when the legs were cut differently since it was saved); of
+    * several, the one first in [[ModeOverride.newestFirst]] wins. A
+    * correction to the inferred mode itself (取り消し) leaves the leg as
+    * built, so it is not marked [[Leg.corrected]] and keeps its confidence.
     */
-  def applyOverrides(segs: Vector[Segment], os: Seq[(Long, Long, TransportMode)]): Vector[Segment] =
+  def applyOverrides(segs: Vector[Segment], os: Seq[ModeOverride]): Vector[Segment] =
     if os.isEmpty then segs
-    else segs.map {
-      case t: Trip => t.copy(legs = t.legs.map(l => applyOverride(l, os)))
-      case s       => s
-    }
+    else
+      val ordered = os.sorted(using ModeOverride.newestFirst)
+      segs.map {
+        case t: Trip => t.copy(legs = t.legs.map(l => applyOverride(l, ordered)))
+        case s       => s
+      }
 
-  def applyOverride(l: Leg, os: Seq[(Long, Long, TransportMode)]): Leg =
-    os.find { (s, e, _) =>
-      val ov = math.min(e, l.end) - math.max(s, l.start)
+  /** `ordered`: newest first ([[ModeOverride.newestFirst]]). */
+  private def applyOverride(l: Leg, ordered: Seq[ModeOverride]): Leg =
+    ordered.find { o =>
+      val ov = math.min(o.end, l.end) - math.max(o.start, l.start)
       ov > (l.end - l.start) / 2
-    }.fold(l)((_, _, m) => if m == l.mode then l else l.copy(mode = m, confidence = 1.0, inferred = Some(l.mode)))
+    }.fold(l)(o => if o.mode == l.mode then l else l.copy(mode = o.mode, confidence = 1.0, inferred = Some(l.mode)))
 
   private def weightedQuantile(sorted: IndexedSeq[(Double, Long)], q: Double): Double =
     val total = sorted.map(_._2).sum.toDouble

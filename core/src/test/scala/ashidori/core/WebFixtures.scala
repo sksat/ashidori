@@ -137,7 +137,7 @@ object WebFixtures:
     // One correction, as in the overrides stream: the first vehicle leg.
     val firstVehicle = built.collect { case t: Trip => t.legs }.flatten.find(_.mode.isVehicle)
     val overrides = firstVehicle.toVector.map(l => (l.start, l.end, TransportMode.Car))
-    val corrected = TimelineBuilder.applyOverrides(built, overrides)
+    val corrected = TimelineBuilder.applyOverrides(built, overrides.map((s, e, m) => ModeOverride(s, e, m)))
     val segs = Stats.splitByDay(corrected, Zone).getOrElse(Date, Vector.empty)
     val dayStart = Date.atStartOfDay(Zone).toInstant.toEpochMilli
     val dayEnd = Date.plusDays(1).atStartOfDay(Zone).toInstant.toEpochMilli
@@ -176,6 +176,23 @@ object WebFixtures:
     )))
 
     // --- One palette: the modes' labels and colours, and the other line colours
+    // --- Which correction wins: equal timestamps, two devices ----------------
+    val gapLegs = gapSegs.collect { case t: Trip => t.legs }.flatten.filter(_.mode != TransportMode.Still)
+    val orderRows = gapLegs.take(3).zipWithIndex.flatMap { (l, i) =>
+      val (s, e) = (l.start, l.end)
+      i match
+        case 0 => Seq(ModeOverride(s, e, TransportMode.Bus, 100, "dev-b", 1), ModeOverride(s, e, TransportMode.Car, 100, "dev-a", 7))
+        case 1 => Seq(ModeOverride(s, e, TransportMode.Bus, 100, "dev-a", 2), ModeOverride(s, e, TransportMode.Car, 100, "dev-a", 5))
+        case _ => Seq(ModeOverride(s, e, TransportMode.Train, 200, "dev-a", 1), ModeOverride(s, e, TransportMode.Car, 100, "dev-b", 9))
+    }
+    val chosen = TimelineBuilder.applyOverrides(gapSegs, orderRows).collect { case t: Trip => t.legs }.flatten
+    write(dir, "override-order.json", ujson.write(ujson.Obj(
+      "rows" -> ujson.Arr.from(orderRows.map(o => ujson.Obj("s" -> num(o.start), "e" -> num(o.end), "mode" -> o.mode.key,
+        "updatedAt" -> num(o.updatedAt), "device" -> o.device, "seq" -> num(o.seq)))),
+      "expected" -> ujson.Arr.from(gapLegs.take(3).map(l => ujson.Obj("start" -> num(l.start),
+        "mode" -> chosen.find(_.start == l.start).get.mode.key)))
+    ), indent = 1))
+
     write(dir, "palette.json", ujson.write(ujson.Obj(
       "modes" -> ujson.Arr.from(TransportMode.values.toSeq.map(m =>
         ujson.Obj("key" -> m.key, "label" -> m.label, "emoji" -> m.emoji, "color" -> m.color, "vehicle" -> m.isVehicle))),

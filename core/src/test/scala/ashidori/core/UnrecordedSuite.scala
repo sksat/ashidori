@@ -14,8 +14,9 @@ class UnrecordedSuite extends munit.FunSuite:
 
   test("hours without a position while the place changed are one Unrecorded segment") {
     val us = segs.collect { case u: Unrecorded => u }
-    // The phone off for 3 hours, motion rows without steps, the phone off at a subway's speed.
-    assertEquals(us.size, 3, segs.mkString("\n"))
+    // The phone off for 3 hours, motion rows without steps, the phone off at a
+    // subway's speed, the phone still in a car.
+    assertEquals(us.size, 4, segs.mkString("\n"))
     val u = us.maxBy(_.durationMs)
     assertEqualsDouble(u.durationMs / 60_000.0, 180.0, 0.5)
     assertEqualsDouble(u.displacementM, 20_000.0, 300.0)
@@ -24,8 +25,8 @@ class UnrecordedSuite extends munit.FunSuite:
     assert(!legs(segs).exists(_.mode == TransportMode.Unknown))
   }
 
-  test("a silence with the accelerometer recording stays a trip (a tunnel)") {
-    assert(legs(segs).exists(l => l.mode.isVehicle && l.durationMs >= 19 * 60_000L && l.distanceM > 9_000), legs(segs).mkString("\n"))
+  test("a long silence is never a vehicle leg, whatever the accelerometer recorded") {
+    assert(!legs(segs).exists(l => l.mode.isVehicle && l.durationMs >= 19 * 60_000L), legs(segs).mkString("\n"))
   }
 
   test("a silence with steps counted stays a trip (walking)") {
@@ -49,17 +50,15 @@ class UnrecordedSuite extends munit.FunSuite:
   test("isUnrecorded: evidence of the mode keeps a trip") {
     import TransportMode.*
     val h = 3_600_000L
-    def un(m: TransportMode, silent: Long, dur: Long, phoneOn: Boolean = false, walked: Boolean = false) =
-      TimelineBuilder.isUnrecorded(m, silent, dur, phoneOn, walked)
-    assert(un(Unknown, 3 * h, 3 * h, phoneOn = true, walked = true))
+    def un(m: TransportMode, silent: Long, dur: Long, walked: Boolean = false) =
+      TimelineBuilder.isUnrecorded(m, silent, dur, walked)
+    assert(un(Unknown, 3 * h, 3 * h, walked = true))
     assert(un(Walking, h, h))
-    // Motion rows without steps (a phone on a table) are not a walk.
-    assert(un(Walking, h, h, phoneOn = true))
-    assert(!un(Walking, h, h, phoneOn = true, walked = true))
-    // The speed between the ends alone does not make a subway ride: a phone off in a car gives it too.
+    assert(!un(Walking, h, h, walked = true))
+    // Strong evidence only: the speed between the ends makes no subway or car ride.
     assert(un(Subway, h, h))
     assert(un(Car, h, h))
-    assert(!un(Subway, h, h, phoneOn = true))
+    assert(un(Train, h, h, walked = true))
     assert(!un(Flying, 3 * h, 3 * h))
     // Mostly recorded: a trip, however it was classified.
     assert(!un(Bus, h / 4, h))
@@ -98,11 +97,22 @@ class UnrecordedSuite extends munit.FunSuite:
     assertEquals(unrecorded(out).size, 1, out.mkString("\n"))
   }
 
-  test("a tunnel or subway ride with sparse fixes and the phone recording stays a trip") {
-    // 20 min, 10 km between fixes; the accelerometer was on all along.
+  test("the phone still in a car (motion rows, no steps) is unrecorded") {
+    // 20 min, 10 km between fixes; the accelerometer recorded all along.
     val out = silenceDay(20 * 60_000L, 10_000, (a, b) => tenSecondRows(a, b, 0, 0.4f))
-    assertEquals(unrecorded(out).size, 0, out.mkString("\n"))
-    assert(legs(out).exists(l => l.mode.isVehicle && l.durationMs >= 19 * 60_000L), legs(out).mkString("\n"))
+    assertEquals(unrecorded(out).size, 1, out.mkString("\n"))
+  }
+
+  test("a long subway ride with sparse fixes is unrecorded; a short one stays a trip") {
+    assertEquals(unrecorded(silenceDay(25 * 60_000L, 12_000, (a, b) => tenSecondRows(a, b, 0, 0.2f))).size, 1)
+    val short = silenceDay(8 * 60_000L, 5_000, (a, b) => tenSecondRows(a, b, 0, 0.2f))
+    assertEquals(unrecorded(short).size, 0)
+    assert(legs(short).exists(_.mode == TransportMode.Subway), legs(short).mkString("\n"))
+  }
+
+  test("sensors off while travelling is unrecorded") {
+    // 40 min, 3 km: walking pace, but no motion rows at all.
+    assertEquals(unrecorded(silenceDay(40 * 60_000L, 3_000, (_, _) => Nil)).size, 1)
   }
 
   test("the phone switched off while travelling at a subway's speed is unrecorded") {
@@ -167,7 +177,7 @@ class UnrecordedSuite extends munit.FunSuite:
   test("a correction back to the inferred mode (取り消し) leaves the leg as built") {
     val l = legs(segs).find(_.mode == TransportMode.Subway).get
     // Changed to train, then taken back by a newer correction for the same leg.
-    val os = Seq((l.start, l.end, TransportMode.Subway), (l.start, l.end, TransportMode.Train))
+    val os = Seq(ModeOverride(l.start, l.end, TransportMode.Train, updatedAt = 1), ModeOverride(l.start, l.end, TransportMode.Subway, updatedAt = 2))
     val got = legs(TimelineBuilder.applyOverrides(segs, os)).find(_.start == l.start).get
     assertEquals(got, l)
     assert(!got.corrected)
@@ -192,15 +202,27 @@ class UnrecordedSuite extends munit.FunSuite:
       // Edited from this day: saved for the whole leg.
       val clipped = walkOn(day, days)
       assert(clipped.whole.isDefined)
-      val corrected = Stats.splitByDay(TimelineBuilder.applyOverrides(built, Seq((clipped.wholeStart, clipped.wholeEnd, TransportMode.Running))), zone)
+      val corrected = Stats.splitByDay(TimelineBuilder.applyOverrides(built, Seq(ModeOverride(clipped.wholeStart, clipped.wholeEnd, TransportMode.Running))), zone)
       for other <- Seq(d.minusDays(1), d) do
         assertEquals(legs(corrected(other)).find(_.start == walkOn(other, days).start).map(_.mode), Some(TransportMode.Running), s"edited on $day, shown on $other")
+  }
+
+  test("corrections win by updatedAt, then device id, then the device's change order") {
+    val l = legs(segs).find(_.mode == TransportMode.Subway).get
+    def winner(os: ModeOverride*) =
+      legs(TimelineBuilder.applyOverrides(segs, os.toVector)).find(_.start == l.start).get.mode
+    val (s, e) = (l.start, l.end)
+    assertEquals(winner(ModeOverride(s, e, TransportMode.Bus, 5), ModeOverride(s, e, TransportMode.Car, 4)), TransportMode.Bus)
+    assertEquals(winner(ModeOverride(s, e, TransportMode.Bus, 5, "a"), ModeOverride(s, e, TransportMode.Car, 5, "b")), TransportMode.Car)
+    assertEquals(winner(ModeOverride(s, e, TransportMode.Bus, 5, "a", 9), ModeOverride(s, e, TransportMode.Car, 5, "a", 3)), TransportMode.Bus)
+    // The order given does not matter.
+    assertEquals(winner(ModeOverride(s, e, TransportMode.Car, 5, "a", 3), ModeOverride(s, e, TransportMode.Bus, 5, "a", 9)), TransportMode.Bus)
   }
 
   test("a mode correction marks the leg corrected") {
     val t = segs.collect { case t: Trip => t }.find(_.legs.exists(_.mode == TransportMode.Subway)).get
     val l = t.legs.find(_.mode == TransportMode.Subway).get
-    val out = TimelineBuilder.applyOverrides(segs, Seq((l.start, l.end, TransportMode.Train)))
+    val out = TimelineBuilder.applyOverrides(segs, Seq(ModeOverride(l.start, l.end, TransportMode.Train)))
     val got = legs(out).find(_.start == l.start).get
     assertEquals(got.mode, TransportMode.Train)
     assert(got.corrected)
