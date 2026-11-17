@@ -252,6 +252,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       t.setTypeface(null, if m == chosen then android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
     modeInfo.setText(modeText(chosen))
     modeMeasured.setText(EnergyUi.modeLine(chosen))
+    modeMeasured.setVisibility(if Settings.showEstimates then View.VISIBLE else View.GONE)
 
   private def selectMode(m: LoggingMode): Unit =
     if Settings.mode != m then
@@ -315,7 +316,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     unobserve = LoggerState.observe(() => refresh())
     peers.onShow()
     paintModes()
-    EnergyStats.load(_ => modeMeasured.setText(EnergyUi.modeLine(Settings.mode)))
+    if Settings.showEstimates then EnergyStats.load(_ => modeMeasured.setText(EnergyUi.modeLine(Settings.mode)))
     refresh()
     panel.onShow()
     sensorPanel.onShow()

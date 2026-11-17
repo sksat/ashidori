@@ -46,6 +46,39 @@ class FixQualitySuite extends munit.FunSuite:
     assert(FixQuality.describe(r).contains("gnss.screenOff: interval=30.0s"))
   }
 
+  test("a week of 1 Hz fixes streams through in fixed memory") {
+    // 3 million fixes (five weeks at 1 Hz), made one at a time: none is kept.
+    val spans = Seq(EnergySpan(0, 3_000_000_000L, st.copy(screenOn = false)))
+    val a = FixQuality.Aggregator(spans, Nil)
+    def used() =
+      val rt = Runtime.getRuntime
+      System.gc()
+      rt.totalMemory - rt.freeMemory
+    val before = used()
+    var i = 0L
+    while i < 3_000_000L do
+      a.add(Fix(i * 1000L, 35.0, 139.0, (3 + i % 7).toFloat, provider = if i % 10 == 0 then "fused" else "gps"))
+      i += 1
+    val grown = used() - before
+    // Holding the fixes would take hundreds of MB.
+    assert(grown < 32L * 1024 * 1024, s"heap grew by ${grown / 1024 / 1024} MB")
+    val r = a.result
+    assertEqualsDouble(r(Source.Gnss, false).get.intervalS, 1.0, 0.05)
+    assertEquals(r(Source.Gnss, false).get.intervals, 2_699_999)
+    assertEqualsDouble(r(Source.Network, false).get.intervalS, 10.0, 0.4)
+    assertEqualsDouble(r(Source.Gnss, false).get.accuracyM, 6.0, 0.25)
+  }
+
+  test("the streaming median is exact for equal values and within its bin otherwise") {
+    val m = FixQuality.StreamMedian()
+    Seq(5.0, 5.0, 5.0).foreach(m.add)
+    assertEquals(m.median, 5.0)
+    val n = FixQuality.StreamMedian()
+    (1 to 1001).foreach(i => n.add(i.toDouble))
+    assertEqualsDouble(n.median, 501.0, 501 * 0.03)
+    assert(FixQuality.StreamMedian().median.isNaN)
+  }
+
   test("not enough data") {
     val r = FixQuality.analyse(fixes(0, 3 * Min, 10_000, 5f), Seq(EnergySpan(0, 3 * Min, st)), Nil)
     assert(r.cells.values.forall(_.isEmpty))

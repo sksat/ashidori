@@ -31,19 +31,53 @@ object FixQuality:
   private val MaxGapMs = 10 * 60_000L
   private val ReadingMaxAgeMs = 10 * 60_000L
 
-  private def median(v: Seq[Double]): Double =
-    if v.isEmpty then Double.NaN
-    else
-      val s = v.sorted
-      if s.size % 2 == 1 then s(s.size / 2) else (s(s.size / 2 - 1) + s(s.size / 2)) / 2
+  /** A median over a stream in fixed memory: log-spaced bins over
+    * [`lo`, `hi`] (about 3 % wide), each with its count and sum. The median
+    * is the mean of the values in the bin that holds it: exact when they
+    * are all equal, within the bin's width otherwise.
+    */
+  final class StreamMedian(lo: Double = 0.01, hi: Double = 1e6, bins: Int = 512):
+    private val counts = new Array[Long](bins)
+    private val sums = new Array[Double](bins)
+    private val logLo = math.log(lo)
+    private val scale = bins / (math.log(hi) - logLo)
+    var n = 0L
+    def add(v: Double): Unit =
+      if !v.isNaN then
+        val i = ((math.log(math.max(v, lo)) - logLo) * scale).toInt.max(0).min(bins - 1)
+        counts(i) += 1
+        sums(i) += v
+        n += 1
+    def median: Double =
+      if n == 0 then Double.NaN
+      else
+        val target = (n - 1) / 2
+        var cum = 0L
+        var i = 0
+        while cum + counts(i) <= target do
+          cum += counts(i)
+          i += 1
+        sums(i) / counts(i)
 
-  def analyse(fixes: Seq[Fix], spans: Seq[EnergySpan], readings: Seq[BatteryReading]): Result =
-    val sp = spans.filter(_.ms > 0).sortBy(_.start).toIndexedSeq
-    val rd = readings.sortBy(_.time).toIndexedSeq
-    var si = 0
-    var ri = 0
+  /** The analysis over fixes fed in time order ([[add]]), in fixed memory
+    * whatever their number: per source and screen state, three
+    * [[StreamMedian]]s. The spans and readings (days of them) are held.
+    */
+  final class Aggregator(spans: Seq[EnergySpan], readings: Seq[BatteryReading]):
+    private val sp = spans.filter(_.ms > 0).sortBy(_.start).toIndexedSeq
+    private val rd = readings.sortBy(_.time).toIndexedSeq
+    private var si = 0
+    private var ri = 0
+    private final class Group:
+      val iv = StreamMedian()
+      val acc = StreamMedian()
+      val rq = StreamMedian()
+    private val groups = (for s <- Source.values.toSeq; on <- Seq(true, false) yield (s, on) -> Group()).toMap
+    private val last = scala.collection.mutable.Map.empty[Source, (Long, Boolean)]
+    private var lastTime = Long.MinValue
+
     /** (screen on, charging, requested interval ms or -1) at time t; fixes come in time order. */
-    def stateAt(t: Long): Option[(Boolean, Boolean, Long)] =
+    private def stateAt(t: Long): Option[(Boolean, Boolean, Long)] =
       while si < sp.size && sp(si).end <= t do si += 1
       if si < sp.size && sp(si).start <= t then
         val s = sp(si).state
@@ -51,25 +85,31 @@ object FixQuality:
       else
         while ri + 1 < rd.size && rd(ri + 1).time <= t do ri += 1
         rd.lift(ri).filter(r => r.time <= t && t - r.time <= ReadingMaxAgeMs).map(r => (r.screenOn, r.charging, -1L))
-    val groups = scala.collection.mutable.Map.empty[(Source, Boolean), (Vector[Double], Vector[Double], Vector[Double])]
-      .withDefaultValue((Vector.empty, Vector.empty, Vector.empty))
-    val last = scala.collection.mutable.Map.empty[Source, (Long, Boolean)]
-    for f <- fixes.sortBy(_.time); src <- sourceOf(f.provider) do
-      stateAt(f.time) match
-        case Some((screen, false, req)) =>
-          val k = (src, screen)
-          val (iv, acc, rq) = groups(k)
-          val gap = last.get(src).collect { case (t, s) if s == screen && f.time > t && f.time - t <= MaxGapMs => f.time - t }
-          groups(k) = (
-            gap.fold(iv)(iv :+ _ / 1000.0),
-            if f.hasAccuracy then acc :+ f.accuracy.toDouble else acc,
-            if req > 0 then rq :+ req / 1000.0 else rq)
-          last(src) = (f.time, screen)
-        case _ => last.remove(src)
-    Result((for s <- Source.values.toSeq; on <- Seq(true, false) yield
-      val (iv, acc, rq) = groups((s, on))
-      (s, on) -> Option.when(iv.size >= MinIntervals)(Cell(iv.size, median(iv), acc.size, median(acc), median(rq)))
-    ).toMap)
+
+    /** The next fix; one out of time order is left out. */
+    def add(f: Fix): Unit =
+      if f.time >= lastTime then
+        lastTime = f.time
+        for src <- sourceOf(f.provider) do
+          stateAt(f.time) match
+            case Some((screen, false, req)) =>
+              val g = groups((src, screen))
+              last.get(src).collect { case (t, s) if s == screen && f.time > t && f.time - t <= MaxGapMs => f.time - t }
+                .foreach(gap => g.iv.add(gap / 1000.0))
+              if f.hasAccuracy then g.acc.add(f.accuracy.toDouble)
+              if req > 0 then g.rq.add(req / 1000.0)
+              last(src) = (f.time, screen)
+            case _ => last.remove(src)
+
+    def result: Result =
+      Result(groups.map { case (k, g) =>
+        k -> Option.when(g.iv.n >= MinIntervals)(Cell(g.iv.n.toInt, g.iv.median, g.acc.n.toInt, g.acc.median, g.rq.median))
+      })
+
+  def analyse(fixes: Seq[Fix], spans: Seq[EnergySpan], readings: Seq[BatteryReading]): Result =
+    val a = Aggregator(spans, readings)
+    fixes.sortBy(_.time).foreach(a.add)
+    a.result
 
   def describe(r: Result): String =
     (for s <- Source.values.toSeq; on <- Seq(true, false) yield

@@ -397,9 +397,34 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   private def once[A](table: String, xs: Vector[A])(row: A => IndexedSeq[Any]): Vector[A] =
     if AshidoriApp.archive.dedupe(table) then CommitRepair.distinctRows(xs)(row) else xs
 
+  /** Every position in [from, to) to `out` in time order, a day at a time
+    * and a row group or a page of SQLite at a time: memory stays flat
+    * however many there are (a week at 1 Hz is 600,000).
+    */
+  def foreachFix(from: Long, to: Long)(out: Fix => Unit): Unit =
+    val zone = AshidoriApp.zone
+    var d = java.time.Instant.ofEpochMilli(from).atZone(zone).toLocalDate
+    def startOf(x: java.time.LocalDate) = x.atStartOfDay(zone).toInstant.toEpochMilli
+    while startOf(d) < to do
+      val (a, b) = (math.max(from, startOf(d)), math.min(to, startOf(d.plusDays(1))))
+      AshidoriApp.archive.reading(Archive.Fixes) {
+        val (archived, close) = AshidoriApp.archive.stream(Archive.Fixes, a, b)
+        try
+          // Rule C: rows of an unfinished commit whose file is checked are
+          // left out of SQLite; equal rows from both are kept once (merge).
+          val (x, xa) = notPending("fixes")
+          val hot = ArchiveMerge.pages(a, at =>
+            query(s"SELECT rowid,$fixCols FROM fixes WHERE time>=? AND time<? AND (time>? OR (time=? AND rowid>?))$x ORDER BY time, rowid LIMIT 5000",
+              (Seq[Any](math.max(a, at.time), b, at.time, at.time, at.rowid) ++ xa)*)(c => (c.getLong(0), fixOf(c, 1))),
+            (r: (Long, Fix)) => ArchiveMerge.Cursor(r._2.time, r._1)).flatten.map(r => Archive.fixRow(r._2).toIndexedSeq)
+          ArchiveMerge.merge(archived, hot, r => out(Archive.fixOf(r)))
+        finally close()
+      }
+      d = d.plusDays(1)
+
   def hotFixes(from: Long, to: Long): Vector[Fix] =
     val (x, xa) = notPending("fixes")
-    query(s"SELECT $fixCols FROM fixes WHERE time>=? AND time<?$x ORDER BY time", (Seq(from, to) ++ xa)*)(fixOf)
+    query(s"SELECT $fixCols FROM fixes WHERE time>=? AND time<?$x ORDER BY time", (Seq(from, to) ++ xa)*)(fixOf(_))
 
   def lastFix(): Option[Fix] = AshidoriApp.archive.reading(Archive.Fixes) {
     hotLastFix().orElse(AshidoriApp.archive.lastRow(Archive.Fixes).map(Archive.fixOf))
@@ -407,12 +432,12 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   private def hotLastFix(): Option[Fix] =
     val (x, xa) = notPending("fixes")
-    query(s"SELECT $fixCols FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*)(fixOf).headOption
+    query(s"SELECT $fixCols FROM fixes WHERE 1$x ORDER BY time DESC LIMIT 1", xa*)(fixOf(_)).headOption
 
   private val fixCols = "time,lat,lon,acc,alt,speed,bearing,provider,sats,alt_acc,msl,msl_acc"
-  private def fixOf(c: Cursor): Fix =
-    Fix(c.getLong(0), c.getDouble(1), c.getDouble(2), flt(c, 3), dbl(c, 4), flt(c, 5), flt(c, 6), c.getString(7), c.getInt(8),
-      flt(c, 9), dbl(c, 10), flt(c, 11))
+  private def fixOf(c: Cursor, at: Int = 0): Fix =
+    Fix(c.getLong(at), c.getDouble(at + 1), c.getDouble(at + 2), flt(c, at + 3), dbl(c, at + 4), flt(c, at + 5), flt(c, at + 6),
+      c.getString(at + 7), c.getInt(at + 8), flt(c, at + 9), dbl(c, at + 10), flt(c, at + 11))
 
   def insertPressure(ps0: Iterable[PressureSample]): Unit = tx { db =>
     val ps = ps0.filter(p => kept(p.time))

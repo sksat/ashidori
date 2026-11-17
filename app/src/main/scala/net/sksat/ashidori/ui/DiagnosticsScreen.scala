@@ -37,6 +37,11 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private val energy = EnergyPanel()
   /** Positioning with the screen on and off (also in the copied report). */
   private val fixQuality = FixQualityPanel()
+  /** The estimates are experimental: off unless switched on here. */
+  private val estimatesSwitch = switchRow("推定の表示（試験中）", Settings.showEstimates) { b =>
+    Settings.showEstimates = b
+    showEstimates()
+  }
 
   private val debuggable =
     (act.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -112,6 +117,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
             else Nil
           ))*
         ),
+        listGroup(estimatesSwitch),
         energy.view,
         fixQuality.view,
         recording,
@@ -133,16 +139,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     sections("permissions") = permissions()
     sections("scala") = scalaSelfTest()
     sections("db") = AshidoriApp.db.counts().toSeq.sorted.map((k, v) => s"$k=$v").mkString(" ")
-    sections(s"energy (last ${EnergyStats.Days} days)") = "computing"
-    sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = "computing"
     render()
-    EnergyStats.load { a =>
-      energy.show(a.energy)
-      fixQuality.show(a.fixes)
-      sections(s"energy (last ${EnergyStats.Days} days)") = EnergyModel.describe(a.energy)
-      sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = FixQuality.describe(a.fixes)
-      render()
-    }
+    showEstimates()
     AshidoriApp.io.execute(() =>
       val r = simE2E()
       act.runOnUiThread(() =>
@@ -152,6 +150,28 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         render()
       )
     )
+
+  /** The estimate panels and their report sections, when switched on. */
+  private def showEstimates(): Unit =
+    val on = Settings.showEstimates
+    energy.view.setVisibility(if on then View.VISIBLE else View.GONE)
+    fixQuality.view.setVisibility(if on then View.VISIBLE else View.GONE)
+    if !on then
+      sections.remove(s"energy (last ${EnergyStats.Days} days)")
+      sections.remove(s"fixes by screen (last ${EnergyStats.Days} days, medians)")
+      render()
+    else
+      sections(s"energy (last ${EnergyStats.Days} days)") = "computing"
+      sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = "computing"
+      render()
+      EnergyStats.load { a =>
+        if Settings.showEstimates then
+          energy.show(a.energy)
+          fixQuality.show(a.fixes)
+          sections(s"energy (last ${EnergyStats.Days} days)") = EnergyModel.describe(a.energy)
+          sections(s"fixes by screen (last ${EnergyStats.Days} days, medians)") = FixQuality.describe(a.fixes)
+          render()
+      }
 
   override def onHide(): Unit = ticker.removeCallbacks(tick)
 

@@ -86,6 +86,13 @@ object Settings:
     if b && !loggingEnabled then e.putLong("enabledSince", System.currentTimeMillis())
     e.apply()
 
+  /** Show the estimates from this device's records (battery use by what
+    * the logger does, positioning by screen state): experimental, off until
+    * they are verified on real devices. Recording does not depend on it.
+    */
+  def showEstimates: Boolean = prefs.getBoolean("showEstimates", false)
+  def showEstimates_=(b: Boolean): Unit = prefs.edit().putBoolean("showEstimates", b).apply()
+
   /** When recording was last switched on (0 if unknown). */
   def loggingSince: Long = prefs.getLong("enabledSince", 0L)
 

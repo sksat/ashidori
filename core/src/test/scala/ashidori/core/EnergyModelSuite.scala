@@ -36,7 +36,7 @@ class EnergyModelSuite extends munit.FunSuite:
     * Returns (readings, spans).
     */
   private def synth(days: Int, seed: Long, counterMissing: Double = 0.0, counterNoiseUah: Double = 2000,
-      spikes: Int = 0): (Vector[BatteryReading], Vector[EnergySpan]) =
+      spikes: Int = 0, activeOnlyWithGnss: Boolean = false): (Vector[BatteryReading], Vector[EnergySpan]) =
     val rnd = Random(seed)
     val spans = Vector.newBuilder[EnergySpan]
     for d <- 0 until days do
@@ -54,7 +54,8 @@ class EnergyModelSuite extends munit.FunSuite:
             val motion = if ms <= 5_000 then "Vehicle" else "OnFoot"
             (quiet.copy(gnss = true, gnssIntervalMs = ms, provider = "gps", still = false, screenOn = rnd.nextDouble() < 0.25,
               motion = motion, env = "Outdoor"), (10 + rnd.nextInt(50)) * Min)
-          else if u < 0.88 then (quiet.copy(still = false, motion = "OnFoot", env = "Indoor"), (10 + rnd.nextInt(20)) * Min)
+          else if u < 0.88 then
+            (if activeOnlyWithGnss then quiet else quiet.copy(still = false, motion = "OnFoot", env = "Indoor"), (10 + rnd.nextInt(20)) * Min)
           else (quiet.copy(gnss = true, gnssIntervalMs = 1_000, provider = "gps", detail = true), (1 + rnd.nextInt(4)) * Min)
         val e = math.min(end, t + dur)
         spans += EnergySpan(t, e, st)
@@ -102,6 +103,24 @@ class EnergyModelSuite extends munit.FunSuite:
     assertNear("detail", f.detail.perHour, DetailX, 1.5)
     for (c, v) <- GnssX do assertNear(s"gnss ${c.key}", f.gnss(c).perHour, v, 0.25 * v)
     assert(f.baseline.ok && f.screen.ok && f.gnss.values.forall(_.ok), f.toString)
+  }
+
+  test("terms always on together are not identifiable, and not shown however small their error") {
+    // Motion detection only ever with GNSS: only their sums are in the data.
+    val (rs, sp) = synth(7, 1, activeOnlyWithGnss = true)
+    val f = EnergyModel.fit(rs, sp).toOption.get
+    assert(!f.active.identifiable, f.active.toString)
+    assert(!f.active.ok)
+    assert(f.gnss.values.forall(c => !c.identifiable && !c.ok), f.gnss.toString)
+    // Terms the data does separate still are.
+    assert(f.baseline.identifiable && f.screen.identifiable && f.baseline.ok && f.screen.ok)
+    val rep = EnergyModel.analyse(rs, sp)
+    assert(rep.recordingPerDay.left.exists(_.contains("推定不可")), rep.recordingPerDay.toString)
+    assert(EnergyModel.describe(rep).contains("active+=not identifiable"))
+    // With motion detection also on its own (the usual data), all of them are.
+    val (rs2, sp2) = synth(7, 1)
+    val g = EnergyModel.fit(rs2, sp2).toOption.get
+    assert(g.active.identifiable && g.gnss.values.forall(_.identifiable), g.toString)
   }
 
   test("falls back to percentages where the counter is missing") {

@@ -9,7 +9,9 @@ import Ui.*
 
 /** The energy analysis ([[EnergyModel]]) and the positioning by screen state
   * ([[FixQuality]]) of the last days, computed off the main thread and kept
-  * for a few minutes.
+  * for a few minutes. Only while [[Settings.showEstimates]] is on. The
+  * positions stream through ([[Db.foreachFix]], [[FixQuality.Aggregator]]):
+  * the logger's process never holds the week's fixes.
   */
 object EnergyStats:
   val Days = 7
@@ -35,8 +37,9 @@ object EnergyStats:
             val r = scala.util.Try {
               val from = now - Days * 86_400_000L
               val (readings, spans) = AshidoriApp.db.energyData(from, now)
-              Analysis(EnergyModel.analyse(readings, spans),
-                FixQuality.analyse(AshidoriApp.db.fixes(from, now), spans, readings))
+              val fq = FixQuality.Aggregator(spans, readings)
+              AshidoriApp.db.foreachFix(from, now)(fq.add)
+              Analysis(EnergyModel.analyse(readings, spans), fq.result)
             }
             main.post { () =>
               loading = false
@@ -54,11 +57,11 @@ object EnergyStats:
 object EnergyUi:
   def pct(d: Double): String = if d >= 10 then f"$d%.0f" else f"$d%.1f"
 
-  /** The measured line under a mode's description. */
+  /** The estimated line under a mode's description. */
   def modeLine(m: LoggingMode): String =
     EnergyStats.cached match
-      case None    => "実測: 算出中"
-      case Some(r) => r.modePerDay(m).fold(why => s"実測: —（$why）", d => s"実測: 記録による消費 1日 約${pct(d)}%")
+      case None    => "観測からの推定: 算出中"
+      case Some(r) => r.modePerDay(m).fold(why => s"観測からの推定: —（$why）", d => s"観測からの推定: 記録による消費 1日 約${pct(d)}%")
 
 /** What the battery went to over the last week: what recording adds
   * (「記録による消費」) and what the whole phone uses (「端末全体の消費」), in
@@ -84,9 +87,9 @@ final class EnergyPanel(using c: Ctx):
   private val data = mk("データ")
 
   val view: View = vbox(
-    sectionHeader(s"記録による消費（直近${EnergyStats.Days}日の実測）"),
+    sectionHeader(s"記録による消費（直近${EnergyStats.Days}日・観測からの推定）"),
     listGroup(recording, gnss, detail, active),
-    sectionHeader(s"端末全体の消費（直近${EnergyStats.Days}日の実測）"),
+    sectionHeader(s"端末全体の消費（直近${EnergyStats.Days}日・観測からの推定）"),
     listGroup(standby, screen, data)
   )
 
@@ -97,7 +100,8 @@ final class EnergyPanel(using c: Ctx):
   private def hours(h: Double) = if h < 10 then f"$h%.1f時間分" else f"$h%.0f時間分"
 
   private def coef(r: ListRow, c: Coef, value: Double => String, sub: String, what: String): Unit =
-    if c.ok then set(r, value(c.perHour), sub)
+    if !c.perHour.isNaN && !c.identifiable then set(r, "推定不可", "他の消費と分離できない")
+    else if c.ok then set(r, value(c.perHour), sub)
     else if c.perHour.isNaN || c.hours < c.needHours || c.windows < 3 then set(r, "—", s"データ不足（$what${hours(c.hours)}）")
     else set(r, "—", s"精度不足（$what${hours(c.hours)}）")
 
@@ -113,7 +117,8 @@ final class EnergyPanel(using c: Ctx):
         val okClasses = GnssClass.values.toSeq.filter(c => f.gnss(c).ok)
         if okClasses.isEmpty then
           val h = f.gnss.values.map(_.hours).sum
-          set(gnss, "—", s"データ不足（GNSS ${hours(h)}）")
+          if f.gnss.values.exists(c => !c.perHour.isNaN && !c.identifiable) then set(gnss, "推定不可", "他の消費と分離できない")
+          else set(gnss, "—", s"データ不足（GNSS ${hours(h)}）")
         else
           val h = okClasses.map(c => f.gnss(c).hours).sum
           val mean = okClasses.map(c => f.gnss(c).perHour * f.gnss(c).hours).sum / h

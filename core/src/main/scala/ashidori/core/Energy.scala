@@ -127,10 +127,21 @@ object EnergyModel:
 
   /** One fitted term: % per hour of exposure, its standard error, the hours
     * of exposure behind it and the number of windows that had any.
+    * `independence`: the share of the term's exposure (weighted) that the
+    * other terms do not explain, 1 - R² of its column on the others. Near 0,
+    * the data cannot tell the term from the others (it was always on
+    * together with them): its value is not identifiable, whatever its
+    * standard error says.
     */
-  final case class Coef(perHour: Double, se: Double, hours: Double, windows: Int, needHours: Double):
-    /** Enough exposure, and precise enough to state (± no more than half the value, or 0.5 %/h). */
-    def ok: Boolean = !perHour.isNaN && hours >= needHours && windows >= 3 && !(se > math.max(0.5 * perHour, 0.5))
+  final case class Coef(perHour: Double, se: Double, hours: Double, windows: Int, needHours: Double,
+                        independence: Double = 1.0):
+    def identifiable: Boolean = independence >= MinIndependence
+    /** Identifiable, enough exposure, and precise enough to state (± no more than half the value, or 0.5 %/h). */
+    def ok: Boolean =
+      !perHour.isNaN && identifiable && hours >= needHours && windows >= 3 && !(se > math.max(0.5 * perHour, 0.5))
+
+  /** Below this [[Coef.independence]] (variance inflation over 100) a term is not identifiable. */
+  val MinIndependence = 0.01
 
   final case class Fit(
       baseline: Coef,
@@ -332,9 +343,15 @@ object EnergyModel:
       val inv = invert(q)
       val se = Array.fill(P)(Double.NaN)
       for (k, j) <- free.zipWithIndex do se(k) = math.sqrt(math.max(0, sigma2 * inv(j)(j)))
+      // 1 - R² of each column on the others: 1 / (G⁻¹_kk G_kk). The tiny
+      // ridge of `invert` makes an exactly dependent column come out near 0
+      // instead of failing.
+      val indep = Array.fill(P)(Double.NaN)
+      for (k, j) <- free.zipWithIndex if q(j)(j) > 0 do indep(k) = math.min(1.0, 1.0 / (inv(j)(j) * q(j)(j)))
       def coef(k: Int) =
         val h = if k == Base then ws.map(_.quiet).sum else x.map(_(k)).sum
-        Coef(if present(k) then beta(k) else Double.NaN, se(k), h, x.count(_(k) > 0), minHours(k))
+        Coef(if present(k) then beta(k) else Double.NaN, se(k), h, x.count(_(k) > 0), minHours(k),
+          if indep(k).isNaN then 0.0 else indep(k))
       val counterHours = ws.filter(_.counter).map(_.hours).sum
       Right(Fit(coef(Base), coef(Screen), coef(Active), coef(Detail), GnssClass.values.map(c => c -> coef(gnssIx(c))).toMap,
         n, hours, if counterHours >= hours / 2 then Source.Counter else Source.Percent, cap.fold(Double.NaN)(_ / 1000),
@@ -434,7 +451,8 @@ object EnergyModel:
   private def cost(f: Fit, hoursPerDay: Int => Double): Either[String, Double] =
     val terms = (Active +: Detail +: GnssClass.values.toSeq.map(gnssIx)).filter(k => hoursPerDay(k) > 0.02)
     terms.find(k => !f.coef(k).ok) match
-      case Some(k) => Left(s"${termLabel(k)}の実測が不足")
+      case Some(k) if !f.coef(k).identifiable => Left(s"${termLabel(k)}は推定不可")
+      case Some(k) => Left(s"${termLabel(k)}の観測が不足")
       case None    => Right(terms.map(k => f.coef(k).perHour * hoursPerDay(k)).sum)
 
   private def recording(f: Fit, u: Usage): Either[String, Double] =
@@ -483,7 +501,8 @@ object EnergyModel:
     val b = Seq.newBuilder[String]
     def c(name: String, x: Coef, unit: String = "%/h") =
       if x.perHour.isNaN then s"$name=n/a (no exposure)"
-      else f"$name=${x.perHour}%.3f$unit ±${x.se}%.3f (${x.hours}%.1fh, ${x.windows} windows${if x.ok then "" else ", not enough"})"
+      else if !x.identifiable then f"$name=not identifiable (independence ${x.independence}%.4f, ${x.hours}%.1fh)"
+      else f"$name=${x.perHour}%.3f$unit ±${x.se}%.3f (${x.hours}%.1fh, ${x.windows} windows, independence ${x.independence}%.3f${if x.ok then "" else ", not enough"})"
     r.fit match
       case Left(ne) => b += f"fit=none (${ne.reason}; usable ${ne.hours}%.1fh)"
       case Right(f) =>
