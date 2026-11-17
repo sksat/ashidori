@@ -2,7 +2,7 @@ package net.sksat.ashidori
 
 import android.database.sqlite.{SQLiteDatabaseLockedException, SQLiteException}
 import android.os.SystemClock
-import java.io.{File, FileOutputStream}
+import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.Executors
 import scala.util.Try
@@ -181,22 +181,16 @@ object LoggerWrites:
     def spill(lines: Seq[(Long, String)]): Unit = synchronized {
       ArchiveStore.ensureDir(dir)
       seq += 1
-      val f = File(dir, f"raw-${System.currentTimeMillis()}%013d-$seq%06d.txt")
-      val tmp = File(f.getPath + ".tmp")
-      val out = FileOutputStream(tmp)
-      try
-        val sb = StringBuilder()
-        for (t, l) <- lines do sb.append(t).append('\t').append(l).append('\n')
-        out.write(sb.toString.getBytes(UTF_8))
-        out.getFD.sync()
-      finally out.close()
-      if !tmp.renameTo(f) then throw java.io.IOException(s"rename to $f failed")
-      ArchiveStore.syncDir(dir)
+      val sb = StringBuilder()
+      for (t, l) <- lines do sb.append(t).append('\t').append(l).append('\n')
+      // Completed only by the rename (never written again): see OverflowFiles.
+      OverflowFiles.write(dir.toPath, f"raw-${System.currentTimeMillis()}%013d-$seq%06d.txt", sb.toString.getBytes(UTF_8),
+        d => ArchiveStore.syncDir(d.toFile))
     }
 
     /** Imports overflow files while the queue is short (on the write thread). */
     def importSome(pending: () => Long): Unit =
-      val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(".txt")).sortBy(_.getName)
+      val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(OverflowFiles.Completed)).sortBy(_.getName)
       // A backup holds the lock while it copies the database: the import waits
       // for the next commit then, the logger's writes never wait for it.
       for f <- files.take(20) if pending() < WriteBacklog.MaxRawRows / 2 && lock.tryLock() do

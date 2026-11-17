@@ -6,7 +6,7 @@ import java.io.{BufferedOutputStream, File, FileInputStream}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.zip.{CRC32, Deflater, ZipEntry, ZipOutputStream}
 import scala.util.{Try, Using}
-import ashidori.core.Archive
+import ashidori.core.{Archive, BackupManifest, OverflowFiles}
 
 /** 「バックアップを書き出す」: the recorded data in one ZIP file the user
   * picks (release builds are not debuggable and `adb backup` skips apps for
@@ -43,7 +43,9 @@ import ashidori.core.Archive
   * repair quarantined, and the list of them.
   *
   * Every ZIP ends with `manifest.txt`: SHA-256, size and name of every
-  * other entry as written.
+  * other entry as written ([[BackupManifest]]); an overflow `.tmp` (a spill
+  * not completed, see [[OverflowFiles]]) is taken as it is and marked
+  * `partial` there.
   */
 object Backup:
   /** Free space kept for the logger while a backup runs (hours of 全力ログ). */
@@ -110,6 +112,9 @@ object Backup:
     // no copy takes room. (Hard links would do as well, but an app may not
     // make them on Android.)
     def add(name: String, f: File): Unit = opened += ((name, f, FileInputStream(f)))
+    // Entries taken as they were while they may be being written: marked
+    // `partial` in the manifest, never presented as consistent.
+    val partial = scala.collection.mutable.Set.empty[String]
     def walk(f: File): Seq[File] =
       if f.isDirectory then Option(f.listFiles()).toSeq.flatten.sortBy(_.getName).flatMap(walk)
       else if f.isFile then Seq(f)
@@ -127,14 +132,14 @@ object Backup:
         overflow.lock.lock()
         try
           db.snapshotTo(snapshot)
-          // A spill's `.tmp` (rescue only) is taken when it is a minute old:
-          // left by a process that died, not one being written (the logger
-          // is never made to wait for a backup).
-          val now = System.currentTimeMillis()
-          for f <- walk(overflow.dir)
-              if f.getName.endsWith(".txt") || rescue && f.getName.endsWith(".tmp") && now - f.lastModified() > 60_000L do
-            if f.getName.endsWith(".txt") then add("files/overflow/" + under(overflow.dir, f), f)
-            else Try(add("files/overflow/" + under(overflow.dir, f), f))
+          // Completed spill files never change (OverflowFiles): consistent
+          // copies. A `.tmp` may be being written (the logger never waits
+          // for a backup) or left by a process that died: taken as it is,
+          // marked partial. One gone since the listing is skipped.
+          for f <- walk(overflow.dir); p <- OverflowFiles.inBackup(f.getName) do
+            val name = "files/overflow/" + under(overflow.dir, f)
+            if p then Try { add(name, f); partial += name }
+            else add(name, f)
         finally overflow.lock.unlock()
         // Files a repair quarantined are kept whole (they may hold the only
         // copy of some rows); the rescue takes everything as it is.
@@ -167,7 +172,7 @@ object Backup:
       val buf = new Array[Byte](1 << 16)
       val manifest = StringBuilder()
       def note(name: String, bytes: Long, sha: java.security.MessageDigest): Unit =
-        manifest.append(sha.digest().map(b => f"${b & 0xff}%02x").mkString).append("  ").append(bytes).append("  ").append(name).append('\n')
+        manifest.append(BackupManifest.line(sha.digest().map(b => f"${b & 0xff}%02x").mkString, bytes, name, partial(name)))
       Using.resource(c.getContentResolver.openOutputStream(uri, "wt")) { raw =>
         val zip = ZipOutputStream(BufferedOutputStream(raw, 1 << 16))
         zip.setLevel(Deflater.BEST_SPEED)
@@ -245,10 +250,11 @@ object Backup:
             s"""databases/ashidori.db: SQLite, a consistent copy (VACUUM INTO)
                |files/archive/<table>/<YYYY-MM[-DD]>.parquet: archived days and months
                |files/overflow/raw-*.txt: raw lines not in the database yet (time TAB line)
+               |files/overflow/raw-*.txt.tmp: such a file not completed (being written, or its writer died): partial
                |""".stripMargin) +
             s"""files/archive/quarantine/<commit>/<table>/<file>: files a repair moved aside (may hold the only copy of some rows; Parquet, or `.tmp`: a new version that was not published)
                |files/lifecycle.log: lifecycle log (no positions)
-               |manifest.txt: SHA-256, size and name of every other entry
+               |manifest.txt: SHA-256, size and name of every other entry; `partial` after the name: taken as it was while it may have been being written, not a consistent copy
                |""".stripMargin + (if !rescue then "" else
             s"""files/archive/**/*.tmp: new versions written by an unfinished archive commit
                |files/maintenance/commit: the unfinished commit's record (files to replace, rows to delete)
