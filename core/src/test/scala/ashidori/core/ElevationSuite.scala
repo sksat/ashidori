@@ -1,6 +1,5 @@
 package ashidori.core
 
-import java.io.ByteArrayOutputStream
 import ashidori.core.parquet.*
 import Elevation.Source
 
@@ -196,23 +195,26 @@ class ElevationSuite extends munit.FunSuite:
   }
 
   test("archive: new fix columns and pressure round-trip; old files read with NaN") {
-    def write(cols: Seq[Column], rows: Seq[Seq[Any]]): ParquetReader.Table =
-      val bo = ByteArrayOutputStream()
-      val w = ParquetWriter(bo, cols)
+    def write(cols: Seq[Column], rows: Seq[Seq[Any]]): java.io.File =
+      val f = java.io.File.createTempFile("elevation", ".parquet")
+      f.deleteOnExit()
+      val w = ParquetWriter(java.io.FileOutputStream(f), cols)
       rows.foreach(w.write)
       w.close()
-      ParquetReader.read(bo.toByteArray)
+      f
+    def conform(t: Archive.TableDef, f: java.io.File): Vector[IndexedSeq[Any]] =
+      scala.util.Using.resource(Archive.open(t, f.getPath))(_.rowIterator.toVector)
     val f = Fix(T0, 35.1, 139.2, 4f, 80.5, 1f, 90f, "gps", altAccuracy = 3f, msl = 41.25, mslAccuracy = 3.5f)
     val g = Fix(T0 + 1000, 35.1, 139.2, 30f, provider = "fused")
-    val back = Archive.conform(Archive.Fixes, write(Archive.Fixes.columns, Seq(f, g).map(Archive.fixRow))).map(Archive.fixOf).toVector
+    val back = conform(Archive.Fixes, write(Archive.Fixes.columns, Seq(f, g).map(Archive.fixRow))).map(Archive.fixOf).toVector
     assertEquals(back.map(_.toString), Vector(f, g).map(_.toString))
-    // A schema-2 file: the first eight columns only.
+    // A file of schema 1 or 2: the first eight columns only.
     val old = write(Archive.Fixes.columns.take(8), Seq(Archive.fixRow(f).take(8)))
-    val o = Archive.conform(Archive.Fixes, old).map(Archive.fixOf).toVector.head
+    val o = conform(Archive.Fixes, old).map(Archive.fixOf).toVector.head
     assertEquals(o.altitude, 80.5)
     assert(o.msl.isNaN && o.mslAccuracy.isNaN && o.altAccuracy.isNaN)
     val ps = Seq(PressureSample(T0, 1001.25f), PressureSample(T0 + 5000, 1001.5f))
-    val pb = Archive.conform(Archive.Pressure, write(Archive.Pressure.columns, ps.map(Archive.pressureRow))).map(Archive.pressureOf).toVector
+    val pb = conform(Archive.Pressure, write(Archive.Pressure.columns, ps.map(Archive.pressureRow))).map(Archive.pressureOf).toVector
     assertEquals(pb, ps.toVector)
     assert(Archive.SignalTables.contains(Archive.Pressure))
   }

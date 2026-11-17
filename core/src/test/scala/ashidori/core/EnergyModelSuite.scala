@@ -182,11 +182,12 @@ class EnergyModelSuite extends munit.FunSuite:
   test("battery files of schema 1 read with nulls in the new columns") {
     val old = Seq(Column("time", ColType.Int64), Column("pct", ColType.Int32), Column("charging", ColType.Int32),
       Column("screen_on", ColType.Int32), Column("mode", ColType.Str))
-    val bo = ByteArrayOutputStream()
-    val w = ParquetWriter(bo, old)
+    val f = java.io.File.createTempFile("battery", ".parquet")
+    f.deleteOnExit()
+    val w = ParquetWriter(java.io.FileOutputStream(f), old)
     w.write(Seq(1000L, 80, 0, 1, "balanced"))
     w.close()
-    val rows = Archive.conform(Archive.Battery, ParquetReader.read(bo.toByteArray)).toVector
+    val rows = scala.util.Using.resource(Archive.open(Archive.Battery, f.getPath))(_.rowIterator.toVector)
     assertEquals(rows.head.size, Archive.Battery.columns.size)
     val b = Archive.batteryOf(rows.head)
     assertEquals((b.time, b.pct, b.charging, b.screenOn, b.mode), (1000L, 80, false, true, "balanced"))

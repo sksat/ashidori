@@ -26,12 +26,11 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   override def onCreate(db: SQLiteDatabase): Unit =
     Seq(
-      """CREATE TABLE fixes(time INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, acc REAL, alt REAL,
-        |speed REAL, bearing REAL, provider TEXT, sats INTEGER)""".stripMargin,
+      DbSchema.CreateFixes,
       "CREATE INDEX fixes_time ON fixes(time)",
       "CREATE TABLE motion(start INTEGER NOT NULL, end INTEGER NOT NULL, std REAL, mean REAL, steps INTEGER, src TEXT)",
       "CREATE INDEX motion_start ON motion(start)",
-      "CREATE TABLE battery(time INTEGER NOT NULL, pct INTEGER, charging INTEGER, screen_on INTEGER, mode TEXT, plan TEXT)",
+      DbSchema.CreateBattery,
       "CREATE INDEX battery_time ON battery(time)",
       """CREATE TABLE places(id INTEGER PRIMARY KEY AUTOINCREMENT, lat REAL, lon REAL, radius REAL, name TEXT,
         |kind TEXT, external_id TEXT, city TEXT, country TEXT, area TEXT, updated_at INTEGER)""".stripMargin,
@@ -53,35 +52,22 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     addEnergy(db)
     addElevation(db)
 
-  /** Vertical accuracy and MSL altitude of fixes, and barometric pressure
-    * ([[Elevation]]). Only adds what is missing.
-    */
-  private def addElevation(db: SQLiteDatabase): Unit =
-    val existing = Using.resource(db.rawQuery("PRAGMA table_info(fixes)", null)) { c =>
+  private def columns(db: SQLiteDatabase, table: String): Set[String] =
+    Using.resource(db.rawQuery(s"PRAGMA table_info($table)", null)) { c =>
       val names = Set.newBuilder[String]
       while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
       names.result()
     }
-    Seq("alt_acc", "msl", "msl_acc").filterNot(existing).foreach(c => db.execSQL(s"ALTER TABLE fixes ADD COLUMN $c REAL"))
-    db.execSQL("CREATE TABLE IF NOT EXISTS pressure(time INTEGER NOT NULL, hpa REAL NOT NULL)")
-    db.execSQL("CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)")
 
-  /** Battery readings beyond the percentage, and the logger's state spans
-    * ([[EnergyState]]), for the energy analysis. The open span (the current
-    * state) has a NULL end until the state changes.
+  /** Version 7: battery readings beyond the percentage, and the logger's
+    * state spans ([[EnergyState]]). Only adds what is missing.
     */
-  private def addEnergy(db: SQLiteDatabase): Unit =
-    val existing = Using.resource(db.rawQuery("PRAGMA table_info(battery)", null)) { c =>
-      val names = Set.newBuilder[String]
-      while c.moveToNext() do names += c.getString(c.getColumnIndexOrThrow("name"))
-      names.result()
-    }
-    Seq("charge_uah INTEGER", "current_avg_ua INTEGER", "current_now_ua INTEGER", "voltage_mv INTEGER", "temp_c REAL", "plug TEXT")
-      .filterNot(c => existing(c.takeWhile(_ != ' '))).foreach(c => db.execSQL(s"ALTER TABLE battery ADD COLUMN $c"))
-    db.execSQL("""CREATE TABLE IF NOT EXISTS energy_state(start INTEGER NOT NULL, end INTEGER, gnss INTEGER,
-      |gnss_interval_ms INTEGER, provider TEXT, detail INTEGER, still INTEGER, screen_on INTEGER, charging INTEGER,
-      |mode TEXT, eff_mode TEXT, motion TEXT, env TEXT)""".stripMargin)
-    db.execSQL("CREATE INDEX IF NOT EXISTS energy_state_start ON energy_state(start)")
+  private def addEnergy(db: SQLiteDatabase): Unit = DbSchema.toV7(columns(db, "battery")).foreach(db.execSQL)
+
+  /** Version 8: vertical accuracy and MSL altitude of fixes, and barometric
+    * pressure ([[Elevation]]). Only adds what is missing.
+    */
+  private def addElevation(db: SQLiteDatabase): Unit = DbSchema.toV8(columns(db, "fixes")).foreach(db.execSQL)
 
   /** Rowids of the archived tables are never reused ([[claimRowids]]), and
     * the import of pre-Parquet text logs records its progress. Created on
@@ -300,10 +286,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * one for `next` from `end`, if given. One transaction.
     *
     * A span is closed by deleting its open row and inserting the closed
-    * one(s), never by an update: archiving deletes the closed rows of a day
-    * up to the largest rowid at its start ([[maxRowids]]), so a row closed
-    * while it runs must get a new rowid above that, or it would be deleted
-    * without having been archived.
+    * one(s) with new rowids, never by an update ([[DbSchema.archivable]]).
     */
   def switchEnergyState(end: Long, next: Option[EnergyState]): Unit = tx { db =>
     for (rowid, span) <- openEnergy() do
@@ -748,18 +731,18 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Whether any archived table still holds rows of [from, to) in SQLite. */
   def hasHotRows(from: Long, to: Long): Boolean =
     Db.ArchivedTables.exists { (t, col) =>
-      query(s"SELECT EXISTS(SELECT 1 FROM $t WHERE $col>=? AND $col<? AND ${Db.archivable(t)})", from, to)(_.getInt(0)).head == 1
+      query(s"SELECT EXISTS(SELECT 1 FROM $t WHERE $col>=? AND $col<? AND ${DbSchema.archivable(t)})", from, to)(_.getInt(0)).head == 1
     }
 
   /** Rows of an archived table in [from, to) up to `maxRowid`. */
   def countArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
     val col = Db.ArchivedTables(table)
-    query(s"SELECT COUNT(*) FROM $table WHERE $col>=? AND $col<? AND rowid<=? AND ${Db.archivable(table)}", from, to, maxRowid)(_.getLong(0)).head
+    query(s"SELECT COUNT(*) FROM $table WHERE $col>=? AND $col<? AND rowid<=? AND ${DbSchema.archivable(table)}", from, to, maxRowid)(_.getLong(0)).head
 
   /** Deletes rows of an archived table in [from, to) up to `maxRowid`. */
   def deleteArchived(table: String, from: Long, to: Long, maxRowid: Long): Long =
     val col = Db.ArchivedTables(table)
-    deleteChunked(table, s"$col>=? AND $col<? AND rowid<=? AND ${Db.archivable(table)}", Seq(from, to, maxRowid))
+    deleteChunked(table, s"$col>=? AND $col<? AND rowid<=? AND ${DbSchema.archivable(table)}", Seq(from, to, maxRowid))
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
     val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, Db.DeleteChunk))
@@ -776,7 +759,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Earliest time still held in SQLite for an archived table (None if empty). */
   def oldestHot(): Option[Long] =
     Db.ArchivedTables.toSeq.flatMap((t, col) =>
-      query(s"SELECT MIN($col) FROM $t WHERE ${Db.archivable(t)}")(c => if c.isNull(0) then None else Some(c.getLong(0))).head)
+      query(s"SELECT MIN($col) FROM $t WHERE ${DbSchema.archivable(t)}")(c => if c.isNull(0) then None else Some(c.getLong(0))).head)
       .minOption
 
   /** Rows of one archived table in [from, to) up to `maxRowid`, typed as in
@@ -806,7 +789,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         }
       // Closed spans only: the open one is archived once it is closed.
       case Archive.EnergyStates =>
-        query(s"SELECT $energyCols FROM energy_state WHERE ${Db.archivable("energy_state")} AND start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
+        query(s"SELECT $energyCols FROM energy_state WHERE ${DbSchema.archivable("energy_state")} AND start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
           args*) { c =>
           Archive.energyRow(energyOf(c, 0, c.getLong(1)))
         }
@@ -1042,11 +1025,6 @@ object Db:
   val ArchivedTables: Map[String, String] = scala.collection.immutable.ListMap(
     "fixes" -> "time", "motion" -> "start", "battery" -> "time", "gnss_status" -> "time", "energy_state" -> "start",
     "pressure" -> "time", "raw_lines" -> "time")
-
-  /** Which rows of an archived table archiving takes (an SQL condition): all
-    * but the open span of `energy_state`, which stays until it is closed.
-    */
-  def archivable(table: String): String = if table == "energy_state" then "end IS NOT NULL" else "1"
 
   /** Rows per DELETE when archiving: short write transactions. */
   val DeleteChunk = 5000

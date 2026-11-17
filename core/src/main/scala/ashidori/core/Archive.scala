@@ -29,8 +29,8 @@ object Archive:
   val Motion = TableDef("motion", Seq(
     Column("start", Int64), Column("end", Int64), Column("std", Float32), Column("mean", Float32), Column("steps", Int32)))
   /** Battery readings. The columns after `mode` were added in schema 2
-    * (after app 0.20.0); files written before have only the first five, and
-    * [[conform]] reads them with nulls there. Currents are discharge-positive
+    * (after app 0.21.0); files written before have only the first five, and
+    * [[open]] reads them with nulls there. Currents are discharge-positive
     * µA (see [[BatteryReading]]); `temp_c` is °C; `plug` is none, ac, usb,
     * wireless or dock.
     */
@@ -94,26 +94,39 @@ object Archive:
 
   /** Tables built from raw lines (kind = first CSV field). */
   val RawTables: Seq[TableDef] = Seq(GnssRaw, GnssSat, GnssNav, Nmea, Imu, GnssFix)
-  /** Tables kept in SQLite until their day is archived (small, uploaded on any network). */
+  /** Tables kept in SQLite until their day is archived (one row per
+    * reading or span), merged into month files.
+    */
   val SignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus, EnergyStates, Pressure)
+  /** Signal tables the sync uploads (small stream). `energy_state` and
+    * `pressure` stay on the device.
+    */
+  val UploadedSignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus)
   val All: Seq[TableDef] = SignalTables ++ RawTables
 
-  /** Version of the archive layout. 2 added the battery columns after `mode`
-    * and the `energy_state` table; 3 the elevation columns of `fixes` and
-    * the `pressure` table. Readers match columns by name, so older files
-    * read with nulls in the newer columns.
+  /** Version of the archive layout. 1: up to app 0.21.0. 2 added the
+    * battery columns after `mode` and the `energy_state` table; 3 the
+    * elevation columns of `fixes` and the `pressure` table. Columns are
+    * only ever added, at the end, and files do not record the version: a
+    * file's columns tell its layout, and [[open]] reads them by name.
     */
   val SchemaVersion = 3
 
-  /** Rows of a file in the column order of `t`, matched by name: a column
-    * the file lacks (written by an older version) reads as null, and one `t`
-    * no longer has is dropped.
+  /** An archive file of `t` with its rows in `t`'s columns, matched by name
+    * and type: a column the file lacks (written before the column was
+    * added) reads as null.
+    *
+    * `whole`: the file is to be rewritten (merged with new rows), so every
+    * column it has must be one of `t`'s; a file with a column this version
+    * does not know (written by a newer version) is refused, as rewriting it
+    * would drop that column's values.
     */
-  def conform(t: TableDef, file: ashidori.core.parquet.ParquetReader.Table): Iterator[IndexedSeq[Any]] =
-    if file.columns.map(_.name) == t.colNames then file.rowIterator
-    else
-      val arrays = t.columns.map(c => file.data.get(c.name).filter(_ => file.columns.exists(f => f.name == c.name && f.tpe == c.tpe))).toIndexedSeq
-      Iterator.range(0, file.rows).map(i => arrays.map(_.fold(null: Any)(_(i))))
+  def open(t: TableDef, path: String, whole: Boolean = false): ParquetReader.FileReader =
+    val r = ParquetReader.open(path, t.columns)
+    if whole && r.dropped.nonEmpty then
+      r.close()
+      throw IllegalStateException(s"$path has columns ${r.dropped.map(_.name).mkString(", ")} that ${t.name} does not have")
+    r
 
   /** Which raw table a line belongs to. */
   def tableFor(kind: String): Option[TableDef] = kind match

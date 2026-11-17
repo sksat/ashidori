@@ -116,9 +116,18 @@ object ParquetReader:
 
   /** A file opened for reading one row group at a time: memory stays at
     * about one group however large the file is.
+    *
+    * Rows come in [[columns]]: the columns asked for when it was opened, or
+    * else the file's own. A column asked for that the file does not have
+    * (by name and type) reads as null; a column of the file not asked for
+    * is left out ([[dropped]]).
     */
-  final class FileReader private[ParquetReader] (raf: RandomAccessFile, val meta: Meta) extends AutoCloseable:
-    def columns: Seq[Column] = meta.columns
+  final class FileReader private[ParquetReader] (raf: RandomAccessFile, val meta: Meta, as: Seq[Column]) extends AutoCloseable:
+    val columns: Seq[Column] = if as.isEmpty then meta.columns else as
+    /** Rows come as stored: row groups can be copied as they are ([[rawGroup]]). */
+    val asStored: Boolean = columns == meta.columns
+    /** Columns of the file that rows leave out. */
+    def dropped: Seq[Column] = meta.columns.filterNot(columns.contains)
     def rows: Long = meta.rows
     def groups: Int = meta.groups.size
 
@@ -138,7 +147,8 @@ object ParquetReader:
       raf.readFully(bytes)
       val arrays = meta.columns.map(_ => new Array[Any](g.rows))
       decodeGroup(bytes, g.start, meta.columns, g, arrays, 0)
-      Table(meta.columns, g.rows, meta.columns.map(_.name).zip(arrays).toMap)
+      val stored = meta.columns.zip(arrays).toMap
+      Table(columns, g.rows, columns.map(c => c.name -> stored.getOrElse(c, new Array[Any](g.rows))).toMap)
 
     /** Every row in file order, decoding one row group at a time. */
     def rowIterator: Iterator[IndexedSeq[Any]] =
@@ -153,9 +163,10 @@ object ParquetReader:
 
     def close(): Unit = raf.close()
 
-  def open(path: String): FileReader =
+  /** Opens a file; its rows in `as` (matched by name and type) if given. */
+  def open(path: String, as: Seq[Column] = Nil): FileReader =
     val raf = RandomAccessFile(path, "r")
-    try FileReader(raf, readMeta(raf))
+    try FileReader(raf, readMeta(raf), as)
     catch
       case e: Throwable =>
         raf.close()

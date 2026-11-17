@@ -67,7 +67,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     */
   def read(t: Archive.TableDef, from: Long, to: Long): Vector[IndexedSeq[Any]] =
     filesFor(t, from, to).flatMap { f =>
-      Try(Using.resource(ParquetReader.open(f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
+      Try(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).filter(inWindow(from, to)).toVector))
         .getOrElse(Vector.empty)
     }.toVector.sortBy(ArchiveMerge.key)
 
@@ -80,7 +80,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * files with `close`. Call within [[reading]].
     */
   def stream(t: Archive.TableDef, from: Long, to: Long): (Iterator[IndexedSeq[Any]], () => Unit) =
-    val readers = filesFor(t, from, to).flatMap(f => Try(ParquetReader.open(f.getPath)).toOption)
+    val readers = filesFor(t, from, to).flatMap(f => Try(Archive.open(t, f.getPath)).toOption)
     val sorted = readers.map(_.rowsBetween(from, to).filter(inWindow(from, to)))
       .foldLeft(Iterator.empty[IndexedSeq[Any]])((a, b) => mergeSorted(a, b))
     (sorted, () => readers.foreach(r => Try(r.close())))
@@ -88,7 +88,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   /** Most recent archived row of `t`, if any. */
   def lastRow(t: Archive.TableDef): Option[IndexedSeq[Any]] =
     archivedFiles(t).lastOption.flatMap { f =>
-      Try(Using.resource(ParquetReader.open(f.getPath)) { r =>
+      Try(Using.resource(Archive.open(t, f.getPath)) { r =>
         if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.toSeq.lastOption
       }).toOption.flatten
     }
@@ -202,7 +202,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   private final class Rewrite(val t: Archive.TableDef, val dest: File, tooLate: ((IndexedSeq[Any], Long)) => Unit):
     ensureDir(dest.getParentFile)
     val tmp = File(dest.getParentFile, dest.getName + ".tmp")
-    private val existing = if dest.exists then Some(ParquetReader.open(dest.getPath)) else None
+    private val existing = if dest.exists then Some(Archive.open(t, dest.getPath, whole = true)) else None
     // What the file held before: a published new version is told from it
     // by a repair (CommitRepair).
     private val prev = existing.fold(CommitIntent.Prev.Absent)(e => CommitIntent.Prev.File(e.rows, dest.length))
@@ -621,7 +621,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         Archive.All.find(_.name == table).foreach(t => db.hotRows(t, from, to, max).foreach(r => f(table, r.toIndexedSeq)))
       case CommitIntent.Delete.Files(paths) =>
         for p <- paths if file(p).exists do
-          Using.resource(ParquetReader.open(file(p).getPath))(_.rowIterator.foreach(f(CommitRepair.tableOf(p), _)))
+          // In the table's current columns, as the month file has them.
+          val t = CommitRepair.tableOf(p)
+          Using.resource(Archive.All.find(_.name == t).fold(ParquetReader.open(file(p).getPath))(td => Archive.open(td, file(p).getPath)))(
+            _.rowIterator.foreach(f(t, _)))
 
   /** A record of 0.21.0 with what [[CommitRepair.verify]] needs, from the
     * chunk's rows (still all in SQLite, or in the day files of a month
@@ -667,7 +670,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     val max = db.maxRowids()
     // Leftovers of a run that died while writing.
     for t <- Archive.All if !intentNames(Archive.dayFile(t, d)) do File(root, Archive.dayFile(t, d) + ".tmp").delete()
-    for t <- Seq(Archive.Fixes, Archive.Motion, Archive.Battery, Archive.GnssStatus) if !stop() do
+    for t <- Archive.SignalTables if !stop() do
       val table = t.name
       val rows = db.hotRows(t, from, to, max(table))
       if rows.nonEmpty then
@@ -772,7 +775,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       for (month, files) <- days.groupBy(f => YearMonth.parse(f.getName.take(7))).toSeq.sortBy(_._1) if month.isBefore(current) && !stop() do
         val rw = Rewrite(t, file(Archive.monthFile(t, month)), _ => ())
         try
-          val readers = files.sortBy(_.getName).map(f => ParquetReader.open(f.getPath))
+          val readers = files.sortBy(_.getName).map(f => Archive.open(t, f.getPath, whole = true))
           try readers.foreach(_.rowIterator.foreach(r => rw.push(r, 0L, ArchiveMerge.key(r))))
           finally readers.foreach(r => Try(r.close()))
           val n = rw.finish()
@@ -875,7 +878,7 @@ object ArchiveStore:
   /** A day is archived once it has been over this long. */
   val SettleMs: Long = 3_600_000L
 
-  val MonthTables: Seq[Archive.TableDef] = Seq(Archive.Fixes, Archive.Motion, Archive.Battery, Archive.GnssStatus)
+  val MonthTables: Seq[Archive.TableDef] = Archive.SignalTables
 
   /** fsync of a directory: a rename or a new entry in it is durable after
     * this. Throws: whatever depends on it must not happen.

@@ -160,10 +160,14 @@ object ArchiveMerge:
     * stored (by their time statistics), without decoding them. Archiving a
     * long day goes in portions, each rewriting the day's file: so the part
     * archived before costs a copy, not a decode and encode per portion.
-    * Groups without statistics (files of earlier versions) are decoded.
-    * New rows come in time order (see [[Reorder]]).
+    * Groups without statistics (files of earlier versions) are decoded, and
+    * so are all groups of a file of an earlier layout (fewer columns than
+    * the writer: see [[Archive.open]]). New rows come in time order (see
+    * [[Reorder]]).
     */
   final class FileMerge(existing: Option[parquet.ParquetReader.FileReader], writer: parquet.ParquetWriter):
+    // Would lose the values of the columns left out.
+    require(existing.forall(_.dropped.isEmpty), "existing file has columns the rows leave out")
     private val groups = existing.map(_.meta.groups).getOrElse(Nil)
     private var next = 0
     private var decoded: BufferedIterator[Row] = Iterator.empty.buffered
@@ -179,7 +183,7 @@ object ArchiveMerge:
         else
           val g = groups(next)
           val reader = existing.get
-          if g.time.exists((_, hi) => all || hi < k) then
+          if reader.asStored && g.time.exists((_, hi) => all || hi < k) then
             writer.copyGroup(reader.rawGroup(next), g)
             copied += g.rows
           else decoded = reader.readGroup(next).rowIterator.buffered

@@ -501,8 +501,7 @@ object Uploader:
     for stream <- Seq("places", "checkins", "overrides") do
       val table = if stream == "overrides" then "mode_overrides" else stream
       sent += drain(run, stream, table)
-    sent += uploadArchive(run, Seq(ashidori.core.Archive.Fixes, ashidori.core.Archive.Motion, ashidori.core.Archive.Battery,
-      ashidori.core.Archive.GnssStatus), Small)
+    sent += uploadArchive(run, ashidori.core.Archive.UploadedSignalTables, Small)
     // Last, so it only goes out once everything else made it.
     sent + uploadStatus(run)
 
