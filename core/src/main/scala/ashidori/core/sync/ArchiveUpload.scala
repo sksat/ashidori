@@ -60,14 +60,25 @@ object ArchiveUpload:
     val j = rest.indexOf(':')
     Option.when(j > 0 && Set("up", "upgen", "uppart", "upbytes")(rest.take(j)))(rest.drop(j + 1)).filter(_.endsWith(".parquet"))
 
-  /** Whether a part of a file covering `period` ([from, to)), sealed at
-    * `sealedAt`, may hold rows of a deleted range: one not cut out of the
-    * files yet (`pending`), or deleted at or after the part was sealed.
-    * `ranges`: (from, to, deleted at, pending).
+  /** Whether a part of a file covering `period` ([from, to)) may hold rows
+    * of a deleted range: one not cut out of the files yet (`pending`), or
+    * one recorded after the file was opened for the part. `opened`: the
+    * deletion sequence (the largest `deleted_range` rowid, which only grows)
+    * read before the file was opened; 0 for a part sealed by an earlier
+    * version (not known: taken as before every deletion). `ranges`: (from,
+    * to, its sequence, pending).
     */
-  def heldByDeletion(period: (Long, Long), sealedAt: Long, ranges: Seq[(Long, Long, Long, Boolean)]): Boolean =
+  def heldByDeletion(period: (Long, Long), opened: Long, ranges: Seq[(Long, Long, Long, Boolean)]): Boolean =
     val (a, b) = period
-    ranges.exists((x, y, at, pending) => x < b && y > a && (pending || at >= sealedAt))
+    ranges.exists((x, y, seq, pending) => x < b && y > a && (pending || seq > opened))
+
+  /** The archive file (`<table>/<name>`) a batch of stream `archive` is a
+    * part of, from its plaintext (gzipped JSON Lines; see [[nextPart]]'s
+    * caller), if it names one.
+    */
+  def fileOf(plainGz: Array[Byte]): Option[String] =
+    val text = String(Crypto.gunzip(plainGz), java.nio.charset.StandardCharsets.UTF_8)
+    text.linesIterator.nextOption().flatMap(l => scala.util.Try(ujson.read(l)("file").str).toOption).filter(_.endsWith(".parquet"))
   /** Archive files are sent in parts of at most this size, one batch each. */
   val PartSize: Int = 3 * 1024 * 1024
 

@@ -34,19 +34,71 @@ class ArchiveUploadSuite extends munit.FunSuite:
       part = ArchiveUpload.nextPart(snap, p, partSize)
     (out.toByteArray, p)
 
-  test("a part of a file with a deleted range: held while the range is not cut, or if sealed before the deletion") {
+  test("a part of a file with a deleted range: held while the range is not cut, or if the file was opened before it") {
     val day = (1000L, 2000L)
-    // Pending (not cut yet): held, whenever it was sealed.
-    assert(ArchiveUpload.heldByDeletion(day, sealedAt = 5000, Seq((1500L, 1600L, 4000L, true))))
-    // Cut: a part sealed before the deletion is held, one sealed after (from the cut file) is sent.
-    assert(ArchiveUpload.heldByDeletion(day, sealedAt = 3000, Seq((1500L, 1600L, 4000L, false))))
-    assert(!ArchiveUpload.heldByDeletion(day, sealedAt = 5000, Seq((1500L, 1600L, 4000L, false))))
+    // Pending (not cut yet): held, whenever the file was opened.
+    assert(ArchiveUpload.heldByDeletion(day, opened = 5, Seq((1500L, 1600L, 5L, true))))
+    // Cut: a part of the file opened before the deletion (sequence 4 < 5) is held,
+    // one of the file opened after it (the cut version) is sent.
+    assert(ArchiveUpload.heldByDeletion(day, opened = 4, Seq((1500L, 1600L, 5L, false))))
+    assert(!ArchiveUpload.heldByDeletion(day, opened = 5, Seq((1500L, 1600L, 5L, false))))
+    // A part sealed by an earlier version (no sequence: 0) counts as before every deletion.
+    assert(ArchiveUpload.heldByDeletion(day, opened = 0, Seq((1500L, 1600L, 1L, false))))
     // Another day: not held.
-    assert(!ArchiveUpload.heldByDeletion(day, sealedAt = 3000, Seq((2000L, 2600L, 4000L, true))))
+    assert(!ArchiveUpload.heldByDeletion(day, opened = 0, Seq((2000L, 2600L, 1L, true))))
     assertEquals(ArchiveUpload.markFile("reg1|upgen:pressure/2026-11-15.parquet"), Some("pressure/2026-11-15.parquet"))
     assertEquals(ArchiveUpload.markFile("reg1|up:fixes/2026-10.parquet"), Some("fixes/2026-10.parquet"))
     assertEquals(ArchiveUpload.markFile("reg1|rev:places"), None)
     assertEquals(ArchiveUpload.markFile("reg1|seq:archive"), None)
+  }
+
+  tmp.test("opened, then a deletion completes (cut and published), then the upload resumes: no part of the open version goes out") { dir =>
+    val f = File(dir, "2026-10-01.parquet")
+    val before = Array.tabulate[Byte](12)(_.toByte)
+    val cut = Array.tabulate[Byte](8)(i => (50 + i).toByte)
+    Files.write(f.toPath, before)
+    val period = (0L, 86_400_000L)
+    var ranges = Vector.empty[(Long, Long, Long, Boolean)]
+    def seq = ranges.map(_._3).maxOption.getOrElse(0L)
+    // As the uploader: the sequence read before the file is opened.
+    val opened = seq
+    val snap = ArchiveSnapshot.open(f, stat(f))
+    val sent = java.io.ByteArrayOutputStream()
+    try
+      val first = ArchiveUpload.nextPart(snap, ArchiveUpload.resume(None, snap.generation), 4).get
+      assert(!ArchiveUpload.heldByDeletion(period, opened, ranges))
+      sent.write(first.data)
+      // The deletion is recorded (pending), cut out of the file (a new version
+      // renamed over it) and marked done, all before the next part.
+      ranges = ranges :+ (1000L, 2000L, 1L, true)
+      replace(f, cut)
+      ranges = ranges.map(r => r.copy(_4 = false))
+      // Resuming: the next part would come from the version before the cut.
+      assert(ArchiveUpload.nextPart(snap, first.next, 4).isDefined)
+      assert(ArchiveUpload.heldByDeletion(period, opened, ranges), "the open version is held")
+      // So is the part already sealed from it (its sequence is the one read at open).
+      assert(ArchiveUpload.heldByDeletion(period, opened, ranges))
+    finally snap.close()
+    // The next open reads the sequence again: the cut version, sent from part 0.
+    val opened2 = seq
+    val snap2 = ArchiveSnapshot.open(f, stat(f))
+    try
+      assert(!ArchiveUpload.heldByDeletion(period, opened2, ranges))
+      val (all, _) = drain(snap2, ArchiveUpload.resume(Some(ArchiveUpload.Progress(snap.generation, 1, 4)), snap2.generation), 4)
+      assertEquals(all.toSeq, cut.toSeq)
+    finally snap2.close()
+  }
+
+  test("a part sealed by an earlier version (no file recorded): its file is read from the batch") {
+    val keys = BlobKeys.of(Array.fill[Byte](32)(7))
+    val plain = Crypto.gzip(("""{"file":"fixes/2026-10-01.parquet","gen":"1","part":0,"parts":1,"data":""}""" + "\n").getBytes("UTF-8"))
+    val aad = Crypto.aad("dev1", "archive", 42)
+    val blob = Crypto.seal(keys, aad, plain)
+    assertEquals(ArchiveUpload.fileOf(Crypto.open(keys, aad, blob)), Some("fixes/2026-10-01.parquet"))
+    // Not an archive part: none (the caller then does not send it and sends the tables again).
+    assertEquals(ArchiveUpload.fileOf(Crypto.gzip("{\"t\":1}\n".getBytes("UTF-8"))), None)
+    // Under the wrong slot it does not open at all.
+    intercept[java.security.GeneralSecurityException](Crypto.open(keys, Crypto.aad("dev1", "archive", 43), blob))
   }
 
   tmp.test("a file replaced while it is uploaded: every part comes from the version opened (R1)") { dir =>

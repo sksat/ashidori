@@ -79,14 +79,18 @@ object DbSchema:
 
   /** From version 7 to 8. `fixes`, `outbox`: the columns `fixes` and
     * `sync_outbox` have now (none: the table does not exist). The outbox
-    * gets `file`: the archive file a batch is a part of, so that a batch of
-    * a file holding a deleted range is never sent.
+    * gets `file`, the archive file a batch is a part of, and `del_seq`, the
+    * deletion sequence read before that file was opened, so that a batch
+    * of a file holding a deleted range is never sent. Rows of earlier
+    * versions have neither: their file is read from the batch when it is
+    * about to be sent, and they count as opened before every deletion.
     */
   def toV8(fixes: Set[String], outbox: Set[String] = Set.empty): Seq[String] =
     FixColumns.filterNot((n, _) => fixes(n)).map((n, t) => s"ALTER TABLE fixes ADD COLUMN $n $t") ++
       Seq(CreatePressure, "CREATE INDEX IF NOT EXISTS pressure_time ON pressure(time)", CreateDeletedRange,
         CreateFixMsl, "CREATE INDEX IF NOT EXISTS fix_msl_time ON fix_msl(time)") ++
-      Option.when(outbox.nonEmpty && !outbox("file"))("ALTER TABLE sync_outbox ADD COLUMN file TEXT")
+      Option.when(outbox.nonEmpty && !outbox("file"))("ALTER TABLE sync_outbox ADD COLUMN file TEXT") ++
+      Option.when(outbox.nonEmpty && !outbox("del_seq"))("ALTER TABLE sync_outbox ADD COLUMN del_seq INTEGER")
 
   /** Which rows of an archived table archiving takes (an SQL condition):
     * all but the open span of `energy_state`, which stays in SQLite until

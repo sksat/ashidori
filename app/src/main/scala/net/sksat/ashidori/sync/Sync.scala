@@ -462,21 +462,23 @@ object Uploader:
     * it with `progress` in one small transaction. Returns the seq and blob.
     */
   private def enqueue(run: SyncRun, cls: String, stream: String, plain: Array[Byte], progress: Seq[(String, Long)],
-                      remove: Seq[String] = Nil, file: Option[String] = None): (Long, Array[Byte]) =
+                      remove: Seq[String] = Nil, file: Option[String] = None, delSeq: Option[Long] = None): (Long, Array[Byte]) =
     val db = AshidoriApp.db
     val seq = db.nextSeq(run.reg, stream)
     val blob = Crypto.seal(run.keys, Crypto.aad(run.deviceId, stream, seq), plain)
-    db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove, file)
+    db.enqueueSealed(run.reg, run.deviceId, cls, stream, seq, blob, progress, remove, file, delSeq)
     (seq, blob)
 
-  /** Whether a part of archive file `file` (`<table>/<name>`), sealed at
-    * `sealedAt`, may hold rows of a range the user deleted: the range is
-    * not cut out of the files yet, or was deleted after the part was sealed.
-    * Read fresh each time (a deletion may come while a run goes on).
+  /** Whether a part of archive file `file` (`<table>/<name>`), read from
+    * the file opened after deletion sequence `opened`, may hold rows of a
+    * range the user deleted: the range is not cut out of the files yet, or
+    * was recorded after the file was opened (the open file may be the
+    * version before the cut). Read fresh each time (a deletion may come
+    * and complete while a run goes on).
     */
-  def heldByDeletion(file: String, sealedAt: Long): Boolean =
+  def heldByDeletion(file: String, opened: Long): Boolean =
     val ranges = AshidoriApp.db.deletedRangesNow()
-    ranges.nonEmpty && AshidoriApp.archive.periodOf(file.split('/').last).exists(ArchiveUpload.heldByDeletion(_, sealedAt, ranges))
+    ranges.nonEmpty && AshidoriApp.archive.periodOf(file.split('/').last).exists(ArchiveUpload.heldByDeletion(_, opened, ranges))
 
   /** Stores the cut-over record C (gzipped plaintext) for upload, as the next
     * `authcut` batch of this device. On disk when it returns; sent by
@@ -572,6 +574,9 @@ object Uploader:
         // (read fresh for each file): sent once it is (as a new
         // generation), never with those rows.
         heldByDeletion(s"${t.name}/$name", Long.MaxValue)
+      // Read before the file is opened: a deletion recorded after it may
+      // have been cut from a newer version only, not from the open one.
+      val openedSeq = db.deletionSeq()
       // Merged into a month file or deleted meanwhile: nothing to send.
       val snapshot =
         if inProgress then None
@@ -597,8 +602,11 @@ object Uploader:
                 if ArchiveUpload.complete(p, snap.size) then db.updateSync(Seq(handed), Seq(genKey, partKey, bytesKey))
                 else throw IllegalStateException(s"${t.name}/$name: ${p.bytes} bytes enqueued of ${snap.size}")
                 done = true
-              // A deletion came meanwhile: this version of the file is not sent.
-              case Some(_) if heldByDeletion(s"${t.name}/$name", Long.MaxValue) =>
+              // A deletion came after the file was opened (pending, or already
+              // cut from a newer version): this version is not sent. Its
+              // progress is forgotten, so the file goes out from part 0.
+              case Some(_) if heldByDeletion(s"${t.name}/$name", openedSeq) =>
+                db.forgetUpload(s"${t.name}/$name")
                 done = true
               case Some(_) if db.outboxBytes(run.reg, cls) > MaxOutboxBytes =>
                 Log.w(s"outbox over ${MaxOutboxBytes >> 20} MiB: archive upload paused")
@@ -609,9 +617,9 @@ object Uploader:
                   "data" -> java.util.Base64.getEncoder.encodeToString(part.data))))
                 // nextPart checked that the last part completes this generation.
                 val f = Some(s"${t.name}/$name")
-                if part.last then enqueue(run, cls, "archive", plain, Seq(handed), Seq(genKey, partKey, bytesKey), f)
+                if part.last then enqueue(run, cls, "archive", plain, Seq(handed), Seq(genKey, partKey, bytesKey), f, Some(openedSeq))
                 else enqueue(run, cls, "archive", plain,
-                  Seq(genKey -> snap.generation, partKey -> part.next.part, bytesKey -> part.next.bytes), file = f)
+                  Seq(genKey -> snap.generation, partKey -> part.next.part, bytesKey -> part.next.bytes), file = f, delSeq = Some(openedSeq))
                 p = part.next
                 sent += flush(run, cls)
                 done = part.last
@@ -636,17 +644,41 @@ object Uploader:
       rows = db.rowsChangedAfter(table, db.syncValue(mark), MaxRows)
     sent
 
+  /** `e` with its archive file: a part sealed by an earlier version has
+    * none recorded, so it is read from the batch (decrypted with this
+    * registration's keys) and recorded. Unchanged if it cannot be read.
+    */
+  private def withFile(run: SyncRun, e: Db.OutboxEntry): Db.OutboxEntry =
+    if e.stream != "archive" || e.file.isDefined then e
+    else
+      val db = AshidoriApp.db
+      scala.util.Try(ArchiveUpload.fileOf(Crypto.open(run.keys, Crypto.aad(e.deviceId, e.stream, e.seq), db.outboxBlob(e.id))))
+        .toOption.flatten match
+        case Some(f) =>
+          db.setOutboxFile(e.id, f)
+          e.copy(file = Some(f))
+        case None => e
+
   /** Sends the registration's outbox rows of class `cls`, oldest first. */
   private def flush(run: SyncRun, cls: String): Int =
     val db = AshidoriApp.db
     var sent = 0
-    for e <- db.outbox(run.reg, Set(cls)) do
+    for e0 <- db.outbox(run.reg, Set(cls)) do
       run.checkStopped()
+      val e = if e0.deviceId == run.deviceId then withFile(run, e0) else e0
       if e.deviceId != run.deviceId then
         // Sealed for another device id: it would not decrypt. Never sent.
         Log.w(s"dropping outbox ${e.stream}/${e.seq} of another device")
         db.deleteOutbox(e.id)
-      else if e.file.exists(heldByDeletion(_, e.createdAt)) then
+      else if e.stream == "archive" && e.file.isEmpty then
+        // A part of an earlier version whose file cannot be read from it:
+        // not sent (it may hold a deleted range); the files of its tables
+        // go out again from the current versions.
+        Log.w(s"outbox ${e.stream}/${e.seq}: its file is unknown, not sent; its tables are sent again")
+        db.deleteOutbox(e.id)
+        db.forgetUploads(run.reg, (if cls == Raw then ashidori.core.Archive.RawTables else ashidori.core.Archive.UploadedSignalTables)
+          .map(_.name).toSet)
+      else if e.file.exists(heldByDeletion(_, e.delSeq)) then
         // A part of an archive file sealed before a range of it was deleted
         // (or before it was cut): never sent. The cut file goes out as a new
         // generation; seqs may have gaps.

@@ -356,13 +356,17 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
   @volatile private var deletedCache: Option[(Long, Vector[(Long, Long)])] = None
 
-  /** Every deleted range as it is now (no cache): (from, to, deleted at,
-    * whether the archive's files may still hold its rows). For the sync's
-    * check right before it sends a batch.
+  /** Every deleted range as it is now (no cache): (from, to, its sequence
+    * (rowid: rows are never deleted, so it only grows), whether the
+    * archive's files may still hold its rows). For the sync's checks right
+    * before it seals or sends a batch.
     */
   def deletedRangesNow(): Vector[(Long, Long, Long, Boolean)] =
-    query("SELECT start, end, deleted_at, archived_at IS NULL FROM deleted_range")(c =>
+    query("SELECT start, end, rowid, archived_at IS NULL FROM deleted_range")(c =>
       (c.getLong(0), c.getLong(1), c.getLong(2), c.getInt(3) != 0))
+
+  /** The deletion sequence now: the largest `deleted_range` rowid (0: none). */
+  def deletionSeq(): Long = query("SELECT COALESCE(MAX(rowid), 0) FROM deleted_range")(_.getLong(0)).head
 
   /** Deleted ranges whose rows may still be in archive files: (rowid, from, to). */
   def archiveDeletionsPending(): Vector[(Long, Long, Long)] =
@@ -1008,7 +1012,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * `remove` are progress rows that end with this batch.
     */
   def enqueueSealed(reg: String, deviceId: String, cls: String, stream: String, seq: Long, blob: Array[Byte],
-                    progress: Seq[(String, Long)], remove: Seq[String] = Nil, file: Option[String] = None): Unit = tx { db =>
+                    progress: Seq[(String, Long)], remove: Seq[String] = Nil, file: Option[String] = None,
+                    delSeq: Option[Long] = None): Unit = tx { db =>
     val key = s"$reg|seq:$stream"
     if syncValue(key) != seq then throw IllegalStateException(s"seq of $stream moved from $seq: not enqueued")
     val cv = ContentValues()
@@ -1020,6 +1025,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("blob", blob)
     cv.put("created_at", java.lang.Long.valueOf(System.currentTimeMillis()))
     file.foreach(cv.put("file", _))
+    delSeq.foreach(s => cv.put("del_seq", java.lang.Long.valueOf(s)))
     db.insertOrThrow("sync_outbox", null, cv)
     setSyncValue(key, seq + 1)
     progress.foreach(setSyncValue)
@@ -1039,10 +1045,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   /** Outbox rows of a registration and constraint classes, oldest first (without the blob). */
   def outbox(reg: String, classes: Set[String]): Vector[Db.OutboxEntry] =
-    query(s"SELECT id, device_id, stream, seq, class, file, created_at FROM sync_outbox WHERE reg=? AND class IN (${classes.toSeq.map(_ => "?").mkString(",")}) ORDER BY id",
+    query(s"SELECT id, device_id, stream, seq, class, file, del_seq FROM sync_outbox WHERE reg=? AND class IN (${classes.toSeq.map(_ => "?").mkString(",")}) ORDER BY id",
       (reg +: classes.toSeq)*) { c =>
-      Db.OutboxEntry(c.getLong(0), c.getString(1), c.getString(2), c.getLong(3), c.getString(4), Option(c.getString(5)), c.getLong(6))
+      Db.OutboxEntry(c.getLong(0), c.getString(1), c.getString(2), c.getLong(3), c.getString(4), Option(c.getString(5)),
+        if c.isNull(6) then 0L else c.getLong(6))
     }
+
+  /** Records the archive file of outbox row `id` (read from its batch). */
+  def setOutboxFile(id: Long, file: String): Unit =
+    w.execSQL("UPDATE sync_outbox SET file=? WHERE id=?", Array[AnyRef](file, java.lang.Long.valueOf(id)))
 
   /** The sealed blob, read in pieces: a cursor window holds at most ~2 MB. */
   def outboxBlob(id: Long): Array[Byte] =
@@ -1227,6 +1238,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
     deletedCache = None
 
+  /** Forgets every archive upload mark of registration `reg` for the
+    * tables `tables` (by name): their files are all sent again from part 0.
+    */
+  def forgetUploads(reg: String, tables: Set[String]): Unit = tx { db =>
+    for n <- query("SELECT name FROM sync_state WHERE name LIKE ?", s"$reg|up%:%")(_.getString(0))
+        if n.startsWith(reg + "|") && Db.uploadMarkFile(n).exists(f => tables(f.takeWhile(_ != '/'))) do
+      db.delete("sync_state", "name=?", Array(n))
+  }
+
   /** Forgets that archive file `file` (`<table>/<name>`) was handed over or
     * partly enqueued, for every registration: it is sent again from part 0.
     */
@@ -1290,10 +1310,12 @@ object Db:
     * "small" (any allowed network) or "raw" (unmetered only).
     */
   /** `file`: the archive file a batch is a part of (`<table>/<name>`), if
-    * it is one (and was sealed by this version); `createdAt` when sealed.
+    * known (sealed by this version, or read from the batch since); `delSeq`
+    * the deletion sequence read before that file was opened (0: sealed by
+    * an earlier version, before every deletion).
     */
   final case class OutboxEntry(id: Long, deviceId: String, stream: String, seq: Long, cls: String,
-                               file: Option[String] = None, createdAt: Long = 0L)
+                               file: Option[String] = None, delSeq: Long = 0L)
 
   /** Editable tables and the columns whose change bumps `sync_rev` (the synced ones). */
   val RevColumns: Seq[(String, Seq[String])] = Seq(

@@ -240,3 +240,19 @@ class DbMigrationSuite extends munit.FunSuite:
     // A row with a temperature does not fit 5 columns: it matches nothing (kept in SQLite).
     assertEquals(CommitRepair.fit(rows.head.updated(9, 30.5f), 5).size, 11)
   }
+
+  test("the outbox of 0.21.0 gets file and del_seq; its rows have neither (read from the batch when sent)") {
+    val db = v6Db()
+    // As 0.21.0's Db creates it, with an archive part waiting.
+    run(db, """CREATE TABLE sync_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,
+      |reg TEXT NOT NULL, device_id TEXT NOT NULL, stream TEXT NOT NULL, seq INTEGER NOT NULL,
+      |class TEXT NOT NULL, blob BLOB NOT NULL, created_at INTEGER NOT NULL, UNIQUE(reg, stream, seq));
+      |INSERT INTO sync_outbox(reg, device_id, stream, seq, class, blob, created_at) VALUES('r', 'd', 'archive', 3, 'small', x'00', 1);
+      |""".stripMargin)
+    val sql = DbSchema.toV8(columns(db, "fixes"), columns(db, "sync_outbox"))
+    run(db, sql.map(_ + ";").mkString("\n"))
+    assert(Set("file", "del_seq").subsetOf(columns(db, "sync_outbox")))
+    assertEquals(run(db, "SELECT seq, file IS NULL, del_seq IS NULL FROM sync_outbox;"), Vector("3|1|1"))
+    // Again (a step run twice): nothing more to add.
+    assert(DbSchema.toV8(columns(db, "fixes"), columns(db, "sync_outbox")).forall(!_.contains("sync_outbox")))
+  }
