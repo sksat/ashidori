@@ -69,10 +69,21 @@ object Net:
       installed = true
       // The map library must be set up before its HTTP client is replaced.
       org.maplibre.android.MapLibre.getInstance(ctx.getApplicationContext)
-      HttpRequestUtil.setOkHttpClient(mapHttp.client(dispatcher))
+      val client = mapHttp.client(dispatcher)
+      // Debug builds: a delay after the guard (DebugReceiver MAP_DELAY), to hold renders in flight.
+      HttpRequestUtil.setOkHttpClient(
+        if !debug then client
+        else client.newBuilder().addInterceptor(chain => {
+          val ms = debugMapDelayMs
+          if ms > 0 then Thread.sleep(ms)
+          chain.proceed(chain.request())
+        }).build())
   }
 
   private lazy val mapHttp = MapHttp(guard, log)
+
+  /** Debug builds: how long each request of the map library waits after the guard. */
+  @volatile var debugMapDelayMs = 0L
 
   /** At app start: a change of a rule or the pause aborts what is in flight
     * (the map library's calls here, the app's own connections in

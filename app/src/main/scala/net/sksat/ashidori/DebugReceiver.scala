@@ -43,6 +43,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.DETAIL --es key gsi-std       「オンライン地図で表示」 on every open map (none: back)
   *   ... -a ashidori.debug.DATA_DELETE --es kind venues    delete downloaded data (a download then sends)
   *   ... -a ashidori.debug.PAUSE_AT --es at checked:write [--ei stallMs 5000] [--ez pause false]   pause right after that check of the next request
+  *   ... -a ashidori.debug.MAP_DELAY --ei ms 15000            each map request waits after the guard (renders held)
   *   ... -a ashidori.debug.STYLE_FAIL --ei n 3              the next style fetches fail before sending
   *   ... -a ashidori.debug.STYLE_RETRY                      as a network becoming available for the style fetches
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
@@ -238,6 +239,10 @@ class DebugReceiver extends BroadcastReceiver:
                 complete = () => Net.log(s"step pause complete t=$now"))
             Thread.sleep(stallMs)
             Net.log(s"step $st t=$now: the call would go on")
+      case "ashidori.debug.MAP_DELAY" =>
+        // Each request of the map library waits this long after the guard (0: none).
+        Net.debugMapDelayMs = intent.getIntExtra("ms", 0).toLong
+        Log.i(s"map delay: ${Net.debugMapDelayMs} ms")
       case "ashidori.debug.STYLE_FAIL" =>
         // The next style fetches fail before they send (as an unreachable server).
         ui.OnlineStyles.debugFailures = intent.getIntExtra("n", 1)
