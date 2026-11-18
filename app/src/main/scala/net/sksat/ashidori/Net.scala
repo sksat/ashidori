@@ -79,13 +79,33 @@ object Net:
   /** The map library's calls of these destinations (by their marks). */
   private def cancelMapCalls(ds: Set[Dest]): Unit =
     val calls: Seq[Call] = dispatcher.runningCalls().asScala.toSeq ++ dispatcher.queuedCalls().asScala
-    for c <- calls do
+    val cut = calls.filter { c =>
       val dest = TileStyle.strip(c.request().url.toString)._2.flatMap(Settings.tokens.lookup).map(_.dest)
-      if dest.forall(ds) then
+      val hit = dest.forall(ds)
+      if hit then
         log(s"cut dest=${dest.fold("?")(_.key)} host=${c.request().url.host}")
         c.cancel()
+      hit
+    }
+    // Before the change returns, the cancelled calls have ended (at most AbortWaitMs).
+    val deadline = System.currentTimeMillis() + Outbound.AbortWaitMs
+    def left = (dispatcher.runningCalls().asScala ++ dispatcher.queuedCalls().asScala).count(c => cut.exists(_ eq c))
+    while left > 0 && System.currentTimeMillis() < deadline do Thread.sleep(10)
+    if left > 0 then log(s"cut: $left map calls still running")
+
+  /** Changes of the rules and the pause run here, off the main thread: a
+    * change returns only after what was in flight was aborted ([[Outbound]],
+    * [[cancelMapCalls]]). `done` then runs on the main thread.
+    */
+  private val changes = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-rules"))
+  def change(f: => Unit)(done: => Unit = ()): Unit =
+    changes.execute { () =>
+      try f finally AshidoriApp.app.getMainExecutor.execute(() => done)
+    }
 
   private def changed(ctx: Context, ds: Set[Dest]): Unit =
+    // Make sure the guard on connections exists, so that it aborts them.
+    val _ = outbound
     log(s"change dests=${ds.map(_.key).toSeq.sorted.mkString(",")} paused=${Settings.gate.paused}")
     if ds.exists(Dest.Tiles) then
       cancelMapCalls(ds)

@@ -23,22 +23,47 @@ import scala.collection.mutable
 final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => Unit = _ => (),
                      urls: Dest => Option[UrlType] = _ => None):
   import Outbound.*
-  private val open = mutable.Map.empty[HttpURLConnection, Permit]
+  /** A registered connection. Every I/O call on it runs under the read
+    * lock after checking that it was not aborted and its permit is valid
+    * ([[io]]); an abort sets the flag and disconnects it until it can take
+    * the write lock, so it returns only after the I/O call in progress has
+    * ended, and none starts after it.
+    */
+  private final class Conn(val c: HttpURLConnection, val p: Permit):
+    @volatile var aborted = false
+    val lock = java.util.concurrent.locks.ReentrantReadWriteLock()
 
-  /** Cuts the connections of destinations whose rule changed. The
-    * connections are disconnected on their own thread: a disconnect may wait
-    * for a connection in progress, and the change comes from the UI.
+  private val open = mutable.Map.empty[HttpURLConnection, Conn]
+
+  /** On a change of a destination's rules (or the pause), before the change
+    * returns: every connection of it is aborted, in parallel, and the abort
+    * waits (at most [[AbortWaitMs]]) until the I/O call each was in has
+    * ended. When the change returns, no further byte is written on them.
     */
   val stop: () => Unit = gate.onChange { ds =>
     val cut = synchronized {
-      val c = open.filter((_, p) => ds(p.dest)).toSeq
-      open --= c.map(_._1)
+      val c = open.values.filter(x => ds(x.p.dest)).toSeq
+      open --= c.map(_.c)
       c
     }
-    for (c, p) <- cut do
-      log(s"cut dest=${p.dest.key} host=${c.getURL.getHost}")
-      Outbound.cutter.execute(() => try c.disconnect() catch case _: Exception => ())
+    if cut.nonEmpty then
+      val deadline = System.nanoTime() + AbortWaitMs * 1_000_000L
+      val done = cut.map { x =>
+        log(s"cut dest=${x.p.dest.key} host=${x.c.getURL.getHost}")
+        x.aborted = true
+        java.util.concurrent.CompletableFuture.runAsync(() => abort(x, deadline), Outbound.aborter)
+      }
+      try java.util.concurrent.CompletableFuture.allOf(done*).get(AbortWaitMs + 500, java.util.concurrent.TimeUnit.MILLISECONDS)
+      catch case _: Exception => log(s"cut: not all ended within ${AbortWaitMs} ms")
   }
+
+  /** Disconnects `x` until the I/O call in progress on it has ended (or the deadline). */
+  private def abort(x: Conn, deadline: Long): Unit =
+    var ended = false
+    while !ended && System.nanoTime() < deadline do
+      try x.c.disconnect() catch case _: Exception => ()
+      ended = x.lock.writeLock().tryLock(50, java.util.concurrent.TimeUnit.MILLISECONDS)
+    if ended then x.lock.writeLock().unlock()
 
   /** Connections open now (for tests). */
   def openCount: Int = synchronized(open.size)
@@ -56,27 +81,36 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
       throw Refused(s"${p.dest.key}: ${host.getOrElse("?")} is not one of its hosts")
 
   /** Test hook: called with "registered" after a connection is checked and
-    * registered, and "connected" after it connected, before the request is
-    * written (to force a change of the rules in between).
+    * registered, with "checked:<call>" right after the check of each I/O
+    * call (connect, write, answer, header, read), before the call, and with
+    * "done:<call>" when it ended (still under the read lock).
     */
-  @volatile private[core] var step: String => Unit = _ => ()
+  @volatile var step: String => Unit = _ => ()
 
-  /** `c` is still registered (no change of its destination's rules cut it)
-    * and its permit still valid; otherwise it goes and [[Blocked]] is thrown.
+  /** One I/O call `f` on `x` (`at` names it): only if it was not aborted
+    * and its permit is valid, and under the read lock, so an abort waits
+    * for it to end. A failure after an abort or a change is [[Blocked]].
     */
-  private def still(p: Permit, c: HttpURLConnection, at: String): Unit =
-    if !synchronized(open.contains(c) && gate.valid(p)) then
-      log(s"block dest=${p.dest.key} reason=changed at=$at host=${c.getURL.getHost}")
-      throw Blocked(s"${p.dest.key}: not allowed any more")
+  private def io[A](x: Conn, at: String)(f: => A): A =
+    x.lock.readLock().lock()
+    try
+      if x.aborted || !gate.valid(x.p) then
+        log(s"block dest=${x.p.dest.key} reason=changed at=$at host=${x.c.getURL.getHost}")
+        throw Blocked(s"${x.p.dest.key}: not allowed any more")
+      step(s"checked:$at")
+      try f
+      catch case e: IOException if !e.isInstanceOf[Blocked] && (x.aborted || !gate.valid(x.p)) =>
+        throw Blocked(s"${x.p.dest.key}: not allowed any more")
+      finally step(s"done:$at")
+    finally x.lock.readLock().unlock()
 
   /** Sends one request under `p` and returns the answer (status read).
     *
     * The check of the permit and the registration of the connection are
     * one step under this object's lock, which the cut on a change of the
     * rules also takes: a connection checked before a change is registered
-    * before the cut runs and is cut; one checked after it fails the check.
-    * The connection is checked again right before it connects and right
-    * before the request is written, so no request leaves after the cut.
+    * before the cut runs and is aborted; one checked after it fails the
+    * check. Each I/O call is checked again right before it ([[io]]).
     *
     * GET follows up to [[MaxHops]] redirects, each checked as the first
     * request before it connects; other methods do not follow them. `onOpen`
@@ -91,9 +125,10 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
     while true do
       // Opening makes no connection yet.
       val c = URI(u).toURL.openConnection().asInstanceOf[HttpURLConnection]
+      val x = Conn(c, p)
       synchronized {
         allowed(p, u)
-        open(c) = p
+        open(c) = x
       }
       try
         step("registered")
@@ -103,25 +138,26 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
         c.setReadTimeout(readMs)
         c.setRequestMethod(method)
         headers.foreach((k, v) => c.setRequestProperty(k, v))
-        if body.nonEmpty then c.setDoOutput(true)
-        still(p, c, "connect")
-        c.connect()
-        step("connected")
-        still(p, c, "write")
+        body.foreach { b =>
+          c.setDoOutput(true)
+          // Written as it is given, not buffered to be sent later.
+          c.setFixedLengthStreamingMode(b.length)
+        }
+        io(x, "connect")(c.connect())
         log(s"send dest=${p.dest.key} mode=${p.mode} level=${p.level.key} method=$method host=${c.getURL.getHost} path=${c.getURL.getPath} hop=$hops")
         body.foreach { b =>
-          val out = c.getOutputStream
-          try out.write(b) finally out.close()
+          io(x, "write") {
+            val out = c.getOutputStream
+            try out.write(b) finally out.close()
+          }
         }
-        val code = c.getResponseCode
-        // The rule may have changed while the server answered.
-        still(p, c, "answer")
-        val location = Option(c.getHeaderField("Location"))
+        val code = io(x, "answer")(c.getResponseCode)
+        val location = io(x, "header")(Option(c.getHeaderField("Location")))
         if Redirects(code) && method == "GET" && location.nonEmpty && hops < MaxHops then
           u = URI(u).resolve(location.get).toString
           hops += 1
           close(c)
-        else return Response(c, p, code)
+        else return Response(x, code)
       catch
         case e: Exception =>
           close(c)
@@ -132,19 +168,19 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
     synchronized(open -= c)
     try c.disconnect() catch case _: Exception => ()
 
-  /** An answer: its body is read only while the permit stays valid. */
-  final class Response private[Outbound] (c: HttpURLConnection, p: Permit, val code: Int) extends AutoCloseable:
-    def header(name: String): Option[String] = Option(c.getHeaderField(name))
+  /** An answer: its headers and body are read only while it was not aborted
+    * and the permit stays valid.
+    */
+  final class Response private[Outbound] (x: Conn, val code: Int) extends AutoCloseable:
+    private val c = x.c
+    def header(name: String): Option[String] = io(x, "header")(Option(c.getHeaderField(name)))
     def body: InputStream =
-      val in = if code < 400 then c.getInputStream else Option(c.getErrorStream).getOrElse(InputStream.nullInputStream())
+      val in = io(x, "read") {
+        if code < 400 then c.getInputStream else Option(c.getErrorStream).getOrElse(InputStream.nullInputStream())
+      }
       new java.io.FilterInputStream(in):
-        private def blocked = Blocked(s"${p.dest.key}: not allowed any more")
-        private def checked[A](f: => A): A =
-          def ok = Outbound.this.synchronized(open.contains(c)) && gate.valid(p)
-          if !ok then throw blocked
-          try f catch case e: IOException => throw (if ok then e else blocked)
-        override def read(): Int = checked(super.read())
-        override def read(b: Array[Byte], off: Int, len: Int): Int = checked(super.read(b, off, len))
+        override def read(): Int = io(x, "read")(super.read())
+        override def read(b: Array[Byte], off: Int, len: Int): Int = io(x, "read")(super.read(b, off, len))
     def host: String = c.getURL.getHost
     def close(): Unit = Outbound.this.close(c)
 
@@ -181,12 +217,14 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
 
 object Outbound:
   val MaxHops = 5
-  private val cutter = java.util.concurrent.Executors.newSingleThreadExecutor { r =>
-    val t = Thread(r, "ashidori-outbound-cut")
+  val Redirects: Set[Int] = Set(301, 302, 303, 307, 308)
+  /** How long a change waits for the aborted connections' I/O calls to end. */
+  val AbortWaitMs = 3_000L
+  private val aborter = java.util.concurrent.Executors.newCachedThreadPool { r =>
+    val t = Thread(r, "ashidori-outbound-abort")
     t.setDaemon(true)
     t
   }
-  val Redirects: Set[Int] = Set(301, 302, 303, 307, 308)
 
   /** The rules (or the pause) do not allow the request now. */
   final class Blocked(msg: String) extends IOException(msg)

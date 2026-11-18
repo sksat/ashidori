@@ -187,8 +187,10 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
       e.setTextColor(color(attr.error))
       e.setPadding(e.getPaddingLeft, 0, e.getPaddingRight, dp(8))
       list.addView(e)
-    val pause = switchRow("外部への送信を停止", g.paused, "同期、位置の取得、他のアプリは対象外") { on =>
-      Settings.gate.setPaused(on)
+    lazy val pause: SwitchRow = switchRow("外部への送信を停止", g.paused, "同期、位置の取得、他のアプリは対象外") { on =>
+      // Off the main thread: it returns once what was in flight was aborted.
+      pause.setEnabled(false)
+      Net.change(Settings.gate.setPaused(on))(render())
     }
     val rows = Dest.values.toSeq.map { d =>
       markRow(Some(OutboundUi.allowed(d)), OutboundUi.name(d), OutboundUi.subtitle(d), Some(() => act.push(OutboundDestScreen(act, d))))
@@ -294,9 +296,12 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
     val cancel = com.google.android.material.button.MaterialButton(act, null, androidx.appcompat.R.attr.borderlessButtonStyle)
     cancel.setText("キャンセル")
     cancel.setOnClickListener(_ => act.pop())
-    val apply = button("適用") {
-      Settings.gate.setRule(dest, chosen)
-      act.pop()
+    lazy val apply: com.google.android.material.button.MaterialButton = button("適用") {
+      // Off the main thread: it returns once what was in flight was aborted.
+      apply.setEnabled(false)
+      cancel.setEnabled(false)
+      val r = chosen
+      Net.change(Settings.gate.setRule(dest, r))(act.pop())
     }
     apply.setEnabled(chosen != rule && Policy.valid(dest, chosen))
     val lp = wrap

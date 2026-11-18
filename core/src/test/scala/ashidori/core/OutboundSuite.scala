@@ -135,18 +135,99 @@ class OutboundSuite extends munit.FunSuite:
     }
   }
 
-  test("a change right after the check and registration: cut before it connects, no request reaches the server") {
+  test("a change right after the check and registration: aborted before it connects, no request reaches the server") {
     withServer(ex => reply(ex, 200, "ok")) { s =>
-      for at <- Seq("registered", "connected") do
-        val (g, out, log) = setup()
-        val p = g.permit(Dest.Data, Mode.Auto).get
-        // The interleaving forced: the rules change (and the cut runs) at this step.
-        out.step = st => if st == at then g.setPaused(true)
-        intercept[Outbound.Blocked](out.request(p, s.local("/a"), "POST", Some("lat=35.681236".getBytes)))
-        assertEquals(s.hits.get, 0, at)
-        assertEquals(out.openCount, 0, at)
-        assert(!log.exists(_.startsWith("send ")), s"$at: $log")
+      val (g, out, log) = setup()
+      val p = g.permit(Dest.Data, Mode.Auto).get
+      // The rules change (and the abort runs) between registration and the first I/O call.
+      out.step = st => if st == "registered" then g.setPaused(true)
+      intercept[Outbound.Blocked](out.request(p, s.local("/a"), "POST", Some("lat=35.681236".getBytes)))
+      assertEquals(s.hits.get, 0)
+      assertEquals(out.openCount, 0)
+      assert(!log.exists(_.startsWith("send ")), log.toString)
     }
+  }
+
+  /** A pause from another thread right after the check of I/O call `at`
+    * (the call then runs, under the read lock): the pause returns only after
+    * that call ended, and nothing reaches the server after it returned.
+    */
+  private def pauseAfterFinalCheck(at: String): Unit =
+    val arrivals = java.util.concurrent.ConcurrentLinkedQueue[Long]()
+    withServer { ex =>
+      arrivals.add(System.nanoTime())
+      ex.getRequestBody.readAllBytes()
+      reply(ex, 302, headers = Seq("Location" -> "/next"))
+    } { s =>
+      val (g, out, _) = setup()
+      val p = g.permit(Dest.Data, Mode.Auto).get
+      @volatile var returned = Long.MaxValue
+      @volatile var ended = 0L
+      val pauser = java.util.concurrent.atomic.AtomicReference[Thread]()
+      out.step = st =>
+        if st == s"done:$at" then ended = System.nanoTime()
+        if st == s"checked:$at" && pauser.get == null then
+          val t = Thread(() => { g.setPaused(true); returned = System.nanoTime() })
+          pauser.set(t)
+          t.start()
+          // The pause is under way (permits invalid, the abort waiting for this call).
+          while g.valid(p) do Thread.sleep(1)
+          Thread.sleep(100)
+      val e = intercept[java.io.IOException](out.request(p, s.local("/a"), "POST", Some("lat=35.681236".getBytes)))
+      pauser.get.join(5_000)
+      assert(e.isInstanceOf[Outbound.Blocked], e.toString)
+      assert(returned != Long.MaxValue, "the pause returned")
+      // The call under way ended before the pause returned; nothing was sent
+      // after it (the redirect was not followed, no call after the change).
+      assert(ended > 0 && ended < returned, s"$at: the call ended after the pause returned")
+      Thread.sleep(300)
+      assert(arrivals.size <= 1, arrivals.toString)
+      assertEquals(out.openCount, 0)
+    }
+
+  test("a pause right after the final check before connecting: it waits for the call, then nothing more is sent") {
+    pauseAfterFinalCheck("connect")
+  }
+
+  test("a pause right after the final check before writing the request: it waits for the write, then nothing more is sent") {
+    pauseAfterFinalCheck("write")
+  }
+
+  test("a pause right after the final check before reading the answer: the redirect is not followed") {
+    pauseAfterFinalCheck("answer")
+  }
+
+  test("a slow disconnect does not hold back the others, and the change returns within its bound") {
+    val g = gate()
+    val out = Outbound(g, _ => Set("localhost"))
+    // Three connections stuck in reading an answer that never comes.
+    val ss = java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress)
+    val accepted = java.util.concurrent.ConcurrentLinkedQueue[java.net.Socket]()
+    val acceptor = Thread(() => try while true do accepted.add(ss.accept()) catch case _: Exception => ())
+    acceptor.setDaemon(true)
+    acceptor.start()
+    try
+      val p = g.permit(Dest.Data, Mode.Auto).get
+      val errors = java.util.concurrent.ConcurrentLinkedQueue[Throwable]()
+      val ts = (1 to 3).map { i =>
+        val t = Thread { () =>
+          try out.request(p, s"http://localhost:${ss.getLocalPort}/$i", readMs = 60_000)
+          catch case e: Throwable => errors.add(e)
+          ()
+        }
+        t.start()
+        t
+      }
+      while out.openCount < 3 || accepted.size < 3 do Thread.sleep(5)
+      Thread.sleep(200)
+      val t0 = System.nanoTime()
+      g.setPaused(true)
+      val ms = (System.nanoTime() - t0) / 1_000_000
+      ts.foreach(_.join(5_000))
+      assert(ms < Outbound.AbortWaitMs + 1_000, s"$ms ms")
+      assertEquals(errors.size, 3)
+      errors.forEach(e => assert(e.isInstanceOf[Outbound.Blocked], e.toString))
+    finally ss.close()
   }
 
   test("only the URLs a destination lists, where it lists them") {
