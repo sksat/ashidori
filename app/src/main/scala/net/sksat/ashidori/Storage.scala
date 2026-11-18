@@ -4,49 +4,90 @@ import android.content.Context
 import java.io.File
 import ashidori.core.*
 
-/** The storage budget shared by every large write of the app (design 6.8):
-  * the basemap and venue downloads and their extraction, the backups and
-  * the region packs. Each reserves what it will write and reports what it
-  * wrote; none starts or goes on once the free space would cut into the
-  * logging reserve `L` (the logger itself never asks).
+/** The storage budget shared by every large write of the app (design 6.8),
+  * in both of its processes: the basemap and venue downloads and their
+  * extraction, the backups and the region packs (main process), and
+  * archive maintenance (`:maintenance`: compaction, the monthly merge,
+  * cutting deleted ranges, the import of old logs). Each reserves what it
+  * will write and reports what it writes; none starts or goes on once the
+  * free space would cut into the logging reserve `L` (the logger itself
+  * never asks).
+  *
+  * The reservations and L live in `files/storage-budget.json`, read and
+  * written under a file lock by both processes ([[BudgetLedger.Shared]]);
+  * a reservation of a process that died is dropped. The main process
+  * computes L (the logging mode and the measured rate) and publishes it
+  * there whenever it changes; the maintenance process reads it from there
+  * at every report of its writes (at least every MiB).
   */
 object Storage:
-  /** The free space of filesDir less the logging reserve `L`. Debug
-    * builds can pretend less free space ([[debugFree]]).
-    */
-  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve())
-  /** Debug builds: free bytes to pretend (DebugReceiver REGIONS_FREE); None: the real ones. */
+  private def app = AshidoriApp.app
+  lazy val ledgerFile: File = File(app.getFilesDir, "storage-budget.json")
+
+  lazy val budget: StorageBudget =
+    StorageBudget(() => free(), () => ownReserve(), BudgetLedger.Shared(ledgerFile), owner, alive)
+
+  /** This process: the boot, its pid and its start (clock ticks since boot, /proc/<pid>/stat). */
+  lazy val owner: String = s"${bootCount()}:${android.os.Process.myPid()}:${startTicks(android.os.Process.myPid()).getOrElse(0L)}"
+
+  private def bootCount(): Int =
+    scala.util.Try(android.provider.Settings.Global.getInt(app.getContentResolver, android.provider.Settings.Global.BOOT_COUNT)).getOrElse(-1)
+
+  /** Field 22 of /proc/<pid>/stat (after the command in parentheses). */
+  private def startTicks(pid: Int): Option[Long] =
+    scala.util.Try {
+      val st = String(java.nio.file.Files.readAllBytes(File(s"/proc/$pid/stat").toPath))
+      st.substring(st.lastIndexOf(')') + 2).split(' ')(19).toLong
+    }.toOption
+
+  /** A reservation's owner is alive: this boot, and its pid still the same process. */
+  private def alive(o: String): Boolean = o.split(':') match
+    case Array(boot, pid, start) =>
+      boot.toIntOption.contains(bootCount()) &&
+        pid.toIntOption.flatMap(startTicks).exists(t => start.toLongOption.contains(t))
+    case _ => false
+
+  /** Debug builds: free bytes to pretend (DebugReceiver STORAGE_FREE); None: the real ones. */
   @volatile var debugFree: Option[Long] = None
-  def free(): Long = debugFree.filter(_ => debuggable).getOrElse(AshidoriApp.app.getFilesDir.getUsableSpace)
+  def free(): Long = debugFree.filter(_ => debuggable).getOrElse(app.getFilesDir.getUsableSpace)
 
   @volatile private var reserveAt = 0L
   @volatile private var reserveMode: Option[LoggingMode] = None
   @volatile private var reserveValue = StorageBudget.MinReserve
-  /** L, measured at most once a minute (the logger's data size is a walk of
-    * its files), and at once when the logging mode changes.
+
+  /** This process's own L: in the main process measured (at most once a
+    * minute, and at once when the logging mode changes) and published; in
+    * the maintenance process only the floor (the published one counts).
     */
-  def reserve(): Long =
-    val now = System.currentTimeMillis()
-    val mode = Settings.mode
-    if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
-      reserveAt = now
-      reserveMode = Some(mode)
-      reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
-    reserveValue
+  private def ownReserve(): Long =
+    if AshidoriApp.isMaintenanceProcess then StorageBudget.MinReserve
+    else
+      val now = System.currentTimeMillis()
+      val mode = Settings.mode
+      if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
+        reserveAt = now
+        reserveMode = Some(mode)
+        reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
+        // Outside the ledger's lock (this is called under it): published next.
+        val v = reserveValue
+        AshidoriApp.io.execute(() => scala.util.Try(budget.publish(v)))
+      reserveValue
+
+  /** L now (published or this process's). */
+  def reserve(): Long = budget.loggingReserve
+
+  /** The main process: the logging mode changed (or the app started):
+    * L is measured and published at once.
+    */
+  def modeChanged(): Unit =
+    if !AshidoriApp.isMaintenanceProcess then
+      AshidoriApp.io.execute { () =>
+        reserveAt = 0L
+        scala.util.Try(budget.publish(ownReserve()))
+      }
 
   private def debuggable: Boolean =
-    (AshidoriApp.app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-
-  /** What a write in another process (archive maintenance in
-    * `:maintenance`) must leave free: L, from the logging mode and the
-    * stored rate (read only), plus room for one chunk it writes. That
-    * process has no share in the budget; it stops once the free space
-    * reaches this floor.
-    */
-  def floor(): Long =
-    StorageBudget.loggingReserve(Settings.mode, LoggingRate.stored(System.currentTimeMillis())) + ChunkRoom
-  /** Room for one chunk the maintenance writes between its checks. */
-  val ChunkRoom: Long = 32L * 1000 * 1000
+    (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
   /** 「空き容量不足（記録用の予備を除いて N MB 必要）」 */
   def shortage(need: Long): String = s"空き容量不足（記録用の予備を除いて ${math.max(1L, need / 1_000_000)} MB 必要）"

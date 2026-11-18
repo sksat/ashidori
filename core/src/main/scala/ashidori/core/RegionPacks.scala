@@ -668,107 +668,6 @@ object RegionStyle:
     if !st.obj.contains("sprite") then st("sprite") = s"file://$fonts/sprites/light"
     ujson.write(st)
 
-/** The storage budget of the app's large writes (design 6.8), shared by
-  * all of them (the basemap and venue downloads and extractions, the
-  * backups, the region packs): a write of `r` bytes starts only if
-  * `F - ΣO - L >= r`, and stops while it runs once `F - ΣO < L`, where `F`
-  * is the free space now (`free`), `O` each reservation's unwritten rest
-  * and `L` the logging reserve (`reserve`). Writes may run at the same
-  * time: each counts the others' unwritten rest. Thread-safe.
-  */
-final class StorageBudget(free: () => Long, reserve: () => Long):
-  final class Reservation private[StorageBudget] (val bytes: Long, start: Long = 0L):
-    @volatile private var written = start
-    @volatile private var open = true
-    /** `n` more bytes written. False once the write must stop: the free
-      * space would cut into the logging reserve.
-      */
-    def wrote(n: Long): Boolean =
-      StorageBudget.this.synchronized(written += n)
-      StorageBudget.this.ok
-    /** For a file being brought to `bytes` ([[reserveFile]]): it is `size`
-      * bytes long now. A file that became shorter (a restart from the
-      * start, a discarded partial file) has more to write again: that is
-      * admitted like a new reservation, against what the others hold now.
-      * False once the write must stop.
-      */
-    def at(size: Long): Boolean = StorageBudget.this.synchronized {
-      if size < written then
-        written = size
-        val others = active.filterNot(_ eq this).map(_.outstanding).sum
-        free() - others - reserve() >= outstanding && StorageBudget.this.ok
-      else
-        written = size
-        StorageBudget.this.ok
-    }
-    def outstanding: Long = if open then math.max(0L, bytes - written) else 0L
-    def release(): Unit = StorageBudget.this.synchronized {
-      open = false
-      active = active.filterNot(_ eq this)
-    }
-
-  private var active = List.empty[Reservation]
-
-  /** A reservation of `r` bytes, or None: `r` does not fit above the
-    * logging reserve and what the other writes will still take.
-    */
-  def reserve(r: Long): Option[Reservation] = synchronized {
-    if free() - active.map(_.outstanding).sum - reserve() < r then None
-    else
-      val x = Reservation(r)
-      active = x :: active
-      Some(x)
-  }
-
-  /** A reservation for a file brought to `target` bytes from `have` (a
-    * resumed download): what is left. Report its size with
-    * [[Reservation.at]] after every write, a truncation included.
-    */
-  def reserveFile(target: Long, have: Long): Option[Reservation] = synchronized {
-    val rest = math.max(0L, target - have)
-    if free() - active.map(_.outstanding).sum - reserve() < rest then None
-    else
-      val x = Reservation(target, math.min(have, target))
-      active = x :: active
-      Some(x)
-  }
-
-  /** The free space, less what reservations will still write, stays at or above the reserve. */
-  def ok: Boolean = synchronized(free() - active.map(_.outstanding).sum >= reserve())
-  /** What a new reservation may take now. */
-  def available: Long = synchronized(math.max(0L, free() - active.map(_.outstanding).sum - reserve()))
-  def busy: Boolean = synchronized(active.nonEmpty)
-
-object StorageBudget:
-  /** The reserve's floor: 256 MB, the monitoring threshold. */
-  val MinReserve: Long = 256L * 1000 * 1000
-  /** Bytes per hour the logger writes in each mode when no rate is measured
-    * (design 6.8; Max: raw lines, journal and output, detail-log-format.md).
-    */
-  def defaultRate(m: LoggingMode): Long = m match
-    case LoggingMode.Eco => 2L * 1000 * 1000
-    case LoggingMode.Balanced => 5L * 1000 * 1000
-    case LoggingMode.Precise => 20L * 1000 * 1000
-    case LoggingMode.Max => 210L * 1000 * 1000
-
-  /** The logger's measured rate from samples (time ms, bytes of its data):
-    * the growth from the oldest sample of the last `windowMs` to the newest,
-    * if they are at least an hour apart. Shrinking (compaction) counts as none.
-    */
-  def measuredRate(samples: Seq[(Long, Long)], now: Long, windowMs: Long = 6L * 3600 * 1000): Option[Long] =
-    val in = samples.filter((t, _) => t >= now - windowMs && t <= now).sortBy(_._1)
-    for
-      a <- in.headOption
-      b <- in.lastOption
-      if b._1 - a._1 >= 3600L * 1000
-    yield math.max(0L, (b._2 - a._2) * 3600L * 1000 / (b._1 - a._1))
-
-  /** L: the larger of the floor and a day of logging at the higher of the
-    * measured rate and the mode's default.
-    */
-  def loggingReserve(mode: LoggingMode, measured: Option[Long]): Long =
-    math.max(MinReserve, math.max(measured.getOrElse(0L), defaultRate(mode)) * 24)
-
 /** Downloads the planned packs one at a time in cell order and places them
   * (design 6.7, 6.9): for each, its style bundle first (verified,
   * extracted, renamed into place), then the pack (resumed from its partial
@@ -940,6 +839,9 @@ final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatal
     * reader waits): the state is empty meanwhile and changes are refused.
     */
   def loading: Boolean = !loaded
+
+  /** The state if it is loaded; never waits (for a UI thread). */
+  def peek: Option[RegionState] = if loaded then Some(current) else None
 
   private val loadLock = java.util.concurrent.locks.ReentrantLock()
 

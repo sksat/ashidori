@@ -256,24 +256,22 @@ object Maintenance:
       return false
     if !running.compareAndSet(false, true) then return false
     val deadline = System.currentTimeMillis() + BudgetMs
-    // The logging reserve (design 6.8): this process writes outside the
-    // budget, so it stops (keeping all data; the rest is done next time)
-    // once the free space reaches L and one chunk's room. Checked with
-    // every stop check, before each chunk it writes.
-    val floor = Try(Storage.floor()).getOrElse(Storage.ChunkRoom + StorageBudget.MinReserve)
-    val files = ctx.getFilesDir
+    // The logging reserve (design 6.8): every file this process writes is
+    // reserved in the budget it shares with the main process, which
+    // publishes L there; a write that does not fit, or would cut into L,
+    // stops the run (keeping all data; the rest is done next time).
     val low = AtomicBoolean(false)
-    val stopOrLow = () => stop() || {
-      if !low.get && files.getUsableSpace < floor && low.compareAndSet(false, true) then
+    def noRoom(what: String): Unit =
+      if low.compareAndSet(false, true) then
         Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
-        LifeLog.add(LifeKind.Note, s"整理を中断: 空き容量が記録用の予備（${floor / 1_000_000} MB）に近い")
-      low.get
-    }
+        LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が記録用の予備（${Try(Storage.reserve() / 1_000_000).getOrElse(0L)} MB）に近い")
+    val stopOrLow = () => stop() || low.get
     val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
+      archive.budget = Try(Storage.budget).toOption
       // A commit a crash interrupted is resolved first; one waiting for the
       // user stops the run (said so in the progress line).
       try archive.recover(db, progress = l => Progress.set(l))
@@ -291,11 +289,18 @@ object Maintenance:
         try
           if archive.deleteRange(db, from, to, halt, l => Progress.set(l)) then db.markArchiveDeleted(id)
           else left = true
-        catch case NonFatal(e) =>
-          LifeLog.add(LifeKind.Note, s"削除した期間をアーカイブから除けず（次回再試行）: ${LifeLog.describe(e)}")
-          Log.w("cutting a deleted range out of the archive failed", e)
-      val legacy = Option(ctx.getExternalFilesDir(null)).map(File(_, "gnss"))
-      legacy.foreach(d => Try(archive.migrateLegacyLogs(db, d)).failed.foreach(e => Log.w("legacy log migration failed", e)))
+        catch
+          case _: StorageBudget.NoRoom =>
+            noRoom("削除した期間")
+            left = true
+          case NonFatal(e) =>
+            LifeLog.add(LifeKind.Note, s"削除した期間をアーカイブから除けず（次回再試行）: ${LifeLog.describe(e)}")
+            Log.w("cutting a deleted range out of the archive failed", e)
+      val legacy = Option(ctx.getExternalFilesDir(null)).map(File(_, "gnss")).filter(_ => !halt())
+      legacy.foreach(d => Try(archive.migrateLegacyLogs(db, d)).failed.foreach {
+        case _: StorageBudget.NoRoom => noRoom("旧形式のログ")
+        case e => Log.w("legacy log migration failed", e)
+      })
       val now = System.currentTimeMillis()
       val charging = ctx.getSystemService(classOf[android.os.BatteryManager]).isCharging
       val b = build()
@@ -329,6 +334,7 @@ object Maintenance:
             try
               val r = archive.compactDay(db, d, stopOrLow, line => Progress.set(line), until = deadline, portionMs = portionMs)
               if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 生データのうち ${r.unconverted} 行は変換できないため端末内に残す")
+              if r.noRoom then noRoom(s"$d")
               if r.done then
                 Guard.clear(d)
                 Complete.mark(d)
@@ -339,6 +345,13 @@ object Maintenance:
                 before.fold(Guard.clear(d))(Guard.put(d, _))
                 left = true
             catch
+              // No room above the logging reserve: not a failure of the day
+              // (its attempt is not counted); nothing was committed of the
+              // portion stopped, and the rest is done next time.
+              case _: StorageBudget.NoRoom =>
+                before.fold(Guard.clear(d))(Guard.put(d, _))
+                noRoom(s"$d")
+                left = true
               case e: OutOfMemoryError =>
                 // The day's buffers are unreachable by now; this process
                 // stays usable for the log line.
@@ -351,6 +364,9 @@ object Maintenance:
       if !halt() then
         try archive.mergeMonths(db, LocalDate.now(AshidoriApp.zone), halt)
         catch
+          case _: StorageBudget.NoRoom =>
+            noRoom("月の統合")
+            left = true
           case e: OutOfMemoryError => Log.w("monthly merge: out of memory", e)
           case NonFatal(e) => Log.w("monthly merge failed", e)
       if halt() then left = true

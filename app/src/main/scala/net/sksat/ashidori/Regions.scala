@@ -127,13 +127,30 @@ object Regions:
   def use: RegionUse = useInstance
   private val useInstance = RegionUse()
 
-  /** The state now (reconciled on first use; empty while the regions are off). */
-  def state: RegionState = book.state
+  private def onMain: Boolean = android.os.Looper.myLooper() == android.os.Looper.getMainLooper
+  @volatile private var loadAsked = false
+
+  /** The state now (reconciled on first use; empty while the regions are
+    * off). On the main thread it never waits: before the state is loaded
+    * it is empty ([[loading]]), the load runs in the background, and the
+    * screens and maps are told when it is there ([[changed]]).
+    */
+  def state: RegionState =
+    if !onMain then book.state
+    else book.peek.getOrElse {
+      if !loadAsked then
+        loadAsked = true
+        AshidoriApp.io.execute(() => { book.ensureLoaded(); changed() })
+      RegionState.empty
+    }
+
+  /** The state is not loaded yet (screens say 読み込み中). */
+  def loading: Boolean = book.loading
 
   /** Reconciles the state with the files once per process, before any
     * other use of them: the download worker and the UI wait for it.
     */
-  def ensureLoaded(): Unit = book.ensureLoaded()
+  def ensureLoaded(): Unit = if onMain then state else book.ensureLoaded()
 
   /** Why the regions cannot be used now (their files unreadable), or the last write failed. */
   def problem: Option[String] = book.broken.orElse(book.writeError)
@@ -142,6 +159,10 @@ object Regions:
     * state as it was) when it could not be written.
     */
   def update(f: RegionState => RegionState): Either[String, RegionState] =
+    // The main thread never waits for the load: refused until it is there.
+    if onMain && book.peek.isEmpty then
+      state
+      return Left("読み込み中")
     val r = book.update(f)
     changed()
     r

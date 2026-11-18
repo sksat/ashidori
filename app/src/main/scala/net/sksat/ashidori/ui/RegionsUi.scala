@@ -107,7 +107,7 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
       t.setTextColor(color(attr.error))
       list.addView(t)
     }
-    if Regions.book.loading then list.addView(supportingText("読み込み中"))
+    if Regions.loading then list.addView(supportingText("読み込み中"))
     else if s.regions.isEmpty then list.addView(supportingText("なし"))
     else list.addView(listGroup(s.regions.map(row)*))
     // Opening this screen may fetch the catalog (RegionsUi.ensureCatalog): where it goes.
