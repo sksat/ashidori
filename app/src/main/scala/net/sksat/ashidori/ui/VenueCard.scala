@@ -155,8 +155,10 @@ object VenueCard:
     * the record are still being built (on this list's thread, a run at a
     * time, the list refreshed after each), a last row says so
     * (「以前の日は集計中」). The work ends when the list closes. A failure
-    * of the index is not "no days": 「読み込めません」 (or, with the days
-    * found shown, 「以前の日は読み込めません」) and 「再試行」.
+    * is not "no days", nor an old result shown as current: when the index
+    * cannot be read or updated, or days are still not up to date once the
+    * runs end, 「読み込めません」 (or, under the days found,
+    * 「一部の日を読み込めません」) and 「再試行」 ([[VisitIndex.footer]]).
     */
   final class VisitList(act: MainActivity, open: LocalDate => Unit)(using Ctx):
     private val gen = AtomicInteger()
@@ -216,12 +218,13 @@ object VenueCard:
         failed.setVisibility(View.GONE)
         view.setVisibility(View.VISIBLE)
         val live = () => gen.get == g
-        def post(a: Option[VisitDays.Answer], more: Boolean): Unit =
-          act.runOnUiThread(() => if live() then fill(a, more))
+        def post(a: Option[VisitDays.Answer], more: Boolean, trouble: Boolean): Unit =
+          act.runOnUiThread(() => if live() then fill(a, more, trouble))
         VisitDays.exec.execute { () =>
           if live() then
-            VisitDays.opened(() => !live())
-            post(VisitDays.query(venue), more = true)
+            // Noting the record's changes failed: said once the runs end.
+            var trouble = !VisitDays.opened(() => !live())
+            post(VisitDays.query(venue), more = true, trouble = false)
             // Runs until every day is built (or none could be), the list closed.
             var skip = Set.empty[LocalDate]
             var go = true
@@ -230,34 +233,32 @@ object VenueCard:
                 case Some(r) =>
                   skip ++= r.failed
                   go = r.built > 0 && r.left > skip.size
-                  if r.built > 0 then post(VisitDays.query(venue), more = go)
-                case None => go = false
-            post(VisitDays.query(venue), more = false)
+                  if r.built > 0 then post(VisitDays.query(venue), more = go, trouble = false)
+                case None =>
+                  trouble = true
+                  go = false
+            post(VisitDays.query(venue), more = false, trouble = trouble)
         }
 
-    /** `a`: the answer (None: the index failed); `more`: days are still being built. */
-    private def fill(a: Option[VisitDays.Answer], more: Boolean): Unit =
+    /** `a`: the answer (None: the index failed); `more`: days are still
+      * being built; `trouble`: updating the index failed.
+      */
+    private def fill(a: Option[VisitDays.Answer], more: Boolean, trouble: Boolean): Unit =
       progress.setVisibility(View.GONE)
-      a match
-        case None =>
-          // The days shown before stay; the failure is said, not "none".
-          building.setVisibility(View.GONE)
-          none.setVisibility(View.GONE)
-          failedText.setText(if shownDays.isEmpty then "読み込めません" else "以前の日は読み込めません")
+      // The days shown before stay when the index cannot be read.
+      for ans <- a if ans.days != shownDays do
+        shownDays = ans.days
+        rows.removeAllViews()
+        ans.days.foreach(d => rows.addView(row(d)))
+      val footer = VisitIndex.footer(answered = a.isDefined, shown = shownDays.size, unbuilt = a.fold(0)(_.unbuilt),
+        stale = a.fold(0)(_.stale), building = more, trouble = trouble)
+      building.setVisibility(if footer == VisitIndex.Footer.Building then View.VISIBLE else View.GONE)
+      none.setVisibility(if footer == VisitIndex.Footer.NoDays then View.VISIBLE else View.GONE)
+      footer match
+        case VisitIndex.Footer.Failed(some) =>
+          failedText.setText(if some then "一部の日を読み込めません" else "読み込めません")
           failed.setVisibility(View.VISIBLE)
-        case Some(ans) =>
-          val days = ans.days
-          if days != shownDays then
-            shownDays = days
-            rows.removeAllViews()
-            days.foreach(d => rows.addView(row(d)))
-          val incomplete = ans.unbuilt > 0
-          // Building has ended with days left: some could not be read.
-          val stuck = incomplete && !more
-          building.setVisibility(if incomplete && more then View.VISIBLE else View.GONE)
-          none.setVisibility(if days.isEmpty && !incomplete && !more then View.VISIBLE else View.GONE)
-          failedText.setText(if days.isEmpty then "読み込めません" else "以前の日は読み込めません")
-          failed.setVisibility(if stuck then View.VISIBLE else View.GONE)
+        case _ => failed.setVisibility(View.GONE)
 
     private def row(d: VisitIndex.DayVisit): View =
       val date = d.day.format(DayParts.dateFmt)

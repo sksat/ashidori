@@ -27,17 +27,22 @@ import VisitIndex.{DayState, DayVisit, Marks, Changes}
   * and in the maintenance process after archiving ([[maintain]]).
   *
   * No change is missed for good: new rows are found by rowid in SQLite, and
-  * before archiving moves a day's rows out of SQLite the maintenance
-  * process marks that day and its neighbours changed in this file
-  * ([[beforeArchiving]]). If that marking fails, a marker file says the
-  * whole index is of unknown freshness ([[markStale]]): the next use
-  * empties it and it is built again. Neither ever waits for or fails the
-  * archiving. Other writes need no hook: every row of positions or motion
-  * enters SQLite (late ones and imports too: the rowid scan finds them)
-  * and leaves it only by archiving (marked) or a deletion (its sequence);
-  * the other tables (energy, battery, pressure, raw lines) do not change
-  * a stay. Only a write path added later that bypasses SQLite would need
-  * one.
+  * archiving, which moves a day's rows out of SQLite, has the maintenance
+  * process mark that day and its neighbours changed in this file before it
+  * and again after its commit ([[beforeArchiving]], [[afterArchiving]]): a
+  * late row (a spill imported, say) that came after a build had used up
+  * the first mark and left with the same commit is followed by another
+  * build. A durable note of the day archived (`visit_index.archiving`)
+  * lasts from before the move to after the second mark: if the process
+  * dies in between, the next maintenance run marks the day once its
+  * recovery has finished the commit ([[settleArchiving]]). If a marking or
+  * the note fails, a marker file says the whole index is of unknown
+  * freshness ([[markStale]]): the next use empties it and it is built
+  * again. None of this ever waits for or fails the archiving. Rows of
+  * positions and motion leave SQLite only by archiving (marked both sides)
+  * or a deletion (its sequence); the other tables (energy, battery,
+  * pressure, raw lines) do not change a stay. Only a write path added
+  * later that bypasses SQLite would need a mark of its own.
   */
 object VisitDays:
   /** Days built per run while the list is open (the list is refreshed after each). */
@@ -55,6 +60,8 @@ object VisitDays:
   }
 
   def file(c: Context): File = File(c.getNoBackupFilesDir, "visit_index.db")
+  /** The day being archived, from before the move to after the mark after it. */
+  private def archivingFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.archiving")
   /** The marker of unknown freshness, and the same while being acted on. */
   private def staleFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale")
   private def claimedFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale.claimed")
@@ -116,20 +123,30 @@ object VisitDays:
       Changes(db.hoursAdded("fixes", from.fixes, to.fixes) ++ db.hoursAdded("motion", from.motion, to.motion),
         db.deletedBetween(from.deletions, to.deletions))
     def firstDay(): Option[LocalDate] = AshidoriApp.db.firstDataDate()
-    def stays(day: LocalDate): Vector[Visit] = TimelineRepo.stays(day)
+    def stays(day: LocalDate): Vector[Visit] =
+      if failBuildsForTest then throw IllegalStateException("debug: builds fail")
+      TimelineRepo.stays(day)
 
   /** Debug builds (DebugReceiver VISITS fail): every query fails, to see the list's failure state. */
   @volatile var failQueriesForTest = false
+  /** Debug builds (VISITS failbuild): every day fails to build. */
+  @volatile var failBuildsForTest = false
 
-  /** What the list shows: the days found, and the days of the record not built yet. */
-  final case class Answer(days: Vector[DayVisit], unbuilt: Int)
+  /** What the list shows: the days found, the days of the record never
+    * built, and those not up to date (changed since built included).
+    */
+  final case class Answer(days: Vector[DayVisit], unbuilt: Int, stale: Int)
 
-  /** The list is opened: changes noted (until `stop`), today marked to be built again. */
-  def opened(stop: () => Boolean = () => false): Unit = guarded("note") {
+  /** The list is opened: changes noted (until `stop`), today and a day being
+    * archived marked to be built again. False: that failed (said in the list).
+    */
+  def opened(stop: () => Boolean = () => false): Boolean = guarded("note") {
     emptyIfStale()
     VisitIndex.note(store, Record, AshidoriApp.zone, stop)
     VisitIndex.touch(store, today)
-  }
+    // Marked, not settled: only the maintenance process clears the note.
+    archivingDay.foreach(VisitIndex.archiving(store, _))
+  }.isDefined
 
   /** The days of `venue` the index holds now. */
   def query(venue: LatLng): Option[Answer] = guarded("query") {
@@ -140,8 +157,9 @@ object VisitDays:
     val t1 = System.nanoTime()
     val first = AshidoriApp.db.firstDataDateCached.getOrElse(today)
     val unbuilt = VisitIndex.unbuilt(store, first, today)
+    val stale = VisitIndex.stale(store, first, today)
     Log.d(f"visits: query ${days.size} days in ${(t1 - t0) / 1e6}%.1f ms (${(System.nanoTime() - t1) / 1e6}%.1f ms more for the count), $unbuilt days not built")
-    Answer(days, unbuilt)
+    Answer(days, unbuilt, stale)
   }
 
   /** One run of building: at most `maxDays`, until `stop`; days in `skip` not tried. */
@@ -160,9 +178,32 @@ object VisitDays:
     * transaction; on failure the index is marked stale. Never throws.
     */
   def beforeArchiving(day: LocalDate): Unit =
+    // The note first: it outlives this process until the mark after the commit.
+    if scala.util.Try(Maintenance.write(archivingFile, day.toString)).isFailure then markStale(s"noting $day failed")
+    mark(day, "before")
+
+  /** In the maintenance process, after archiving `day` (its commits done,
+    * or it failed): the day and its neighbours marked again, then the note
+    * removed. Never throws.
+    */
+  def afterArchiving(day: LocalDate): Unit =
+    if mark(day, "after") then scala.util.Try(archivingFile.delete())
+
+  /** In the maintenance process, after recovery has finished an interrupted
+    * commit: the day its note names is marked, and the note removed.
+    */
+  def settleArchiving(): Unit = archivingDay.foreach(afterArchiving)
+
+  private def archivingDay: Option[LocalDate] =
+    scala.util.Try(LocalDate.parse(String(java.nio.file.Files.readAllBytes(archivingFile.toPath), java.nio.charset.StandardCharsets.UTF_8).trim)).toOption
+
+  /** The day and its neighbours marked changed; on failure the index is marked stale. */
+  private def mark(day: LocalDate, when: String): Boolean =
     val t0 = System.nanoTime()
-    if guarded("mark before archiving")(VisitIndex.archiving(store, day)).isEmpty then markStale(s"marking $day failed")
-    else Log.d(f"visits: $day and its neighbours marked before archiving in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
+    val ok = guarded(s"mark $when archiving")(VisitIndex.archiving(store, day)).isDefined
+    if !ok then markStale(s"marking $day $when archiving failed")
+    else Log.d(f"visits: $day and its neighbours marked $when archiving in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
+    ok
 
   /** In the maintenance process, after archiving: a bounded run (days, and [[MaintainMs]]). */
   def maintain(charging: Boolean, halt: () => Boolean): Unit =

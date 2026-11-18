@@ -51,7 +51,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
   *   ... -a ashidori.debug.VISITS --es op rebuild     「訪れた日」: the index deleted and built whole (timed);
   *                                                    `--es op reset`: only deleted; `fail`, `unfail`: queries
-  *                                                    fail (or not); `stale`: marked of unknown freshness
+  *                                                    fail (`unfail` also ends `failbuild`: builds fail); `stale`: marked of unknown freshness
   *   ... -a ashidori.debug.VISITS --es op check --es at "35.63,139.79;35.68,139.76"  the index's answer for
   *                                                    each venue (timed) against every day built and filtered
   *

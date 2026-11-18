@@ -250,7 +250,11 @@ object DebugData:
       case "reset" =>
         VisitDays.reset()
         Log.i("visits bench: reset")
+      case "failbuild" =>
+        VisitDays.failBuildsForTest = true
+        Log.i("visits bench: builds fail")
       case "fail" | "unfail" =>
+        if op == "unfail" then VisitDays.failBuildsForTest = false
         VisitDays.failQueriesForTest = op == "fail"
         Log.i(s"visits bench: queries fail ${VisitDays.failQueriesForTest}")
       case "stale" => VisitDays.markStale("debug")

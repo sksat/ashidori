@@ -116,6 +116,8 @@ object Maintenance:
           else
             val had = archive.commitPending
             archive.recover(db, progress = l => Progress.set(l))
+            // A commit it finished: the 「訪れた日」 index marks its day after it.
+            VisitDays.settleArchiving()
             if had then "中断された整理を解決しました" else "未完了の整理はありません"
         catch
           case _: ArchiveStore.CommitStuck => "自動では解決できません（「整理を修復」で解決）"
@@ -265,6 +267,9 @@ object Maintenance:
           // Not a failure of this run: nothing to archive until it is resolved.
           Progress.set("記録の整理が停止（要確認）", running = false)
           return false
+      // A commit it finished (the process died before the mark after it):
+      // the 「訪れた日」 index marks its day now.
+      VisitDays.settleArchiving()
       // Ranges the user deleted: cut out of the archive files first (their
       // SQLite rows are gone already). One left pending is cut again next time.
       for (id, from, to) <- db.archiveDeletionsPending() if !halt() do
@@ -299,9 +304,10 @@ object Maintenance:
             // run sees the attempt.
             Guard.put(d, next)
             Complete.clear(d)
-            // Before rows of the day leave SQLite: the 「訪れた日」 index marks
-            // the day (one short write of its own file; never throws, never
-            // waits for the index: on failure it is marked stale instead).
+            // Before rows of the day leave SQLite, and again after (below):
+            // the 「訪れた日」 index marks the day (short writes of its own
+            // files; never throws, never waits for the index: on failure it
+            // is marked stale instead).
             VisitDays.beforeArchiving(d)
             if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していた整理を再試行")
             val t0 = System.currentTimeMillis()
@@ -326,6 +332,7 @@ object Maintenance:
               case NonFatal(e) =>
                 LifeLog.add(LifeKind.Note, s"$d: 整理に失敗（データは端末内に保持）: ${LifeLog.describe(e)}")
                 Log.w(s"archiving $d failed; kept in SQLite", e)
+            finally VisitDays.afterArchiving(d)
       if !halt() then
         try archive.mergeMonths(db, LocalDate.now(AshidoriApp.zone), halt)
         catch
