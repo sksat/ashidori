@@ -256,6 +256,24 @@ class RegionPacksSuite extends munit.FunSuite:
       RegionStatus.Failed(RegionRun.MismatchReason))
   }
 
+  test("download: an unusable pack planned again at its own version fetches only its bundle") {
+    val p = publish("20261117", Seq(tokyo))
+    val store = RegionStore(tmpDir())
+    store.root.mkdirs()
+    val f = File(store.root, "x")
+    Files.write(f.toPath, pack(tokyo))
+    store.placePack(f, tokyo, "20261117", "s1")
+    val http = Http(p.files)
+    val env = Env(store, http, budget())
+    env.update(_ => RegionState(Seq(Region("r1", "a", Seq(tokyo), 0)),
+      Map(tokyo -> PackState(Some(Installed("20261117", "s1", 9, 1)), Some(RegionCatalog.target(p.catalog, p.catalog.cells(tokyo)))))))
+    assertEquals(RegionRun.run(env), RegionRun.Result.Done)
+    assertEquals(http.requests.map(_._1).toSeq, Seq(RegionCatalog.styleName("s1")))
+    assert(store.stylePresent("s1"))
+    assertEquals(env.state.packs(tokyo).target, None)
+    assertEquals(env.state.packs(tokyo).installed.map(_.at), Some(42L))
+  }
+
   test("download: a pack whose header leaves its cell is refused after its sha256 matched") {
     val p = publish("20261117", Seq(tokyo))
     // The catalog pins Osaka's bytes under Tokyo's name.
