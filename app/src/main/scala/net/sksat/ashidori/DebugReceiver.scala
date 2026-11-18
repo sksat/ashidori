@@ -195,7 +195,10 @@ class DebugReceiver extends BroadcastReceiver:
       case "ashidori.debug.CAMERA" =>
         val p = ashidori.core.LatLng(intent.getFloatExtra("lat", 35.681f).toDouble, intent.getFloatExtra("lon", 139.767f).toDouble)
         val z = intent.getFloatExtra("zoom", 14f).toDouble
-        AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.moveTo(p, z)))
+        AshidoriApp.app.getMainExecutor.execute { () =>
+          ui.TrackMap.all.foreach(_.moveTo(p, z))
+          ui.RegionSelectScreen.shown.foreach(_.moveTo(p, z))
+        }
       case "ashidori.debug.CUSTOM_TILES" =>
         // An empty URL removes it (as before the user set one).
         val url = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
@@ -268,6 +271,46 @@ class DebugReceiver extends BroadcastReceiver:
         val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
         dl.start(c, allowMetered = true)
         Log.i(s"data start ${dl.WorkName} allowed=${dl.allowed}")
+      case "ashidori.debug.REGIONS_SOURCE" =>
+        // The region packs from a local server (adb reverse) and its catalog's pin:
+        // --es url http://127.0.0.1:8799 --es version V --el bytes N --es sha256 H ("none": the bundled pin).
+        val url = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
+        val version = Option(intent.getStringExtra("version")).getOrElse("")
+        val pin = if url.isEmpty then "" else ujson.write(ujson.Obj("format" -> ashidori.core.RegionPin.Format,
+          "version" -> version, "file" -> ashidori.core.RegionPin.catalogName(version),
+          "bytes" -> intent.getLongExtra("bytes", 0L).toDouble, "sha256" -> Option(intent.getStringExtra("sha256")).getOrElse("")))
+        Regions.setDebugSource(url, pin)
+        Log.i(s"regions source: ${Regions.debugUrl} pin ${Regions.pin}")
+      case "ashidori.debug.REGIONS_FREE" =>
+        // Pretends this many free bytes for the storage budget (0: the real free space).
+        val b = intent.getLongExtra("bytes", 0L)
+        RegionDownload.debugFree = Option.when(b > 0)(b)
+        Log.i(s"regions free: ${RegionDownload.free()} reserve ${RegionDownload.reserve()}")
+      case "ashidori.debug.REGIONS_ADD" =>
+        // A region of --es cells "8-227-100,8-228-100" (--es name), planned and started as the screen does.
+        val cells = Option(intent.getStringExtra("cells")).toSeq.flatMap(_.split(",")).flatMap(ashidori.core.Cell.parse)
+        val name = Option(intent.getStringExtra("name")).getOrElse("地域")
+        AshidoriApp.io.execute { () =>
+          val r = scala.util.Try {
+            val p = Settings.gate.permit(ashidori.core.Dest.Data, ashidori.core.Mode.OnAction).get
+            val cat = Regions.fetchCatalog(p)
+            Regions.add(name, cells, cat)
+          }
+          Log.i(s"regions add: $r")
+          AshidoriApp.app.getMainExecutor.execute(() => RegionDownload.start(c))
+        }
+      case "ashidori.debug.REGIONS_DELETE" =>
+        // As 削除 in the list: --es id r1.
+        val id = Option(intent.getStringExtra("id")).getOrElse("")
+        AshidoriApp.app.getMainExecutor.execute(() => Regions.delete(id))
+        Log.i(s"regions delete $id")
+      case "ashidori.debug.REGIONS_STATE" =>
+        AshidoriApp.io.execute { () =>
+          val s = Regions.state
+          Log.i(s"regions state: ${ashidori.core.RegionState.encode(s)}")
+          Log.i(s"regions scan: ${Regions.store.scan()} holders ${Regions.use.holders} drawable ${Regions.placed.map(_._1)}")
+          Log.i(s"regions budget: free ${RegionDownload.free()} reserve ${RegionDownload.reserve()} available ${RegionDownload.budget.available}")
+        }
       case "ashidori.debug.VISITS" =>
         val op = Option(intent.getStringExtra("op")).getOrElse("check")
         val at = Option(intent.getStringExtra("at")).toSeq.flatMap(_.split(";")).flatMap(s =>
