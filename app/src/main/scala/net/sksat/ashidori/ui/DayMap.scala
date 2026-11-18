@@ -56,8 +56,10 @@ object DayMap:
     var generation = 0
     /** Its snapshot rendering now, cancelled when it leaves the window. */
     var running: Option[MapSnapshotter] = None
-    /** On screen (attached and shown): only then may a job of it start. */
-    def onScreen: Boolean = isAttachedToWindow && isShown
+    /** In a window (its screen is shown; a page of it may be hidden): only then may a job of it start. */
+    def onScreen: Boolean = isAttachedToWindow
+    /** A job of it did not start (not in a window yet, or not any more): drawn when it is attached. */
+    def deferred(): Unit = if !isAttachedToWindow then stale = true
     /** Now if shown; a detached card (an old feed, another tab) when it comes back. */
     def invalidateMap(): Unit =
       if isAttachedToWindow then
@@ -240,7 +242,8 @@ object DayMap:
             queue.enqueue { () =>
               // A card that left the screen since: nothing (drawn when it comes back).
               if frame.generation != gen || !frame.onScreen then
-                Net.log(s"snapshot skipped: card off screen")
+                Net.log(s"snapshot deferred: card not in a window (queued for $gen, now ${frame.generation}, attached ${frame.isAttachedToWindow})")
+                frame.deferred()
                 None
               // Rendered while scrolling, without the user asking for that
               // area: an online map only if its destination is automatic, by
