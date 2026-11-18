@@ -41,6 +41,9 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.DATA_URL --es url http://10.0.2.2:8799   the data's debug source (none removes it)
   *   ... -a ashidori.debug.MAP_STYLE --es key gsi-std    the chosen base map (no consent)
   *   ... -a ashidori.debug.DETAIL --es key gsi-std       「オンライン地図で表示」 on every open map (none: back)
+  *   ... -a ashidori.debug.DATA_DELETE --es kind venues    delete downloaded data (a download then sends)
+  *   ... -a ashidori.debug.PAUSE_AT --es at checked:write    pause right after that check of the next request
+  *   ... -a ashidori.debug.STYLE_RETRY                      as a network becoming available for the style fetches
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
   *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
   *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
@@ -156,10 +159,15 @@ class DebugReceiver extends BroadcastReceiver:
           l <- Level.fromKey(Option(intent.getStringExtra("level")).getOrElse(Settings.gate.rule(d).level.key))
         yield d -> Rule(w, l, Option(intent.getStringExtra("off")).fold(Set.empty[String])(_.split(',').map(_.trim).filter(_.nonEmpty).toSet))
         rule match
-          case Some((d, r)) if Policy.valid(d, r) => Log.i(s"outbound rule ${d.key}: $r changed=${Settings.gate.setRule(d, r)}")
+          case Some((d, r)) if Policy.valid(d, r) => Net.change(Log.i(s"outbound rule ${d.key}: $r changed=${Settings.gate.setRule(d, r)}"))()
           case other => Log.w(s"outbound: not a rule: $other")
       case "ashidori.debug.PAUSE" =>
-        Log.i(s"outbound pause changed=${Settings.gate.setPaused(intent.getBooleanExtra("on", true))}")
+        val on = intent.getBooleanExtra("on", true)
+        Net.change {
+          val t0 = System.nanoTime()
+          val changed = Settings.gate.setPaused(on)
+          Log.i(s"outbound pause changed=$changed returned after ${(System.nanoTime() - t0) / 1_000_000} ms")
+        }()
       case "ashidori.debug.OUTBOUND_STATE" =>
         val st = Settings.gate.snapshot
         Log.i(s"outbound state paused=${st.paused} problem=${st.problem} policy=${ashidori.core.Policy.encode(st.policy)} " +
@@ -197,8 +205,34 @@ class DebugReceiver extends BroadcastReceiver:
         val ms = ui.MapStyle.values.find(_.key == intent.getStringExtra("key"))
         AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.setDetailed(ms.nonEmpty, ms)))
       case "ashidori.debug.DATA_URL" =>
-        BasemapDownload.debugUrl = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
-        Log.i(s"data debug url: ${BasemapDownload.debugUrl}")
+        val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
+        dl.debugUrl = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
+        Log.i(s"data debug url (${dl.WorkName}): ${dl.debugUrl}")
+      case "ashidori.debug.DATA_DELETE" =>
+        // Deletes the downloaded data, so that a download sends again.
+        val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
+        dl.delete(c)
+        Log.i(s"data deleted (${dl.WorkName})")
+      case "ashidori.debug.PAUSE_AT" =>
+        // The next Outbound request: the pause starts (on another thread) right
+        // after the check of the I/O call `at` (e.g. checked:write), while that call waits.
+        val at = Option(intent.getStringExtra("at")).getOrElse("checked:write")
+        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
+        def now = f"${System.nanoTime() / 1e6}%.1f"
+        Net.outbound.step = st =>
+          if fired.get && st == "done:" + at.stripPrefix("checked:") then Net.log(s"step $st t=$now")
+          if st == at && fired.compareAndSet(false, true) then
+            Net.log(s"step $st t=$now: pausing")
+            Thread(() =>
+              Settings.gate.setPaused(true)
+              Net.log(s"step pause returned t=$now")
+            ).start()
+            Thread.sleep(300)
+            Net.log(s"step $st t=$now: the call goes on")
+      case "ashidori.debug.STYLE_RETRY" =>
+        // As a network becoming available: the waiting style fetches are retried.
+        ui.OnlineStyles.retryNow()
+        Log.i("style retry asked")
       case "ashidori.debug.FETCH" =>
         // One request through Outbound under a permit of `dest` (a redirect test).
         val dest = ashidori.core.Dest.fromKey(Option(intent.getStringExtra("dest")).getOrElse("data")).get
