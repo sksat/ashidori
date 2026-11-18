@@ -50,13 +50,18 @@ class MapHttpSuite extends munit.FunSuite:
       names.add(host)
       java.util.List.of(InetAddress.getLoopbackAddress)
 
-  private def fixture(policy: Policy, tiles: Tiles) =
+  private def fixture(policy: Policy, tiles: Tiles, proxy: Option[Int] = None) =
     val g = gate(policy)
     val template = s"http://tiles.test:${tiles.port}/t/{z}/{x}/{y}.png"
     val guard = MapGuard(g, TokenTable(Map.empty), d => Option.when(d == Dest.CustomTiles)(UrlType.template(template)).flatten)
     val dns = Lookups()
     val log = scala.collection.mutable.ArrayBuffer.empty[String]
-    val client = MapHttp(guard, l => log.synchronized(log += l), system = dns).client()
+    val selector = new java.net.ProxySelector:
+      def select(u: java.net.URI): java.util.List[java.net.Proxy] = proxy match
+        case Some(port) => java.util.List.of(java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress.createUnresolved("proxy.test", port)))
+        case None => java.util.List.of(java.net.Proxy.NO_PROXY)
+      def connectFailed(u: java.net.URI, a: java.net.SocketAddress, e: java.io.IOException): Unit = ()
+    val client = MapHttp(guard, l => log.synchronized(log += l), system = dns, proxies = selector).client()
     (g, guard, client, dns, log)
 
   private def get(client: okhttp3.OkHttpClient, url: String): Either[java.io.IOException, Int] =
@@ -151,3 +156,29 @@ class MapHttpSuite extends munit.FunSuite:
       assertEquals(dns.names.size, 0)
     }
   }
+
+  test("through the system's HTTP proxy: only the proxy's name is looked up; a refused request looks up nothing") {
+    val asked = java.util.concurrent.ConcurrentLinkedQueue[String]()
+    val proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    proxy.createContext("/", ex =>
+      asked.add(ex.getRequestURI.toString)
+      val b = "x".getBytes
+      ex.sendResponseHeaders(200, b.length)
+      ex.getResponseBody.write(b)
+      ex.close())
+    proxy.start()
+    try
+      withServers((_, _) => _ => (200, Nil)) { (tiles, _) =>
+        val (g, guard, client, dns, _) = fixture(auto, tiles, proxy = Some(proxy.getAddress.getPort))
+        val url = s"http://tiles.test:${tiles.port}/t/14/1/2.png"
+        assert(get(client, url).isLeft)
+        assertEquals(dns.names.size, 0)
+        val t = guard.hold("snapshot", Object(), g.permit(Dest.CustomTiles, Mode.Auto).get)
+        assertEquals(get(client, TileStyle.withToken(url, t)), Right(200))
+        assertEquals(dns.names.toArray.toSeq, Seq("proxy.test"))
+        assertEquals(asked.toArray.toSeq, Seq(url))
+        assertEquals(tiles.hits.get, 0)
+      }
+    finally proxy.stop(0)
+  }
+

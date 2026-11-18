@@ -4,6 +4,7 @@ import java.io.IOException
 import java.net.InetAddress
 import okhttp3.{Dispatcher, Dns, Interceptor, OkHttpClient, Response}
 import MapGuard.Verdict
+import scala.jdk.CollectionConverters.*
 
 /** The map library's HTTP client with [[MapGuard]] on every request
   * (design 4.4). OkHttp runs the application interceptors before it looks
@@ -17,13 +18,17 @@ import MapGuard.Verdict
   *    connection made for a hop that is not allowed.
   *  - [[hop]] (network interceptor): each request on the network is
   *    verified once more (a second line).
-  *  - [[dns]]: only the hosts of the map destinations' URLs are looked up.
+  *  - [[dns]]: only the hosts of the map destinations' URLs are looked up,
+  *    and the HTTP proxy the system selects for them (OkHttp resolves a
+  *    proxy's name through the same resolver). Without a proxy no other name
+  *    is looked up.
   *
   * A refusal is a plain IOException, which the map library treats as a
   * permanent failure and does not retry (prototypes 2.3). `log` hears each
   * pass and refusal; `system` resolves the names allowed.
   */
-final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int = 5, system: Dns = Dns.SYSTEM):
+final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int = 5, system: Dns = Dns.SYSTEM,
+                    proxies: java.net.ProxySelector = java.net.ProxySelector.getDefault):
   private def refuse(reason: String, url: String): Nothing =
     log(s"reject reason=$reason url=${Outbound.redact(url)}")
     throw IOException(s"ashidori: $reason")
@@ -65,15 +70,29 @@ final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int
         case Verdict.Reject(reason) => refuse(s"hop: $reason", req.url.toString)
       case None => refuse("hop: unchecked", req.url.toString)
 
+  /** The proxies the system selects for the map destinations' URLs: OkHttp
+    * looks up an HTTP proxy's name through [[dns]] too.
+    */
+  private def proxyHosts: Set[String] =
+    if proxies == null then Set.empty
+    else for
+      h <- guard.hosts
+      scheme <- Set("http", "https")
+      proxy <- (try Option(proxies.select(java.net.URI(s"$scheme://$h/"))).fold(Seq.empty[java.net.Proxy])(_.asScala.toSeq)
+                catch case _: Exception => Seq.empty)
+      if proxy.`type` != java.net.Proxy.Type.DIRECT
+      addr <- Option(proxy.address).collect { case a: java.net.InetSocketAddress => a.getHostString.toLowerCase }
+    yield addr
+
   val dns: Dns = host =>
-    if guard.hosts(host.toLowerCase) then system.lookup(host)
+    if guard.hosts(host.toLowerCase) || proxyHosts(host.toLowerCase) then system.lookup(host)
     else
       log(s"reject reason=dns host=$host")
       throw java.net.UnknownHostException(s"ashidori: $host is not a map destination's")
 
-  /** The client: no redirects or retries of its own. */
+  /** The client: no redirects or retries of its own; the proxy the system selects. */
   def client(dispatcher: Dispatcher = Dispatcher()): OkHttpClient =
-    OkHttpClient.Builder()
+    val b = OkHttpClient.Builder()
       .dispatcher(dispatcher)
       .dns(dns)
       .addInterceptor(check)
@@ -81,4 +100,5 @@ final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int
       .followRedirects(false)
       .followSslRedirects(false)
       .retryOnConnectionFailure(false)
-      .build()
+    Option(proxies).foreach(b.proxySelector)
+    b.build()
