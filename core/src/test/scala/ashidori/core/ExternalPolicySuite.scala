@@ -153,3 +153,23 @@ class ExternalPolicySuite extends munit.FunSuite:
     // A map claimed for another destination.
     assertEquals(Consents.read(Consents.encode(Map("map" -> Consent(GsiStd, Dest.Ofm, Level.Exact))), Surfaces, destOf), Map.empty[String, Consent])
   }
+
+  test("a policy stored with the wrong type is corrupt: recovery, kept as it is, no migration, the pause as stored") {
+    for paused <- Seq(Stored.Ok(true), Stored.Missing, Stored.Bad) do
+      val v = ExternalSettings.Values(Stored.Bad, Stored.Ok(Consents.encode(Map("map" -> Consent(GsiStd, Dest.Gsi, Level.Exact)))),
+        Stored.Missing, paused, Stored.Ok(false), Stored.Missing)
+      val (state, writes) = ExternalSettings.load(v, Surfaces, destOf, java.util.Random(1))
+      assertEquals(state.policy, Policy.recovery, paused.toString)
+      assertEquals(state.problem, Some(Policy.Problem.Corrupt))
+      assertEquals(state.consents, Map.empty[String, Consent])
+      assertEquals(state.paused, paused != Stored.Missing, paused.toString)
+      // New generations are stored, the policy is not touched; older versions read "block".
+      assert(writes.forall(w => !w.strings.contains(ExternalSettings.PolicyKey)))
+      assert(writes.forall(w => w.booleans.get(ExternalSettings.LegacyBlockKey).forall(identity)))
+    // Only a missing policy migrates.
+    val (migrated, _) = ExternalSettings.load(ExternalSettings.Values(Stored.Missing, Stored.Missing, Stored.Missing,
+      Stored.Ok(true), Stored.Ok(false), Stored.Missing), Surfaces, destOf, java.util.Random(1))
+    assertEquals(migrated.policy, Policy.fromBlock(false))
+    assert(migrated.paused)
+  }
+

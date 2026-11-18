@@ -37,29 +37,33 @@ object ExternalSettings:
     */
   def load(v: Values, surfaces: Set[String], destOf: String => Option[Dest],
            rnd: java.util.Random): (SendGate.State, Option[Writes]) =
+    val paused = v.paused match
+      case Stored.Ok(b) => b
+      case Stored.Missing => false
+      // Unreadable: the safer side.
+      case Stored.Bad => true
+    def stored(read: Policy.Read, consents: Map[String, Consent]) =
+      val gens = v.gens match
+        case Stored.Ok(g) => Gens.read(g)
+        case _ => None
+      val state = SendGate.State(read.policy, consents, gens.getOrElse(Gens.random(rnd)), paused, read.problem)
+      (state, Option.when(gens.isEmpty)(writes(state)))
     v.policy match
       case Stored.Ok(json) =>
         val read = Policy.read(json)
-        val p = read.policy
         val consents = v.consents match
-          case Stored.Ok(c) => usable(Consents.read(c, surfaces, destOf), p)
+          case Stored.Ok(c) => usable(Consents.read(c, surfaces, destOf), read.policy)
           case _ => Map.empty
-        val paused = v.paused match
-          case Stored.Ok(b) => b
-          case Stored.Missing => false
-          // Unreadable: the safer side.
-          case Stored.Bad => true
-        val stored = v.gens match
-          case Stored.Ok(g) => Gens.read(g)
-          case _ => None
-        val state = SendGate.State(p, consents, stored.getOrElse(Gens.random(rnd)), paused, read.problem)
-        (state, Option.when(stored.isEmpty)(writes(state)))
-      case _ =>
-        // Missing (or of the wrong type, which only this version writes): migrate.
+        stored(read, consents)
+      // Present but not a string: corrupt, as an unreadable value (recovery,
+      // nothing migrated, the pause as stored, the value left as it is).
+      case Stored.Bad => stored(Policy.Read(Policy.recovery, Some(Policy.Problem.Corrupt)), Map.empty)
+      case Stored.Missing =>
+        // A fresh install or a version before these settings: migrate.
         val (block, old) = MapConsents.load(v.legacyBlock, v.legacyConsents, surfaces, id => destOf(id).isDefined)
         val p = Policy.fromBlock(block)
         val consents = old.flatMap((s, m) => destOf(m).map(d => s -> Consent(m, d, Level.Exact)))
-        val state = SendGate.State(p, usable(consents, p), Gens.random(rnd))
+        val state = SendGate.State(p, usable(consents, p), Gens.random(rnd), paused)
         (state, Some(writes(state)))
 
   /** Consents of destinations sent to on action at the consent's level. */
