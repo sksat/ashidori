@@ -68,6 +68,8 @@ object DayMap:
       super.onDetachedFromWindow()
       Net.guard.release("snapshot", this)
       OnlineStyles.forget(this)
+      // Drawn again when it comes back (from the cache, or asking anew).
+      stale = true
 
   /** Cards built so far, while something still shows them. */
   private val cards = java.util.Collections.newSetFromMap(java.util.WeakHashMap[MapCard, java.lang.Boolean]())
