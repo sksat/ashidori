@@ -180,8 +180,9 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
       act.runOnUiThread(() => device.setValue(f"${bytes / 1e6}%.0f MB"))
     }
     val sync =
-      if SyncConfig.paired then markRow(Some(true), "同期サーバ", "暗号化して送信", Some(() => act.push(SyncSettingsScreen(act))))
-      else markRow(Some(false), "同期サーバ", "未設定", Some(() => act.push(SyncSettingsScreen(act))))
+      if SyncConfig.paired then markRow(Some(true), "同期サーバ", "暗号化して送信", Some(() => if !changing then act.push(SyncSettingsScreen(act))))
+      else markRow(Some(false), "同期サーバ", "未設定", Some(() => if !changing then act.push(SyncSettingsScreen(act))))
+    sync.setEnabled(!changing)
     list.addView(sectionHeader("保存先"))
     list.addView(listGroup(device, sync))
 
@@ -218,8 +219,10 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
     }
     // The OS's positioning: a reference, the app does not control it.
     val location = markRow(None, "位置の取得", "OS の設定による", Some(() =>
-      try act.startActivity(android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-      catch case _: android.content.ActivityNotFoundException => ()))
+      if !changing then
+        try act.startActivity(android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+        catch case _: android.content.ActivityNotFoundException => ()))
+    location.setEnabled(!changing)
     list.addView(listGroup((pause +: rows :+ location)*))
     list.addView(spacer(24))
 

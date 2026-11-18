@@ -52,6 +52,12 @@ object DayMap:
   private final class MapCard(c: Context) extends FrameLayout(c):
     var redraw: () => Unit = () => ()
     private var stale = false
+    /** Moves on each time it leaves the window: a job queued before does not start. */
+    var generation = 0
+    /** Its snapshot rendering now, cancelled when it leaves the window. */
+    var running: Option[MapSnapshotter] = None
+    /** On screen (attached and shown): only then may a job of it start. */
+    def onScreen: Boolean = isAttachedToWindow && isShown
     /** Now if shown; a detached card (an old feed, another tab) when it comes back. */
     def invalidateMap(): Unit =
       if isAttachedToWindow then
@@ -66,8 +72,15 @@ object DayMap:
     /** Off screen: its snapshot holds no permit, and no style fetch is retried for it. */
     override def onDetachedFromWindow(): Unit =
       super.onDetachedFromWindow()
+      generation += 1
       Net.guard.release("snapshot", this)
       OnlineStyles.forget(this)
+      // Its rendering stops (its requests are cancelled), and the queue goes on.
+      running.foreach { s =>
+        running = None
+        s.cancel()
+        queue.finished(s)
+      }
       // Drawn again when it comes back (from the cache, or asking anew).
       stale = true
 
@@ -198,13 +211,16 @@ object DayMap:
         .withLogo(false)
       MapStyle.applyNetworkPolicy(act)
       val snap = MapSnapshotter(act, opts)
+      frame.running = Some(snap)
       snap.start(
         s => {
+          if frame.running.contains(snap) then frame.running = None
           cache.put(key(style), s.getBitmap)
           show(s.getBitmap)
           queue.finished(snap)
         },
         (_: String) => {
+          if frame.running.contains(snap) then frame.running = None
           // Offline or no tiles: keep the sketch. The basemap removed
           // meanwhile: say so.
           if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()
@@ -220,11 +236,16 @@ object DayMap:
           case Some(b) => show(b)
           case None =>
             pending()
+            val gen = frame.generation
             queue.enqueue { () =>
+              // A card that left the screen since: nothing (drawn when it comes back).
+              if frame.generation != gen || !frame.onScreen then
+                Net.log(s"snapshot skipped: card off screen")
+                None
               // Rendered while scrolling, without the user asking for that
               // area: an online map only if its destination is automatic, by
               // the rules now, not when the card was laid out.
-              MapStyle.snapshot(frame) match
+              else MapStyle.snapshot(frame) match
                 case Some((Outcome.Draw(s), Some(json))) => start(s, json)
                 case Some((_, _)) =>
                   sketchOnly()
