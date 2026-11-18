@@ -250,6 +250,10 @@ object DebugData:
       case "reset" =>
         VisitDays.reset()
         Log.i("visits bench: reset")
+      case "fail" | "unfail" =>
+        VisitDays.failQueriesForTest = op == "fail"
+        Log.i(s"visits bench: queries fail ${VisitDays.failQueriesForTest}")
+      case "stale" => VisitDays.markStale("debug")
       case "rebuild" =>
         VisitDays.reset()
         val t0 = System.nanoTime()

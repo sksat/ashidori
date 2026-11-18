@@ -106,7 +106,11 @@ object Maintenance:
       val result =
         try
           if manual then
-            if !archive.repairNow(db, l => Progress.set(l)) then "未完了の整理はありません"
+            val repaired = archive.repairNow(db, l => Progress.set(l))
+            // Files it quarantined are no longer read: the 「訪れた日」 index
+            // may hold stays of them (emptied and built again).
+            if repaired then VisitDays.markStale("repair")
+            if !repaired then "未完了の整理はありません"
             else if Attention.all().exists(!_.seen) then "修復しました（隔離したファイルの行は復元していません）"
             else "修復しました"
           else
@@ -253,9 +257,6 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
-      // The 「訪れた日」 index notes new rows before archiving moves them out
-      // of SQLite (derived data: a failure is logged and changes nothing here).
-      VisitDays.noteBeforeArchiving()
       // A commit a crash interrupted is resolved first; one waiting for the
       // user stops the run (said so in the progress line).
       try archive.recover(db, progress = l => Progress.set(l))
@@ -298,6 +299,10 @@ object Maintenance:
             // run sees the attempt.
             Guard.put(d, next)
             Complete.clear(d)
+            // Before rows of the day leave SQLite: the 「訪れた日」 index marks
+            // the day (one short write of its own file; never throws, never
+            // waits for the index: on failure it is marked stale instead).
+            VisitDays.beforeArchiving(d)
             if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していた整理を再試行")
             val t0 = System.currentTimeMillis()
             try

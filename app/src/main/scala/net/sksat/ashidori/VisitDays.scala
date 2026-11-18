@@ -25,6 +25,19 @@ import VisitIndex.{DayState, DayVisit, Marks, Changes}
   * Built in the background, a bounded run at a time: in the main process
   * while the list is open (one day at a time, as the day view builds a day),
   * and in the maintenance process after archiving ([[maintain]]).
+  *
+  * No change is missed for good: new rows are found by rowid in SQLite, and
+  * before archiving moves a day's rows out of SQLite the maintenance
+  * process marks that day and its neighbours changed in this file
+  * ([[beforeArchiving]]). If that marking fails, a marker file says the
+  * whole index is of unknown freshness ([[markStale]]): the next use
+  * empties it and it is built again. Neither ever waits for or fails the
+  * archiving. Other writes need no hook: every row of positions or motion
+  * enters SQLite (late ones and imports too: the rowid scan finds them)
+  * and leaves it only by archiving (marked) or a deletion (its sequence);
+  * the other tables (energy, battery, pressure, raw lines) do not change
+  * a stay. Only a write path added later that bypasses SQLite would need
+  * one.
   */
 object VisitDays:
   /** Days built per run while the list is open (the list is refreshed after each). */
@@ -42,6 +55,26 @@ object VisitDays:
   }
 
   def file(c: Context): File = File(c.getNoBackupFilesDir, "visit_index.db")
+  /** The marker of unknown freshness, and the same while being acted on. */
+  private def staleFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale")
+  private def claimedFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale.claimed")
+
+  /** The index may have missed a change (a marking failed, or a repair
+    * quarantined files): emptied at its next use and built again.
+    */
+  def markStale(why: String): Unit =
+    val ok = scala.util.Try(staleFile.createNewFile() || staleFile.exists).getOrElse(false)
+    Log.w(s"visits: index of unknown freshness ($why)" + (if ok then "" else "; the marker could not be written"))
+
+  /** A marker found: claimed (a new one may come meanwhile and stays), the
+    * index emptied, then the claim removed.
+    */
+  private def emptyIfStale(): Unit =
+    if staleFile.exists then staleFile.renameTo(claimedFile)
+    if claimedFile.exists then
+      store.clear()
+      claimedFile.delete()
+      Log.i("visits: index emptied (unknown freshness); built again")
 
   @volatile private var helper: IndexDb = null
   private def store: IndexDb = synchronized {
@@ -85,17 +118,23 @@ object VisitDays:
     def firstDay(): Option[LocalDate] = AshidoriApp.db.firstDataDate()
     def stays(day: LocalDate): Vector[Visit] = TimelineRepo.stays(day)
 
+  /** Debug builds (DebugReceiver VISITS fail): every query fails, to see the list's failure state. */
+  @volatile var failQueriesForTest = false
+
   /** What the list shows: the days found, and the days of the record not built yet. */
   final case class Answer(days: Vector[DayVisit], unbuilt: Int)
 
-  /** The list is opened: changes noted, today marked to be built again. */
-  def opened(): Unit = guarded("note") {
-    VisitIndex.note(store, Record, AshidoriApp.zone)
+  /** The list is opened: changes noted (until `stop`), today marked to be built again. */
+  def opened(stop: () => Boolean = () => false): Unit = guarded("note") {
+    emptyIfStale()
+    VisitIndex.note(store, Record, AshidoriApp.zone, stop)
     VisitIndex.touch(store, today)
   }
 
   /** The days of `venue` the index holds now. */
   def query(venue: LatLng): Option[Answer] = guarded("query") {
+    if failQueriesForTest then throw IllegalStateException("debug: queries fail")
+    emptyIfStale()
     val t0 = System.nanoTime()
     val days = VisitIndex.query(store, venue)
     val t1 = System.nanoTime()
@@ -107,6 +146,7 @@ object VisitDays:
 
   /** One run of building: at most `maxDays`, until `stop`; days in `skip` not tried. */
   def run(maxDays: Int, stop: () => Boolean, skip: Set[LocalDate] = Set.empty): Option[VisitIndex.Run] = guarded("build") {
+    emptyIfStale()
     val t0 = System.nanoTime()
     val r = VisitIndex.build(store, Record, AshidoriApp.zone, today, maxDays, stop, skip)
     if r.built > 0 || r.failed.nonEmpty then
@@ -115,10 +155,14 @@ object VisitDays:
     r
   }
 
-  /** In the maintenance process, first: changes noted before archiving
-    * moves new rows out of SQLite (the marks read rowids there).
+  /** In the maintenance process, before archiving `day`: that day and its
+    * neighbours marked changed ([[VisitIndex.archiving]]), one short
+    * transaction; on failure the index is marked stale. Never throws.
     */
-  def noteBeforeArchiving(): Unit = guarded("note")(VisitIndex.note(store, Record, AshidoriApp.zone))
+  def beforeArchiving(day: LocalDate): Unit =
+    val t0 = System.nanoTime()
+    if guarded("mark before archiving")(VisitIndex.archiving(store, day)).isEmpty then markStale(s"marking $day failed")
+    else Log.d(f"visits: $day and its neighbours marked before archiving in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
 
   /** In the maintenance process, after archiving: a bounded run (days, and [[MaintainMs]]). */
   def maintain(charging: Boolean, halt: () => Boolean): Unit =
@@ -231,11 +275,19 @@ object VisitDays:
       exec("DELETE FROM stays WHERE start<? AND end>?", to, from)
     }
 
-    def candidates(cells: Seq[Long]): Vector[(Long, Visit)] =
+    private def params(n: Int) = Seq.fill(n)("?").mkString(",")
+
+    def candidateDays(cells: Seq[Long], before: Long, limit: Int): Vector[Long] =
       if cells.isEmpty then Vector.empty
       else
+        q(s"SELECT DISTINCT day FROM cells WHERE cell IN (${params(cells.size)}) AND day<? ORDER BY day DESC LIMIT ?",
+          (cells ++ Seq(before, limit.toLong))*)(_.getLong(0))
+
+    def candidates(cells: Seq[Long], days: Seq[Long]): Vector[(Long, Visit)] =
+      if cells.isEmpty || days.isEmpty then Vector.empty
+      else
         q(s"SELECT s.day, s.start, s.end, s.lat, s.lon, s.radius FROM stays s WHERE s.id IN " +
-          s"(SELECT stay FROM cells WHERE cell IN (${cells.map(_ => "?").mkString(",")}))", cells*) { c =>
+          s"(SELECT stay FROM cells WHERE cell IN (${params(cells.size)}) AND day IN (${params(days.size)}))", (cells ++ days)*) { c =>
           c.getLong(0) -> Visit(c.getLong(1), c.getLong(2), c.getDouble(3), c.getDouble(4), c.getDouble(5), 0)
         }
 
