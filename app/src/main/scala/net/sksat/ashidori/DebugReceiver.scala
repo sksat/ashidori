@@ -30,6 +30,15 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.REPAIR                     「整理を修復」 (a job)
   *   ... -a ashidori.debug.REPAIR_NOW                 the same outside JobScheduler (DebugMaintenanceService)
   *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
+  *   ... -a ashidori.debug.OUTBOUND --es dest gsi --es when auto --es level district [--es off h1,h2]
+  *                                                    set a destination's rule (as 「適用」 does)
+  *   ... -a ashidori.debug.PAUSE --ez on true         「地図・検索への送信を停止」
+  *   ... -a ashidori.debug.OUTBOUND_STATE             log the rules, generations and the pause
+  *   ... -a ashidori.debug.CORRUPT_POLICY [--es value '{"v":9}']  store an unreadable policy (read at the next start)
+  *   ... -a ashidori.debug.GEOCODE --ef lat 35.68 --ef lon 139.76   area and region names (the platform geocoder if allowed)
+  *   ... -a ashidori.debug.VENUES --ef lat 35.68 --ef lon 139.76    the online venue search, as its button does
+  *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
+  *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
   *
   * A commit that recovery cannot finish: create `files/maintenance/stuck-delete-tmp`
   * (or `stuck-corrupt-tmp`) with run-as, then archive (see ArchiveStore.debugBreakRest).
@@ -134,6 +143,40 @@ class DebugReceiver extends BroadcastReceiver:
       case "ashidori.debug.AUDIT" =>
         val ago = intent.getIntExtra("daysAgo", 1)
         Thread(() => DebugData.audit(LocalDate.now(AshidoriApp.zone).minusDays(ago)).foreach(l => Log.i(s"audit $l")), "ashidori-audit").start()
+      case "ashidori.debug.OUTBOUND" =>
+        import ashidori.core.*
+        val rule = for
+          d <- Dest.fromKey(Option(intent.getStringExtra("dest")).getOrElse(""))
+          w <- When.fromKey(Option(intent.getStringExtra("when")).getOrElse(""))
+          l <- Level.fromKey(Option(intent.getStringExtra("level")).getOrElse(Settings.gate.rule(d).level.key))
+        yield d -> Rule(w, l, Option(intent.getStringExtra("off")).fold(Set.empty[String])(_.split(',').map(_.trim).filter(_.nonEmpty).toSet))
+        rule match
+          case Some((d, r)) if Policy.valid(d, r) => Log.i(s"outbound rule ${d.key}: $r changed=${Settings.gate.setRule(d, r)}")
+          case other => Log.w(s"outbound: not a rule: $other")
+      case "ashidori.debug.PAUSE" =>
+        Log.i(s"outbound pause changed=${Settings.gate.setPaused(intent.getBooleanExtra("on", true))}")
+      case "ashidori.debug.OUTBOUND_STATE" =>
+        val st = Settings.gate.snapshot
+        Log.i(s"outbound state paused=${st.paused} problem=${st.problem} policy=${ashidori.core.Policy.encode(st.policy)} " +
+          s"consents=${ashidori.core.Consents.encode(st.consents)}")
+      case "ashidori.debug.CORRUPT_POLICY" =>
+        c.getSharedPreferences("settings", Context.MODE_PRIVATE).edit()
+          .putString(ashidori.core.ExternalSettings.PolicyKey, Option(intent.getStringExtra("value")).getOrElse("{corrupt")).commit()
+        Log.i("outbound policy corrupted (read at the next start)")
+      case "ashidori.debug.GEOCODE" =>
+        val (lat, lon) = (intent.getFloatExtra("lat", 35.681f).toDouble, intent.getFloatExtra("lon", 139.767f).toDouble)
+        Thread(() => Log.i(s"geocode area=${Geocoding.area(lat, lon)} region=${Geocoding.region(lat, lon)}"), "ashidori-geocode").start()
+      case "ashidori.debug.VENUES" =>
+        val p = ashidori.core.LatLng(intent.getFloatExtra("lat", 35.681f).toDouble, intent.getFloatExtra("lon", 139.767f).toDouble)
+        ui.VenueSearch.latest(p)(r => Log.i(s"venues ${r.map(a => s"${a.venues.size} from ${a.server}")}"))
+      case "ashidori.debug.CAMERA" =>
+        val p = ashidori.core.LatLng(intent.getFloatExtra("lat", 35.681f).toDouble, intent.getFloatExtra("lon", 139.767f).toDouble)
+        val z = intent.getFloatExtra("zoom", 14f).toDouble
+        AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.moveTo(p, z)))
+      case "ashidori.debug.DATA_START" =>
+        val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
+        dl.start(c, allowMetered = true)
+        Log.i(s"data start ${dl.WorkName} allowed=${dl.allowed}")
       case other => Log.w(s"debug receiver: unknown action $other")
 
 /** Debug builds only (declared in the debug manifest, in the `:maintenance`
