@@ -93,6 +93,7 @@ object DayMap:
       generation += 1
       Net.guard.release("snapshot", this)
       OnlineStyles.forget(this)
+      Regions.release(this)
       // Its rendering stops (its requests are cancelled), and the queue goes
       // on unless held (the screen is leaving: nothing starts until shown).
       waiting = false
@@ -107,6 +108,15 @@ object DayMap:
   /** Cards built so far, while something still shows them. */
   private val cards = java.util.Collections.newSetFromMap(java.util.WeakHashMap[MapCard, java.lang.Boolean]())
   private var basemapVersion = Basemap.installedVersion
+  private var regionsKey = Regions.key
+  // Region packs placed or deleted: the offline snapshots (keyed by them) are drawn again.
+  private val stopRegions = Regions.listen { () =>
+    val k = Regions.key
+    if k != regionsKey then
+      regionsKey = k
+      cache.snapshot().keySet().asScala.filter(_.startsWith(s"${MapStyle.Offline.key}@")).foreach(cache.remove)
+      cards.asScala.toSeq.foreach(_.invalidateMap())
+  }
   private val stopBasemap = BasemapDownload.listen { () =>
     val v = Basemap.installedVersion
     if v != basemapVersion then
@@ -238,6 +248,7 @@ object DayMap:
           if frame.running.contains(snap) then
             frame.running = None
             frame.waiting = false
+          Regions.release(frame)
           cache.put(key(style), s.getBitmap)
           show(s.getBitmap)
           queue.finished(snap)
@@ -246,6 +257,7 @@ object DayMap:
           if frame.running.contains(snap) then
             frame.running = None
             frame.waiting = false
+          Regions.release(frame)
           // Offline or no tiles: keep the sketch. The basemap removed
           // meanwhile: say so.
           if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()

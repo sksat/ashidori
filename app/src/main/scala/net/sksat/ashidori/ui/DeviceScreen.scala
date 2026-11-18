@@ -62,6 +62,7 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     // Off screen: its snapshot holds no permit, and no style fetch is retried for it.
     Net.guard.release("snapshot", this)
     OnlineStyles.forget(this)
+    Regions.release(this)
 
   private def stopMap(): Unit =
     snapshotter.foreach { s => s.cancel(); MapStyle.untrack(s) }
@@ -226,8 +227,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     snapshotter = Some(snap)
     MapStyle.track(snap)
     snap.start(
-      s => { MapStyle.untrack(snap); img.setImageBitmap(s.getBitmap) },
-      (msg: String) => { MapStyle.untrack(snap); Log.w(s"device map: $msg") }
+      s => { MapStyle.untrack(snap); Regions.release(this); img.setImageBitmap(s.getBitmap) },
+      (msg: String) => { MapStyle.untrack(snap); Regions.release(this); Log.w(s"device map: $msg") }
     )
     frame
 

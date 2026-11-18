@@ -58,6 +58,9 @@ class AshidoriApp extends Application:
     // The offline venue index (施設データ), likewise.
     AshidoriApp.io.execute(() => VenueData.cleanup())
     VenueDownload.autoStart(this)
+    // The region packs: the state and the files reconciled before any use,
+    // then (with the data rule automatic) updates and packs left planned.
+    RegionDownload.autoStart(this)
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
 

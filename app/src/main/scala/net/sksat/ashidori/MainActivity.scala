@@ -364,6 +364,9 @@ class MainActivity extends AppCompatActivity:
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
 
+  /** The screen shown now. */
+  def currentScreen: Option[Screen] = current
+
   /** `s` is the screen shown now (the same instance). */
   def showing(s: Screen): Boolean = current.exists(_ eq s)
 

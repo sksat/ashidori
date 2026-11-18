@@ -104,31 +104,27 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     row.value.setTextColor(ModeInfo.color(m))
     row.setSubtitle(ModeInfo.battery(m))
 
-  /** A download row's one line, in the error colour while its last attempt failed. */
-  private def showDownload(row: ListRow, st: BasemapStatus, line: String): Unit =
-    row.setSubtitle(line)
-    row.subtitle.setTextColor(color(st match
-      case _: BasemapStatus.Failed => attr.error
-      case _ => attr.onSurfaceVariant))
-  private def showBasemap(row: ListRow): Unit =
-    val st = BasemapDownload.status
-    showDownload(row, st, BasemapUi.rowLine(st, Basemap.sizeLabel))
-  private def showVenues(row: ListRow): Unit =
-    val st = VenueDownload.status
-    showDownload(row, st, VenueDataUi.rowLine(st))
-
   private val list = vbox()
   val view: View = scroll(list)
 
-  /** The オフライン地図 row, kept current while the download runs. */
-  private var basemapRow: Option[ListRow] = None
-  private val stopBasemap = BasemapDownload.listen(() => basemapRow.foreach(showBasemap))
-  /** The 施設データ row, likewise. */
-  private var venuesRow: Option[ListRow] = None
-  private val stopVenues = VenueDownload.listen(() => venuesRow.foreach(showVenues))
+  /** The オフラインのデータ row, kept current while downloads run. */
+  private var offlineRow: Option[ListRow] = None
+  private val stopBasemap = BasemapDownload.listen(() => offlineRow.foreach(showOffline))
+  private val stopVenues = VenueDownload.listen(() => offlineRow.foreach(showOffline))
+  private val stopRegions = Regions.listen(() => offlineRow.foreach(showOffline))
   override def onDestroy(): Unit =
     stopBasemap()
     stopVenues()
+    stopRegions()
+
+  /** One line: a failed download first (in the error colour), else what is on the device. */
+  private def showOffline(row: ListRow): Unit =
+    val failed = Seq(BasemapDownload.status -> "オフライン地図", VenueDownload.status -> "施設データ").collectFirst {
+      case (f: BasemapStatus.Failed, name) => s"$name: ${BasemapUi.failedText(f.failure)}"
+    }
+    val regions = if Regions.offered then Seq(s"地域 ${Regions.state.regions.size}") else Seq.empty
+    row.setSubtitle(failed.getOrElse((regions ++ Seq("全域の地図", "施設データ")).mkString("・")))
+    row.subtitle.setTextColor(color(if failed.nonEmpty then attr.error else attr.onSurfaceVariant))
 
   override def onShow(): Unit =
     list.removeAllViews()
@@ -142,18 +138,15 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     add(sectionHeader("プライバシー"), listGroup(
       navRow("データの扱い", OutboundUi.summary)(act.push(DataHandlingScreen(act)))))
 
-    val basemap = navRow("オフライン地図", " ")(BasemapUi.showDialog(act))
-    showBasemap(basemap)
-    basemapRow = Some(basemap)
-    val venues = navRow("施設データ", " ")(VenueDataUi.showDialog(act))
-    showVenues(venues)
-    venuesRow = Some(venues)
+    val offline = navRow("オフラインのデータ", " ")(act.push(OfflineDataScreen(act)))
+    showOffline(offline)
+    offlineRow = Some(offline)
     // Open (check) the installed index, so an unreadable one shows here.
     AshidoriApp.io.execute { () =>
       VenueData.index()
       VenueDownload.changed()
     }
-    add(sectionHeader("地図"), listGroup(basemap, venues))
+    add(sectionHeader("地図"), listGroup(offline))
 
     val syncState =
       if SyncConfig.ready then s"同期中・${SyncConfig.serverUrl}"

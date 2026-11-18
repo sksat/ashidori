@@ -33,7 +33,7 @@ object Net:
     case Dest.Data =>
       import net.sksat.ashidori.sync.SyncConfig
       val server = Option(SyncConfig.serverUrl).filter(_ => SyncConfig.paired).flatMap(hostOf)
-      val dev = Seq(BasemapDownload, VenueDownload).flatMap(_.debugUrl).flatMap(hostOf)
+      val dev = (Seq(BasemapDownload, VenueDownload).flatMap(_.debugUrl) ++ Regions.debugUrl).flatMap(hostOf)
       Outbound.GitHubHosts ++ server ++ dev
     case _ => Set.empty
 
@@ -132,4 +132,5 @@ object Net:
       AshidoriApp.app.getMainExecutor.execute { () =>
         BasemapDownload.rulesChanged(ctx)
         VenueDownload.rulesChanged(ctx)
+        RegionDownload.rulesChanged(ctx)
       }

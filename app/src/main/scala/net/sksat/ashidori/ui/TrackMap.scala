@@ -247,7 +247,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     detailButton.setText(
       if !detailedFlag then TrackMap.detailLabel(detail)
       // Back to the offline map, or to none when it is not downloaded.
-      else if Basemap.available then TrackMap.twoLines(s"オフライン地図に戻す（${online}を表示中）", TrackMap.KeptOnLine)
+      else if MapStyle.offlineAvailable then TrackMap.twoLines(s"オフライン地図に戻す（${online}を表示中）", TrackMap.KeptOnLine)
       else TrackMap.twoLines(s"オンライン地図を終了（${online}を表示中）", TrackMap.KeptOnLine))
     // Sending is the exception: mark it with the tertiary (warning) colours.
     given Ui.Ctx = act
@@ -421,6 +421,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     if mv != null then
       initialCamera = camera.orElse(initialCamera)
       venues.detach()
+      Regions.release(this)
       mapView = null
       mlMap = None
       map = None
@@ -442,6 +443,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     venues.detach()
     shown = Some(base)
     loadedBasemap = Basemap.installedVersion
+    // The offline style holds the region packs it draws again ([[Regions.style]]).
+    Regions.release(this)
+    loadedRegions = Regions.key
     updateDetailButton()
     awaitingStyle = false
     val builder = base match
@@ -615,6 +619,18 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private var awaitingStyle = false
   private val stopStyles = OnlineStyles.listen(() => if awaitingStyle then refreshBaseMap(force = true))
 
+  /** The region packs drawn by the loaded offline style ([[Regions.key]]). */
+  private var loadedRegions = ""
+  // Region packs placed or deleted: the offline map is drawn with them (or
+  // without), which also lets go of the files it no longer draws from.
+  private val stopRegions = Regions.listen { () =>
+    val offline = shown.exists {
+      case Outcome.Draw(s) => s == MapStyle.Offline
+      case Outcome.NoBasemap => true
+    }
+    if offline && loadedRegions != Regions.key then refreshBaseMap(force = true)
+  }
+
   private val stopBasemap = BasemapDownload.listen { () =>
     val usesBasemap = shown.exists {
       case Outcome.Draw(s) => s == MapStyle.Offline || s.basemapFonts
@@ -778,8 +794,18 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       snapshotters.foreach { s => s.cancel(); MapStyle.untrack(s) }
       Dest.Tiles.foreach(d => Net.guard.release(s"thumb:${d.key}", dialog))
       OnlineStyles.forget(dialog)
+      Regions.release(dialog)
     }
-    val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
+    val titleText = Ui.text("地図の種類", 20f, bold = true)
+    titleText.setLayoutParams(Ui.weighted())
+    val head = Ui.hbox(titleText)
+    head.setGravity(android.view.Gravity.CENTER_VERTICAL)
+    // The region packs (design 6.11): a detailed offline map of an area.
+    if Regions.offered && Settings.gate.rule(Dest.Data).level == ashidori.core.Level.Cell then
+      head.addView(Ui.outlined("地図をダウンロード") {
+        dialog.dismiss()
+        if Regions.allowed then act.push(RegionSelectScreen(act)) else act.push(OutboundDestScreen(act, Dest.Data))
+      })
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
     dialog.show()
 
@@ -978,6 +1004,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   def onSaveInstanceState(b: Bundle): Unit = if mapView != null then mapView.onSaveInstanceState(b)
   def onDestroy(): Unit =
     stopBasemap()
+    stopRegions()
     stopVenues()
     stopObserving()
     act.unregisterMap(this)

@@ -780,6 +780,10 @@ object RegionRun:
     if !stillWanted(env.update(identity), c, t) then
       store.part(t.file.file).delete()
       return
+    // Already in place (only its bundle was missing): recorded, not downloaded again.
+    if store.packFile(c, t.version).isFile then
+      record(env, c, t)
+      return
     fetch(env, t.file, Some(c)) match
       case Left(reason) => fail(env, c, t, reason)
       case Right(part) =>
@@ -793,14 +797,18 @@ object RegionRun:
             if !stillWanted(env.update(identity), c, t) then part.delete()
             else
               store.placePack(part, c, t.version, t.style)
-              val at = env.now()
-              env.update { s =>
-                s.packs.get(c) match
-                  case Some(p) if p.target.contains(t) =>
-                    s.copy(packs = s.packs.updated(c, PackState(Some(Installed(t.version, t.style, t.file.bytes, at)), None)))
-                  case _ => s
-              }
+              record(env, c, t)
               env.log(s"regions: $c ${t.version} placed")
+
+  /** The state says the pack is placed, last of all. */
+  private def record(env: Env, c: Cell, t: Target): Unit =
+    val at = env.now()
+    env.update { s =>
+      s.packs.get(c) match
+        case Some(p) if p.target.contains(t) =>
+          s.copy(packs = s.packs.updated(c, PackState(Some(Installed(t.version, t.style, t.file.bytes, at)), None)))
+        case _ => s
+    }
 
   /** Brings `f` to `.download/<file>.part`, under a reservation of what is
     * left, and checks its size and sha256 (a wrong file is deleted: Left).

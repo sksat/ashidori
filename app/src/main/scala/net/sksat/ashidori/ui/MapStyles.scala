@@ -3,7 +3,7 @@ package net.sksat.ashidori.ui
 import android.content.Context
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
-import net.sksat.ashidori.{AshidoriApp, Basemap, Log, Net, Settings}
+import net.sksat.ashidori.{AshidoriApp, Basemap, Log, Net, Regions, Settings}
 import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Outbound, Permit, Precision, Refetch, TileStyle, When}
 import ashidori.core.BaseMapPolicy.Outcome
 
@@ -25,7 +25,8 @@ enum MapStyle(val key: String, val label: String, val note: String):
   /** Identifies what a snapshot of this map shows: the offline map changes
     * when its data is downloaded or deleted.
     */
-  def cacheKey: String = if this == Offline then s"$key@${Basemap.installedVersion.getOrElse("none")}" else key
+  def cacheKey: String =
+    if this == Offline then s"$key@${Basemap.installedVersion.getOrElse("none")}+${Regions.key}" else key
 
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
@@ -80,7 +81,8 @@ enum MapStyle(val key: String, val label: String, val note: String):
     */
   def styleJson(holder: String, owner: AnyRef, p: Option[Permit]): Option[String] =
     resolved match
-      case Offline => Some(Basemap.styleJson.getOrElse(MapStyle.blankJson))
+      // The region packs over the basemap; `owner` then holds their files.
+      case Offline => Some(Regions.style(owner, Basemap.styleJson).getOrElse(Basemap.styleJson.getOrElse(MapStyle.blankJson)))
       case ms =>
         p.filter(q => ms.dest.contains(q.dest)).flatMap { p =>
           val token = Net.guard.hold(holder, owner, p)
@@ -142,13 +144,16 @@ object MapStyle:
     * downloaded.
     */
   def forView(surface: String, onScreen: Boolean): Outcome[MapStyle] =
-    BaseMapPolicy.interactive(when, current, Offline, Basemap.available, consented(surface), onScreen)
+    BaseMapPolicy.interactive(when, current, Offline, offlineAvailable, consented(surface), onScreen)
 
   /** Base map of a still image (feed, period, other devices) by the rules
     * now; a job takes its permit right before it starts ([[snapshot]]).
     * With [[Outcome.NoBasemap]] the image is drawn without MapLibre.
     */
-  def forSnapshot: Outcome[MapStyle] = BaseMapPolicy.snapshot(when, current, Offline, Basemap.available)
+  def forSnapshot: Outcome[MapStyle] = BaseMapPolicy.snapshot(when, current, Offline, offlineAvailable)
+
+  /** The offline map has something to draw: the basemap, or region packs. */
+  def offlineAvailable: Boolean = Basemap.available || Regions.drawable
 
   /** What a snapshot about to start draws: the base map with its style (an
     * online one under a permit taken now; the offline map when there is no
@@ -161,13 +166,13 @@ object MapStyle:
         s.dest.flatMap(Settings.gate.permit(_, Mode.Auto)) match
           case Some(p) => s.styleJson("snapshot", owner, Some(p)).map(j => o -> Some(j))
           case None =>
-            if Basemap.available then Some(Outcome.Draw(Offline) -> Offline.styleJson("snapshot", owner, None))
+            if offlineAvailable then Some(Outcome.Draw(Offline) -> Offline.styleJson("snapshot", owner, None))
             else Some(Outcome.NoBasemap -> None)
       case o @ Outcome.Draw(s) => Some(o -> s.styleJson("snapshot", owner, None))
 
   /** Whether the picker may render this map's thumbnail at the current view. */
   def thumbnailAllowed(s: MapStyle): Boolean =
-    BaseMapPolicy.thumbnail(when, s, Offline, Basemap.available)
+    BaseMapPolicy.thumbnail(when, s, Offline, offlineAvailable)
 
   /** A builder for a snapshotter whose builder also adds sources. An inline
     * JSON style finishes loading inside the snapshotter's constructor, before
