@@ -63,6 +63,11 @@ object DayMap:
       if stale then
         stale = false
         redraw()
+    /** Off screen: its snapshot holds no permit, and no style fetch is retried for it. */
+    override def onDetachedFromWindow(): Unit =
+      super.onDetachedFromWindow()
+      Net.guard.release("snapshot", this)
+      OnlineStyles.forget(this)
 
   /** Cards built so far, while something still shows them. */
   private val cards = java.util.Collections.newSetFromMap(java.util.WeakHashMap[MapCard, java.lang.Boolean]())
@@ -217,7 +222,7 @@ object DayMap:
               // Rendered while scrolling, without the user asking for that
               // area: an online map only if its destination is automatic, by
               // the rules now, not when the card was laid out.
-              MapStyle.snapshot(DayMap) match
+              MapStyle.snapshot(frame) match
                 case Some((Outcome.Draw(s), Some(json))) => start(s, json)
                 case Some((_, _)) =>
                   sketchOnly()

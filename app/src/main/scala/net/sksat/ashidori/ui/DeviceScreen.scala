@@ -59,6 +59,9 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     unwatchBasemap()
     unwatchBasemap = () => ()
     stopMap()
+    // Off screen: its snapshot holds no permit, and no style fetch is retried for it.
+    Net.guard.release("snapshot", this)
+    OnlineStyles.forget(this)
 
   private def stopMap(): Unit =
     snapshotter.foreach { s => s.cancel(); MapStyle.untrack(s) }
