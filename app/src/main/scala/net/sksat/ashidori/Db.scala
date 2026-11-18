@@ -32,10 +32,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       "CREATE INDEX motion_start ON motion(start)",
       DbSchema.CreateBattery,
       "CREATE INDEX battery_time ON battery(time)",
-      """CREATE TABLE places(id INTEGER PRIMARY KEY AUTOINCREMENT, lat REAL, lon REAL, radius REAL, name TEXT,
-        |kind TEXT, external_id TEXT, city TEXT, country TEXT, area TEXT, updated_at INTEGER)""".stripMargin,
-      """CREATE TABLE checkins(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER, lat REAL, lon REAL, venue TEXT,
-        |category TEXT, external_id TEXT, place_id INTEGER, comment TEXT, private INTEGER, updated_at INTEGER)""".stripMargin,
+      DbSchema.CreatePlaces,
+      DbSchema.CreateCheckIns,
       "CREATE INDEX checkins_time ON checkins(time)",
       // User corrections of a leg's transport mode, keyed by time range.
       "CREATE TABLE mode_overrides(start INTEGER, end INTEGER, mode TEXT, updated_at INTEGER)",
@@ -51,6 +49,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     createVenueCache(db)
     addEnergy(db)
     addElevation(db)
+    addTombstones(db)
 
   private def columns(db: SQLiteDatabase, table: String): Set[String] =
     Using.resource(db.rawQuery(s"PRAGMA table_info($table)", null)) { c =>
@@ -70,6 +69,10 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     */
   private def addElevation(db: SQLiteDatabase): Unit =
     DbSchema.toV8(columns(db, "fixes"), columns(db, "sync_outbox")).foreach(db.execSQL)
+
+  /** Version 9: check-ins and places are deleted by a tombstone (`deleted`). */
+  private def addTombstones(db: SQLiteDatabase): Unit =
+    DbSchema.toV9(columns(db, "checkins"), columns(db, "places")).foreach(db.execSQL)
 
   /** Rowids of the archived tables are never reused ([[claimRowids]]), and
     * the import of pre-Parquet text logs records its progress. Created on
@@ -129,9 +132,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
           db.execSQL("UPDATE sync_counter SET value=value+1")
           db.execSQL(s"UPDATE $table SET sync_rev=(SELECT value FROM sync_counter) WHERE rowid=?", Array[AnyRef](java.lang.Long.valueOf(id)))
       db.execSQL(s"CREATE INDEX IF NOT EXISTS ${table}_sync_rev ON $table(sync_rev)")
-      val bump = s"UPDATE sync_counter SET value=value+1; UPDATE $table SET sync_rev=(SELECT value FROM sync_counter) WHERE rowid=NEW.rowid;"
-      db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_ins AFTER INSERT ON $table BEGIN $bump END")
-      db.execSQL(s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_upd AFTER UPDATE OF ${cols.map(c => "\"" + c + "\"").mkString(",")} ON $table BEGIN $bump END")
+      DbSchema.revTriggers(table, cols).foreach(db.execSQL)
 
   /** Online venue search results kept on the device ([[VenueCache]]): one
     * row per search, keyed by its cell and radius, and its venues. Not user
@@ -180,6 +181,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if oldV < 6 then createVenueCache(db)
     if oldV < 7 then addEnergy(db)
     if oldV < 8 then addElevation(db)
+    if oldV < 9 then addTombstones(db)
 
   /** A database of a newer app version: not opened (Android's default
     * would fail the same way). The data stays as it is; the way back is a
@@ -581,7 +583,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   // --- places -------------------------------------------------------------
 
   def places(): Vector[Place] =
-    query("SELECT id,lat,lon,radius,name,kind,external_id,area FROM places") { c =>
+    query(s"SELECT id,lat,lon,radius,name,kind,external_id,area FROM places WHERE ${DbSchema.Live}") { c =>
       Place(c.getLong(0), c.getDouble(1), c.getDouble(2), c.getDouble(3), Option(c.getString(4)).getOrElse(""),
         PlaceKind.fromKey(Option(c.getString(5)).getOrElse("")), Option(c.getString(6)).getOrElse(""),
         Option(c.getString(7)).getOrElse(""))
@@ -626,11 +628,21 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     w.insert("checkins", null, cv)
 
   def checkIns(from: Long, to: Long): Vector[CheckIn] =
-    query("SELECT id,time,lat,lon,venue,category,external_id,place_id,comment,private FROM checkins WHERE time>=? AND time<? ORDER BY time DESC", from, to) { c =>
+    checkInsWhere(s"time>=? AND time<? AND ${DbSchema.Live} ORDER BY time DESC", from, to)
+
+  /** The check-in `id`, unless deleted. */
+  def checkIn(id: Long): Option[CheckIn] = checkInsWhere(s"id=? AND ${DbSchema.Live}", id).headOption
+
+  private def checkInsWhere(where: String, args: Any*): Vector[CheckIn] =
+    query(s"SELECT id,time,lat,lon,venue,category,external_id,place_id,comment,private FROM checkins WHERE $where", args*) { c =>
       CheckIn(c.getLong(0), c.getLong(1), c.getDouble(2), c.getDouble(3), c.getString(4), Option(c.getString(5)).getOrElse(""),
         Option(c.getString(6)).getOrElse(""), if c.isNull(7) then None else Some(c.getLong(7)),
         Option(c.getString(8)).getOrElse(""), c.getInt(9) != 0)
     }
+
+  /** Live check-ins that refer to the place `placeId`. */
+  def checkInsOfPlace(placeId: Long): Int =
+    query(s"SELECT COUNT(*) FROM checkins WHERE place_id=? AND ${DbSchema.Live}", placeId)(_.getInt(0)).head
 
   // --- mode overrides -------------------------------------------------------
 
@@ -677,8 +689,13 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** Runs `f` (writes of this class) in one transaction: all or nothing. */
   def atomically[A](f: => A): A = tx(_ => f)
 
+  /** Deletes the check-in `id` by a tombstone, synced as its latest snapshot ([[DbSchema.tombstone]]). */
   def deleteCheckIn(id: Long): Unit =
-    w.delete("checkins", "id=?", Array(id.toString))
+    w.execSQL(DbSchema.tombstone("checkins"), Array[AnyRef](java.lang.Long.valueOf(System.currentTimeMillis()), java.lang.Long.valueOf(id)))
+
+  /** Deletes the place `id` by a tombstone, as [[deleteCheckIn]]. */
+  def deletePlace(id: Long): Unit =
+    w.execSQL(DbSchema.tombstone("places"), Array[AnyRef](java.lang.Long.valueOf(System.currentTimeMillis()), java.lang.Long.valueOf(id)))
 
   def checkInsAtPlace(placeId: Long): Vector[CheckIn] =
     checkIns(0, Long.MaxValue).filter(_.placeId.contains(placeId))
@@ -1289,7 +1306,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
 object Db:
-  val Version = 8
+  val Version = 9
 
   /** The archive file of an upload mark (`<reg>|up:<file>`, `upgen:`,
     * `uppart:`, `upbytes:`), if `name` is one.
@@ -1351,11 +1368,7 @@ object Db:
                                file: Option[String] = None, delSeq: Long = 0L)
 
   /** Editable tables and the columns whose change bumps `sync_rev` (the synced ones). */
-  val RevColumns: Seq[(String, Seq[String])] = Seq(
-    "places" -> Seq("lat", "lon", "radius", "name", "kind", "external_id", "updated_at"),
-    "checkins" -> Seq("time", "lat", "lon", "venue", "category", "external_id", "place_id", "comment", "private", "updated_at"),
-    "mode_overrides" -> Seq("start", "end", "mode", "updated_at")
-  )
+  val RevColumns: Seq[(String, Seq[String])] = DbSchema.RevColumns
 
   /** Column -> JSON field mapping per synced table (docs/sync-protocol.md). */
   val SyncColumns: Map[String, Seq[(String, String)]] = Map(
@@ -1364,9 +1377,9 @@ object Db:
     "motion" -> Seq("start" -> "s", "end" -> "e", "std" -> "std", "mean" -> "mean", "steps" -> "steps"),
     "battery" -> Seq("time" -> "t", "pct" -> "pct", "charging" -> "chg", "screen_on" -> "scr"),
     "places" -> Seq("id" -> "id", "lat" -> "lat", "lon" -> "lon", "radius" -> "r", "name" -> "name", "kind" -> "kind",
-      "external_id" -> "ext", "updated_at" -> "updatedAt"),
+      "external_id" -> "ext", "updated_at" -> "updatedAt", "deleted" -> "deleted"),
     "checkins" -> Seq("id" -> "id", "time" -> "t", "lat" -> "lat", "lon" -> "lon", "venue" -> "venue", "category" -> "cat",
       "external_id" -> "ext", "place_id" -> "place", "comment" -> "comment", "private" -> "private",
-      "updated_at" -> "updatedAt"),
+      "updated_at" -> "updatedAt", "deleted" -> "deleted"),
     "mode_overrides" -> Seq("start" -> "s", "end" -> "e", "mode" -> "mode", "updated_at" -> "updatedAt")
   )

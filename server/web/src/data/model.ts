@@ -177,6 +177,8 @@ export interface Place {
   name: string;
   kind: PlaceKind;
   updatedAt: number;
+  /** A tombstone: the place was deleted (never shown). */
+  deleted: boolean;
 }
 
 /** Place.displayName without the area (the viewer has no reverse geocoder). */
@@ -197,6 +199,8 @@ export interface CheckIn {
   comment: string;
   isPrivate: boolean;
   updatedAt: number;
+  /** A tombstone: the check-in was deleted (never shown). */
+  deleted: boolean;
 }
 
 export interface ModeOverride {

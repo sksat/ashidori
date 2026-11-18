@@ -9,6 +9,8 @@ const obj = (x: unknown): Obj | null => (typeof x === "object" && x !== null && 
 const num = (v: unknown, d = NaN) => (typeof v === "number" && Number.isFinite(v) ? v : d);
 const str = (v: unknown) => (typeof v === "string" ? v : "");
 const KINDS: PlaceKind[] = ["HOME", "WORK", "SCHOOL", "UNKNOWN"];
+/** A tombstone (`deleted` 1, app database version 9); missing: not deleted. */
+const deletedOf = (v: unknown) => v === true || v === 1;
 
 export function placeOf(deviceId: string, x: unknown): Place | null {
   const r = obj(x);
@@ -17,7 +19,16 @@ export function placeOf(deviceId: string, x: unknown): Place | null {
   const lon = num(r.lon);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
   const kind = KINDS.includes(r.kind as PlaceKind) ? (r.kind as PlaceKind) : "UNKNOWN";
-  return { key: `${deviceId}/${r.id}`, lat, lon, radius: num(r.r, 50), name: str(r.name), kind, updatedAt: num(r.updatedAt, 0) };
+  return {
+    key: `${deviceId}/${r.id}`,
+    lat,
+    lon,
+    radius: num(r.r, 50),
+    name: str(r.name),
+    kind,
+    updatedAt: num(r.updatedAt, 0),
+    deleted: deletedOf(r.deleted),
+  };
 }
 
 export function checkInOf(deviceId: string, x: unknown): CheckIn | null {
@@ -37,6 +48,7 @@ export function checkInOf(deviceId: string, x: unknown): CheckIn | null {
     comment: str(r.comment),
     isPrivate: r.private === true || r.private === 1,
     updatedAt: num(r.updatedAt, 0),
+    deleted: deletedOf(r.deleted),
   };
 }
 
@@ -80,6 +92,15 @@ export function latestByKey<T extends { key: string; updatedAt: number }>(rows: 
     if (!prev || r.updatedAt >= prev.updatedAt) out.set(r.key, r);
   }
   return out;
+}
+
+/**
+ * The rows as they are now: the latest snapshot per key, without the
+ * deleted ones. A tombstone is a snapshot like any other, so it wins over
+ * the earlier ones and then takes the row out.
+ */
+export function liveByKey<T extends { key: string; updatedAt: number; deleted: boolean }>(rows: Iterable<T>): T[] {
+  return [...latestByKey(rows).values()].filter((r) => !r.deleted);
 }
 
 /** Overrides have no id: the app replaces one by its (start, end). The one first in compareOverrides wins. */

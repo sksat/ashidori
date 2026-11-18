@@ -104,3 +104,50 @@ object DbSchema:
     * would let the deletion take a row that was never archived.
     */
   def archivable(table: String): String = if table == "energy_state" then "end IS NOT NULL" else "1"
+
+  // ---- editable tables: places, check-ins (synced, docs/sync-protocol.md) ----
+
+  /** `places` as versions 1 to 8 create it (version 2 added city, country, area to older ones). */
+  val CreatePlaces: String =
+    """CREATE TABLE places(id INTEGER PRIMARY KEY AUTOINCREMENT, lat REAL, lon REAL, radius REAL, name TEXT,
+      |kind TEXT, external_id TEXT, city TEXT, country TEXT, area TEXT, updated_at INTEGER)""".stripMargin
+  /** `checkins` as versions 1 to 8 create it. */
+  val CreateCheckIns: String =
+    """CREATE TABLE checkins(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER, lat REAL, lon REAL, venue TEXT,
+      |category TEXT, external_id TEXT, place_id INTEGER, comment TEXT, private INTEGER, updated_at INTEGER)""".stripMargin
+
+  /** Editable tables and the columns whose change bumps `sync_rev` (the synced ones). */
+  val RevColumns: Seq[(String, Seq[String])] = Seq(
+    "places" -> Seq("lat", "lon", "radius", "name", "kind", "external_id", "updated_at"),
+    "checkins" -> Seq("time", "lat", "lon", "venue", "category", "external_id", "place_id", "comment", "private", "updated_at"),
+    "mode_overrides" -> Seq("start", "end", "mode", "updated_at")
+  )
+
+  /** The triggers that set `sync_rev` from the change counter on every
+    * insert and every update of a synced column of `table` (version 5).
+    */
+  def revTriggers(table: String, cols: Seq[String]): Seq[String] =
+    val bump = s"UPDATE sync_counter SET value=value+1; UPDATE $table SET sync_rev=(SELECT value FROM sync_counter) WHERE rowid=NEW.rowid;"
+    Seq(
+      s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_ins AFTER INSERT ON $table BEGIN $bump END",
+      s"CREATE TRIGGER IF NOT EXISTS ${table}_rev_upd AFTER UPDATE OF ${cols.map(c => "\"" + c + "\"").mkString(",")} ON $table BEGIN $bump END")
+
+  /** Version 9: check-ins and places are deleted by a tombstone, `deleted`
+    * 1 on the same row, so that the deletion is synced as the row's latest
+    * snapshot (a deleted row is never uploaded). `checkins`, `places`: the
+    * columns the tables have now.
+    */
+  def toV9(checkins: Set[String], places: Set[String]): Seq[String] =
+    Seq("checkins" -> checkins, "places" -> places).collect {
+      case (t, cols) if !cols("deleted") => s"ALTER TABLE $t ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
+    }
+
+  /** The rows that are not deleted (an SQL condition). */
+  val Live = "deleted=0"
+
+  /** Deletes the row `id` of `checkins` or `places` (arguments: the time
+    * now, `id`): the tombstone keeps its fields, marks it deleted and sets
+    * `updated_at`, a synced column, so the change counter takes it to the
+    * next upload. A row already deleted is left as it is.
+    */
+  def tombstone(table: String): String = s"UPDATE $table SET deleted=1, updated_at=? WHERE id=? AND deleted=0"

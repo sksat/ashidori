@@ -24,7 +24,7 @@ import {
 } from "./archive";
 import { BlobError, STATUS_CAPS, openBlob } from "./crypto";
 import type { CheckIn, DeviceStatus, Fix, ModeOverride, MotionWindow, Place, Segment } from "./model";
-import { checkInOf, latestByKey, latestOverrides, overrideOf, placeOf, statusOf } from "./records";
+import { checkInOf, latestOverrides, liveByKey, overrideOf, placeOf, statusOf } from "./records";
 import type { DaySummary } from "./timeline";
 import { addDays, buildTimeline, dayKey, dayStart, linkPlaces, shownSegments, splitByDay, summarizeDay } from "./timeline";
 
@@ -222,8 +222,8 @@ export class ViewerStore extends EventTarget {
         }
       }
     }
-    this.places = [...latestByKey(places).values()];
-    this.checkIns = [...latestByKey(checkIns).values()].sort((a, b) => a.time - b.time);
+    this.places = liveByKey(places);
+    this.checkIns = liveByKey(checkIns).sort((a, b) => a.time - b.time);
     this.overrides = latestOverrides(overrides);
   }
 
