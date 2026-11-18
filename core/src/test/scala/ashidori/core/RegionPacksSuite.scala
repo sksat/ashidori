@@ -644,3 +644,127 @@ class RegionPacksSuite extends munit.FunSuite:
     // With room for two, the two in view.
     assertEquals(RegionPick(all, Some(v), 2).map(_._1.x), Seq(218, 219))
   }
+
+  // ---- review 68 ----
+
+  test("budget: a file cut back to the start must be admitted again; a writer that took the freed room stops it") {
+    var disk = 600L
+    var others = 0L
+    val b = StorageBudget(() => 10_000L - disk - others, () => 8_000L)
+    // Resumed at 600 of 1,000: 400 to write.
+    val r1 = b.reserveFile(1_000, 600).get
+    assert(r1.at(600))
+    // The server answers 200 to the Range request: the file starts over (600 freed).
+    disk = 0
+    // Before the first write is reported, another writer takes what looks free.
+    val r2 = b.reserveFile(1_600, 0).get
+    // The restart needs 1,000 now: it does not fit next to the other one.
+    assert(!r1.at(0))
+    r1.release()
+    r2.release()
+    // Alone, the same restart is admitted and every write is checked.
+    disk = 600
+    val r3 = b.reserveFile(1_000, 600).get
+    disk = 0
+    assert(r3.at(0))
+    disk = 500
+    assert(r3.at(500))
+    others = 1_600
+    assert(!r3.at(600))
+  }
+
+  test("download: a server that ignores Range starts over; the restart is checked against the budget before it writes") {
+    val p = publish("20261117", Seq(tokyo))
+    val store = RegionStore(tmpDir())
+    val name = RegionCatalog.packName(tokyo, "20261117")
+    val packBytes = p.files(name)
+    store.root.mkdirs()
+    // The bundle is there; 3,000 bytes of the pack too.
+    Files.createDirectories(store.styleRoot("s1").toPath)
+    Files.write(File(store.styleRoot("s1"), "layers.json").toPath, layers.getBytes(UTF_8))
+    Files.createDirectories(store.downloadDir.toPath)
+    Files.write(store.part(name).toPath, packBytes.take(3_000))
+    // A server without Range: 200 and the whole file.
+    // The logger (or another app) writes 2,000 bytes while the request is made.
+    var logged = 2_000L
+    var extra = 0L
+    val noRange = new RangeHttp:
+      def get(url: String, from: Long) =
+        extra = logged
+        new RangeHttp.Response:
+          def code = 200
+          def header(n: String) = None
+          def body: InputStream = ByteArrayInputStream(packBytes)
+          def close() = ()
+    def disk = Option(store.part(name)).filter(_.isFile).map(_.length).getOrElse(0L)
+    // Room for the rest (about 1,200), not for the whole file again after the logger wrote.
+    val budget = StorageBudget(() => 20_000L - disk - extra, () => 15_000L)
+    val env = Env(store, noRange, budget)
+    env.update(_.add(Region("r1", "a", Seq(tokyo), 0), p.catalog))
+    assertEquals(RegionRun.run(env), RegionRun.Result.NoRoom)
+    // It stopped at the restart, before it wrote into the reserve.
+    assertEquals(disk, 0L)
+    logged = 0L
+    extra = 0L
+    assertEquals(RegionRun.run(Env(store, noRange, budget)), RegionRun.Result.Done)
+    assert(store.packFile(tokyo, "20261117").isFile)
+  }
+
+  test("scan: a directory that cannot be listed stops the start; nothing is changed or deleted") {
+    val p = publish("20261117", Seq(tokyo))
+    val root = tmpDir()
+    val good = RegionStore(root)
+    val f = File(root, "x")
+    Files.write(f.toPath, pack(tokyo))
+    good.placePack(f, tokyo, "20261117", "s1")
+    val s = RegionState(Seq(Region("r1", "a", Seq(tokyo), 0)), Map(tokyo -> PackState(Some(Installed("20261117", "s1", 9, 1)), None)))
+    good.writeState(s)
+    val before = Files.readAllBytes(good.stateFile.toPath).toSeq
+    // The listing of packs/ fails (null), as on an I/O error.
+    val failing = new RegionStore(root):
+      override protected def names(d: File): Array[String] =
+        if d.getName == RegionStore.PacksDir then null else super.names(d)
+    val book = RegionBook(failing, () => Some(p.catalog), () => 7L)
+    assertEquals(book.state, RegionState.empty)
+    assert(book.broken.exists(_.contains("cannot list")), book.broken.toString)
+    assert(book.update(identity).isLeft)
+    book.tidy()
+    assertEquals(Files.readAllBytes(good.stateFile.toPath).toSeq, before)
+    assert(good.packFile(tokyo, "20261117").isFile)
+  }
+
+  test("start: readers while another thread loads wait for the whole state; ids are taken from it") {
+    val p = publish("20261117", Seq(tokyo, osaka))
+    val root = tmpDir()
+    RegionStore(root).writeState(RegionState.empty.add(Region("r1", "a", Seq(tokyo), 0), p.catalog))
+    val entered = java.util.concurrent.CountDownLatch(1)
+    val go = java.util.concurrent.CountDownLatch(1)
+    val slow = new RegionStore(root):
+      override def scan(): RegionScan =
+        entered.countDown()
+        go.await()
+        super.scan()
+    val book = RegionBook(slow, () => Some(p.catalog), () => 7L)
+    val loader = java.util.concurrent.CompletableFuture.supplyAsync(() => book.state)
+    entered.await()
+    // A reader and a change while the load is in its scan.
+    val reader = java.util.concurrent.CompletableFuture.supplyAsync(() => book.state)
+    val adder = java.util.concurrent.CompletableFuture.supplyAsync(() =>
+      book.update(s => s.add(Region(s.nextId, "b", Seq(osaka), 0), p.catalog)))
+    Thread.sleep(100)
+    assert(!reader.isDone && !adder.isDone)
+    go.countDown()
+    assertEquals(reader.get().regions.map(_.id).headOption, Some("r1"))
+    assertEquals(adder.get().map(_.regions.map(_.id)), Right(Seq("r1", "r2")))
+    assertEquals(loader.get().regions.head.id, "r1")
+    // A reader that cannot wait for a load stuck in its scan sees "loading", and changes are refused.
+    val stuck = new RegionStore(tmpDir()):
+      override def scan(): RegionScan = { Thread.sleep(2_000); super.scan() }
+    val b2 = RegionBook(stuck, () => None, () => 7L, loadWaitMs = 50)
+    val first = java.util.concurrent.CompletableFuture.supplyAsync(() => b2.state)
+    Thread.sleep(100)
+    assert(b2.loading)
+    assert(b2.update(identity).isLeft)
+    first.get()
+    assert(!b2.loading)
+  }

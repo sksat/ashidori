@@ -111,14 +111,22 @@ object Backup:
       Some(Storage.budget.reserve(r).getOrElse(throw java.io.IOException(Storage.shortage(r))))
     var accounted = 0L
     val floor = if mode == Mode.Quarantine then QuarantineFloor else LoggingMargin
+    // What has been written on this storage (the copy, then the ZIP's
+    // output bytes) goes to the budget; false once it cuts into the reserve.
+    // Its own lock: the copy's watcher calls it while this object's lock is held.
+    val spaceLock = new Object
+    def space(written: Long): Boolean = spaceLock.synchronized {
+      reserved.forall { r =>
+        val more = math.max(0L, written - accounted)
+        accounted = math.max(accounted, written)
+        r.wrote(more)
+      }
+    }
     // While it runs: stop before the logger has no room left.
     def checkSpace(written: Long): Unit =
       if dir.getUsableSpace < floor then
         throw java.io.IOException(s"空き容量が ${floor >> 20} MB 未満のため中断（記録用の領域を確保）")
-      for r <- reserved do
-        val more = written - accounted
-        accounted = written
-        if !r.wrote(more) then throw java.io.IOException("空き容量が記録用の予備を下回るため中断")
+      if !space(written) then throw java.io.IOException("空き容量が記録用の予備を下回るため中断")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     // The files to write, opened under the locks. Every writer of them
     // makes a new file (a tmp file is deleted before it is written again,
@@ -149,7 +157,28 @@ object Backup:
         val overflow = LoggerWrites.Overflow
         overflow.lock.lock()
         try
-          db.snapshotTo(snapshot)
+          // The copy is watched: every 200 ms its size goes to the budget,
+          // and a copy that would cut into the logging reserve is interrupted.
+          val sig = android.os.CancellationSignal()
+          @volatile var breached = false
+          val watcher = Thread(() =>
+            try
+              while !Thread.currentThread().isInterrupted do
+                Thread.sleep(200)
+                if !space(snapshot.length) then
+                  breached = true
+                  sig.cancel()
+            catch case _: InterruptedException => ()
+          , "ashidori-backup-watch")
+          watcher.setDaemon(true)
+          watcher.start()
+          try db.snapshotTo(snapshot, Some(sig))
+          catch case e: android.os.OperationCanceledException =>
+            throw java.io.IOException("空き容量が記録用の予備を下回るため中断", e)
+          finally
+            watcher.interrupt()
+            watcher.join(1000)
+          if breached then throw java.io.IOException("空き容量が記録用の予備を下回るため中断")
           checkSpace(snapshot.length)
           // Completed spill files never change (OverflowFiles): consistent
           // copies. A `.tmp` may be being written (the logger never waits
@@ -195,13 +224,18 @@ object Backup:
       val manifest = StringBuilder()
       def note(name: String, bytes: Long, sha: java.security.MessageDigest): Unit =
         manifest.append(BackupManifest.line(sha.digest().map(b => f"${b & 0xff}%02x").mkString, bytes, name, partial(name)))
-      Using.resource(c.getContentResolver.openOutputStream(uri, "wt")) { raw =>
+      // The ZIP's output bytes (compressed), what takes room.
+      var zipBytes = 0L
+      Using.resource(c.getContentResolver.openOutputStream(uri, "wt")) { raw0 =>
+        val raw = new java.io.FilterOutputStream(raw0):
+          override def write(b: Int): Unit = { raw0.write(b); zipBytes += 1 }
+          override def write(b: Array[Byte], off: Int, len: Int): Unit = { raw0.write(b, off, len); zipBytes += len }
         val zip = ZipOutputStream(BufferedOutputStream(raw, 1 << 16))
         zip.setLevel(Deflater.BEST_SPEED)
         def tick(): Unit =
           if done - reported >= (4 << 20) then
             reported = done
-            checkSpace(snapshot.length + done)
+            checkSpace((if withDb then snapshot.length else 0L) + zipBytes)
             progress(done, total)
         def copy(in: java.io.InputStream, name: String, time: Long): Unit =
           val sha = java.security.MessageDigest.getInstance("SHA-256")

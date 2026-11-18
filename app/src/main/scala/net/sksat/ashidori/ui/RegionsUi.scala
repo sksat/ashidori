@@ -107,8 +107,13 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
       t.setTextColor(color(attr.error))
       list.addView(t)
     }
-    if s.regions.isEmpty then list.addView(supportingText("なし"))
+    if Regions.book.loading then list.addView(supportingText("読み込み中"))
+    else if s.regions.isEmpty then list.addView(supportingText("なし"))
     else list.addView(listGroup(s.regions.map(row)*))
+    // Opening this screen may fetch the catalog (RegionsUi.ensureCatalog): where it goes.
+    if Regions.offered then
+      val host = scala.util.Try(java.net.URI(Regions.url("v", "f")).getHost).toOption.getOrElse("github.com")
+      list.addView(supportingText(s"更新の確認 · $host"))
     list.addView(sectionHeader("全域"))
     list.addView(listGroup(pinnedRow("オフライン地図 · 全域", BasemapDownload.status, Basemap.sizeLabel)(BasemapUi.showDialog(act)),
       pinnedRow("施設データ · 日本", VenueDownload.status, VenueData.sizeLabel)(VenueDataUi.showDialog(act))))

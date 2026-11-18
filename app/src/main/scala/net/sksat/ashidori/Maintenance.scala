@@ -256,7 +256,20 @@ object Maintenance:
       return false
     if !running.compareAndSet(false, true) then return false
     val deadline = System.currentTimeMillis() + BudgetMs
-    val halt = () => stop() || System.currentTimeMillis() > deadline
+    // The logging reserve (design 6.8): this process writes outside the
+    // budget, so it stops (keeping all data; the rest is done next time)
+    // once the free space reaches L and one chunk's room. Checked with
+    // every stop check, before each chunk it writes.
+    val floor = Try(Storage.floor()).getOrElse(Storage.ChunkRoom + StorageBudget.MinReserve)
+    val files = ctx.getFilesDir
+    val low = AtomicBoolean(false)
+    val stopOrLow = () => stop() || {
+      if !low.get && files.getUsableSpace < floor && low.compareAndSet(false, true) then
+        Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
+        LifeLog.add(LifeKind.Note, s"整理を中断: 空き容量が記録用の予備（${floor / 1_000_000} MB）に近い")
+      low.get
+    }
+    val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false
     try
       val db = AshidoriApp.db
@@ -314,7 +327,7 @@ object Maintenance:
             // is marked stale instead).
             VisitDays.beforeArchiving(d)
             try
-              val r = archive.compactDay(db, d, stop, line => Progress.set(line), until = deadline, portionMs = portionMs)
+              val r = archive.compactDay(db, d, stopOrLow, line => Progress.set(line), until = deadline, portionMs = portionMs)
               if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 生データのうち ${r.unconverted} 行は変換できないため端末内に残す")
               if r.done then
                 Guard.clear(d)
@@ -341,7 +354,7 @@ object Maintenance:
           case e: OutOfMemoryError => Log.w("monthly merge: out of memory", e)
           case NonFatal(e) => Log.w("monthly merge failed", e)
       if halt() then left = true
-      Progress.set(if left then "中断（続きは次回）" else "完了", running = false)
+      Progress.set(if low.get then "空き容量が記録用の予備に近いため中断（続きは次回）" else if left then "中断（続きは次回）" else "完了", running = false)
       // Then a bounded run of the 「訪れた日」 index (fewer days on battery).
       // Never a reason to run again: it is built while its list is open too.
       if !halt() then VisitDays.maintain(charging, halt)

@@ -370,8 +370,9 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     part.getParentFile.mkdirs()
     // The rest of the archive, within the shared budget (design 6.8); its
     // extraction reserves again once it is verified.
-    val need = pin.bytes - (if part.isFile then part.length else 0L)
-    val room = Storage.budget.reserve(need).getOrElse {
+    val have = if part.isFile then part.length else 0L
+    val need = pin.bytes - have
+    val room = Storage.budget.reserveFile(pin.bytes, have).getOrElse {
       Log.w(s"$name: ${Storage.shortage(need)}")
       throw PinnedFailure(DownloadCause.Storage)
     }
@@ -398,13 +399,11 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     val found = sources.iterator.map { (source, url) =>
       try
         var shown = -1L
-        var accounted = if part.isFile then part.length else 0L
         ResumableDownload.run(http, url, part, pin.bytes, () => isStopped, n => {
-          // Stops (the partial file stays) once it would cut into the logging reserve.
-          if n > accounted then
-            val ok = room.wrote(n - accounted)
-            accounted = n
-            if !ok then throw PinnedFailure(DownloadCause.Storage)
+          // Every write reports the file's size, also after a restart from
+          // the start (another source, HTTP 200 to a Range request): it stops
+          // (the partial file stays) once it would cut into the logging reserve.
+          if !room.at(n) then throw PinnedFailure(DownloadCause.Storage)
           // About every 1 %.
           if n == pin.bytes || n - shown >= pin.bytes / 100 then
             shown = n

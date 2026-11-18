@@ -536,7 +536,11 @@ class RegionStore(val root: File):
     finally BasemapStore.deleteTree(tmp)
 
   def scan(): RegionScan =
-    def list(d: File): Seq[String] = Option(d.list()).map(_.toSeq.sorted).getOrElse(Seq.empty)
+    // A directory that cannot be listed is an I/O error (not "empty"): the
+    // caller changes nothing on it.
+    def list(d: File): Seq[String] =
+      if !d.isDirectory then Seq.empty
+      else Option(names(d)).map(_.toSeq.sorted).getOrElse(throw IOException(s"cannot list ${d.getName}"))
     val other = scala.collection.mutable.ArrayBuffer.empty[String]
     val packs = list(File(root, PacksDir)).flatMap { name =>
       Cell.parse(name) match
@@ -566,6 +570,9 @@ class RegionStore(val root: File):
     for n <- list(root) if !Set(StateFile, PacksDir, StylesDir, DownloadDir, CatalogDir)(n) do other += n
     val bytes = for (c, vs) <- packs; v <- vs.keys yield packDir(c, v) -> packFile(c, v).length
     RegionScan(packs, styles, other.toSeq.sorted, bytes.toMap)
+
+  /** The names in a directory (`File.list`); null on an I/O error. */
+  protected def names(d: File): Array[String] = d.list()
 
   /** Deletes `rel` (a path [[RegionScan]] or [[RegionReconcile]] named). */
   def delete(rel: String): Unit =
@@ -670,8 +677,8 @@ object RegionStyle:
   * time: each counts the others' unwritten rest. Thread-safe.
   */
 final class StorageBudget(free: () => Long, reserve: () => Long):
-  final class Reservation private[StorageBudget] (val bytes: Long):
-    @volatile private var written = 0L
+  final class Reservation private[StorageBudget] (val bytes: Long, start: Long = 0L):
+    @volatile private var written = start
     @volatile private var open = true
     /** `n` more bytes written. False once the write must stop: the free
       * space would cut into the logging reserve.
@@ -679,6 +686,21 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
     def wrote(n: Long): Boolean =
       StorageBudget.this.synchronized(written += n)
       StorageBudget.this.ok
+    /** For a file being brought to `bytes` ([[reserveFile]]): it is `size`
+      * bytes long now. A file that became shorter (a restart from the
+      * start, a discarded partial file) has more to write again: that is
+      * admitted like a new reservation, against what the others hold now.
+      * False once the write must stop.
+      */
+    def at(size: Long): Boolean = StorageBudget.this.synchronized {
+      if size < written then
+        written = size
+        val others = active.filterNot(_ eq this).map(_.outstanding).sum
+        free() - others - reserve() >= outstanding && StorageBudget.this.ok
+      else
+        written = size
+        StorageBudget.this.ok
+    }
     def outstanding: Long = if open then math.max(0L, bytes - written) else 0L
     def release(): Unit = StorageBudget.this.synchronized {
       open = false
@@ -694,6 +716,19 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
     if free() - active.map(_.outstanding).sum - reserve() < r then None
     else
       val x = Reservation(r)
+      active = x :: active
+      Some(x)
+  }
+
+  /** A reservation for a file brought to `target` bytes from `have` (a
+    * resumed download): what is left. Report its size with
+    * [[Reservation.at]] after every write, a truncation included.
+    */
+  def reserveFile(target: Long, have: Long): Option[Reservation] = synchronized {
+    val rest = math.max(0L, target - have)
+    if free() - active.map(_.outstanding).sum - reserve() < rest then None
+    else
+      val x = Reservation(target, math.min(have, target))
       active = x :: active
       Some(x)
   }
@@ -859,12 +894,12 @@ object RegionRun:
     part.getParentFile.mkdirs()
     val have = if part.isFile then part.length else 0L
     if have < f.bytes then
-      val r = env.budget.reserve(f.bytes - have).getOrElse(throw NoRoom())
+      val r = env.budget.reserveFile(f.bytes, have).getOrElse(throw NoRoom())
       try
-        var last = have
+        // Every write reports the file's size, also after a restart from the
+        // start (HTTP 200 to a Range request, a discarded partial file).
         ResumableDownload.run(env.http, env.url(version, f.file), part, f.bytes, () => env.cancelled(), n => {
-          if n > last && !r.wrote(n - last) then throw NoRoom()
-          last = math.max(last, n)
+          if !r.at(n) then throw NoRoom()
           cell.foreach(c => env.progress(Some(c), n))
         })
       finally r.release()
@@ -888,7 +923,7 @@ object RegionRun:
   * ([[RegionUse]]) needs them at that moment.
   */
 final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatalog], now: () => Long,
-                       log: String => Unit = _ => (), val use: RegionUse = RegionUse()):
+                       log: String => Unit = _ => (), val use: RegionUse = RegionUse(), loadWaitMs: Long = 10_000):
   private val lock = new Object
   @volatile private var current = RegionState.empty
   @volatile private var loaded = false
@@ -901,9 +936,23 @@ final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatal
     ensureLoaded()
     current
 
-  def ensureLoaded(): Unit = if !loaded then lock.synchronized {
-    if !loaded then
-      loaded = true
+  /** Still reading the files (another thread loads them, longer than a
+    * reader waits): the state is empty meanwhile and changes are refused.
+    */
+  def loading: Boolean = !loaded
+
+  private val loadLock = java.util.concurrent.locks.ReentrantLock()
+
+  /** Loads the state once. A reader while another thread loads waits for
+    * it (at most `loadWaitMs`); `loaded` is published only when the state
+    * is complete.
+    */
+  def ensureLoaded(): Unit =
+    if !loaded && loadLock.tryLock(loadWaitMs, java.util.concurrent.TimeUnit.MILLISECONDS) then
+      try if !loaded then lock.synchronized(load())
+      finally loadLock.unlock()
+
+  private def load(): Unit =
       try
         val scan = store.scan()
         val stored = store.readState() match
@@ -932,13 +981,15 @@ final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatal
         broken = Some(message(e))
         current = RegionState.empty
         log(s"regions: off: ${message(e)}")
-  }
+      finally loaded = true
 
   /** Applies `f` to the state and writes it; only then is it the state.
     * Left (the state unchanged) when the regions are off or the write failed.
     */
   def update(f: RegionState => RegionState): Either[String, RegionState] =
     ensureLoaded()
+    // Still loading in another thread: refused at once (not waiting on its lock).
+    if !loaded then return Left("読み込み中")
     lock.synchronized {
       broken match
         case Some(b) => Left(b)
@@ -962,9 +1013,9 @@ final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatal
     */
   def tidy(): Unit =
     ensureLoaded()
-    lock.synchronized {
+    if loaded then lock.synchronized {
       try
-        if broken.isEmpty then
+        if loaded && broken.isEmpty then
           val extra = RegionReconcile.deletable(current, store.scan())
             .filterNot(d => d.startsWith(RegionStore.TmpPrefix) || d.startsWith(RegionStore.DownloadDir + "/"))
             .filterNot(current.trash.contains)
@@ -977,7 +1028,7 @@ final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatal
     }
 
   /** Deletes what is in the trash and needed by neither the state nor a map now. */
-  def collect(): Unit = lock.synchronized {
+  def collect(): Unit = if loaded then lock.synchronized {
     try collectLocked() catch case e: Throwable => log(s"regions: delete failed: ${message(e)}")
   }
 

@@ -250,8 +250,13 @@ object Regions:
 
   /** Adds a region of `cells` and plans its packs. */
   def add(name: String, cells: Seq[Cell], c: RegionCatalog): Either[String, Region] =
-    val r = Region(state.nextId, name, cells.distinct.sorted, System.currentTimeMillis())
-    update(_.add(r, c)).map(_ => r)
+    // The id is taken from the state as the change is made (under its lock).
+    var made: Option[Region] = None
+    update { s =>
+      val r = Region(s.nextId, name, cells.distinct.sorted, System.currentTimeMillis())
+      made = Some(r)
+      s.add(r, c)
+    }.map(_ => made.get)
 
   def rename(id: String, name: String): Either[String, RegionState] = update(_.rename(id, name))
 

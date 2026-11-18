@@ -1050,10 +1050,16 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * INTO on a read-only connection of its own, which reads one snapshot
     * (WAL: the logger keeps writing meanwhile, nothing waits for it).
     */
-  def snapshotTo(dest: java.io.File): Unit =
+  def snapshotTo(dest: java.io.File, cancel: Option[android.os.CancellationSignal] = None): Unit =
     dest.delete()
     val ro = SQLiteDatabase.openDatabase(getReadableDatabase.getPath, null, SQLiteDatabase.OPEN_READONLY, Db.KeepOnCorruption)
-    try ro.execSQL("VACUUM INTO ?", Array[AnyRef](dest.getPath))
+    try cancel match
+      case None => ro.execSQL("VACUUM INTO ?", Array[AnyRef](dest.getPath))
+      // Run as a query so that `cancel` can interrupt it (sqlite3_interrupt):
+      // the copy stops part-way with OperationCanceledException.
+      case Some(sig) =>
+        val c = ro.rawQuery("VACUUM INTO ?", Array[String](dest.getPath), sig)
+        try c.getCount finally c.close()
     finally ro.close()
 
   // --- sync ---------------------------------------------------------------------
