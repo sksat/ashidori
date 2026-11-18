@@ -43,6 +43,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.DETAIL --es key gsi-std       「オンライン地図で表示」 on every open map (none: back)
   *   ... -a ashidori.debug.DATA_DELETE --es kind venues    delete downloaded data (a download then sends)
   *   ... -a ashidori.debug.PAUSE_AT --es at checked:write    pause right after that check of the next request
+  *   ... -a ashidori.debug.STYLE_FAIL --ei n 3              the next style fetches fail before sending
   *   ... -a ashidori.debug.STYLE_RETRY                      as a network becoming available for the style fetches
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
   *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
@@ -229,6 +230,10 @@ class DebugReceiver extends BroadcastReceiver:
             ).start()
             Thread.sleep(300)
             Net.log(s"step $st t=$now: the call goes on")
+      case "ashidori.debug.STYLE_FAIL" =>
+        // The next style fetches fail before they send (as an unreachable server).
+        ui.OnlineStyles.debugFailures = intent.getIntExtra("n", 1)
+        Log.i(s"style fetches to fail: ${ui.OnlineStyles.debugFailures}")
       case "ashidori.debug.STYLE_RETRY" =>
         // As a network becoming available: the waiting style fetches are retried.
         ui.OnlineStyles.retryNow()

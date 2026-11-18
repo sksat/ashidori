@@ -339,10 +339,17 @@ object OnlineStyles:
   /** `owner` no longer shows an online style (left the screen, gone): no fetch or retry for it. */
   def forget(owner: AnyRef): Unit = refetch.forgetWhere(_.owner eq owner)
 
+  /** Debug builds (DebugReceiver STYLE_FAIL): the next fetches fail before sending anything. */
+  @volatile var debugFailures = 0
+
   /** One fetch of `name` for the first of `wanted` still allowed, checked again before each request. */
   private def fetch(name: String, wanted: Seq[Wanted]): Boolean =
     def who = wanted.find(allowed).getOrElse(throw Outbound.Blocked(s"style $name: no map wants it any more"))
     try
+      Net.log(s"style fetch name=$name for=${wanted.map(_.holder).mkString(",")}")
+      if debugFailures > 0 then
+        debugFailures -= 1
+        throw java.io.IOException("debug failure")
       val ua = Seq("User-Agent" -> s"ashidori/${_root_.net.sksat.ashidori.BuildInfo.versionName} (Android)")
       val style = Net.outbound.small(who.permit, s"https://tiles.openfreemap.org/styles/$name", ua).getOrElse(throw java.io.IOException("style"))
       val urls = ujson.read(style)("sources").obj.values.flatMap(_.obj.get("url").flatMap(_.strOpt)).filter(_.startsWith("http")).toSeq.distinct
