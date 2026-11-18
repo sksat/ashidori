@@ -97,10 +97,13 @@ enum MapStyle(val key: String, val label: String, val note: String):
 object MapStyle:
   private def prefs = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-  /** Interactive map surfaces, each with its own remembered consent: the map tab and the period view. */
+  /** Interactive map surfaces, each with its own remembered consent: the
+    * map tab, the period view and the venue picker of a stay.
+    */
   val SurfaceMap = "map"
   val SurfacePeriod = "period"
-  val Surfaces: Set[String] = Set(SurfaceMap, SurfacePeriod)
+  val SurfacePicker = "picker"
+  val Surfaces: Set[String] = Set(SurfaceMap, SurfacePeriod, SurfacePicker)
 
   private def byKey(k: String): Option[MapStyle] = values.find(_.key == k)
 

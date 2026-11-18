@@ -83,9 +83,9 @@ final class PlaceSheet(
 
     val actions = vbox()
     visit.foreach { v =>
-      actions.addView(button("この滞在にチェックイン", tonal = true) {
+      actions.addView(button("滞在先を選択", tonal = true) {
         dialog.dismiss()
-        CheckInSheet(act, Some((v.latLng, v.start + math.min(v.durationMs / 2, 10 * 60_000L))), onChanged).show()
+        act.push(VenuePicker(act, v, onChanged))
       })
     }
     val root = padded(

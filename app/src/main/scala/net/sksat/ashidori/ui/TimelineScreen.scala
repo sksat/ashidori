@@ -140,6 +140,10 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     val slp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
     slp.setBehavior(behavior)
     coord.addView(sheet, slp)
+    // A venue picked on the map: its sheet over the day's sheet.
+    val vlp = androidx.coordinatorlayout.widget.CoordinatorLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    vlp.gravity = Gravity.BOTTOM
+    coord.addView(venueCard.view, vlp)
     behavior.setHideable(false)
     behavior.setFitToContents(false)
     behavior.setHalfExpandedRatio(0.5f)
@@ -187,7 +191,24 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
         case DayItem.Stay(v) => map.highlightPlace(v.latLng)
         case other           => other.path.filter(_.points.size >= 2).foreach(p => map.highlight(p))
 
-  private lazy val rows = DayRows(act, _ => load(), showOnMap)
+  private lazy val rows = DayRows(act, _ => load(), it => { showOnMap(it); venueCard.refresh() })
+
+  /** The selected item of the day shown, if a stay. */
+  private def selectedStay: Option[Visit] =
+    for tl <- current; k <- rows.selection; v <- DayItem.of(tl).find(_.key == k).collect { case DayItem.Stay(v) => v } yield v
+
+  private lazy val venueCard: VenueCard = VenueCard(act,
+    () => VenueCard.Context(selectedStay, current.toSeq.flatMap(_.segments.collect { case v: Visit => v }),
+      current.exists(_.date == LocalDate.now(AshidoriApp.zone))),
+    onClose = () => { map.pickVenue(None); liftFab() },
+    onChanged = () => load(),
+    openDay = d => act.openDay(d))
+  map.onVenue = {
+    case Some(p) =>
+      venueCard.show(p)
+      act.setCheckInVisible(false)
+    case None => venueCard.hide()
+  }
   private val dayMarkerClick: (String, String) => Unit = (layer, key) =>
     if layer == "visit" then
       current.foreach { tl =>
@@ -209,7 +230,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
       val covered = view.getHeight - sheet.getTop
       val half = (view.getHeight * 0.5).toInt
       act.setFabLift(math.max(0, math.min(covered, half)))
-      act.setCheckInVisible(span == Span.Day && covered <= half + dp(8))
+      act.setCheckInVisible(span == Span.Day && covered <= half + dp(8) && !venueCard.isOpen)
 
   override def onShow(): Unit =
     map.onScreen()
@@ -237,6 +258,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
 
   override def onHide(): Unit =
     unobserve()
+    venueCard.hide()
     // Leaving the screen ends the view's grant to use the network; the map
     // chosen here stays for when it is shown again.
     map.offScreen()
@@ -333,7 +355,7 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
   def load(): Unit =
     val date = anchor
     val today = LocalDate.now(AshidoriApp.zone)
-    if span == Span.Day then { act.setCheckInVisible(true); liftFab() } else act.setCheckInVisible(false)
+    if span == Span.Day then { act.setCheckInVisible(!venueCard.isOpen); liftFab() } else act.setCheckInVisible(false)
     if span != Span.Day then
       dateLabel.setText(span.title(date, today))
       current = None
@@ -397,6 +419,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
         scroller.post(() => scroller.scrollTo(0, r.scroll))
       }
       openLink.setVisibility(View.VISIBLE)
+    // The stays and the selection may have changed.
+    venueCard.refresh()
 
   /** Redraws the selected item's highlight (the day's data was replaced). */
   private def showSelected(it: DayItem): Unit = it match

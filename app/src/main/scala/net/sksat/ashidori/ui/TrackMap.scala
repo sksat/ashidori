@@ -107,6 +107,17 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     case TrackMap.CameraIntent.Focus(p, zoom) =>
       map.foreach((m, _) => m.easeCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(p.lat, p.lon), zoom)))
   var onMarkerClick: (String, String) => Unit = (_, _) => ()
+  /** A venue of the venue layer was picked (a tap, or TalkBack), or the pick
+    * ended by a tap elsewhere on the map (None).
+    */
+  var onVenue: Option[VenueLayer.Picked] => Unit = _ => ()
+  venues.onPick = p => onVenue(p)
+
+  /** Marks `p` as the picked venue (None: none), without [[onVenue]]. */
+  def pickVenue(p: Option[VenueLayer.Picked]): Unit = venues.setPick(p)
+  def pickedVenue: Option[VenueLayer.Picked] = venues.pick
+  /** `v` as this map draws it ([[VenueLayer.pickedFor]]). */
+  def venueAsDrawn(v: Venue, tag: Option[(String, String)]): VenueLayer.Picked = venues.pickedFor(v, tag)
   private var myLocation: Option[Location] = None
   /** Pixels at the bottom covered by an overlay (e.g. a bottom sheet). */
   var bottomInset: Int = 0
@@ -385,7 +396,21 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       case Outcome.Draw(ms) => ms.builder
       case Outcome.NoBasemap => MapStyle.blankBuilder(act)
     m.setStyle(builder, (style: Style) => {
-      for id <- Seq("track", "highlight", "visits", "checkins", "live") do style.addSource(GeoJsonSource(id))
+      for id <- Seq("track", "highlight", "visits", "checkins", "live", "stay-area") do style.addSource(GeoJsonSource(id))
+      // A stay's area ([[markStay]]): its radius in metres, as the accuracy circle.
+      style.addLayer(
+        CircleLayer("stay-area", "stay-area").withProperties(
+          PropertyFactory.circleColor(Palette.Stay),
+          PropertyFactory.circleOpacity(0.12f),
+          PropertyFactory.circleStrokeColor(Palette.Stay),
+          PropertyFactory.circleStrokeWidth(1.5f),
+          PropertyFactory.circleStrokeOpacity(0.6f),
+          PropertyFactory.circleRadius(
+            Expression.interpolate(Expression.exponential(2), Expression.zoom(),
+              Expression.stop(0, Expression.division(Expression.get("r"), Expression.literal(78271.5))),
+              Expression.stop(22, Expression.division(Expression.get("r"), Expression.literal(0.0187)))))
+        )
+      )
       // From the end of the drawn route to where we are now, updated per fix.
       style.addLayer(
         LineLayer("live-line", "live").withProperties(
@@ -495,10 +520,15 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         m.addOnMapClickListener { p =>
           val pt = m.getProjection.toScreenLocation(p)
           val hits = m.queryRenderedFeatures(pt, "visit-circles", "checkin-circles").asScala
-          hits.headOption.exists { f =>
-            onMarkerClick(f.getStringProperty("layer"), f.getStringProperty("key"))
-            true
-          }
+          hits.headOption match
+            case Some(f) =>
+              if venues.pick.nonEmpty then
+                venues.setPick(None)
+                onVenue(None)
+              onMarkerClick(f.getStringProperty("layer"), f.getStringProperty("key"))
+              true
+            // A venue drawn there, or the end of a pick.
+            case None => venues.tap(pt)
         }
       enableMyLocation(m, style)
       // Shops and other places from the venue index, under the basemap's labels and our layers.
@@ -751,6 +781,17 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     }
     if fit then moveCamera(TrackMap.CameraIntent.Focus(at, 16))
 
+  /** A stay's area: a disc of `radiusM` metres at `at` (None: none). */
+  def markStay(area: Option[(LatLng, Double)]): Unit =
+    withStyle("stay-area") { (_, style) =>
+      Option(style.getSourceAs[GeoJsonSource]("stay-area")).foreach(_.setGeoJson(FeatureCollection.fromFeatures(area.toSeq.map { (at, r) =>
+        val props = JsonObject()
+        // Metres per pixel shrink with cos(latitude), as for the accuracy circle.
+        props.addProperty("r", r / math.cos(math.toRadians(at.lat)))
+        Feature.fromGeometry(Point.fromLngLat(at.lon, at.lat), props)
+      }.asJava)))
+    }
+
   def clearHighlight(): Unit =
     withStyle("highlight") { (_, style) =>
       style.getSourceAs[GeoJsonSource]("highlight").setGeoJson(FeatureCollection.fromFeatures(java.util.List.of()))
@@ -771,6 +812,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     mlMap match
       case Some(m) => m.moveCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(p.lat, p.lon), zoom))
       case None    => initialCamera = Some((p, zoom))
+
+  /** Fits the camera to `pts` (also before the map is ready). */
+  def show(pts: Seq[LatLng]): Unit = moveCamera(TrackMap.CameraIntent.Show(pts))
 
   def focus(p: LatLng, zoom: Double = 15): Unit =
     moveCamera(TrackMap.CameraIntent.Focus(p, zoom))
@@ -882,6 +926,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     stopBasemap()
     stopVenues()
     stopObserving()
+    act.unregisterMap(this)
     // The grant ends with the view; the surface's consent stays.
     Settings.gate.revoke(this)
     TrackMap.all -= this

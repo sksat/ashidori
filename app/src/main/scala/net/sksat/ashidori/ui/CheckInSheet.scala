@@ -408,20 +408,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
       val time = at.map(_._2).getOrElse(System.currentTimeMillis())
       val ci = CheckIn(0, time, p.lat, p.lon, v.name, v.category, v.id, None, comment.getText.toString.trim, priv.isChecked)
       dialog.dismiss()
-      AshidoriApp.io.execute { () =>
-        val id = CheckIns.save(ci, v)
-        TimelineRepo.invalidate()
-        act.runOnUiThread { () =>
-          onDone()
-          Snackbar.make(act.snackbarAnchor, s"${v.name} にチェックインしました", com.google.android.material.snackbar.BaseTransientBottomBar.LENGTH_LONG)
-            .setAction("取り消し", _ => AshidoriApp.io.execute { () =>
-              AshidoriApp.db.deleteCheckIn(id)
-              TimelineRepo.invalidate()
-              act.runOnUiThread(() => onDone())
-            })
-            .show()
-        }
-      }
+      CheckIns.commit(act, ci, v, s"${v.name} にチェックインしました", onDone)
     }
 
 object CheckInSheet:
@@ -438,12 +425,103 @@ object CheckIns:
   /** Stores a check-in and links it to the matching place, naming the place
     * after the venue when it has no name yet. Runs on the I/O thread.
     */
-  def save(ci: CheckIn, v: Venue): Long =
+  def save(ci: CheckIn, v: Venue): Long = saveNaming(ci, v)._1
+
+  /** As [[save]]; also the naming of the place it did (its id and the
+    * edit), for 取り消し.
+    */
+  private def saveNaming(ci: CheckIn, v: Venue): (Long, Option[(Long, PlaceEdit)]) =
     val db = AshidoriApp.db
     val visit = Visit(ci.time, ci.time, ci.lat, ci.lon, 30, 1)
-    val placeId = Places.nearest(visit, db.places()) match
+    Places.nearest(visit, db.places()) match
       case Some(pl) =>
-        if pl.name.isEmpty then db.updatePlace(pl.copy(name = v.name, externalId = v.id))
-        pl.id
-      case None => db.insertPlace(Place(0, ci.lat, ci.lon, 50, v.name, PlaceKind.Other, v.id))
-    db.insertCheckIn(ci.copy(placeId = Some(placeId)))
+        val named = Option.when(pl.name.isEmpty)(PlaceEdit.rename(pl, v.name, Some(v.id))).filterNot(_.isNoop)
+        named.foreach(e => db.updatePlace(e.applyTo(pl)))
+        (db.insertCheckIn(ci.copy(placeId = Some(pl.id))), named.map(pl.id -> _))
+      case None =>
+        val placeId = db.insertPlace(Place(0, ci.lat, ci.lon, 50, v.name, PlaceKind.Other, v.id))
+        (db.insertCheckIn(ci.copy(placeId = Some(placeId))), None)
+
+  /** Applies `edit` to the place as stored now; the edit, if it changed it. */
+  private def edit(placeId: Long, edit: Place => PlaceEdit): Option[(Long, PlaceEdit)] =
+    AshidoriApp.db.places().find(_.id == placeId).flatMap { p =>
+      val e = edit(p)
+      Option.when(!e.isNoop) {
+        AshidoriApp.db.updatePlace(e.applyTo(p))
+        placeId -> e
+      }
+    }
+
+  /** Takes back a change of a place, while it still holds what was set. */
+  private def revert(change: Option[(Long, PlaceEdit)]): Unit =
+    for (id, e) <- change; p <- AshidoriApp.db.places().find(_.id == id); back <- e.revert(p) do AshidoriApp.db.updatePlace(back)
+
+  /** Stores `ci` ([[save]]) and shows `message` with 取り消し, which removes
+    * the check-in and the naming of the place it did. `onDone` runs on the
+    * main thread after each.
+    */
+  def commit(act: MainActivity, ci: CheckIn, v: Venue, message: String, onDone: () => Unit): Unit =
+    AshidoriApp.io.execute { () =>
+      val (id, named) = AshidoriApp.db.atomically(saveNaming(ci, v))
+      TimelineRepo.invalidate()
+      act.runOnUiThread { () =>
+        onDone()
+        Edits.snackbar(act.snackbarAnchor, message) {
+          AshidoriApp.io.execute { () =>
+            AshidoriApp.db.atomically {
+              AshidoriApp.db.deleteCheckIn(id)
+              revert(named)
+            }
+            TimelineRepo.invalidate()
+            act.runOnUiThread(() => onDone())
+          }
+        }
+      }
+    }
+
+  /** The check-in of a past stay, from the venue picker: to `v`, at the
+    * stay's time ([[VenueCheckIn.stayTime]]). `replacing`, the stay's
+    * check-in, is rewritten in place (its id, time, comment and privacy
+    * kept), so that sync carries the change: a deleted row is never
+    * uploaded. `rename`: the stay's place, named after the venue too. All
+    * in one transaction; 取り消し restores the check-in as it was (or
+    * removes the new one) and the place's name.
+    */
+  def toStay(act: MainActivity, v: Venue, visit: Visit, replacing: Option[CheckIn], rename: Option[Place],
+             message: String, onDone: () => Unit): Unit =
+    val p = if v.lat.isNaN then visit.latLng else v.latLng
+    AshidoriApp.io.execute { () =>
+      val db = AshidoriApp.db
+      val undo: () => Unit = db.atomically {
+        val renamed = rename.flatMap(pl => edit(pl.id, now => PlaceEdit.rename(now, v.name, Some(v.id))))
+        replacing match
+          case Some(old) =>
+            db.updateCheckIn(old.copy(lat = p.lat, lon = p.lon, venueName = v.name, venueCategory = v.category,
+              venueExternalId = v.id, placeId = visit.placeId.orElse(old.placeId)))
+            () => { db.updateCheckIn(old); revert(renamed) }
+          case None =>
+            val ci = CheckIn(0, VenueCheckIn.stayTime(visit), p.lat, p.lon, v.name, v.category, v.id)
+            val (id, named) = saveNaming(ci, v)
+            () => { db.deleteCheckIn(id); revert(named); revert(renamed) }
+      }
+      Log.d(s"check-ins: stay ${visit.start}, ${if replacing.isDefined then "replaced" else "added"}${if rename.isDefined then ", place named" else ""}")
+      TimelineRepo.invalidate()
+      act.runOnUiThread { () =>
+        onDone()
+        Edits.snackbar(act.snackbarAnchor, message) {
+          AshidoriApp.io.execute { () =>
+            db.atomically(undo())
+            Log.d(s"check-ins: stay ${visit.start}, taken back")
+            TimelineRepo.invalidate()
+            act.runOnUiThread(() => onDone())
+          }
+        }
+      }
+    }
+
+  /** 「「スターバックス」にチェックイン（12:10 の滞在）」, or without the stay for now. */
+  def message(name: String, stay: Option[Visit]): String =
+    val t = stay.fold("")(v => s"（${java.time.Instant.ofEpochMilli(v.start).atZone(AshidoriApp.zone).format(StayTime)} の滞在）")
+    s"「$name」にチェックイン$t"
+
+  private val StayTime = java.time.format.DateTimeFormatter.ofPattern("H:mm")

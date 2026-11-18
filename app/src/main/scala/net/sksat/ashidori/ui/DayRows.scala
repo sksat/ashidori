@@ -228,7 +228,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit, onSelect:
         val suggestion = place.filter(!_.named).flatMap(p => tl.suggestions.get(p.id))
         val name = place.map(p => suggestion.map(n => s"$n（候補）").getOrElse(p.displayName)).getOrElse("不明な場所")
         title.setText(name)
-        val checkIns = tl.checkIns.filter(c => c.time >= v.start - 60_000 && c.time <= v.end + 60_000).map(c => s"✓ ${c.venueName}")
+        val checkIns = tl.checkIns.filter(VenueCheckIn.during(_, v)).map(c => s"✓ ${c.venueName}")
         val area = place.filter(p => p.named && p.area.nonEmpty).map(_.area).toSeq
         val kind = place.filter(p => p.kind != PlaceKind.Other && p.displayName != p.kind.label).map(_.kind.label).toSeq
         val detail = (kind ++ area ++ checkIns).mkString("・")
@@ -239,7 +239,7 @@ final class DayRows(act: MainActivity, onChanged: DayTimeline => Unit, onSelect:
           suggestion.foreach { s =>
             actions.addView(actionChip(s"「$s」にする")(Edits.updatePlace(act, p.id, PlaceEdit.rename(p, s), Edits.renameMessage(s), () => changed(tl))))
           }
-          actions.addView(actionChip("✎ 編集", "場所を編集")(PlacePicker(act, p, Some(v), () => changed(tl)).show()))
+          actions.addView(actionChip("✎ 編集", "滞在先を選択")(act.push(VenuePicker(act, v, () => changed(tl)))))
           actions.addView(actionChip("場所を見る")(PlaceSheet(act, p, Some(v), () => changed(tl), Some(d => act.openDay(d))).show()))
         }
         (stayEmoji(place), s"$name、${third.getText}")

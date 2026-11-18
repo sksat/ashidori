@@ -11,13 +11,13 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.maplibre.android.geometry.LatLng as MLatLng
 import org.maplibre.android.maps.{MapLibreMap, Style}
 import org.maplibre.android.style.expressions.Expression
-import org.maplibre.android.style.layers.{Property, PropertyFactory, SymbolLayer}
+import org.maplibre.android.style.layers.{CircleLayer, Property, PropertyFactory, SymbolLayer}
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Point
 import scala.jdk.CollectionConverters.*
 import scala.util.Try
 import net.sksat.ashidori.{Log, VenueData}
-import ashidori.core.{LatLng, VenueMapLayer}
+import ashidori.core.{LatLng, Venue, VenueMapLayer}
 
 /** Shops and other places on an interactive map ([[TrackMap]]), from the
   * on-device venue index ([[VenueMapLayer]]): the offline basemap and the
@@ -31,10 +31,11 @@ import ashidori.core.{LatLng, VenueMapLayer}
   * data being installed or removed asks again ([[refresh]]). The layer lies
   * under the basemap's own POIs and place labels, so those win a collision.
   *
-  * The drawn venues are also virtual views of [[accessibilityView]] (an
-  * overlay of the map), so that TalkBack reads their names and kinds. Not
-  * interactive yet: there is no venue sheet to open (the check-in sheet
-  * would check in, which a tap must not do).
+  * A tap on a drawn venue ([[tap]]) picks it: a ring marks it and
+  * [[onPick]] gets it (the host opens its sheet); a tap elsewhere ends the
+  * pick. The drawn venues are also virtual views of [[accessibilityView]]
+  * (an overlay of the map), so that TalkBack reads their names and kinds;
+  * activating one picks it as a tap does.
   */
 final class VenueLayer(ctx: android.content.Context):
   import VenueLayer.*
@@ -52,6 +53,10 @@ final class VenueLayer(ctx: android.content.Context):
   private val main = Handler(Looper.getMainLooper)
   private val fetch: Runnable = () => request()
   private var destroyed = false
+  /** The picked venue, marked on the map (also after a new style). */
+  private var picked: Option[Picked] = None
+  /** A venue was picked (Some) or the pick ended by a tap elsewhere (None). */
+  var onPick: Option[Picked] => Unit = _ => ()
   /** One background thread per map: queries never pile up on the main thread. */
   private val worker: ExecutorService = Executors.newSingleThreadExecutor { r =>
     val t = Thread(() => { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "ashidori-venue-map")
@@ -102,7 +107,16 @@ final class VenueLayer(ctx: android.content.Context):
         PropertyFactory.textHaloColor("#ffffff"),
         PropertyFactory.textHaloWidth(1f))
     style.addLayerBelow(layer, anchor)
+    // The picked venue: a ring in its colour over its icon.
+    style.addSource(GeoJsonSource(PickedSourceId))
+    style.addLayerAbove(CircleLayer(PickedLayerId, PickedSourceId).withProperties(
+      PropertyFactory.circleRadius(13f),
+      PropertyFactory.circleColor(Expression.toColor(Expression.get("color"))),
+      PropertyFactory.circleOpacity(0.25f),
+      PropertyFactory.circleStrokeColor(Expression.toColor(Expression.get("color"))),
+      PropertyFactory.circleStrokeWidth(3f)), LayerId)
     target = Some((m, style))
+    showPicked()
     val moved: MapLibreMap.OnCameraMoveStartedListener = _ =>
       // The answer for the old range would show it mid-move.
       gen.incrementAndGet()
@@ -185,10 +199,76 @@ final class VenueLayer(ctx: android.content.Context):
         main.postDelayed(nodesChanged, 500)
       }
 
+  // ---- picking ----
+
+  /** The venue picked now. */
+  def pick: Option[Picked] = picked
+
+  /** Marks `p` as picked (None: none), without telling [[onPick]]. */
+  def setPick(p: Option[Picked]): Unit =
+    picked = p
+    showPicked()
+
+  private def pickAndTell(p: Option[Picked]): Unit =
+    setPick(p)
+    onPick(p)
+
+  private def showPicked(): Unit = target.foreach { (_, style) =>
+    Option(style.getSourceAs[GeoJsonSource](PickedSourceId)).foreach(_.setGeoJson(picked.fold(Empty) { p =>
+      ujson.write(ujson.Obj("type" -> "FeatureCollection", "features" -> ujson.Arr(ujson.Obj(
+        "type" -> "Feature",
+        "geometry" -> ujson.Obj("type" -> "Point", "coordinates" -> ujson.Arr(p.venue.lon, p.venue.lat)),
+        "properties" -> ujson.Obj("color" -> p.color)))))
+    }))
+  }
+
+  /** A tap on the map at `pt` (screen pixels): the drawn venue closest to
+    * it within a finger's reach is picked. Elsewhere, a pick ends. Returns
+    * whether the tap was used.
+    */
+  def tap(pt: android.graphics.PointF): Boolean = target match
+    case None => false
+    case Some((m, style)) =>
+      val r = TapSlopDp * ctx.getResources.getDisplayMetrics.density
+      val hits = Try(m.queryRenderedFeatures(RectF(pt.x - r, pt.y - r, pt.x + r, pt.y + r), LayerId).asScala.toVector)
+        .getOrElse(Vector.empty)
+      val near = hits.flatMap(f => pickedOf(f, style).map { p =>
+        val s = m.getProjection.toScreenLocation(MLatLng(p.venue.lat, p.venue.lon))
+        p -> math.hypot(s.x - pt.x, s.y - pt.y)
+      }).minByOption(_._2).map(_._1)
+      near match
+        case Some(p) =>
+          pickAndTell(Some(p))
+          true
+        case None if picked.nonEmpty =>
+          pickAndTell(None)
+          true
+        case None => false
+
+  /** `v` (with its OpenStreetMap tag, if known) as the map would draw it,
+    * for a venue picked elsewhere (a list): its colour and icon. Main thread.
+    */
+  def pickedFor(v: Venue, tag: Option[(String, String)]): Picked =
+    val st = tag.map((k, value) => VenueMapLayer.style(k, value))
+    val img = st.map(x => if sprite && x.icon.nonEmpty then x.icon else dotId(x.group))
+    val bmp = for i <- img; (_, style) <- target; b <- Option(Try(style.getImage(i)).getOrElse(null)) yield b
+    Picked(v, st.fold(VenueMapLayer.Group.Other.color)(_.group.color), bmp)
+
+  /** A drawn feature as a picked venue, with its icon from the style. */
+  private def pickedOf(f: org.maplibre.geojson.Feature, style: Style): Option[Picked] =
+    def str(k: String) = Option(Try(f.getStringProperty(k)).getOrElse(null))
+    (f.geometry(), str("id"), str("name")) match
+      case (pt: Point, Some(id), Some(name)) =>
+        val img = str("img").getOrElse("")
+        Some(Picked(Venue(id, str("full").getOrElse(name), str("kind").getOrElse(""), pt.latitude, pt.longitude),
+          str("color").getOrElse(VenueMapLayer.Group.Other.color),
+          Option(Try(style.getImage(img)).getOrElse(null))))
+      case _ => None
+
   // ---- accessibility: the drawn venues as virtual views ----
 
-  /** A drawn venue: its virtual view id, what is read, and where its icon and label are. */
-  private final case class Node(id: Int, text: String, at: Rect)
+  /** A drawn venue: its virtual view id, what is read, where its icon and label are, and the venue. */
+  private final case class Node(id: Int, text: String, at: Rect, venue: Picked)
   /** The drawn venues as last read; None: to be read when asked. */
   private var nodes: Option[Vector[Node]] = Some(Vector.empty)
   private val nodesChanged: Runnable = () => accessibilityChanged()
@@ -254,7 +334,7 @@ final class VenueLayer(ctx: android.content.Context):
     */
   private def currentNodes: Vector[Node] = nodes.getOrElse {
     val t0 = System.nanoTime()
-    val read = target.fold(Vector.empty[Node]) { (m, _) =>
+    val read = target.fold(Vector.empty[Node]) { (m, style) =>
       val (area, covers) = unobscured()
       if area.isEmpty then Vector.empty
       else
@@ -297,9 +377,10 @@ final class VenueLayer(ctx: android.content.Context):
             val r = Rect(x - icon, y - icon, x + icon, y + icon)
             r.union(label)
             if !r.intersect(area) then None
-            else
+            else pickedOf(f, style).map { p =>
               val vid = virtualIds.getOrElseUpdate(id, virtualIds.size)
-              Some(Node(vid, str(f, "kind").filter(_.nonEmpty).fold(name)(k => s"$name、$k"), r))
+              Node(vid, str(f, "kind").filter(_.nonEmpty).fold(name)(k => s"$name、$k"), r, p)
+            }
         }.sortBy(n => (n.at.centerY / math.max(1, 2 * icon), n.at.centerX))
     }
     nodes = Some(read)
@@ -339,11 +420,17 @@ final class VenueLayer(ctx: android.content.Context):
         case Some(n) =>
           node.setContentDescription(n.text)
           node.setBoundsInParent(n.at)
+          node.setClickable(true)
+          node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_CLICK)
         case None =>
           // Gone since it was listed: an empty node where the helper asks one.
           node.setContentDescription("")
           node.setBoundsInParent(Rect(0, 0, 1, 1))
-    override def onPerformActionForVirtualView(id: Int, action: Int, args: Bundle): Boolean = false
+    override def onPerformActionForVirtualView(id: Int, action: Int, args: Bundle): Boolean =
+      action == AccessibilityNodeInfoCompat.ACTION_CLICK && currentNodes.find(_.id == id).exists { n =>
+        pickAndTell(Some(n.venue))
+        true
+      }
   ViewCompat.setAccessibilityDelegate(accessibilityView, helper)
 
   // ---- drawing ----
@@ -367,8 +454,17 @@ final class VenueLayer(ctx: android.content.Context):
     bmp
 
 object VenueLayer:
+  /** A venue picked on the map: the venue (its full name), its group
+    * colour and the icon the map draws for it (None: not in the style).
+    */
+  final case class Picked(venue: Venue, color: String, icon: Option[Bitmap])
+
   val SourceId = "venues"
   val LayerId = "venue-symbols"
+  private val PickedSourceId = "venue-picked"
+  private val PickedLayerId = "venue-picked-ring"
+  /** A tap picks a venue drawn within this of it (dp). */
+  val TapSlopDp = 14f
   /** Features drawn at most (the closest to the centre, by rank). */
   val Cap = 1_200
   /** The GeoJSON at most (chars, about bytes for Latin names, a third for Japanese). */
@@ -393,6 +489,9 @@ object VenueLayer:
 
   private def dotId(g: VenueMapLayer.Group) = s"venue-dot-${g.key}"
 
+  /** A category as shown: "" for a raw tag value (no Japanese label). */
+  def kindOf(category: String): String = if RawTag.matches(category) then "" else category
+
   private def cut(s: String): String =
     if s.codePointCount(0, s.length) <= MaxNameChars then s
     else s.substring(0, s.offsetByCodePoints(0, MaxNameChars - 1)) + "…"
@@ -407,13 +506,15 @@ object VenueLayer:
     while !full && it.hasNext do
       val i = it.next()
       val st = i.style
-      val kind = Some(i.venue.category).filterNot(c => c.isEmpty || RawTag.matches(c)).getOrElse("")
+      val kind = kindOf(i.venue.category)
       val f = ujson.write(ujson.Obj(
         "type" -> "Feature",
         "geometry" -> ujson.Obj("type" -> "Point", "coordinates" -> ujson.Arr(i.venue.lon, i.venue.lat)),
         "properties" -> ujson.Obj(
           "id" -> i.venue.id,
           "name" -> cut(i.venue.name),
+          // The full name for the venue's sheet and its check-in, only when cut.
+          "full" -> (if cut(i.venue.name) == i.venue.name then ujson.Null else ujson.Str(i.venue.name)),
           "kind" -> kind,
           "img" -> (if sprite && st.icon.nonEmpty then st.icon else dotId(st.group)),
           "color" -> st.group.color,

@@ -279,6 +279,7 @@ class MainActivity extends AppCompatActivity:
     * Either way the archive must match the pin (app/src/main/assets/{basemap,venues}-pin.json).
     * For screenshots, to a running activity:
     *   --es ashidori.mapAt 35.6812,139.7671,16         every open map's camera there (lat,lon,zoom)
+    *   --es ashidori.here 35.6812,139.7671             the current position, as a fix of the logger now
     */
   private def debugDownloads(intent: Intent): Unit =
     Option(intent.getStringExtra("ashidori.basemapUrl")).foreach { u =>
@@ -295,6 +296,9 @@ class MainActivity extends AppCompatActivity:
       VenueData.pin.foreach(p => VenueDownload.importFile(this, java.io.File(getExternalFilesDir(null), s"venues/${p.file}")))
     Option(intent.getStringExtra("ashidori.mapAt")).flatMap(s => scala.util.Try(s.split(",").map(_.trim.toDouble)).toOption)
       .collect { case Array(lat, lon, zoom) => maps.foreach(_.moveTo(ashidori.core.LatLng(lat, lon), zoom)) }
+    // `--es ashidori.here 35.6377,139.7922`: the current position as if the logger had it now (not stored).
+    Option(intent.getStringExtra("ashidori.here")).flatMap(s => scala.util.Try(s.split(",").map(_.trim.toDouble)).toOption)
+      .collect { case Array(lat, lon) => LoggerState.lastFix = Some(ashidori.core.Fix(System.currentTimeMillis(), lat, lon, 10f, provider = "debug")) }
 
   private def handleIntent(intent: Intent): Unit =
     if intent.getBooleanExtra(MainActivity.ExtraOpenDiagnostics, false) && Settings.onboarded then
@@ -412,6 +416,8 @@ class MainActivity extends AppCompatActivity:
     for y <- scrollY.remove(s) if y > 0; v <- MainActivity.scroller(s.view) do restoreScroll(v, y)
 
   def registerMap(m: TrackMap): Unit = maps += m
+  /** A map destroyed before the activity (the venue picker's). */
+  def unregisterMap(m: TrackMap): Unit = maps -= m
 
   /** Scroll position of each hidden screen's main scroll view. */
   private val scrollY = mutable.Map.empty[Screen, Int]
@@ -493,7 +499,7 @@ class MainActivity extends AppCompatActivity:
   override def onDestroy(): Unit =
     current.foreach(_.onHide())
     tabs.values.foreach(_.onDestroy())
-    maps.foreach(_.onDestroy())
+    maps.toList.foreach(_.onDestroy())
     super.onDestroy()
 
   // --- shared actions ------------------------------------------------------------------------

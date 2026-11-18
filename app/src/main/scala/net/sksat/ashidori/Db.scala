@@ -654,6 +654,29 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     db.insert("mode_overrides", null, cv)
   }
 
+  /** Rewrites the check-in `ci.id` with every field of `ci`: one row,
+    * changed in place, so sync sends it as the latest snapshot of that id
+    * (a deleted row is not uploaded, see docs/sync-protocol.md).
+    */
+  def updateCheckIn(ci: CheckIn): Unit =
+    val cv = ContentValues()
+    cv.put("time", java.lang.Long.valueOf(ci.time))
+    cv.put("lat", java.lang.Double.valueOf(ci.lat))
+    cv.put("lon", java.lang.Double.valueOf(ci.lon))
+    cv.put("venue", ci.venueName)
+    cv.put("category", ci.venueCategory)
+    cv.put("external_id", ci.venueExternalId)
+    ci.placeId match
+      case Some(id) => cv.put("place_id", java.lang.Long.valueOf(id))
+      case None     => cv.putNull("place_id")
+    cv.put("comment", ci.comment)
+    cv.put("private", java.lang.Integer.valueOf(if ci.isPrivate then 1 else 0))
+    cv.put("updated_at", java.lang.Long.valueOf(System.currentTimeMillis()))
+    w.update("checkins", cv, "id=?", Array(ci.id.toString))
+
+  /** Runs `f` (writes of this class) in one transaction: all or nothing. */
+  def atomically[A](f: => A): A = tx(_ => f)
+
   def deleteCheckIn(id: Long): Unit =
     w.delete("checkins", "id=?", Array(id.toString))
 
