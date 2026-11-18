@@ -155,7 +155,9 @@ object VisitIndex:
     def candidateDays(cells: Seq[Long], before: Long, limit: Int): Vector[Long]
     /** The stays of `days` registered in any of `cells`, each once, with its day. */
     def candidates(cells: Seq[Long], days: Seq[Long]): Vector[(Long, Visit)]
-    /** Empties the index: stays, cells, days and meta (not the generation). */
+    /** Empties the index: stays, cells, days and meta, but not the generation
+      * nor the meta keys starting with "stale" ([[emptyIfStale]]).
+      */
     def clear(): Unit
 
   /** The record, read through its safe readers. */
@@ -364,3 +366,114 @@ object VisitIndex:
         before = days.min
         more = days.size == QueryPage
     out.result()
+
+  // --- what must outlive a crash: the archiving note and the stale marker -------------------
+
+  /** Small files beside the index, written durably (each write may throw).
+    *
+    *   - The stale marker: a generation; the index is of unknown freshness
+    *     while it is above the generation a full rebuild consumed.
+    *   - The archiving note: the day being archived, from before its rows
+    *     move to after the mark after the commit (corrupt: `Left`).
+    *   - The archiving sequence: one more for every archiving begun.
+    *   - "Active": an archiving is under way (a lock its process holds,
+    *     released by a crash).
+    */
+  trait Beside:
+    def staleGen: Long
+    def setStaleGen(g: Long): Unit
+    def doneGen: Long
+    def setDoneGen(g: Long): Unit
+    def archiving: Option[Either[String, LocalDate]]
+    def setArchiving(day: LocalDate): Unit
+    def clearArchiving(): Unit
+    def archivingSeq: Long
+    def setArchivingSeq(n: Long): Unit
+    def archivingActive: Boolean
+    def holdArchiving(): Unit
+    def releaseArchiving(): Unit
+
+  def isStale(b: Beside): Boolean = b.staleGen > b.doneGen
+
+  /** A new stale generation. False if it could not be written. */
+  def markStale(b: Beside): Boolean =
+    scala.util.Try(b.setStaleGen(math.max(b.staleGen, b.doneGen) + 1)).isSuccess
+
+  /** No archiving under way, none noted (a crash in one leaves its note). */
+  private def quiet(b: Beside): Boolean = !b.archivingActive && b.archiving.isEmpty
+
+  /** Before a use, under the index's write lock. A corrupt archiving note
+    * makes the index stale. A stale index is emptied (to be built whole)
+    * once per marker generation, and again if it was emptied while an
+    * archiving was under way or noted, or one has begun since, and now
+    * none is: only a rebuild begun quiet can consume the marker
+    * ([[consumeStale]]).
+    */
+  def emptyIfStale(store: Store, b: Beside): Unit =
+    store.transaction {
+      if b.archiving.exists(_.isLeft) then markStale(b)
+      if isStale(b) then
+        val g = b.staleGen.toString
+        val seq = b.archivingSeq.toString
+        val ok = quiet(b)
+        val begun = store.meta("staleGen").contains(g)
+        val begunQuiet = begun && store.meta("staleQuiet").contains("1") && store.meta("staleSeq").contains(seq)
+        if !begun || (!begunQuiet && ok) then
+          store.clear()
+          store.setMeta("staleGen", g)
+          store.setMeta("staleQuiet", if ok then "1" else "0")
+          store.setMeta("staleSeq", seq)
+    }
+
+  /** After a run that left nothing to build: the marker generation the
+    * rebuild began under is consumed, if it began quiet, no archiving has
+    * begun since, and none is under way or noted now. True if consumed.
+    */
+  def consumeStale(store: Store, b: Beside, first: LocalDate, today: LocalDate): Boolean =
+    store.transaction {
+      val g = b.staleGen
+      val ok = isStale(b) && store.meta("staleGen").contains(g.toString) && store.meta("staleQuiet").contains("1") &&
+        store.meta("staleSeq").contains(b.archivingSeq.toString) && quiet(b) && pending(store, first, today).isEmpty
+      ok && scala.util.Try(b.setDoneGen(g)).isSuccess
+    }
+
+  /** Marks `day` and its neighbours ([[archiving]]); false if that failed. */
+  private def markArchiving(store: Store, day: LocalDate): Boolean = scala.util.Try(archiving(store, day)).isSuccess
+
+  /** Before archiving `day`: held active, the sequence moved on, the day
+    * noted, then marked. A failed write makes the index stale. Never throws.
+    */
+  def beforeArchiving(store: Store, b: Beside, day: LocalDate): Unit =
+    val held = scala.util.Try(b.holdArchiving()).isSuccess
+    val noted = held && scala.util.Try { b.setArchivingSeq(b.archivingSeq + 1); b.setArchiving(day) }.isSuccess
+    if !noted then markStale(b)
+    if !markArchiving(store, day) then markStale(b)
+
+  /** After archiving `day` (done, failed or stopped): marked again, then the
+    * note removed and the hold released. Never throws.
+    */
+  def afterArchiving(store: Store, b: Beside, day: LocalDate): Unit =
+    try
+      if markArchiving(store, day) then scala.util.Try(b.clearArchiving())
+      else markStale(b)
+    finally scala.util.Try(b.releaseArchiving())
+
+  /** In the maintenance process once recovery has finished a commit (and
+    * after 「整理を修復」): a note left by a crash is settled: its day
+    * marked, or the index made stale if the note cannot be read; then the
+    * note removed (kept if neither could be written).
+    */
+  def settleArchiving(store: Store, b: Beside): Unit =
+    b.archiving match
+      case None              => ()
+      case Some(Right(day))  => if markArchiving(store, day) || markStale(b) then scala.util.Try(b.clearArchiving())
+      case Some(Left(_))     => if markStale(b) then scala.util.Try(b.clearArchiving())
+
+  /** In the main process when the list opens: a noted day marked (the note
+    * stays for the maintenance process), a corrupt note makes it stale.
+    */
+  def noteArchiving(store: Store, b: Beside): Unit =
+    b.archiving match
+      case Some(Right(day)) => if !markArchiving(store, day) then markStale(b)
+      case Some(Left(_))    => markStale(b)
+      case None             => ()

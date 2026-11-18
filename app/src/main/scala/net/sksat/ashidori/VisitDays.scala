@@ -33,12 +33,19 @@ import VisitIndex.{DayState, DayVisit, Marks, Changes}
   * late row (a spill imported, say) that came after a build had used up
   * the first mark and left with the same commit is followed by another
   * build. A durable note of the day archived (`visit_index.archiving`)
-  * lasts from before the move to after the second mark: if the process
-  * dies in between, the next maintenance run marks the day once its
-  * recovery has finished the commit ([[settleArchiving]]). If a marking or
-  * the note fails, a marker file says the whole index is of unknown
-  * freshness ([[markStale]]): the next use empties it and it is built
-  * again. None of this ever waits for or fails the archiving. Rows of
+  * lasts from before the move to after the second mark, and the archiving
+  * process holds a lock (`visit_index.archiving.lock`) as long: if the
+  * process dies in between, the next maintenance run (or 「整理を修復」)
+  * marks the day once recovery has finished the commit
+  * ([[settleArchiving]]); a note that cannot be read makes the index stale
+  * and is removed there. If a marking or the note fails, the stale marker
+  * (`visit_index.stale`, a generation) says the whole index is of unknown
+  * freshness: the next use empties it and it is built again, and only a
+  * whole rebuild begun and ended with no archiving under way or noted, and
+  * none begun meanwhile (`visit_index.archiving.seq`), consumes that
+  * generation (`visit_index.stale.done`; [[VisitIndex.emptyIfStale]],
+  * [[VisitIndex.consumeStale]]). None of this ever waits for or fails the
+  * archiving. Rows of
   * positions and motion leave SQLite only by archiving (marked both sides)
   * or a deletion (its sequence); the other tables (energy, battery,
   * pressure, raw lines) do not change a stay. Only a write path added
@@ -60,28 +67,78 @@ object VisitDays:
   }
 
   def file(c: Context): File = File(c.getNoBackupFilesDir, "visit_index.db")
-  /** The day being archived, from before the move to after the mark after it. */
-  private def archivingFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.archiving")
-  /** The marker of unknown freshness, and the same while being acted on. */
-  private def staleFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale")
-  private def claimedFile = File(AshidoriApp.app.getNoBackupFilesDir, "visit_index.stale.claimed")
+  private def beside(name: String) = File(AshidoriApp.app.getNoBackupFilesDir, name)
 
-  /** The index may have missed a change (a marking failed, or a repair
-    * quarantined files): emptied at its next use and built again.
+  /** The files beside the index ([[VisitIndex.Beside]]): written durably
+    * (Maintenance.write: a tmp file, fsync, rename, fsync of the directory).
+    */
+  private object Files extends VisitIndex.Beside:
+    private def read(name: String): Option[String] =
+      val f = beside(name)
+      if !f.exists then None
+      else Some(String(java.nio.file.Files.readAllBytes(f.toPath), java.nio.charset.StandardCharsets.UTF_8).trim)
+    private def number(name: String): Long = scala.util.Try(read(name)).toOption.flatten.fold(0L)(_.toLongOption.getOrElse(-1L))
+    private def write(name: String, v: String): Unit = Maintenance.write(beside(name), v)
+
+    /** An unreadable marker counts as one generation above the one consumed. */
+    def staleGen: Long = number("visit_index.stale") match
+      case -1 => doneGen + 1
+      case g  => g
+    def setStaleGen(g: Long): Unit = write("visit_index.stale", g.toString)
+    def doneGen: Long = math.max(0L, number("visit_index.stale.done"))
+    def setDoneGen(g: Long): Unit = write("visit_index.stale.done", g.toString)
+    def archiving: Option[Either[String, LocalDate]] =
+      scala.util.Try(read("visit_index.archiving")) match
+        case scala.util.Failure(e) => Some(Left(s"unreadable: $e"))
+        case scala.util.Success(None) => None
+        case scala.util.Success(Some(t)) => Some(scala.util.Try(LocalDate.parse(t)).toEither.left.map(_ => s"corrupt: $t"))
+    def setArchiving(day: LocalDate): Unit = write("visit_index.archiving", day.toString)
+    def clearArchiving(): Unit =
+      val f = beside("visit_index.archiving")
+      if f.exists && !f.delete() then throw java.io.IOException(s"cannot delete $f")
+      ArchiveStore.syncDir(f.getParentFile)
+    /** Unreadable: -1, so the next one differs from any rebuild's record. */
+    def archivingSeq: Long = number("visit_index.archiving.seq")
+    def setArchivingSeq(n: Long): Unit = write("visit_index.archiving.seq", math.max(n, 1L).toString)
+
+    private val lockFile = "visit_index.archiving.lock"
+    @volatile private var held: Option[(java.nio.channels.FileChannel, java.nio.channels.FileLock)] = None
+    def archivingActive: Boolean =
+      held.nonEmpty || scala.util.Try {
+        val ch = java.io.RandomAccessFile(beside(lockFile), "rw").getChannel
+        try
+          val l = ch.tryLock()
+          if l == null then true else { l.release(); false }
+        finally ch.close()
+      }.getOrElse(true)
+    def holdArchiving(): Unit = synchronized {
+      if held.isEmpty then
+        val ch = java.io.RandomAccessFile(beside(lockFile), "rw").getChannel
+        held = Some((ch, ch.lock()))
+    }
+    def releaseArchiving(): Unit = synchronized {
+      held.foreach { (ch, l) => scala.util.Try(l.release()); scala.util.Try(ch.close()) }
+      held = None
+    }
+
+  /** The index may have missed a change (a repair quarantined files, say):
+    * emptied at its next use and built again.
     */
   def markStale(why: String): Unit =
-    val ok = scala.util.Try(staleFile.createNewFile() || staleFile.exists).getOrElse(false)
+    val ok = VisitIndex.markStale(Files)
     Log.w(s"visits: index of unknown freshness ($why)" + (if ok then "" else "; the marker could not be written"))
 
-  /** A marker found: claimed (a new one may come meanwhile and stays), the
-    * index emptied, then the claim removed.
-    */
+  /** Before a use: a stale index emptied (once per marker generation, see [[VisitIndex.emptyIfStale]]). */
   private def emptyIfStale(): Unit =
-    if staleFile.exists then staleFile.renameTo(claimedFile)
-    if claimedFile.exists then
-      store.clear()
-      claimedFile.delete()
-      Log.i("visits: index emptied (unknown freshness); built again")
+    val was = VisitIndex.isStale(Files)
+    VisitIndex.emptyIfStale(store, Files)
+    if !was && VisitIndex.isStale(Files) then Log.w("visits: the archiving note cannot be read; index of unknown freshness")
+
+  /** After a run with nothing left: the stale marker consumed if it may be. */
+  private def consumeStale(): Unit =
+    if VisitIndex.isStale(Files) then
+      val first = AshidoriApp.db.firstDataDateCached.getOrElse(today)
+      if VisitIndex.consumeStale(store, Files, first, today) then Log.i("visits: rebuilt whole; the stale marker consumed")
 
   @volatile private var helper: IndexDb = null
   private def store: IndexDb = synchronized {
@@ -145,7 +202,7 @@ object VisitDays:
     VisitIndex.note(store, Record, AshidoriApp.zone, stop)
     VisitIndex.touch(store, today)
     // Marked, not settled: only the maintenance process clears the note.
-    archivingDay.foreach(VisitIndex.archiving(store, _))
+    VisitIndex.noteArchiving(store, Files)
   }.isDefined
 
   /** The days of `venue` the index holds now. */
@@ -170,40 +227,36 @@ object VisitDays:
     if r.built > 0 || r.failed.nonEmpty then
       Log.d(f"visits: built ${r.built} days in ${(System.nanoTime() - t0) / 1e6}%.0f ms, ${r.left} left" +
         (if r.failed.nonEmpty then s", failed ${r.failed.mkString(",")}" else ""))
+    if r.left == 0 then consumeStale()
     r
   }
 
-  /** In the maintenance process, before archiving `day`: that day and its
-    * neighbours marked changed ([[VisitIndex.archiving]]), one short
-    * transaction; on failure the index is marked stale. Never throws.
+  /** In the maintenance process, before archiving `day`: held active, noted
+    * durably, its day and neighbours marked ([[VisitIndex.beforeArchiving]]).
+    * Never throws; on failure the index is marked stale.
     */
-  def beforeArchiving(day: LocalDate): Unit =
-    // The note first: it outlives this process until the mark after the commit.
-    if scala.util.Try(Maintenance.write(archivingFile, day.toString)).isFailure then markStale(s"noting $day failed")
-    mark(day, "before")
+  def beforeArchiving(day: LocalDate): Unit = atArchiving(s"before archiving $day")(VisitIndex.beforeArchiving(store, Files, day))
 
   /** In the maintenance process, after archiving `day` (its commits done,
-    * or it failed): the day and its neighbours marked again, then the note
-    * removed. Never throws.
+    * or it failed or stopped): marked again, the note removed, the hold
+    * released. Never throws.
     */
   def afterArchiving(day: LocalDate): Unit =
-    if mark(day, "after") then scala.util.Try(archivingFile.delete())
+    try atArchiving(s"after archiving $day")(VisitIndex.afterArchiving(store, Files, day))
+    finally Files.releaseArchiving()
 
-  /** In the maintenance process, after recovery has finished an interrupted
-    * commit: the day its note names is marked, and the note removed.
+  /** In the maintenance process, once recovery has finished an interrupted
+    * commit, and after 「整理を修復」: a note left by a crash settled (its
+    * day marked, or the index stale if it cannot be read; then removed).
     */
-  def settleArchiving(): Unit = archivingDay.foreach(afterArchiving)
+  def settleArchiving(): Unit =
+    Files.archiving.foreach(n => atArchiving(s"settling the archiving note ${n.fold(why => s"($why)", _.toString)}")(
+      VisitIndex.settleArchiving(store, Files)))
 
-  private def archivingDay: Option[LocalDate] =
-    scala.util.Try(LocalDate.parse(String(java.nio.file.Files.readAllBytes(archivingFile.toPath), java.nio.charset.StandardCharsets.UTF_8).trim)).toOption
-
-  /** The day and its neighbours marked changed; on failure the index is marked stale. */
-  private def mark(day: LocalDate, when: String): Boolean =
+  private def atArchiving(what: String)(f: => Unit): Unit =
     val t0 = System.nanoTime()
-    val ok = guarded(s"mark $when archiving")(VisitIndex.archiving(store, day)).isDefined
-    if !ok then markStale(s"marking $day $when archiving failed")
-    else Log.d(f"visits: $day and its neighbours marked $when archiving in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
-    ok
+    if guarded(what)(f).isEmpty then markStale(what)
+    else Log.d(f"visits: $what: done in ${(System.nanoTime() - t0) / 1e6}%.1f ms")
 
   /** In the maintenance process, after archiving: a bounded run (days, and [[MaintainMs]]). */
   def maintain(charging: Boolean, halt: () => Boolean): Unit =
@@ -333,5 +386,6 @@ object VisitDays:
         }
 
     def clear(): Unit = transaction {
-      for t <- Seq("cells", "stays", "days", "meta") do exec(s"DELETE FROM $t")
+      for t <- Seq("cells", "stays", "days") do exec(s"DELETE FROM $t")
+      exec("DELETE FROM meta WHERE k NOT LIKE 'stale%'")
     }

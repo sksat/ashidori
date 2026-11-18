@@ -39,7 +39,7 @@ class VisitIndexSuite extends munit.FunSuite:
     def candidates(cells: Seq[Long], days: Seq[Long]): Vector[(Long, Visit)] =
       stays.toVector.filter((d, _) => days.contains(d))
         .flatMap((d, ss) => ss.collect { case (v, cs) if cs.exists(cells.contains) => (d, v) })
-    def clear(): Unit = { meta.clear(); dayStates.clear(); stays.clear() }
+    def clear(): Unit = { meta.filterInPlace((k, _) => k.startsWith("stale")); dayStates.clear(); stays.clear() }
 
   /** A record: stays per day; position rows (rowid -> time) in "SQLite"
     * until archived; deleted ranges in sequence.
@@ -446,4 +446,133 @@ class VisitIndexSuite extends munit.FunSuite:
     // The update of the index failed (noting the changes): not "none".
     assertEquals(footer(answered = true, shown = 0, unbuilt = 0, stale = 0, building = false, trouble = true), Footer.Failed(false))
     assertEquals(footer(answered = true, shown = 2, unbuilt = 0, stale = 0, building = false, trouble = false), Footer.Nothing)
+  }
+
+  // --- the archiving note and the stale marker ----------------------------------------------
+
+  /** The files beside the index in memory; `crash()` releases the hold only. */
+  final class FakeBeside extends Beside:
+    var stale = 0L
+    var done = 0L
+    var note: Option[Either[String, LocalDate]] = None
+    var seq = 0L
+    var held = false
+    var failWrites = false
+    /** Only the note (and its sequence) cannot be written. */
+    var failNote = false
+    private def write(): Unit = if failWrites then throw java.io.IOException("cannot write")
+    private def writeNote(): Unit = if failWrites || failNote then throw java.io.IOException("cannot write the note")
+    def staleGen: Long = stale
+    def setStaleGen(g: Long): Unit = { write(); stale = g }
+    def doneGen: Long = done
+    def setDoneGen(g: Long): Unit = { write(); done = g }
+    def archiving: Option[Either[String, LocalDate]] = note
+    def setArchiving(day: LocalDate): Unit = { writeNote(); note = Some(Right(day)) }
+    def clearArchiving(): Unit = note = None
+    def archivingSeq: Long = seq
+    def setArchivingSeq(n: Long): Unit = { writeNote(); seq = n }
+    def archivingActive: Boolean = held
+    def holdArchiving(): Unit = held = true
+    def releaseArchiving(): Unit = held = false
+    def crash(): Unit = held = false
+
+  /** A use of the index by the list: emptied if stale, built whole, the marker consumed if it may be. */
+  private def useAll(store: FakeStore, src: FakeSource, b: Beside, first: LocalDate): Boolean =
+    emptyIfStale(store, b)
+    noteArchiving(store, b)
+    build(store, src, zone, today, maxDays = 1_000)
+    consumeStale(store, b, first, today)
+
+  test("a stale index used while an archiving runs, then a crash: still stale until a quiet rebuild") {
+    val (store, src) = fixture(5)
+    val b = FakeBeside()
+    val first = today.minusDays(4)
+    val d = today.minusDays(2)
+    build(store, src, zone, today, maxDays = 100)
+    // The note of an archiving could not be written: stale.
+    b.failNote = true
+    beforeArchiving(store, b, d)
+    b.failNote = false
+    assert(isStale(b))
+    // The main process uses the index meanwhile: emptied and rebuilt, but not consumed.
+    assert(!useAll(store, src, b, first))
+    assert(isStale(b))
+    // A late row of d, moved by the same archiving; the process dies before its mark after.
+    src.add(Seq(startOf(d) + 13 * H))
+    src.stays(d) = Vector(stay(d, venue, 13, 1))
+    src.archive(d)
+    b.crash()
+    // Still stale: the rebuild began while the archiving ran.
+    assert(isStale(b))
+    assert(useAll(store, src, b, first))
+    assert(!isStale(b))
+    assertEquals(query(store, venue).map(_.day), Vector(d))
+  }
+
+  test("an archiving begun during a rebuild keeps the marker; a crash in it too") {
+    val (store, src) = fixture(5)
+    val b = FakeBeside()
+    val first = today.minusDays(4)
+    val d = today.minusDays(1)
+    assert(markStale(b))
+    emptyIfStale(store, b)
+    build(store, src, zone, today, maxDays = 2)
+    // An archiving begins and the process dies after its commit, before the mark after.
+    beforeArchiving(store, b, d)
+    build(store, src, zone, today, maxDays = 1_000)
+    b.crash()
+    assert(!consumeStale(store, b, first, today))
+    // The noted day keeps it stale until maintenance settles the note.
+    assert(!useAll(store, src, b, first))
+    settleArchiving(store, b)
+    assertEquals(b.note, None)
+    // An archiving begun and finished during a rebuild: that rebuild cannot consume either.
+    emptyIfStale(store, b)
+    beforeArchiving(store, b, d)
+    afterArchiving(store, b, d)
+    build(store, src, zone, today, maxDays = 1_000)
+    assert(!consumeStale(store, b, first, today))
+    // A quiet rebuild consumes it.
+    assert(useAll(store, src, b, first))
+    assert(!isStale(b))
+  }
+
+  test("a corrupt archiving note makes the index stale; maintenance removes the note") {
+    val (store, src) = fixture(3)
+    val b = FakeBeside()
+    build(store, src, zone, today, maxDays = 100)
+    b.note = Some(Left("unreadable"))
+    noteArchiving(store, b)
+    assert(isStale(b))
+    assertEquals(b.note, Some(Left("unreadable")))
+    settleArchiving(store, b)
+    assertEquals(b.note, None)
+    assert(isStale(b))
+    assert(useAll(store, src, b, today.minusDays(2)))
+    assert(!isStale(b))
+    // A note that cannot be read and a marker that cannot be written: the note stays for next time.
+    b.note = Some(Left("unreadable"))
+    b.failWrites = true
+    settleArchiving(store, b)
+    assertEquals(b.note, Some(Left("unreadable")))
+  }
+
+  test("settling a note (recovery, 「整理を修復」): its day and neighbours marked, the note removed") {
+    val (store, src) = fixture(5)
+    val b = FakeBeside()
+    val d = today.minusDays(2)
+    build(store, src, zone, today, maxDays = 100)
+    b.note = Some(Right(d))
+    settleArchiving(store, b)
+    assertEquals(b.note, None)
+    assert(!isStale(b))
+    assertEquals(pending(store, today.minusDays(4), today), Vector(d.plusDays(1), d, d.minusDays(1)))
+    // A normal archiving: held, noted and marked, then marked again, released and the note removed.
+    build(store, src, zone, today, maxDays = 100)
+    beforeArchiving(store, b, d)
+    assert(b.held && b.note.contains(Right(d)) && b.seq == 1)
+    build(store, src, zone, today, maxDays = 100)
+    afterArchiving(store, b, d)
+    assert(!b.held && b.note.isEmpty)
+    assertEquals(pending(store, today.minusDays(4), today).size, 3)
   }

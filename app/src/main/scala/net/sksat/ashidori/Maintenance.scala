@@ -107,8 +107,10 @@ object Maintenance:
         try
           if manual then
             val repaired = archive.repairNow(db, l => Progress.set(l))
-            // Files it quarantined are no longer read: the 「訪れた日」 index
-            // may hold stays of them (emptied and built again).
+            // A commit it finished or resolved: the 「訪れた日」 index settles
+            // the note of its day. Files it quarantined are no longer read:
+            // the index may hold stays of them (emptied and built again).
+            VisitDays.settleArchiving()
             if repaired then VisitDays.markStale("repair")
             if !repaired then "未完了の整理はありません"
             else if Attention.all().exists(!_.seen) then "修復しました（隔離したファイルの行は復元していません）"
@@ -304,13 +306,13 @@ object Maintenance:
             // run sees the attempt.
             Guard.put(d, next)
             Complete.clear(d)
+            if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していた整理を再試行")
+            val t0 = System.currentTimeMillis()
             // Before rows of the day leave SQLite, and again after (below):
             // the 「訪れた日」 index marks the day (short writes of its own
             // files; never throws, never waits for the index: on failure it
             // is marked stale instead).
             VisitDays.beforeArchiving(d)
-            if retry then LifeLog.add(LifeKind.Archive, s"$d: 保留していた整理を再試行")
-            val t0 = System.currentTimeMillis()
             try
               val r = archive.compactDay(db, d, stop, line => Progress.set(line), until = deadline, portionMs = portionMs)
               if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 生データのうち ${r.unconverted} 行は変換できないため端末内に残す")
