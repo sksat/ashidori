@@ -369,53 +369,115 @@ object VisitIndex:
 
   // --- what must outlive a crash: the archiving note and the stale marker -------------------
 
-  /** Small files beside the index, written durably (each write may throw).
-    *
-    *   - The stale marker: a generation; the index is of unknown freshness
-    *     while it is above the generation a full rebuild consumed.
-    *   - The archiving note: the day being archived, from before its rows
-    *     move to after the mark after the commit (corrupt: `Left`).
-    *   - The archiving sequence: one more for every archiving begun.
-    *   - "Active": an archiving is under way (a lock its process holds,
-    *     released by a crash).
+  /** Small files beside the index, by name ([[BesideFile]]): read as text
+    * (None: no file; a read may throw), written atomically and durably (a
+    * temporary file renamed over it; a write may throw), deleted. All of
+    * them are read and written in [[locked]], which both processes share;
+    * "active" is a lock the archiving process holds (released by a crash).
     */
   trait Beside:
-    def staleGen: Long
-    def setStaleGen(g: Long): Unit
-    def doneGen: Long
-    def setDoneGen(g: Long): Unit
-    def archiving: Option[Either[String, LocalDate]]
-    def setArchiving(day: LocalDate): Unit
-    def clearArchiving(): Unit
-    def archivingSeq: Long
-    def setArchivingSeq(n: Long): Unit
+    /** `f` under the lock of these files (both processes; reentrant in a thread). */
+    def locked[A](f: => A): A
+    def read(name: String): Option[String]
+    def write(name: String, value: String): Unit
+    def delete(name: String): Unit
     def archivingActive: Boolean
     def holdArchiving(): Unit
     def releaseArchiving(): Unit
 
-  def isStale(b: Beside): Boolean = b.staleGen > b.doneGen
+  /** The files beside the index. */
+  object BesideFile:
+    /** The stale marker: a generation; the index is of unknown freshness while it is above [[Done]]. */
+    val Stale = "visit_index.stale"
+    /** The generation a whole rebuild consumed. */
+    val Done = "visit_index.stale.done"
+    /** The day being archived, from before its rows move to after the mark after the commit. */
+    val Note = "visit_index.archiving"
+    /** One more for every archiving begun. */
+    val Seq = "visit_index.archiving.seq"
+    /** The content of the unreadable note the marker was moved on for (once per note). */
+    val Bumped = "visit_index.archiving.bumped"
 
-  /** A new stale generation. False if it could not be written. */
+  private def readOr(b: Beside, name: String): Either[String, Option[String]] =
+    scala.util.Try(b.read(name)).toEither.left.map(e => s"unreadable: $e")
+
+  /** (stale, done), in [[Beside.locked]]. A corrupt file is repaired once
+    * here, so that the same file is never taken for a new generation
+    * twice: a corrupt done record as 0 with the marker moved above it (the
+    * consumption is unknown: one rebuild), a corrupt marker as one above
+    * done. If the repair cannot be written, it is as stale.
+    */
+  private def generations(b: Beside): (Long, Long) =
+    val done0 = readOr(b, BesideFile.Done) match
+      case Right(None)    => Some(0L)
+      case Right(Some(t)) => t.toLongOption.filter(_ >= 0)
+      case Left(_)        => None
+    val done = done0.getOrElse { scala.util.Try(b.write(BesideFile.Done, "0")); 0L }
+    val stale0 = readOr(b, BesideFile.Stale) match
+      case Right(None)    => Some(0L)
+      case Right(Some(t)) => t.toLongOption.filter(_ >= 0)
+      case Left(_)        => None
+    val stale = (stale0, done0) match
+      case (Some(g), Some(_)) => g
+      case (g, _) =>
+        val next = math.max(g.getOrElse(0L), done) + 1
+        scala.util.Try(b.write(BesideFile.Stale, next.toString))
+        next
+    (stale, done)
+
+  def isStale(b: Beside): Boolean = b.locked { val (s, d) = generations(b); s > d }
+
+  /** The marker moved to a new generation, read and written under the lock.
+    * False if it could not be written.
+    */
   def markStale(b: Beside): Boolean =
-    scala.util.Try(b.setStaleGen(math.max(b.staleGen, b.doneGen) + 1)).isSuccess
+    scala.util.Try(b.locked {
+      val (s, d) = generations(b)
+      b.write(BesideFile.Stale, (math.max(s, d) + 1).toString)
+    }).isSuccess
+
+  /** The archiving note: None, the day, or `Left(identity)` if it cannot be read as one. */
+  def archivingNote(b: Beside): Option[Either[String, LocalDate]] =
+    b.locked {
+      readOr(b, BesideFile.Note) match
+        case Right(None)    => None
+        case Right(Some(t)) => Some(scala.util.Try(LocalDate.parse(t.trim)).toEither.left.map(_ => s"corrupt: $t"))
+        case Left(why)      => Some(Left(why))
+    }
+
+  private def archivingSeq(b: Beside): String =
+    readOr(b, BesideFile.Seq).toOption.flatten.getOrElse("none")
+
+  /** A note that cannot be read: the marker moved on once for it (its
+    * identity kept in [[BesideFile.Bumped]] until the note is removed).
+    * False if the marker could not be moved.
+    */
+  private def staleForNote(b: Beside, identity: String): Boolean =
+    scala.util.Try(b.locked {
+      if !readOr(b, BesideFile.Bumped).toOption.flatten.contains(identity) then
+        val (s, d) = generations(b)
+        b.write(BesideFile.Stale, (math.max(s, d) + 1).toString)
+        b.write(BesideFile.Bumped, identity)
+    }).isSuccess
 
   /** No archiving under way, none noted (a crash in one leaves its note). */
-  private def quiet(b: Beside): Boolean = !b.archivingActive && b.archiving.isEmpty
+  private def quiet(b: Beside): Boolean = !b.archivingActive && archivingNote(b).isEmpty
 
-  /** Before a use, under the index's write lock. A corrupt archiving note
-    * makes the index stale. A stale index is emptied (to be built whole)
-    * once per marker generation, and again if it was emptied while an
-    * archiving was under way or noted, or one has begun since, and now
-    * none is: only a rebuild begun quiet can consume the marker
+  /** Before a use, under the index's write lock. A note that cannot be read
+    * makes the index stale (once per note). A stale index is emptied (to be
+    * built whole) once per marker generation, and again if it was emptied
+    * while an archiving was under way or noted, or one has begun since, and
+    * now none is: only a rebuild begun quiet can consume the marker
     * ([[consumeStale]]).
     */
   def emptyIfStale(store: Store, b: Beside): Unit =
     store.transaction {
-      if b.archiving.exists(_.isLeft) then markStale(b)
-      if isStale(b) then
-        val g = b.staleGen.toString
-        val seq = b.archivingSeq.toString
-        val ok = quiet(b)
+      archivingNote(b).foreach(_.left.foreach(staleForNote(b, _)))
+      val (stale, seq, ok) = b.locked {
+        val (s, d) = generations(b)
+        (Option.when(s > d)(s.toString), archivingSeq(b), quiet(b))
+      }
+      for g <- stale do
         val begun = store.meta("staleGen").contains(g)
         val begunQuiet = begun && store.meta("staleQuiet").contains("1") && store.meta("staleSeq").contains(seq)
         if !begun || (!begunQuiet && ok) then
@@ -426,15 +488,19 @@ object VisitIndex:
     }
 
   /** After a run that left nothing to build: the marker generation the
-    * rebuild began under is consumed, if it began quiet, no archiving has
-    * begun since, and none is under way or noted now. True if consumed.
+    * rebuild began under is consumed (under the lock of the files), if it
+    * began quiet, no archiving has begun since, and none is under way or
+    * noted now. True if consumed.
     */
   def consumeStale(store: Store, b: Beside, first: LocalDate, today: LocalDate): Boolean =
     store.transaction {
-      val g = b.staleGen
-      val ok = isStale(b) && store.meta("staleGen").contains(g.toString) && store.meta("staleQuiet").contains("1") &&
-        store.meta("staleSeq").contains(b.archivingSeq.toString) && quiet(b) && pending(store, first, today).isEmpty
-      ok && scala.util.Try(b.setDoneGen(g)).isSuccess
+      scala.util.Try(b.locked {
+        val (s, d) = generations(b)
+        val ok = s > d && store.meta("staleGen").contains(s.toString) && store.meta("staleQuiet").contains("1") &&
+          store.meta("staleSeq").contains(archivingSeq(b)) && quiet(b) && pending(store, first, today).isEmpty
+        if ok then b.write(BesideFile.Done, s.toString)
+        ok
+      }).getOrElse(false)
     }
 
   /** Marks `day` and its neighbours ([[archiving]]); false if that failed. */
@@ -445,16 +511,24 @@ object VisitIndex:
     */
   def beforeArchiving(store: Store, b: Beside, day: LocalDate): Unit =
     val held = scala.util.Try(b.holdArchiving()).isSuccess
-    val noted = held && scala.util.Try { b.setArchivingSeq(b.archivingSeq + 1); b.setArchiving(day) }.isSuccess
+    val noted = held && scala.util.Try(b.locked {
+      val n = readOr(b, BesideFile.Seq).toOption.flatten.flatMap(_.toLongOption).getOrElse(0L)
+      b.write(BesideFile.Seq, (n + 1).toString)
+      b.write(BesideFile.Note, day.toString)
+    }).isSuccess
     if !noted then markStale(b)
     if !markArchiving(store, day) then markStale(b)
+
+  /** The note removed, and the record of a bump for it. */
+  private def removeNote(b: Beside): Boolean =
+    scala.util.Try(b.locked { b.delete(BesideFile.Note); b.delete(BesideFile.Bumped) }).isSuccess
 
   /** After archiving `day` (done, failed or stopped): marked again, then the
     * note removed and the hold released. Never throws.
     */
   def afterArchiving(store: Store, b: Beside, day: LocalDate): Unit =
     try
-      if markArchiving(store, day) then scala.util.Try(b.clearArchiving())
+      if markArchiving(store, day) then removeNote(b)
       else markStale(b)
     finally scala.util.Try(b.releaseArchiving())
 
@@ -464,16 +538,17 @@ object VisitIndex:
     * note removed (kept if neither could be written).
     */
   def settleArchiving(store: Store, b: Beside): Unit =
-    b.archiving match
-      case None              => ()
-      case Some(Right(day))  => if markArchiving(store, day) || markStale(b) then scala.util.Try(b.clearArchiving())
-      case Some(Left(_))     => if markStale(b) then scala.util.Try(b.clearArchiving())
+    archivingNote(b) match
+      case None             => ()
+      case Some(Right(day)) => if markArchiving(store, day) || markStale(b) then removeNote(b)
+      case Some(Left(id))   => if staleForNote(b, id) then removeNote(b)
 
   /** In the main process when the list opens: a noted day marked (the note
-    * stays for the maintenance process), a corrupt note makes it stale.
+    * stays for the maintenance process); one that cannot be read makes the
+    * index stale (once per note).
     */
   def noteArchiving(store: Store, b: Beside): Unit =
-    b.archiving match
+    archivingNote(b) match
       case Some(Right(day)) => if !markArchiving(store, day) then markStale(b)
-      case Some(Left(_))    => markStale(b)
+      case Some(Left(id))   => staleForNote(b, id)
       case None             => ()

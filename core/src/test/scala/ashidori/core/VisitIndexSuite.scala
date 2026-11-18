@@ -450,31 +450,40 @@ class VisitIndexSuite extends munit.FunSuite:
 
   // --- the archiving note and the stale marker ----------------------------------------------
 
-  /** The files beside the index in memory; `crash()` releases the hold only. */
+  /** The files beside the index in memory, under a lock as the app's;
+    * `crash()` releases the hold only. `slow` yields between steps, to
+    * let concurrent bumpers interleave if anything is not under the lock.
+    */
   final class FakeBeside extends Beside:
-    var stale = 0L
-    var done = 0L
-    var note: Option[Either[String, LocalDate]] = None
-    var seq = 0L
+    val files = mutable.Map.empty[String, String]
     var held = false
     var failWrites = false
     /** Only the note (and its sequence) cannot be written. */
     var failNote = false
-    private def write(): Unit = if failWrites then throw java.io.IOException("cannot write")
-    private def writeNote(): Unit = if failWrites || failNote then throw java.io.IOException("cannot write the note")
-    def staleGen: Long = stale
-    def setStaleGen(g: Long): Unit = { write(); stale = g }
-    def doneGen: Long = done
-    def setDoneGen(g: Long): Unit = { write(); done = g }
-    def archiving: Option[Either[String, LocalDate]] = note
-    def setArchiving(day: LocalDate): Unit = { writeNote(); note = Some(Right(day)) }
-    def clearArchiving(): Unit = note = None
-    def archivingSeq: Long = seq
-    def setArchivingSeq(n: Long): Unit = { writeNote(); seq = n }
+    /** These files cannot be read at all. */
+    var unreadable = Set.empty[String]
+    var slow = false
+    private val lock = java.util.concurrent.locks.ReentrantLock()
+    def locked[A](f: => A): A =
+      lock.lock()
+      try f
+      finally lock.unlock()
+    def read(name: String): Option[String] =
+      if unreadable(name) then throw java.io.IOException(s"cannot read $name")
+      if slow then Thread.`yield`()
+      files.synchronized(files.get(name))
+    def write(name: String, value: String): Unit =
+      if failWrites || (failNote && (name == BesideFile.Note || name == BesideFile.Seq)) then
+        throw java.io.IOException(s"cannot write $name")
+      if slow then Thread.`yield`()
+      files.synchronized(files(name) = value)
+    def delete(name: String): Unit = files.synchronized(files.remove(name))
     def archivingActive: Boolean = held
     def holdArchiving(): Unit = held = true
     def releaseArchiving(): Unit = held = false
     def crash(): Unit = held = false
+    def note: Option[Either[String, LocalDate]] = archivingNote(this)
+    def stale: Long = files.get(BesideFile.Stale).flatMap(_.toLongOption).getOrElse(0L)
 
   /** A use of the index by the list: emptied if stale, built whole, the marker consumed if it may be. */
   private def useAll(store: FakeStore, src: FakeSource, b: Beside, first: LocalDate): Boolean =
@@ -537,24 +546,77 @@ class VisitIndexSuite extends munit.FunSuite:
     assert(!isStale(b))
   }
 
-  test("a corrupt archiving note makes the index stale; maintenance removes the note") {
+  test("a corrupt archiving note: the marker moved once per note, however often used; removed by maintenance") {
     val (store, src) = fixture(3)
     val b = FakeBeside()
+    val first = today.minusDays(2)
     build(store, src, zone, today, maxDays = 100)
-    b.note = Some(Left("unreadable"))
-    noteArchiving(store, b)
-    assert(isStale(b))
-    assertEquals(b.note, Some(Left("unreadable")))
+    b.files(BesideFile.Note) = "garbage"
+    for _ <- 0 until 3 do noteArchiving(store, b)
+    emptyIfStale(store, b)
+    assertEquals(b.stale, 1L)
+    assertEquals(b.note, Some(Left("corrupt: garbage")))
+    // While it stays, uses rebuild once and do not consume (an archiving is noted), and do not bump again.
+    for _ <- 0 until 3 do assert(!useAll(store, src, b, first))
+    assertEquals(b.stale, 1L)
     settleArchiving(store, b)
     assertEquals(b.note, None)
-    assert(isStale(b))
-    assert(useAll(store, src, b, today.minusDays(2)))
+    assertEquals(b.stale, 1L)
+    assert(useAll(store, src, b, first))
     assert(!isStale(b))
-    // A note that cannot be read and a marker that cannot be written: the note stays for next time.
-    b.note = Some(Left("unreadable"))
+    // The same garbage again later is a new note: once more.
+    b.files(BesideFile.Note) = "garbage"
+    noteArchiving(store, b)
+    noteArchiving(store, b)
+    assertEquals(b.stale, 2L)
+    // A note that cannot be read at all, and a marker that cannot be written: the note stays for next time.
+    settleArchiving(store, b)
+    b.files(BesideFile.Note) = "x"
+    b.unreadable = Set(BesideFile.Note)
     b.failWrites = true
     settleArchiving(store, b)
-    assertEquals(b.note, Some(Left("unreadable")))
+    b.unreadable = Set.empty
+    assertEquals(b.files.get(BesideFile.Note), Some("x"))
+  }
+
+  test("a corrupt stale marker is repaired once, not taken for a new generation at every read") {
+    val (store, src) = fixture(3)
+    val b = FakeBeside()
+    val first = today.minusDays(2)
+    b.files(BesideFile.Done) = "4"
+    b.files(BesideFile.Stale) = "#!garbage"
+    assert(isStale(b))
+    assertEquals(b.files.get(BesideFile.Stale), Some("5"))
+    assert(useAll(store, src, b, first))
+    assert(!isStale(b))
+    for _ <- 0 until 3 do
+      emptyIfStale(store, b)
+      assert(!isStale(b))
+    assertEquals(b.files.get(BesideFile.Done), Some("5"))
+  }
+
+  test("a corrupt done record: one rebuild, then consumed") {
+    val (store, src) = fixture(3)
+    val b = FakeBeside()
+    val first = today.minusDays(2)
+    build(store, src, zone, today, maxDays = 100)
+    b.files(BesideFile.Stale) = "7"
+    b.files(BesideFile.Done) = "seven"
+    assert(isStale(b))
+    assertEquals(b.files.get(BesideFile.Done), Some("0"))
+    assertEquals(b.files.get(BesideFile.Stale), Some("8"))
+    assert(useAll(store, src, b, first))
+    assert(!isStale(b))
+    assertEquals(b.files.get(BesideFile.Done), Some("8"))
+  }
+
+  test("concurrent bumpers: every one moves the marker, none is lost") {
+    val b = FakeBeside()
+    b.slow = true
+    val threads = (0 until 8).map(_ => Thread(() => for _ <- 0 until 50 do assert(markStale(b))))
+    threads.foreach(_.start())
+    threads.foreach(_.join())
+    assertEquals(b.stale, 400L)
   }
 
   test("settling a note (recovery, 「整理を修復」): its day and neighbours marked, the note removed") {
@@ -562,7 +624,7 @@ class VisitIndexSuite extends munit.FunSuite:
     val b = FakeBeside()
     val d = today.minusDays(2)
     build(store, src, zone, today, maxDays = 100)
-    b.note = Some(Right(d))
+    b.files(BesideFile.Note) = d.toString
     settleArchiving(store, b)
     assertEquals(b.note, None)
     assert(!isStale(b))
@@ -570,7 +632,7 @@ class VisitIndexSuite extends munit.FunSuite:
     // A normal archiving: held, noted and marked, then marked again, released and the note removed.
     build(store, src, zone, today, maxDays = 100)
     beforeArchiving(store, b, d)
-    assert(b.held && b.note.contains(Right(d)) && b.seq == 1)
+    assert(b.held && b.note.contains(Right(d)) && b.files.get(BesideFile.Seq).contains("1"))
     build(store, src, zone, today, maxDays = 100)
     afterArchiving(store, b, d)
     assert(!b.held && b.note.isEmpty)

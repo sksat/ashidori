@@ -39,7 +39,8 @@ import VisitIndex.{DayState, DayVisit, Marks, Changes}
   * marks the day once recovery has finished the commit
   * ([[settleArchiving]]); a note that cannot be read makes the index stale
   * and is removed there. If a marking or the note fails, the stale marker
-  * (`visit_index.stale`, a generation) says the whole index is of unknown
+  * (`visit_index.stale`, a generation, read and moved on under the lock of
+  * these files; a corrupt one repaired once) says the whole index is of unknown
   * freshness: the next use empties it and it is built again, and only a
   * whole rebuild begun and ended with no archiving under way or noted, and
   * none begun meanwhile (`visit_index.archiving.seq`), consumes that
@@ -69,37 +70,35 @@ object VisitDays:
   def file(c: Context): File = File(c.getNoBackupFilesDir, "visit_index.db")
   private def beside(name: String) = File(AshidoriApp.app.getNoBackupFilesDir, name)
 
-  /** The files beside the index ([[VisitIndex.Beside]]): written durably
-    * (Maintenance.write: a tmp file, fsync, rename, fsync of the directory).
+  /** The files beside the index ([[VisitIndex.Beside]]), in `no_backup/`:
+    * written atomically and durably (Maintenance.write: a temporary file,
+    * fsync, rename over the file, fsync of the directory), all under one
+    * lock both processes take (`visit_index.gen.lock`: a thread lock in
+    * the process, a file lock across them).
     */
   private object Files extends VisitIndex.Beside:
-    private def read(name: String): Option[String] =
+    private val inProcess = java.util.concurrent.locks.ReentrantLock()
+    def locked[A](f: => A): A =
+      inProcess.lock()
+      try
+        if inProcess.getHoldCount > 1 then f
+        else
+          val ch = java.io.RandomAccessFile(beside("visit_index.gen.lock"), "rw").getChannel
+          try
+            val l = ch.lock()
+            try f
+            finally l.release()
+          finally ch.close()
+      finally inProcess.unlock()
+    def read(name: String): Option[String] =
       val f = beside(name)
       if !f.exists then None
       else Some(String(java.nio.file.Files.readAllBytes(f.toPath), java.nio.charset.StandardCharsets.UTF_8).trim)
-    private def number(name: String): Long = scala.util.Try(read(name)).toOption.flatten.fold(0L)(_.toLongOption.getOrElse(-1L))
-    private def write(name: String, v: String): Unit = Maintenance.write(beside(name), v)
-
-    /** An unreadable marker counts as one generation above the one consumed. */
-    def staleGen: Long = number("visit_index.stale") match
-      case -1 => doneGen + 1
-      case g  => g
-    def setStaleGen(g: Long): Unit = write("visit_index.stale", g.toString)
-    def doneGen: Long = math.max(0L, number("visit_index.stale.done"))
-    def setDoneGen(g: Long): Unit = write("visit_index.stale.done", g.toString)
-    def archiving: Option[Either[String, LocalDate]] =
-      scala.util.Try(read("visit_index.archiving")) match
-        case scala.util.Failure(e) => Some(Left(s"unreadable: $e"))
-        case scala.util.Success(None) => None
-        case scala.util.Success(Some(t)) => Some(scala.util.Try(LocalDate.parse(t)).toEither.left.map(_ => s"corrupt: $t"))
-    def setArchiving(day: LocalDate): Unit = write("visit_index.archiving", day.toString)
-    def clearArchiving(): Unit =
-      val f = beside("visit_index.archiving")
+    def write(name: String, value: String): Unit = Maintenance.write(beside(name), value)
+    def delete(name: String): Unit =
+      val f = beside(name)
       if f.exists && !f.delete() then throw java.io.IOException(s"cannot delete $f")
       ArchiveStore.syncDir(f.getParentFile)
-    /** Unreadable: -1, so the next one differs from any rebuild's record. */
-    def archivingSeq: Long = number("visit_index.archiving.seq")
-    def setArchivingSeq(n: Long): Unit = write("visit_index.archiving.seq", math.max(n, 1L).toString)
 
     private val lockFile = "visit_index.archiving.lock"
     @volatile private var held: Option[(java.nio.channels.FileChannel, java.nio.channels.FileLock)] = None
@@ -250,7 +249,7 @@ object VisitDays:
     * day marked, or the index stale if it cannot be read; then removed).
     */
   def settleArchiving(): Unit =
-    Files.archiving.foreach(n => atArchiving(s"settling the archiving note ${n.fold(why => s"($why)", _.toString)}")(
+    VisitIndex.archivingNote(Files).foreach(n => atArchiving(s"settling the archiving note ${n.fold(why => s"($why)", _.toString)}")(
       VisitIndex.settleArchiving(store, Files)))
 
   private def atArchiving(what: String)(f: => Unit): Unit =
