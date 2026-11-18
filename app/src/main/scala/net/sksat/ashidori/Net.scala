@@ -105,6 +105,7 @@ object Net:
             main.execute(() => complete())
           }
         case _ =>
+          log(s"change $c")
           main.execute { () =>
             returned(c)
             complete()

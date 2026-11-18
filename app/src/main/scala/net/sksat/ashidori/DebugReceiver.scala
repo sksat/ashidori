@@ -42,7 +42,7 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.MAP_STYLE --es key gsi-std    the chosen base map (no consent)
   *   ... -a ashidori.debug.DETAIL --es key gsi-std       「オンライン地図で表示」 on every open map (none: back)
   *   ... -a ashidori.debug.DATA_DELETE --es kind venues    delete downloaded data (a download then sends)
-  *   ... -a ashidori.debug.PAUSE_AT --es at checked:write [--ei stallMs 5000]   pause right after that check of the next request
+  *   ... -a ashidori.debug.PAUSE_AT --es at checked:write [--ei stallMs 5000] [--ez pause false]   pause right after that check of the next request
   *   ... -a ashidori.debug.STYLE_FAIL --ei n 3              the next style fetches fail before sending
   *   ... -a ashidori.debug.STYLE_RETRY                      as a network becoming available for the style fetches
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
@@ -224,15 +224,18 @@ class DebugReceiver extends BroadcastReceiver:
         // deadline gives 「停止中…」 first).
         val at = Option(intent.getStringExtra("at")).getOrElse("checked:write")
         val stallMs = intent.getIntExtra("stallMs", 300).toLong
+        // false: only hold the call (the pause then comes from the screen).
+        val pause = intent.getBooleanExtra("pause", true)
         val fired = java.util.concurrent.atomic.AtomicBoolean(false)
         def now = f"${System.nanoTime() / 1e6}%.1f"
         Net.outbound.step = st =>
           if fired.get && st == "done:" + at.stripPrefix("checked:") then Net.log(s"step $st t=$now")
           if st == at && fired.compareAndSet(false, true) then
-            Net.log(s"step $st t=$now: pausing, the call held for $stallMs ms")
-            Net.change(Settings.gate.changePaused(true))(
-              returned = c => Net.log(s"step pause returned t=$now: $c"),
-              complete = () => Net.log(s"step pause complete t=$now"))
+            Net.log(s"step $st t=$now: the call held for $stallMs ms${if pause then ", pausing" else ""}")
+            if pause then
+              Net.change(Settings.gate.changePaused(true))(
+                returned = c => Net.log(s"step pause returned t=$now: $c"),
+                complete = () => Net.log(s"step pause complete t=$now"))
             Thread.sleep(stallMs)
             Net.log(s"step $st t=$now: the call would go on")
       case "ashidori.debug.STYLE_FAIL" =>
