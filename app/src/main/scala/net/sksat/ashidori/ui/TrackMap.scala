@@ -291,7 +291,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       MapStyle.applyNetworkPolicy(act)
     else
       MapStyle.applyNetworkPolicy(act)
-      refreshBaseMap()
+      // Back on screen still without its online style: asked for again.
+      refreshBaseMap(force = awaitingStyle)
     updateDetailButton()
 
   /** The view is on screen: with this surface's consent it loads the online
