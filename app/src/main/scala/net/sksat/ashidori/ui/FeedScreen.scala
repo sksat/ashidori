@@ -224,6 +224,8 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
       scroller.requestLayout()
 
   override def onShow(): Unit =
+    // Day maps start again (held while the feed was away).
+    DayMap.release()
     val today = LocalDate.now(AshidoriApp.zone)
     // Coming back keeps where the user was (scroll, 日 / 週 / 月, the day
     // opened from the map). Only a new day, or a jump asked for, starts over.
@@ -239,11 +241,16 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
       if unit == Span.Day then { if dayBoxes.contains(today) then refreshDay(today) }
       else refreshPeriod(unit.range(today)._1)
 
+  /** Leaving (before its views detach): no day map starts until it is shown again. */
+  override def onHide(): Unit = DayMap.hold()
+
   def reload(): Unit =
     // Content starts over: never the generic restore of an older position
     // (a recreated feed restores its own, see continueRestore).
     act.forgetScroll(this)
     generation += 1
+    // Before the cards leave: none of them starts a day map while they detach one by one.
+    DayMap.hold()
     items.removeAllViews()
     footer.setText("読み込み中…")
     emptyRun = Vector.empty
@@ -251,7 +258,7 @@ final class FeedScreen(act: MainActivity, saved: android.os.Bundle = null) exten
     loading = false
     dayBoxes.clear()
     periodBoxes.clear()
-    DayMap.cancelPending()
+    if act.showing(this) then DayMap.release()
     if unit != Span.Day then startAt = None
     backToToday.setVisibility(if startAt.isDefined then View.VISIBLE else View.GONE)
     cursor = startAt.getOrElse(unit.range(LocalDate.now(AshidoriApp.zone))._1)

@@ -481,6 +481,8 @@ class MainActivity extends AppCompatActivity:
     maps.foreach(_.onPause())
     super.onPause()
   override def onStop(): Unit =
+    // Out of sight: no day map renders until the feed is shown (onResume).
+    DayMap.hold()
     maps.foreach(_.onStop())
     super.onStop()
   override def onLowMemory(): Unit =

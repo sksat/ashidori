@@ -34,7 +34,11 @@ import Ui.*
   * under a permit taken then (holder `snapshot`, [[MapGuard]]), and a change
   * of a map destination's rule or the pause drops the queued ones and
   * cancels the running one ([[SnapshotQueue]]); every card is then drawn
-  * again, so none is left waiting for a dropped job. Main thread only.
+  * again, so none is left waiting for a dropped job. The feed holds the
+  * queue before its cards leave the window ([[hold]]: its screen hidden, the
+  * activity stopped, a reload) and releases it when it is shown
+  * ([[release]]): cards detach one by one, and a card still attached must
+  * not start its job meanwhile. Main thread only.
   */
 object DayMap:
   private val cache = android.util.LruCache[String, Bitmap](40)
@@ -52,6 +56,8 @@ object DayMap:
   private final class MapCard(c: Context) extends FrameLayout(c):
     var redraw: () => Unit = () => ()
     private var stale = false
+    /** A job of it is queued or rendering. */
+    var waiting = false
     /** Moves on each time it leaves the window: a job queued before does not start. */
     var generation = 0
     /** Its snapshot rendering now, cancelled when it leaves the window. */
@@ -60,6 +66,16 @@ object DayMap:
     def onScreen: Boolean = isAttachedToWindow
     /** A job of it did not start (not in a window yet, or not any more): drawn when it is attached. */
     def deferred(): Unit = if !isAttachedToWindow then stale = true
+    /** The queue was held: its job (queued or rendering, cancelled) is gone; drawn again on [[resumed]]. */
+    def held(): Unit =
+      running = None
+      if waiting then stale = true
+      waiting = false
+    /** The queue was released: a card still in a window whose job was dropped asks again. */
+    def resumed(): Unit =
+      if stale && isAttachedToWindow then
+        stale = false
+        redraw()
     /** Now if shown; a detached card (an old feed, another tab) when it comes back. */
     def invalidateMap(): Unit =
       if isAttachedToWindow then
@@ -77,7 +93,9 @@ object DayMap:
       generation += 1
       Net.guard.release("snapshot", this)
       OnlineStyles.forget(this)
-      // Its rendering stops (its requests are cancelled), and the queue goes on.
+      // Its rendering stops (its requests are cancelled), and the queue goes
+      // on unless held (the screen is leaving: nothing starts until shown).
+      waiting = false
       running.foreach { s =>
         running = None
         s.cancel()
@@ -214,15 +232,20 @@ object DayMap:
       MapStyle.applyNetworkPolicy(act)
       val snap = MapSnapshotter(act, opts)
       frame.running = Some(snap)
+      frame.waiting = true
       snap.start(
         s => {
-          if frame.running.contains(snap) then frame.running = None
+          if frame.running.contains(snap) then
+            frame.running = None
+            frame.waiting = false
           cache.put(key(style), s.getBitmap)
           show(s.getBitmap)
           queue.finished(snap)
         },
         (_: String) => {
-          if frame.running.contains(snap) then frame.running = None
+          if frame.running.contains(snap) then
+            frame.running = None
+            frame.waiting = false
           // Offline or no tiles: keep the sketch. The basemap removed
           // meanwhile: say so.
           if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()
@@ -239,7 +262,9 @@ object DayMap:
           case None =>
             pending()
             val gen = frame.generation
+            frame.waiting = true
             queue.enqueue { () =>
+              frame.waiting = false
               // A card that left the screen since: nothing (drawn when it comes back).
               if frame.generation != gen || !frame.onScreen then
                 Net.log(s"snapshot deferred: card not in a window (queued for $gen, now ${frame.generation}, attached ${frame.isAttachedToWindow})")
@@ -262,5 +287,19 @@ object DayMap:
     render()
     Some(frame)
 
-  /** Drop queued work (e.g. the feed reloaded). */
-  def cancelPending(): Unit = queue.clearQueued()
+  /** The feed leaves the screen, or is about to remove its cards (reload):
+    * called before they detach. Queued jobs are dropped and the running
+    * one cancelled; no job starts until [[release]].
+    */
+  def hold(): Unit =
+    val r = queue.hold()
+    r.foreach(_.cancel())
+    cards.asScala.toSeq.foreach(_.held())
+    Net.log(s"day maps held (cancelled ${r.size})")
+
+  /** The feed is shown: cards whose job was dropped ask again, and queued jobs start. */
+  def release(): Unit =
+    if queue.isHeld then
+      Net.log("day maps released")
+      cards.asScala.toSeq.foreach(_.resumed())
+      queue.release()

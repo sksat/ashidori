@@ -214,33 +214,54 @@ final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = 
   * not when it was queued, and a job queued before a change of the rules of
   * `dests` never starts ([[invalidate]] drops it; its ticket would also be
   * stale). `H` is the handle of a running job (e.g. its snapshotter), which
-  * [[invalidate]] gives back to be cancelled. Not thread-safe: use from one
-  * thread (the main thread).
+  * [[invalidate]] gives back to be cancelled. While the screen showing the
+  * snapshots is leaving or away ([[hold]] until [[release]]), no job
+  * starts: views leaving one by one end their jobs, and the queue does not
+  * go on to the next one meanwhile. Not thread-safe: use from one thread
+  * (the main thread).
   */
 final class SnapshotQueue[H](gate: SendGate, dests: Set[Dest] = Dest.Tiles):
   private final case class Job(ticket: SendGate.Ticket, start: () => Option[H])
   private val queue = mutable.Queue.empty[Job]
   private var running: Option[H] = None
   private var busy = false
+  private var held = false
 
   def queued: Int = queue.size
   def isBusy: Boolean = busy
+  def isHeld: Boolean = held
 
   /** Queues a job. `start()` begins rendering and returns its handle, or
     * None when it ended at once (failed, nothing to do); the job then calls
-    * [[finished]] with that handle when it is done.
+    * [[finished]] with that handle when it is done. While held it waits for
+    * [[release]].
     */
   def enqueue(start: () => Option[H]): Unit =
     queue.enqueue(Job(gate.ticket(dests), start))
-    if !busy then next()
+    if !busy && !held then next()
 
   /** The job with handle `h` is done; a handle that is no longer the running
-    * one (cancelled by [[invalidate]]) is ignored.
+    * one (cancelled by [[invalidate]] or [[hold]]) is ignored. While held,
+    * the next job waits for [[release]].
     */
   def finished(h: H): Unit =
     if running.contains(h) then
       running = None
-      next()
+      busy = false
+      if !held then next()
+
+  /** The screen leaves (before its views do): drops queued jobs and returns
+    * the running one to be cancelled; no job starts until [[release]].
+    */
+  def hold(): Option[H] =
+    held = true
+    invalidate()
+
+  /** The screen is shown again: queued jobs start. */
+  def release(): Unit =
+    if held then
+      held = false
+      if !busy then next()
 
   /** A rule of `dests` changed: drops queued jobs and returns the running one to be cancelled. */
   def invalidate(): Option[H] =
@@ -255,7 +276,7 @@ final class SnapshotQueue[H](gate: SendGate, dests: Set[Dest] = Dest.Tiles):
 
   private def next(): Unit =
     busy = false
-    while !busy && queue.nonEmpty do
+    while !busy && !held && queue.nonEmpty do
       val job = queue.dequeue()
       if gate.current(job.ticket) then
         busy = true

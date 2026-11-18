@@ -190,6 +190,65 @@ class SendGateSuite extends munit.FunSuite:
     assertEquals(started.toSeq, Seq("a", "new"))
   }
 
+  test("a screen leaving holds the queue first: a card still attached while the others detach starts nothing") {
+    // The day map cards of a feed: a job starts only for a card still in a
+    // window (DayMap), and a card leaving ends its running job (finished).
+    val g = gate(Policy.fromBlock(false))
+    val q = SnapshotQueue[String](g)
+    val attached = scala.collection.mutable.Map("1" -> true, "2" -> true, "3" -> true)
+    val started = scala.collection.mutable.ArrayBuffer.empty[String]
+    def job(card: String): () => Option[String] = () =>
+      if attached(card) && g.permit(Dest.Ofm, Mode.Auto).isDefined then { started += card; Some(card) } else None
+    def detach(card: String): Unit =
+      attached(card) = false
+      q.finished(card)
+
+    // Without the hold: card 1 detaching first lets card 2 (still attached) start.
+    Seq("1", "2", "3").foreach(c => q.enqueue(job(c)))
+    assertEquals(started.toSeq, Seq("1"))
+    detach("1")
+    assertEquals(started.toSeq, Seq("1", "2"))
+    q.invalidate()
+
+    // With it: held before any view detaches; card 1 rendering, cards 2 and 3 waiting and attached.
+    Seq("1", "2", "3").foreach(attached(_) = true)
+    started.clear()
+    Seq("1", "2", "3").foreach(c => q.enqueue(job(c)))
+    assertEquals(started.toSeq, Seq("1"))
+    assertEquals(q.hold(), Some("1"))
+    assertEquals(q.queued, 0)
+    detach("1")
+    assertEquals(started.toSeq, Seq("1"))
+    // Card 2 is still attached here, between the detach callbacks.
+    assert(attached("2"))
+    q.finished("2")
+    detach("2")
+    detach("3")
+    assertEquals(started.toSeq, Seq("1"))
+    // A card attached again while held asks again, and waits for the screen.
+    attached("2") = true
+    q.enqueue(job("2"))
+    assertEquals(started.toSeq, Seq("1"))
+    assert(!q.isBusy)
+    // Shown again: it starts, and the next waits for it.
+    attached("3") = true
+    q.enqueue(job("3"))
+    q.release()
+    assertEquals(started.toSeq, Seq("1", "2"))
+    q.finished("2")
+    assertEquals(started.toSeq, Seq("1", "2", "3"))
+    // A change of a map rule while held keeps it held.
+    q.hold()
+    q.enqueue(job("2"))
+    g.setRule(Dest.Ofm, Rule(When.OnAction, Level.Exact))
+    q.invalidate()
+    q.enqueue(job("2"))
+    assert(q.isHeld)
+    assertEquals(started.toSeq, Seq("1", "2", "3"))
+    q.release()
+    assertEquals(started.toSeq, Seq("1", "2", "3"))
+  }
+
   test("a fallback server is not asked once the permit ends (retry re-checked)") {
     val g = gate()
     val p = g.permit(Dest.Overpass, Mode.OnAction).get
