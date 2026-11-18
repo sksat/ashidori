@@ -35,35 +35,34 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
 
   private val open = mutable.Map.empty[HttpURLConnection, Conn]
 
-  /** On a change of a destination's rules (or the pause), before the change
-    * returns: every connection of it is aborted, in parallel, and the abort
-    * waits (at most [[AbortWaitMs]]) until the I/O call each was in has
-    * ended. When the change returns, no further byte is written on them.
+  /** On a change of a destination's rules (or the pause): every connection
+    * of it is aborted, in parallel ([[SendGate.Revoker]]). Each abort
+    * disconnects its connection until it can take the write lock, so its
+    * future completes once the I/O call under way has ended; no call starts
+    * after it. An abort that outlives the change's deadline goes on (the
+    * change then says [[SendGate.Change.Stopping]]).
     */
-  val stop: () => Unit = gate.onChange { ds =>
+  val stop: () => Unit = gate.onRevoke { (ds, _) =>
     val cut = synchronized {
       val c = open.values.filter(x => ds(x.p.dest)).toSeq
       open --= c.map(_.c)
       c
     }
-    if cut.nonEmpty then
-      val deadline = System.nanoTime() + AbortWaitMs * 1_000_000L
-      val done = cut.map { x =>
-        log(s"cut dest=${x.p.dest.key} host=${x.c.getURL.getHost}")
-        x.aborted = true
-        java.util.concurrent.CompletableFuture.runAsync(() => abort(x, deadline), Outbound.aborter)
-      }
-      try java.util.concurrent.CompletableFuture.allOf(done*).get(AbortWaitMs + 500, java.util.concurrent.TimeUnit.MILLISECONDS)
-      catch case _: Exception => log(s"cut: not all ended within ${AbortWaitMs} ms")
+    cut.map { x =>
+      log(s"cut dest=${x.p.dest.key} host=${x.c.getURL.getHost}")
+      x.aborted = true
+      java.util.concurrent.CompletableFuture.supplyAsync(() => abort(x), Outbound.aborter)
+    }
   }
 
-  /** Disconnects `x` until the I/O call in progress on it has ended (or the deadline). */
-  private def abort(x: Conn, deadline: Long): Unit =
+  /** Disconnects `x` again and again until the I/O call in progress on it has ended. */
+  private def abort(x: Conn): Unit =
     var ended = false
-    while !ended && System.nanoTime() < deadline do
+    while !ended do
       try x.c.disconnect() catch case _: Exception => ()
       ended = x.lock.writeLock().tryLock(50, java.util.concurrent.TimeUnit.MILLISECONDS)
-    if ended then x.lock.writeLock().unlock()
+    x.lock.writeLock().unlock()
+    log(s"cut done dest=${x.p.dest.key} host=${x.c.getURL.getHost}")
 
   /** Connections open now (for tests). */
   def openCount: Int = synchronized(open.size)
@@ -98,6 +97,8 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
         log(s"block dest=${x.p.dest.key} reason=changed at=$at host=${x.c.getURL.getHost}")
         throw Blocked(s"${x.p.dest.key}: not allowed any more")
       step(s"checked:$at")
+      // An abort that came meanwhile: the call does not start.
+      if x.aborted then throw Blocked(s"${x.p.dest.key}: not allowed any more")
       try f
       catch case e: IOException if !e.isInstanceOf[Blocked] && (x.aborted || !gate.valid(x.p)) =>
         throw Blocked(s"${x.p.dest.key}: not allowed any more")
@@ -218,8 +219,6 @@ final class Outbound(gate: SendGate, hosts: Dest => Set[String], log: String => 
 object Outbound:
   val MaxHops = 5
   val Redirects: Set[Int] = Set(301, 302, 303, 307, 308)
-  /** How long a change waits for the aborted connections' I/O calls to end. */
-  val AbortWaitMs = 3_000L
   private val aborter = java.util.concurrent.Executors.newCachedThreadPool { r =>
     val t = Thread(r, "ashidori-outbound-abort")
     t.setDaemon(true)

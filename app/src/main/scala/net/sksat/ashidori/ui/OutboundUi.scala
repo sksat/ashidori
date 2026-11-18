@@ -148,10 +148,14 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
   private val list = vbox()
   val view: View = scroll(list)
   private var unwatch: () => Unit = () => ()
+  /** A change of the pause under way; `stopping` while sends are still ending. */
+  private var changing = false
+  private var stopping = false
+  override def holdsBack: Boolean = changing
 
   override def onShow(): Unit =
     unwatch()
-    unwatch = Settings.gate.onChange(_ => act.runOnUiThread(() => render()))
+    unwatch = Settings.gate.onChange(_ => act.runOnUiThread(() => if act.showing(this) then render()))
     render()
   override def onHide(): Unit =
     unwatch()
@@ -187,13 +191,30 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
       e.setTextColor(color(attr.error))
       e.setPadding(e.getPaddingLeft, 0, e.getPaddingRight, dp(8))
       list.addView(e)
-    lazy val pause: SwitchRow = switchRow("外部への送信を停止", g.paused, "同期、位置の取得、他のアプリは対象外") { on =>
-      // Off the main thread: it returns once what was in flight was aborted.
-      pause.setEnabled(false)
-      Net.change(Settings.gate.setPaused(on))(render())
+    lazy val pause: SwitchRow = switchRow("外部への送信を停止", g.paused,
+        if stopping then "停止中…" else "同期、位置の取得、他のアプリは対象外") { on =>
+      if !changing then
+        // Off the main thread: done once what was in flight has ended.
+        changing = true
+        render()
+        Net.change(Settings.gate.changePaused(on))(
+          returned = c => c match
+            case _: SendGate.Change.Stopping =>
+              stopping = true
+              if act.showing(this) then render()
+            case _ => (),
+          complete = () =>
+            changing = false
+            stopping = false
+            if act.showing(this) then render())
     }
+    pause.setEnabled(!changing)
+    pause.switch.setEnabled(!changing)
     val rows = Dest.values.toSeq.map { d =>
-      markRow(Some(OutboundUi.allowed(d)), OutboundUi.name(d), OutboundUi.subtitle(d), Some(() => act.push(OutboundDestScreen(act, d))))
+      val r = markRow(Some(OutboundUi.allowed(d)), OutboundUi.name(d), OutboundUi.subtitle(d),
+        Some(() => if !changing then act.push(OutboundDestScreen(act, d))))
+      r.setEnabled(!changing)
+      r
     }
     // The OS's positioning: a reference, the app does not control it.
     val location = markRow(None, "位置の取得", "OS の設定による", Some(() =>
@@ -221,10 +242,15 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
   private val (whens, levels) = Policy.choices(dest)
   private var rule = Settings.gate.rule(dest)
   private var chosen = rule
+  /** 「適用」 under way (inputs and back are held); `stopping` while sends are still ending. */
+  private var applying = false
+  private var stopping = false
+  override def holdsBack: Boolean = applying
 
   override def onShow(): Unit =
-    rule = Settings.gate.rule(dest)
-    chosen = rule
+    if !applying then
+      rule = Settings.gate.rule(dest)
+      chosen = rule
     render()
 
   private def radioRow(label: String, sub: String, on: Boolean, trailing: Option[View])(pick: => Unit): ListRow =
@@ -238,7 +264,9 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
     b.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
     r.addView(b, 0)
     trailing.foreach(r.trailing)
-    r.onTap(pick)
+    r.onTap(if !applying then pick)
+    r.setEnabled(!applying)
+    b.setEnabled(!applying)
     a11yRole(r, classOf[android.widget.RadioButton], Some(() => on))
     r
 
@@ -249,7 +277,11 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
 
   private def render(): Unit =
     list.removeAllViews()
-    if Settings.gate.paused then
+    if stopping then
+      val p = supportingText("停止中…")
+      p.setPadding(p.getPaddingLeft, dp(12), p.getPaddingRight, 0)
+      list.addView(p)
+    else if Settings.gate.paused then
       val p = supportingText("外部への送信を停止中")
       p.setPadding(p.getPaddingLeft, dp(12), p.getPaddingRight, 0)
       list.addView(p)
@@ -271,18 +303,19 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
         val on = !hosts.exists(chosen.off)
         val others = groups.filterNot(_ == hosts).exists(h => !h.exists(chosen.off))
         val row = switchRow(hosts.mkString("、"), on) { b =>
-          chosen = chosen.copy(off = if b then chosen.off -- hosts else chosen.off ++ hosts)
+          if !applying then
+            chosen = chosen.copy(off = if b then chosen.off -- hosts else chosen.off ++ hosts)
           render()
         }
         // All of them off is 「送信しない」.
-        row.setEnabled(!on || others)
-        row.switch.setEnabled(!on || others)
+        row.setEnabled(!applying && (!on || others))
+        row.switch.setEnabled(!applying && (!on || others))
         row
       }*))
     val hostLine = OutboundUi.hosts(dest).mkString("、")
     val target =
       if dest == Dest.CustomTiles then
-        navRow("送信先", if hostLine.nonEmpty then hostLine else "未設定")(MapStyle.editCustom(act)(() => render()))
+        navRow("送信先", if hostLine.nonEmpty then hostLine else "未設定")(if !applying then MapStyle.editCustom(act)(() => render()))
       else ListRow(act).tap { r => r.title.setText("送信先"); r.setSubtitle(hostLine) }
     val extra = Option.when(dest == Dest.Geocoder)(ListRow(act).tap { r => r.title.setText("対象"); r.setSubtitle(OutboundUi.what(dest)) })
     if dest != Dest.Overpass then
@@ -295,15 +328,27 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
     buttons.setPadding(dp(16), dp(8), dp(16), dp(12))
     val cancel = com.google.android.material.button.MaterialButton(act, null, androidx.appcompat.R.attr.borderlessButtonStyle)
     cancel.setText("キャンセル")
-    cancel.setOnClickListener(_ => act.pop())
+    cancel.setOnClickListener(_ => if !applying && act.showing(this) then act.pop())
     lazy val apply: com.google.android.material.button.MaterialButton = button("適用") {
-      // Off the main thread: it returns once what was in flight was aborted.
-      apply.setEnabled(false)
-      cancel.setEnabled(false)
-      val r = chosen
-      Net.change(Settings.gate.setRule(dest, r))(act.pop())
+      if !applying then
+        // Off the main thread; this screen closes once what was in flight has ended.
+        applying = true
+        render()
+        val r = chosen
+        Net.change(Settings.gate.changeRule(dest, r))(
+          returned = c => c match
+            case _: SendGate.Change.Stopping =>
+              stopping = true
+              if act.showing(this) then render()
+            case _ => (),
+          complete = () =>
+            applying = false
+            stopping = false
+            // Only this screen, and only while it is the one shown.
+            if act.showing(this) then act.pop())
     }
-    apply.setEnabled(chosen != rule && Policy.valid(dest, chosen))
+    apply.setEnabled(!applying && chosen != rule && Policy.valid(dest, chosen))
+    cancel.setEnabled(!applying)
     val lp = wrap
     lp.setMarginStart(dp(8))
     apply.setLayoutParams(lp)

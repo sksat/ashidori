@@ -19,9 +19,9 @@ import scala.jdk.CollectionConverters.*
   *  - [[hop]] (network interceptor): each request on the network is
   *    verified once more (a second line).
   *  - [[dns]]: only the hosts of the map destinations' URLs are looked up,
-  *    and the HTTP proxy the system selects for them (OkHttp resolves a
-  *    proxy's name through the same resolver). Without a proxy no other name
-  *    is looked up.
+  *    and the HTTP proxy the system selected for a request of theirs
+  *    ([[selector]]; OkHttp resolves a proxy's name through the same
+  *    resolver). Without a proxy no other name is looked up.
   *
   * A refusal is a plain IOException, which the map library treats as a
   * permanent failure and does not retry (prototypes 2.3). `log` hears each
@@ -70,19 +70,49 @@ final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int
         case Verdict.Reject(reason) => refuse(s"hop: $reason", req.url.toString)
       case None => refuse("hop: unchecked", req.url.toString)
 
-  /** The proxies the system selects for the map destinations' URLs: OkHttp
-    * looks up an HTTP proxy's name through [[dns]] too.
+  /** The names of the proxies selected for requests of the map
+    * destinations ([[selector]]): OkHttp looks an HTTP proxy's name up
+    * through [[dns]] too.
     */
-  private def proxyHosts: Set[String] =
-    if proxies == null then Set.empty
-    else for
-      h <- guard.hosts
-      scheme <- Set("http", "https")
-      proxy <- (try Option(proxies.select(java.net.URI(s"$scheme://$h/"))).fold(Seq.empty[java.net.Proxy])(_.asScala.toSeq)
-                catch case _: Exception => Seq.empty)
-      if proxy.`type` != java.net.Proxy.Type.DIRECT
-      addr <- Option(proxy.address).collect { case a: java.net.InetSocketAddress => a.getHostString.toLowerCase }
-    yield addr
+  private val proxyNames = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  /** The system's selector, recording the proxy it selects for each request
+    * URL (scheme, host and port, as OkHttp asks) of a map destination's host:
+    * exactly that proxy's name may then be looked up.
+    */
+  val selector: java.net.ProxySelector = new java.net.ProxySelector:
+    def select(u: java.net.URI): java.util.List[java.net.Proxy] =
+      val ps = Option(proxies).flatMap(p => Option(p.select(u))).getOrElse(java.util.List.of(java.net.Proxy.NO_PROXY))
+      if Option(u.getHost).exists(h => guard.hosts(h.toLowerCase)) then
+        ps.asScala.foreach { p =>
+          if p.`type` == java.net.Proxy.Type.HTTP then
+            Option(p.address).collect { case a: java.net.InetSocketAddress => a.getHostString.toLowerCase }.foreach(proxyNames.add)
+        }
+      ps
+    def connectFailed(u: java.net.URI, a: java.net.SocketAddress, e: IOException): Unit =
+      Option(proxies).foreach(_.connectFailed(u, a, e))
+
+  private def proxyHosts(host: String): Boolean = proxyNames.contains(host)
+
+  /** On a change of a map destination's rules (or the pause): the calls of
+    * `dispatcher` marked for it are cancelled ([[SendGate.Revoker]]), and
+    * each one's future completes when it has left the dispatcher (a call
+    * waiting for a name or a connection fails at its next step). Cancelled
+    * again until then.
+    */
+  def revoker(dispatcher: Dispatcher): SendGate.Revoker = (ds, _) =>
+    val calls = dispatcher.runningCalls().asScala.toSeq ++ dispatcher.queuedCalls().asScala
+    calls.filter(c => guard.keyOf(c.request().url.toString).map(_.dest).forall(ds)).map { c =>
+      log(s"cut dest=${guard.keyOf(c.request().url.toString).fold("?")(_.dest.key)} host=${c.request().url.host}")
+      c.cancel()
+      java.util.concurrent.CompletableFuture.supplyAsync(() =>
+        def inFlight = (dispatcher.runningCalls().asScala.iterator ++ dispatcher.queuedCalls().asScala.iterator).exists(_ eq c)
+        while inFlight do
+          c.cancel()
+          Thread.sleep(20)
+        log(s"cut done host=${c.request().url.host}")
+      , MapHttp.waiter)
+    }
 
   val dns: Dns = host =>
     if guard.hosts(host.toLowerCase) || proxyHosts(host.toLowerCase) then system.lookup(host)
@@ -100,5 +130,12 @@ final class MapHttp(guard: MapGuard, log: String => Unit = _ => (), maxHops: Int
       .followRedirects(false)
       .followSslRedirects(false)
       .retryOnConnectionFailure(false)
-    Option(proxies).foreach(b.proxySelector)
+    b.proxySelector(selector)
     b.build()
+
+object MapHttp:
+  private val waiter = java.util.concurrent.Executors.newCachedThreadPool { r =>
+    val t = Thread(r, "ashidori-map-cut")
+    t.setDaemon(true)
+    t
+  }

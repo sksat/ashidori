@@ -178,6 +178,9 @@ final class MapGuard(gate: SendGate, tokens: TokenTable, urlType: Dest => Option
     */
   def recheck(k: TokenKey, url: String): MapGuard.Verdict = verify(k, url)
 
+  /** The key of the token `url` carries, if any. */
+  def keyOf(url: String): Option[TokenKey] = TileStyle.strip(url)._2.flatMap(tokens.lookup)
+
   /** `owner` still renders for `holder` under `p`, which is valid, and on
     * action its view holds the grant: what a retry on its behalf needs.
     */

@@ -50,18 +50,24 @@ class MapHttpSuite extends munit.FunSuite:
       names.add(host)
       java.util.List.of(InetAddress.getLoopbackAddress)
 
-  private def fixture(policy: Policy, tiles: Tiles, proxy: Option[Int] = None) =
-    val g = gate(policy)
+  private def fixture(policy: Policy, tiles: Tiles, proxy: Option[Int] = None, proxyOnlyFor: Option[Int] = None,
+                      dnsHook: String => Unit = _ => ()) =
+    val g = gate(policy, revokeWaitMs = 300)
     val template = s"http://tiles.test:${tiles.port}/t/{z}/{x}/{y}.png"
     val guard = MapGuard(g, TokenTable(Map.empty), d => Option.when(d == Dest.CustomTiles)(UrlType.template(template)).flatten)
     val dns = Lookups()
     val log = scala.collection.mutable.ArrayBuffer.empty[String]
     val selector = new java.net.ProxySelector:
       def select(u: java.net.URI): java.util.List[java.net.Proxy] = proxy match
-        case Some(port) => java.util.List.of(java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress.createUnresolved("proxy.test", port)))
-        case None => java.util.List.of(java.net.Proxy.NO_PROXY)
+        // Only for the URLs of one port, if so configured (a per-port rule).
+        case Some(port) if proxyOnlyFor.forall(_ == u.getPort) =>
+          java.util.List.of(java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress.createUnresolved("proxy.test", port)))
+        case _ => java.util.List.of(java.net.Proxy.NO_PROXY)
       def connectFailed(u: java.net.URI, a: java.net.SocketAddress, e: java.io.IOException): Unit = ()
-    val client = MapHttp(guard, l => log.synchronized(log += l), system = dns, proxies = selector).client()
+    val http = MapHttp(guard, l => log.synchronized(log += l), system = { host => dnsHook(host); dns.lookup(host) }, proxies = selector)
+    val dispatcher = okhttp3.Dispatcher()
+    g.onRevoke(http.revoker(dispatcher))
+    val client = http.client(dispatcher)
     (g, guard, client, dns, log)
 
   private def get(client: okhttp3.OkHttpClient, url: String): Either[java.io.IOException, Int] =
@@ -180,5 +186,96 @@ class MapHttpSuite extends munit.FunSuite:
         assertEquals(tiles.hits.get, 0)
       }
     finally proxy.stop(0)
+  }
+
+  test("a per-port proxy: the proxy chosen for the request's own port is looked up, and used") {
+    val asked = java.util.concurrent.ConcurrentLinkedQueue[String]()
+    val proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    proxy.createContext("/", ex =>
+      asked.add(ex.getRequestURI.toString)
+      val b = "x".getBytes
+      ex.sendResponseHeaders(200, b.length)
+      ex.getResponseBody.write(b)
+      ex.close())
+    proxy.start()
+    try
+      withServers((_, _) => _ => (200, Nil)) { (tiles, _) =>
+        val (g, guard, client, dns, _) = fixture(auto, tiles, proxy = Some(proxy.getAddress.getPort), proxyOnlyFor = Some(tiles.port))
+        val url = s"http://tiles.test:${tiles.port}/t/14/1/2.png"
+        val t = guard.hold("snapshot", Object(), g.permit(Dest.CustomTiles, Mode.Auto).get)
+        assertEquals(get(client, TileStyle.withToken(url, t)), Right(200))
+        assertEquals(dns.names.toArray.toSeq, Seq("proxy.test"))
+        assertEquals(asked.toArray.toSeq, Seq(url))
+      }
+    finally proxy.stop(0)
+  }
+
+  test("a call waiting for a slow name lookup: the change says Stopping, the call ends without connecting") {
+    val lookup = java.util.concurrent.CountDownLatch(1)
+    val inLookup = java.util.concurrent.CountDownLatch(1)
+    withServers((_, _) => _ => (200, Nil)) { (tiles, _) =>
+      val (g, guard, client, _, _) = fixture(auto, tiles, dnsHook = _ => { inLookup.countDown(); lookup.await() })
+      val t = guard.hold("snapshot", Object(), g.permit(Dest.CustomTiles, Mode.Auto).get)
+      val result = java.util.concurrent.CompletableFuture.supplyAsync(() =>
+        get(client, TileStyle.withToken(s"http://tiles.test:${tiles.port}/t/14/1/2.png", t)))
+      inLookup.await()
+      val change = g.changePaused(true)
+      val done = change match
+        case SendGate.Change.Stopping(1, d) => d
+        case other => fail(s"not Stopping(1): $other")
+      assert(!done.isDone)
+      lookup.countDown()
+      done.get(3, java.util.concurrent.TimeUnit.SECONDS)
+      assert(result.get(3, java.util.concurrent.TimeUnit.SECONDS).isLeft)
+      assertEquals(tiles.hits.get, 0)
+    }
+  }
+
+  test("a call reading a slow answer: cancelled and ended before the change returns (Done)") {
+    val started = java.util.concurrent.CountDownLatch(1)
+    val other = ServerSocket(0, 50, InetAddress.getLoopbackAddress)
+    // Answers the headers, then trickles the body without end.
+    val t = Thread { () =>
+      try
+        val c = other.accept()
+        c.getInputStream.read(new Array[Byte](4096))
+        val o = c.getOutputStream
+        o.write("HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n".getBytes)
+        o.flush()
+        started.countDown()
+        while true do
+          o.write(1)
+          o.flush()
+          Thread.sleep(50)
+      catch case _: Exception => ()
+    }
+    t.setDaemon(true)
+    t.start()
+    try
+      val g = gate(Policy.fromBlock(false).updated(Dest.CustomTiles, Rule(When.Auto, Level.Exact)), revokeWaitMs = 2_000)
+      val template = s"http://tiles.test:${other.getLocalPort}/t/{z}/{x}/{y}.png"
+      val guard = MapGuard(g, TokenTable(Map.empty), d => Option.when(d == Dest.CustomTiles)(UrlType.template(template)).flatten)
+      val http = MapHttp(guard, system = _ => java.util.List.of(InetAddress.getLoopbackAddress))
+      val dispatcher = okhttp3.Dispatcher()
+      g.onRevoke(http.revoker(dispatcher))
+      val client = http.client(dispatcher)
+      val tok = guard.hold("snapshot", Object(), g.permit(Dest.CustomTiles, Mode.Auto).get)
+      // As the map library does: an enqueued call that reads the body in its callback.
+      val result = java.util.concurrent.CompletableFuture[Int]()
+      client.newCall(Request.Builder().url(TileStyle.withToken(s"http://tiles.test:${other.getLocalPort}/t/14/1/2.png", tok)).build())
+        .enqueue(new okhttp3.Callback:
+          def onFailure(c: okhttp3.Call, e: java.io.IOException): Unit = result.complete(-1)
+          def onResponse(c: okhttp3.Call, r: okhttp3.Response): Unit =
+            try result.complete(r.body.bytes().length)
+            catch case _: java.io.IOException => result.complete(-1)
+            finally r.close())
+      started.await()
+      Thread.sleep(200)
+      val t0 = System.nanoTime()
+      assertEquals(g.changePaused(true), SendGate.Change.Done)
+      assert((System.nanoTime() - t0) / 1_000_000 < 2_000)
+      assertEquals(result.get(2, java.util.concurrent.TimeUnit.SECONDS), -1)
+      assertEquals(dispatcher.runningCallsCount(), 0)
+    finally other.close()
   }
 

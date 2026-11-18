@@ -10,3 +10,5 @@ trait Screen:
   def onShow(): Unit = ()
   def onHide(): Unit = ()
   def onDestroy(): Unit = ()
+  /** Working on something the user must not leave (back is ignored meanwhile). */
+  def holdsBack: Boolean = false

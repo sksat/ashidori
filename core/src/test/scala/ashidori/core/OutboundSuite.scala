@@ -179,7 +179,9 @@ class OutboundSuite extends munit.FunSuite:
       assert(returned != Long.MaxValue, "the pause returned")
       // The call under way ended before the pause returned; nothing was sent
       // after it (the redirect was not followed, no call after the change).
-      assert(ended > 0 && ended < returned, s"$at: the call ended after the pause returned")
+      // The call under way either did not start (aborted right after its
+      // check) or ended before the pause returned; nothing was sent after it.
+      assert(ended < returned, s"$at: the call ended after the pause returned")
       Thread.sleep(300)
       assert(arrivals.size <= 1, arrivals.toString)
       assertEquals(out.openCount, 0)
@@ -224,7 +226,7 @@ class OutboundSuite extends munit.FunSuite:
       g.setPaused(true)
       val ms = (System.nanoTime() - t0) / 1_000_000
       ts.foreach(_.join(5_000))
-      assert(ms < Outbound.AbortWaitMs + 1_000, s"$ms ms")
+      assert(ms < SendGate.RevokeWaitMs + 1_000, s"$ms ms")
       assertEquals(errors.size, 3)
       errors.forEach(e => assert(e.isInstanceOf[Outbound.Blocked], e.toString))
     finally ss.close()
@@ -240,5 +242,49 @@ class OutboundSuite extends munit.FunSuite:
       intercept[Outbound.Refused](out.request(p, s.local("/elsewhere")))
       assertEquals(s.hits.get, 1)
     }
+  }
+
+  test("a call stuck past the change's deadline: the change says Stopping, completes once it ended, nothing sent") {
+    val arrivals = AtomicInteger()
+    withServer { ex =>
+      arrivals.incrementAndGet()
+      reply(ex, 200, "ok")
+    } { s =>
+      val g = gate(revokeWaitMs = 200)
+      val out = Outbound(g, d => if d == Dest.Data then Set("localhost") else Set.empty)
+      val p = g.permit(Dest.Data, Mode.Auto).get
+      val stuck = java.util.concurrent.CountDownLatch(1)
+      @volatile var change: SendGate.Change = null
+      @volatile var returnedAt = 0L
+      @volatile var releasedAt = 0L
+      out.step = st =>
+        if st == "checked:write" then
+          // The pause comes while this call is stuck (as in a socket that blocks) for 800 ms.
+          val t = Thread(() => { change = g.changePaused(true); returnedAt = System.nanoTime() })
+          t.start()
+          stuck.await(800, java.util.concurrent.TimeUnit.MILLISECONDS)
+          releasedAt = System.nanoTime()
+      val e = intercept[java.io.IOException](out.request(p, s.local("/a"), "POST", Some("lat=35.681236".getBytes)))
+      assert(e.isInstanceOf[Outbound.Blocked], e.toString)
+      // The change returned at its deadline, before the call was released, and said so.
+      assert(returnedAt > 0 && returnedAt < releasedAt)
+      change match
+        case SendGate.Change.Stopping(n, done) =>
+          assertEquals(n, 1)
+          done.get(2, java.util.concurrent.TimeUnit.SECONDS)
+        case other => fail(s"not Stopping: $other")
+      // The stuck call did not go on after its check: no request reached the server.
+      Thread.sleep(200)
+      assertEquals(arrivals.get, 0)
+      assertEquals(out.openCount, 0)
+    }
+  }
+
+  test("a change with nothing stuck is Done within the deadline") {
+    val g = gate(revokeWaitMs = 200)
+    val out = Outbound(g, _ => Set("localhost"))
+    assertEquals(g.changePaused(true), SendGate.Change.Done)
+    assertEquals(g.changePaused(true), SendGate.Change.Unchanged)
+    assertEquals(out.openCount, 0)
   }
 

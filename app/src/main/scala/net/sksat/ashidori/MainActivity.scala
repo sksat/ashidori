@@ -119,7 +119,7 @@ class MainActivity extends AppCompatActivity:
       .foreach(d => selectedDate = LocalDate.parse(d))
 
     toolbar = MaterialToolbar(this)
-    toolbar.setNavigationOnClickListener(_ => pop())
+    toolbar.setNavigationOnClickListener(_ => if !current.exists(_.holdsBack) then pop())
 
     screenHost = FrameLayout(this)
     fab = ExtendedFloatingActionButton(this)
@@ -184,7 +184,8 @@ class MainActivity extends AppCompatActivity:
 
     getOnBackPressedDispatcher.addCallback(this, new OnBackPressedCallback(true):
       override def handleOnBackPressed(): Unit =
-        if stack.nonEmpty && !current.exists(_.isInstanceOf[OnboardingScreen]) then pop()
+        if current.exists(_.holdsBack) then ()
+        else if stack.nonEmpty && !current.exists(_.isInstanceOf[OnboardingScreen]) then pop()
         else if stack.isEmpty && tabId != MainActivity.TabTimeline then nav.setSelectedItemId(MainActivity.TabTimeline)
         else
           setEnabled(false)
@@ -362,6 +363,9 @@ class MainActivity extends AppCompatActivity:
       s.onHide()
       current = None
       show(if stack.nonEmpty then stack.top else tabs(tabId))
+
+  /** `s` is the screen shown now (the same instance). */
+  def showing(s: Screen): Boolean = current.exists(_ eq s)
 
   def openSearch(): Unit = push(SearchScreen(this))
 

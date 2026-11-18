@@ -36,6 +36,6 @@ object OutboundFixtures:
       ws.foreach(write)
       SendGate(state, s => write(ExternalSettings.writes(s)), rnd, epoch)
 
-  def gate(p: Policy = Policy.fresh, paused: Boolean = false, seed: Long = 7): SendGate =
+  def gate(p: Policy = Policy.fresh, paused: Boolean = false, seed: Long = 7, revokeWaitMs: Long = SendGate.RevokeWaitMs): SendGate =
     val rnd = java.util.Random(seed)
-    SendGate(SendGate.State(p, Map.empty, Gens.random(rnd), paused), _ => (), rnd)
+    SendGate(SendGate.State(p, Map.empty, Gens.random(rnd), paused), _ => (), rnd, Epoch.random(), revokeWaitMs)

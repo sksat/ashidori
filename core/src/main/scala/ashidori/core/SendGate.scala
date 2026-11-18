@@ -30,11 +30,13 @@ import scala.collection.mutable
   */
 final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = _ => (),
                      rnd: java.util.Random = java.security.SecureRandom(),
-                     val epoch: Epoch = Epoch.random()):
-  import SendGate.State
+                     val epoch: Epoch = Epoch.random(),
+                     revokeWaitMs: Long = SendGate.RevokeWaitMs):
+  import SendGate.{Change, Revoker, State}
   private var state = initial
   private val grants = mutable.Map.empty[AnyRef, Permit]
   private val listeners = mutable.LinkedHashSet.empty[Set[Dest] => Unit]
+  private val revokers = mutable.LinkedHashSet.empty[Revoker]
 
   def policy: Policy = synchronized(state.policy)
   def rule(d: Dest): Rule = synchronized(state.policy.rule(d))
@@ -55,7 +57,10 @@ final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = 
     * consents; it is stored, then the listeners hear of `d`. Returns whether
     * it changed.
     */
-  def setRule(d: Dest, r: Rule): Boolean =
+  def setRule(d: Dest, r: Rule): Boolean = changeRule(d, r) != Change.Unchanged
+
+  /** [[setRule]], with what became of the sends in flight ([[Change]]). */
+  def changeRule(d: Dest, r: Rule): Change =
     require(Policy.valid(d, r), s"$d does not offer $r")
     val changed = synchronized {
       if state.policy.rules.get(d).contains(r) && state.problem.isEmpty then false
@@ -67,8 +72,7 @@ final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = 
         persist(state)
         true
     }
-    if changed then tell(Set(d))
-    changed
+    if changed then revoke(Set(d)) else Change.Unchanged
 
   /** Starts or ends the pause (design 4.5): the rules stay, but every
     * destination is treated as never while it lasts. Either way every
@@ -76,7 +80,10 @@ final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = 
     * also ends every consent, so an explicit send does not come back by
     * itself when it ends.
     */
-  def setPaused(p: Boolean): Boolean =
+  def setPaused(p: Boolean): Boolean = changePaused(p) != Change.Unchanged
+
+  /** [[setPaused]], with what became of the sends in flight ([[Change]]). */
+  def changePaused(p: Boolean): Change =
     val changed = synchronized {
       if state.paused == p then false
       else
@@ -86,15 +93,33 @@ final class SendGate(initial: SendGate.State, persist: SendGate.State => Unit = 
         persist(state)
         true
     }
-    if changed then tell(Dest.values.toSet)
-    changed
+    if changed then revoke(Dest.values.toSet) else Change.Unchanged
 
   private def fresh(old: Long): Long =
     var g = rnd.nextLong()
     while g == old do g = rnd.nextLong()
     g
 
-  private def tell(ds: Set[Dest]): Unit = synchronized(listeners.toVector).foreach(_(ds))
+  /** After a change (permits of `ds` already invalid): every revoker aborts
+    * what it has in flight for `ds`, all against one deadline; then the
+    * listeners hear of it. [[Change.Done]] when every aborted send ended by
+    * the deadline, else [[Change.Stopping]] with those still ending (their
+    * abort goes on).
+    */
+  private def revoke(ds: Set[Dest]): Change =
+    val deadline = System.nanoTime() + revokeWaitMs * 1_000_000L
+    val pending = synchronized(revokers.toVector).flatMap(r => try r(ds, deadline) catch case _: Exception => Nil)
+    synchronized(listeners.toVector).foreach(_(ds))
+    val all = java.util.concurrent.CompletableFuture.allOf(pending*)
+    val left = math.max(0L, deadline - System.nanoTime())
+    try all.get(left, java.util.concurrent.TimeUnit.NANOSECONDS) catch case _: Exception => ()
+    val open = pending.count(!_.isDone)
+    if open == 0 then Change.Done else Change.Stopping(open, all.thenApply(_ => ()))
+
+  /** Aborts what is in flight on a change ([[Revoker]]). Returns the function that stops it. */
+  def onRevoke(f: Revoker): () => Unit =
+    synchronized(revokers += f)
+    () => synchronized(revokers -= f)
 
   /** Called after every change with the destinations it concerns. Returns the function that stops it. */
   def onChange(f: Set[Dest] => Unit): () => Unit =
@@ -293,6 +318,26 @@ object MapConsents:
       case _ => (true, Map.empty)
 
 object SendGate:
+  /** How long a change waits for the sends it aborted to end, in all. */
+  val RevokeWaitMs = 3_000L
+
+  /** Called on a change with its destinations and the common deadline
+    * (`System.nanoTime`): starts aborting what it has in flight for them
+    * and returns one future per aborted send, completed when that send has
+    * ended (no further byte from it). The abort goes on after the deadline
+    * until they all completed.
+    */
+  type Revoker = (Set[Dest], Long) => Seq[java.util.concurrent.CompletableFuture[Unit]]
+
+  /** What a change of the rules or the pause did to the sends in flight. */
+  enum Change:
+    /** Nothing changed. */
+    case Unchanged
+    /** Every send of the destinations concerned has ended: none sends any more. */
+    case Done
+    /** `pending` sends were still ending at the deadline; `done` completes when they have. */
+    case Stopping(pending: Int, done: java.util.concurrent.CompletableFuture[Unit])
+
   /** What is stored together (design 3.4): the rules (written only while
     * readable or changed by the user: `problem` is None), consents,
     * generations and the pause.
