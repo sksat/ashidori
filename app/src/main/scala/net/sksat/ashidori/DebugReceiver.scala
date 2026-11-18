@@ -296,10 +296,10 @@ class DebugReceiver extends BroadcastReceiver:
         Regions.setDebugSource(url, pin)
         Log.i(s"regions source: ${Regions.debugUrl} pin ${Regions.pin}")
       case "ashidori.debug.REGIONS_FREE" | "ashidori.debug.STORAGE_FREE" =>
-        // Pretends this many free bytes for the shared storage budget (0: the real free space).
+        // Pretends this many free bytes for the storage guard (0: the real free space).
         val b = intent.getLongExtra("bytes", 0L)
         Storage.debugFree = Option.when(b > 0)(b)
-        Log.i(s"regions free: ${Storage.free()} reserve ${Storage.reserve()}")
+        AshidoriApp.io.execute(() => Log.i(s"regions free: ${Storage.free()} reserve ${Storage.reserve()}"))
       case "ashidori.debug.REGIONS_ADD" =>
         // A region of --es cells "8-227-100,8-228-100" (--es name), planned and started as the screen does.
         val cells = Option(intent.getStringExtra("cells")).toSeq.flatMap(_.split(",")).flatMap(ashidori.core.Cell.parse)
