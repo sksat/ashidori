@@ -32,11 +32,14 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.AUDIT [--ei daysAgo 1]     per raw table: rows archived, in SQLite, and distinct (no locks)
   *   ... -a ashidori.debug.OUTBOUND --es dest gsi --es when auto --es level district [--es off h1,h2]
   *                                                    set a destination's rule (as 「適用」 does)
-  *   ... -a ashidori.debug.PAUSE --ez on true         「地図・検索への送信を停止」
+  *   ... -a ashidori.debug.PAUSE --ez on true         「外部への送信を停止」
   *   ... -a ashidori.debug.OUTBOUND_STATE             log the rules, generations and the pause
   *   ... -a ashidori.debug.CORRUPT_POLICY [--es value '{"v":9}']  store an unreadable policy (read at the next start)
   *   ... -a ashidori.debug.GEOCODE --ef lat 35.68 --ef lon 139.76   area and region names (the platform geocoder if allowed)
   *   ... -a ashidori.debug.VENUES --ef lat 35.68 --ef lon 139.76    the online venue search, as its button does
+  *   ... -a ashidori.debug.CUSTOM_TILES --es url http://10.0.2.2:8799/{z}/{x}/{y}.png   the custom map's URL ('' removes it)
+  *   ... -a ashidori.debug.DATA_URL --es url http://10.0.2.2:8799   the data's debug source ('' removes it)
+  *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
   *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
   *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
   *
@@ -173,6 +176,24 @@ class DebugReceiver extends BroadcastReceiver:
         val p = ashidori.core.LatLng(intent.getFloatExtra("lat", 35.681f).toDouble, intent.getFloatExtra("lon", 139.767f).toDouble)
         val z = intent.getFloatExtra("zoom", 14f).toDouble
         AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.moveTo(p, z)))
+      case "ashidori.debug.CUSTOM_TILES" =>
+        // An empty URL removes it (as before the user set one).
+        val url = Option(intent.getStringExtra("url")).getOrElse("")
+        if url.isEmpty then c.getSharedPreferences("settings", Context.MODE_PRIVATE).edit().remove("customTileUrl").commit()
+        else ui.MapStyle.setCustom(url, "")
+        Log.i(s"custom tiles: ${ui.MapStyle.custom._1}")
+        AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.refreshBaseMap(force = true)))
+      case "ashidori.debug.DATA_URL" =>
+        BasemapDownload.debugUrl = Option(intent.getStringExtra("url")).getOrElse("")
+        Log.i(s"data debug url: ${BasemapDownload.debugUrl}")
+      case "ashidori.debug.FETCH" =>
+        // One request through Outbound under a permit of `dest` (a redirect test).
+        val dest = ashidori.core.Dest.fromKey(Option(intent.getStringExtra("dest")).getOrElse("data")).get
+        val url = intent.getStringExtra("url")
+        Thread(() =>
+          val r = scala.util.Try(Settings.gate.permit(dest, ashidori.core.Mode.OnAction).map(p => Net.outbound.small(p, url)))
+          Log.i(s"fetch ${dest.key}: ${r.map(_.map(_.map(_.length)))}")
+        , "ashidori-fetch").start()
       case "ashidori.debug.DATA_START" =>
         val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
         dl.start(c, allowMetered = true)
