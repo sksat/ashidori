@@ -9,7 +9,6 @@ import Ui.*
 /** Settings hub. Each row says what it is and its current state. */
 final class SettingsScreen(act: MainActivity) extends Screen:
   private given Ctx = act
-  private val PrivacySwitch = "オンライン地図と地名検索"
   override val title = "設定"
 
   /** Attribution of the bundled data (from the generated manifests) and of
@@ -70,17 +69,6 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
     "Geofabrik の日本の抽出（https://download.geofabrik.de/asia/japan.html）。加工: チェックインの対象となる施設を抜き出し、索引形式に変換（ashidori）"
   ).map("・" + _).mkString("\n")
-
-  /** オン・オフ of the privacy switch and what it does not cover, behind its info button. */
-  private def showPrivacyInfo(): Unit =
-    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
-      .setTitle(PrivacySwitch)
-      .setMessage(
-        "オン: オンライン地図の表示範囲を配信元へ送信。端末内で地名が求まらない位置は、Android の地名検索サービス（Google など、端末による）へ送信します。\n\n" +
-        "オフ: 地図・地名は端末内のデータを使用。画面ごとにオンライン地図を選ぶと、その画面の表示範囲を送信します。選択は再起動後も保持され、オフライン地図に戻すか、この設定を切り替えると解除されます。\n\n" +
-        "施設のオンライン検索は、設定に関係なくボタン操作時に検索位置を施設検索先（Overpass API）へ送信します。")
-      .setPositiveButton("閉じる", null)
-      .show()
 
   private def modeValue(m: LoggingMode) = s"${ModeInfo.symbol(m)} ${m.label}"
 
@@ -150,13 +138,9 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     showMode(mode)
     add(sectionHeader("記録"), listGroup(mode))
 
-    // A positive switch, inverted over the stored setting (whose meaning stays: true = do not send).
+    // Where the records are kept and what is sent where, per destination.
     add(sectionHeader("プライバシー"), listGroup(
-      switchRow(PrivacySwitch, ashidori.core.SendGate.switchOn(Settings.blockExternalLocation),
-        "表示範囲を地図配信元へ、位置を地名検索先へ送信", onInfo = Some(() => showPrivacyInfo())) { on =>
-        Settings.blockExternalLocation = ashidori.core.SendGate.blockFor(on)
-        TrackMap.privacyChanged(act)
-      }))
+      navRow("データの扱い", OutboundUi.summary)(act.push(DataHandlingScreen(act)))))
 
     val basemap = navRow("オフライン地図", " ")(BasemapUi.showDialog(act))
     showBasemap(basemap)

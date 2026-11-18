@@ -7,7 +7,7 @@ import android.widget.EditText
 import com.google.android.material.bottomsheet.{BottomSheetBehavior, BottomSheetDialog}
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.snackbar.Snackbar
-import java.net.{HttpURLConnection, URL, URLEncoder}
+import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.{Executors, TimeUnit}
 import scala.util.{Try, Using}
@@ -23,14 +23,20 @@ enum VenueError(val message: String, val withCache: String, val withIndex: Strin
   case Offline extends VenueError("オフライン: よく行く場所と過去のチェックイン先", "オフライン", "オフライン")
   case ServerBusy extends VenueError("検索サーバが応答しません",
     "検索サーバが応答しません（保存済みを表示）", "検索サーバが応答しません（施設データを表示）")
+  /** The rule of the venue search (or the pause) stopped it. */
+  case NotAllowed extends VenueError("オンライン検索は停止中", "オンライン検索は停止中（保存済みを表示）", "オンライン検索は停止中（施設データを表示）")
 
 /** Online venue search on OpenStreetMap (Overpass), shared by the
   * check-in sheet and the place sheet. It runs only when the user presses
-  * 「オンラインで検索（位置を送信）」: nothing sends a position to it by itself,
-  * whatever 「位置情報を外部サービスに送らない」 says (the press is the
-  * consent, as for any explicit action). The sheets show the venue index
-  * ([[VenueData]]) and the saved results ([[VenueCache]], 90 days) without
-  * sending anything; every online result is saved there.
+  * 「オンラインで検索（位置を送信）」, which the sheets offer only while the
+  * rule of [[Dest.Overpass]] allows it ([[allowed]]): nothing sends a
+  * position to it by itself. The press takes a permit; every instance tried
+  * is checked against it ([[Net.outbound]]), and the instances turned off
+  * are not asked. At 地区 the box of the 0.01° cell and its neighbours is
+  * sent instead of the position, and the answer narrowed down on the
+  * device. The sheets show the venue index ([[VenueData]]) and the saved
+  * results ([[VenueCache]], 90 days) without sending anything; every online
+  * result is saved there.
   */
 object VenueSearch:
   private val net = Executors.newSingleThreadExecutor()
@@ -69,36 +75,41 @@ object VenueSearch:
 
   private object OutOfTime extends Exception("time budget spent")
 
+  /** The sheets offer the online search. */
+  def allowed: Boolean = Settings.gate.permit(Dest.Overpass, Mode.OnAction).isDefined
+
   /** The answer of one search: the venues and the server that gave them. */
   final case class Answer(venues: Vector[(Venue, Double)], server: String)
 
   /** Asks each instance in turn ([[Overpass.order]]) within
     * [[Overpass.BudgetMs]] in all; an HTTP error moves on at once.
     */
-  private def query(p: LatLng, radiusM: Int): (Vector[(Venue, Double)], Boolean, String) =
-    val body = ("data=" + URLEncoder.encode(Overpass.query(p.lat, p.lon, radiusM), StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)
+  private def query(permit: Permit, p: LatLng, radiusM: Int): (Vector[(Venue, Double)], Boolean, String) =
+    val (q, limit) = Overpass.queryAt(permit.level, p.lat, p.lon, radiusM)
+    val body = ("data=" + URLEncoder.encode(q, StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8)
+    // A box is wider than the circle: keep what the circle would have found.
+    val maxDistM = if permit.level == Level.District then radiusM * 2.0 else 600.0
     val start = System.currentTimeMillis()
-    val order = health.synchronized(Overpass.order(Overpass.Endpoints, health.lastOk, health.failedAt, start))
-    // Explicit: the user asked for this search, so each server may be tried.
-    val result = SendGate.firstSuccess(order.zipWithIndex, () => true) { (url, i) =>
+    val off = Settings.gate.rule(Dest.Overpass).off
+    val endpoints = Overpass.Endpoints.filterNot(u => off(java.net.URI(u).getHost))
+    val order = health.synchronized(Overpass.order(endpoints, health.lastOk, health.failedAt, start))
+    // Each instance only while the permit of the press holds.
+    val result = SendGate.firstSuccess(order.zipWithIndex, () => Settings.gate.valid(permit)) { (url, i) =>
       val remaining = Overpass.BudgetMs - (System.currentTimeMillis() - start)
       val (connectMs, readMs) = Overpass.timeouts(i, remaining).getOrElse(throw OutOfTime)
-      val conn = URL(url).openConnection().asInstanceOf[HttpURLConnection]
-      // Read timeouts are per read: a server that trickles is cut at the budget.
-      val deadline = timer.schedule((() => conn.disconnect()): Runnable, remaining, TimeUnit.MILLISECONDS)
+      var deadline: Option[java.util.concurrent.ScheduledFuture[?]] = None
       try
-        conn.setRequestMethod("POST")
-        conn.setDoOutput(true)
-        conn.setConnectTimeout(connectMs)
-        conn.setReadTimeout(readMs)
-        conn.setRequestProperty("User-Agent", s"ashidori/${BuildInfo.versionName} (Android)")
-        Using.resource(conn.getOutputStream)(_.write(body))
-        val code = conn.getResponseCode
-        if code != 200 then throw RuntimeException(s"HTTP $code")
-        val json = Using.resource(conn.getInputStream)(in => String(in.readAllBytes(), StandardCharsets.UTF_8))
-        val (vs, complete) = Overpass.parseAnswer(json, p.lat, p.lon)
+        // Read timeouts are per read: a server that trickles is cut at the budget.
+        val r = Net.outbound.request(permit, url, "POST", Some(body),
+          Seq("User-Agent" -> s"ashidori/${BuildInfo.versionName} (Android)", "Content-Type" -> "application/x-www-form-urlencoded"),
+          connectMs, readMs,
+          onOpen = c => deadline = Some(timer.schedule((() => c.disconnect()): Runnable, remaining, TimeUnit.MILLISECONDS)))
+        val json = Using.resource(r)(r =>
+          if r.code != 200 then throw RuntimeException(s"HTTP ${r.code}")
+          Using.resource(r.body)(in => String(in.readAllBytes(), StandardCharsets.UTF_8)))
+        val (vs, complete) = Overpass.parseAnswer(json, p.lat, p.lon, maxDistM, limit)
         health.synchronized(health.lastOk = Some(url))
-        (vs, complete, URL(url).getHost)
+        (vs, complete, java.net.URI(url).getHost)
       catch
         case e: Exception =>
           health.synchronized {
@@ -106,10 +117,11 @@ object VenueSearch:
             if health.lastOk.contains(url) then health.lastOk = None
           }
           throw e
-      finally deadline.cancel(false)
+      finally deadline.foreach(_.cancel(false))
     }
     result match
       case Right(answer) => answer
+      case Left(SendGate.Blocked) => throw VenueError.NotAllowed
       case Left(_) => throw (if online then VenueError.ServerBusy else VenueError.Offline)
 
   /** Venues near `p` from the server, always asked (no saved answer stands
@@ -117,10 +129,13 @@ object VenueSearch:
     * they are. Only for an explicit request of the user: it sends `p`.
     */
   def latest(p: LatLng, radiusM: Int = 200)(done: Try[Answer] => Unit): Unit =
+    // The press is the request: its permit, taken now.
+    val permit = Settings.gate.permit(Dest.Overpass, Mode.OnAction)
     net.execute { () =>
       val r = Try {
+        val pm = permit.getOrElse(throw VenueError.NotAllowed)
         if !online then throw VenueError.Offline
-        val (vs, complete, server) = query(p, radiusM)
+        val (vs, complete, server) = query(pm, p, radiusM)
         Try(AshidoriApp.db.applyVenueCache(store.put(p, radiusM, System.currentTimeMillis(), vs.map(_._1), complete)))
         Answer(vs, server)
       }
@@ -315,7 +330,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
           case VenueData.Lookup.Broken => IndexBroken
           case VenueData.Lookup.Missing => hit.fold(LocalOnly)(savedFrom)
         )
-        searchOnce.setVisibility(View.VISIBLE)
+        searchOnce.setVisibility(if VenueSearch.allowed then View.VISIBLE else View.GONE)
       }
     }
 
@@ -334,7 +349,7 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
             case _             => if indexed then NoVenuesIndex else if saved then NoVenuesSaved else NoVenues
           )
           // It can be tried again.
-          searchOnce.setVisibility(View.VISIBLE)
+          searchOnce.setVisibility(if VenueSearch.allowed then View.VISIBLE else View.GONE)
         },
         a => {
           venues = merged(a.venues)

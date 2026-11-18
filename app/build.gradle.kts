@@ -96,6 +96,8 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     implementation(libs.maplibre)
+    // MapLibre's HTTP client with the app's interceptor (Net.install): the version MapLibre brings.
+    implementation(libs.okhttp)
     implementation(libs.work.runtime)
     // Scanning registration links (QR codes); decoded on the device with ZXing (core).
     implementation(libs.camera.camera2)

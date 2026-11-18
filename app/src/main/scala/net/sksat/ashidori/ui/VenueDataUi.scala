@@ -27,7 +27,9 @@ object VenueDataUi:
   def requestDownload(act: MainActivity, again: Boolean = false): Unit =
     def go(metered: Boolean) =
       if again then VenueDownload.redownload(act, metered) else VenueDownload.start(act, metered)
-    if !metered(act) then go(false)
+    // Never sent to (or paused): the setting instead.
+    if !VenueDownload.allowed then act.push(OutboundDestScreen(act, ashidori.core.Dest.Data))
+    else if !metered(act) then go(false)
     else
       MaterialAlertDialogBuilder(act)
         .setTitle("モバイルデータ通信でダウンロードしますか")

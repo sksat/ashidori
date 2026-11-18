@@ -36,11 +36,12 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
 /** MapLibre map with layers for tracks, visits, check-ins and one highlighted
   * path. Data set before the style finishes loading is applied afterwards.
   *
-  * With 「位置情報を外部サービスに送らない」 on, it shows the on-device map
-  * until the user asks for an online one on this map ([[detailed]]). That
-  * choice is remembered for this map's `surface` ([[SendGate.remember]]):
-  * kept across tab switches and restarts until the user switches back,
-  * picks another base map here, or the setting changes. Another surface
+  * Where the chosen map's destination is sent to on action only
+  * ([[SendGate]]), it shows the on-device map until the user asks for an
+  * online one on this map ([[detailed]]). That choice is remembered for
+  * this map's `surface` ([[SendGate.remember]]): kept across tab switches
+  * and restarts until the user switches back, picks another base map here,
+  * or the destination's rule changes. Another surface
   * does not inherit it. Only while on screen with the app in the foreground
   * ([[onScreen]], [[onStart]]) does it load the online map and hold a grant
   * that lets the map library use the network; otherwise ([[offScreen]],
@@ -49,12 +50,20 @@ final case class MapMarker(at: LatLng, key: String, label: String = "", weight: 
   *
   * Without the on-device map's data ([[Outcome.NoBasemap]]) it draws the
   * routes and stays on a plain canvas, still panned and zoomed as a map.
-  * With the setting on, a card then offers the download and this view's
-  * online map; with it off (the user chose the offline map), the chip of
-  * the timeline's cards ([[NoBasemapChip]]) says so and offers the download.
+  * Where an online map would be shown on action, a card then offers the
+  * download and this view's online map; otherwise (the user chose the
+  * offline map), the chip of the timeline's cards ([[NoBasemapChip]]) says
+  * so and offers the download.
+  *
+  * Its online style is marked for `surface` ([[MapGuard]]): the map
+  * library's requests pass only under this view's permit (and, on action,
+  * its grant), within the zoom of the destination's level. The map
+  * library's attribution dialog is replaced by the app's ([[showAttribution]]),
+  * which adds no camera position to the links.
   */
 final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controlsOnTop: Boolean = false):
   MapLibre.getInstance(act)
+  Net.mapClient(act)
   TrackMap.enlargeCache(act)
   /** Lifecycle the activity has reached (kept here: a map view is made and
     * destroyed over time, see [[dropMapView]]).
@@ -75,7 +84,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   /** The user chose an online map on this surface, and the consent still
     * holds (same setting, same map).
     */
-  private def detailedFlag: Boolean = Settings.gate.consent(surface).flatMap(MapStyle.fromConsent).isDefined
+  private def detailedFlag: Boolean = MapStyle.consented(surface).isDefined
   def detailed: Boolean = detailedFlag
   /** On screen (between [[onScreen]] and [[offScreen]]). */
   private var visible = false
@@ -145,7 +154,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     b.setOnClickListener(_ => pickBaseMap())
     b
 
-  /** Explicit switch to the online map for this view (setting on only). */
+  /** Explicit switch to the online map for this view (on-action maps only). */
   private val detailButton =
     val b = Ui.button("", tonal = true)(toggleDetailed())(using act)
     b.setTextSize(12f)
@@ -171,7 +180,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     compact(Ui.button(BasemapUi.downloadLabel(BasemapDownload.status))(BasemapUi.requestDownload(act))(using act))
   private val grantButton =
     val b = compact(Ui.button("", tonal = true)(setDetailed(true))(using act))
-    b.setText(TrackMap.DetailLabel)
+    b.setText(TrackMap.detailLabel(MapStyle.detailMap))
     b
   /** Shown in place of the detail button while the map has no base map. */
   private val noMapCard =
@@ -213,7 +222,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private def noMap: Boolean = shown.contains(Outcome.NoBasemap)
 
   private def updateNoMap(): Unit =
-    val offer = shown.exists(o => BaseMapPolicy.offerAlternatives(Settings.blockExternalLocation, o))
+    val offer = shown.exists(o => BaseMapPolicy.offerAlternatives(MapStyle.when, MapStyle.detailMap, o))
     noMapCard.setVisibility(if offer then android.view.View.VISIBLE else android.view.View.GONE)
     noMapBadge.show(noMap && !offer)
     if offer then
@@ -229,13 +238,14 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   private def updateDetailButton(): Unit =
     updateNoMap()
     val offer = noMapCard.getVisibility == android.view.View.VISIBLE
-    detailButton.setVisibility(if Settings.blockExternalLocation && !offer then android.view.View.VISIBLE else android.view.View.GONE)
-    val online = Settings.gate.consent(surface).flatMap(MapStyle.fromConsent).fold("")(_.label)
+    val detail = MapStyle.detailMap
+    detailButton.setVisibility(if BaseMapPolicy.offerDetail(MapStyle.when, detail, detailedFlag, offer) then android.view.View.VISIBLE else android.view.View.GONE)
+    val online = MapStyle.consented(surface).fold("")(_.label)
     // After the choice, the button itself shows that it holds (its colour and
     // a second line); two lines' room either way, so it keeps its height.
     detailButton.setMinLines(2)
     detailButton.setText(
-      if !detailedFlag then TrackMap.DetailLabel
+      if !detailedFlag then TrackMap.detailLabel(detail)
       // Back to the offline map, or to none when it is not downloaded.
       else if Basemap.available then TrackMap.twoLines(s"オフライン地図に戻す（${online}を表示中）", TrackMap.KeptOnLine)
       else TrackMap.twoLines(s"オンライン地図を終了（${online}を表示中）", TrackMap.KeptOnLine))
@@ -250,9 +260,9 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   /** Switches this surface between the offline and an online map
     * (`online`, by default the chosen one), remembering the choice.
     */
-  def setDetailed(on: Boolean, online: MapStyle = MapStyle.detailMap): Unit =
+  def setDetailed(on: Boolean, online: Option[MapStyle] = MapStyle.detailMap): Unit =
     if on then
-      Settings.gate.remember(surface, online.consentId)
+      for ms <- online; d <- ms.dest do Settings.gate.remember(surface, ms.consentId, d)
     else Settings.gate.forget(surface)
     sync()
 
@@ -267,7 +277,12 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     * the next screen's map is shown and may turn the network back on.
     */
   private def sync(): Unit =
-    if active && detailedFlag then Settings.gate.grant(this) else Settings.gate.revoke(this)
+    // A grant: a permit of the consented map's destination, to this view.
+    MapStyle.consented(surface).flatMap(_.dest).filter(_ => active).flatMap(Settings.gate.permit(_, Mode.OnAction)) match
+      case Some(p) => Settings.gate.grant(this, p)
+      // Without the grant its on-action requests are refused ([[MapGuard]]);
+      // an automatic map keeps its registration.
+      case None => Settings.gate.revoke(this)
     if !active then
       refreshBaseMap()
       MapStyle.applyNetworkPolicy(act)
@@ -321,8 +336,33 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     clp.setMargins(Ui.dp(64)(using act), Ui.dp(10)(using act), Ui.dp(12)(using act), Ui.dp(14)(using act))
     f.addView(noMapCard, clp)
     f.addView(noMapBadge)
+    // Where the map library put its attribution button.
+    val info = android.widget.ImageButton(act)
+    info.setImageResource(org.maplibre.android.R.drawable.maplibre_info_bg_selector)
+    info.setBackground(null)
+    info.setContentDescription("地図の出典")
+    info.setOnClickListener(_ => showAttribution())
+    val ilp = FrameLayout.LayoutParams(Ui.dp(28)(using act), Ui.dp(28)(using act), Gravity.BOTTOM | Gravity.START)
+    ilp.setMargins(Ui.dp(88)(using act), 0, 0, Ui.dp(2)(using act))
+    f.addView(info, ilp)
     updateDetailButton()
     f
+
+  /** The attribution of the sources drawn, as the app's dialog: each link
+    * opens exactly as the source gives it (the map library's dialog may add
+    * the camera position to some, design 4.8).
+    */
+  private def showAttribution(): Unit =
+    given Ui.Ctx = act
+    val html = map.toSeq.flatMap((_, style) => style.getSources.asScala.flatMap(s => Option(s.getAttribution)).filter(_.nonEmpty)).distinct
+    val lines = if html.nonEmpty then html else Seq("地図の出典なし")
+    val body = Ui.text(android.text.Html.fromHtml(lines.mkString("<br>"), android.text.Html.FROM_HTML_MODE_COMPACT), 14f)
+    body.setMovementMethod(android.text.method.LinkMovementMethod.getInstance())
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("地図の出典")
+      .setView(Ui.padded(body, 24, 8))
+      .setPositiveButton("閉じる", null)
+      .show()
 
   // Follow the logger's fixes; the map never turns GNSS on by itself.
   private val stopObserving =
@@ -360,6 +400,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         mlMap = Some(m)
         m.getUiSettings.setRotateGesturesEnabled(false)
         m.getUiSettings.setTiltGesturesEnabled(false)
+        // The app's attribution dialog instead ([[showAttribution]]).
+        m.getUiSettings.setAttributionEnabled(false)
         initialCamera.foreach(c => m.moveCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(c._1.lat, c._1.lon), c._2)))
         initialCamera = None
         loadStyle(m, MapStyle.forView(surface, active))
@@ -397,8 +439,21 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     shown = Some(base)
     loadedBasemap = Basemap.installedVersion
     updateDetailButton()
+    awaitingStyle = false
     val builder = base match
-      case Outcome.Draw(ms) => ms.builder
+      case Outcome.Draw(ms) =>
+        // An online map under a permit of now: automatic, or this view's grant.
+        val permit = ms.dest.flatMap { d =>
+          if MapStyle.when(ms) == When.Auto then Settings.gate.permit(d, Mode.Auto)
+          else Settings.gate.granted(this).filter(_.dest == d)
+        }
+        if ms.online && permit.isEmpty then Net.guard.release(surface, this)
+        ms.styleJson(surface, this, permit) match
+          case Some(json) => Style.Builder().fromJson(json)
+          // OpenFreeMap's style is being fetched, or nothing may be sent: none yet.
+          case None =>
+            awaitingStyle = permit.nonEmpty
+            MapStyle.blankBuilder(act)
       case Outcome.NoBasemap => MapStyle.blankBuilder(act)
     m.setStyle(builder, (style: Style) => {
       for id <- Seq("track", "highlight", "visits", "checkins", "live", "stay-area") do style.addSource(GeoJsonSource(id))
@@ -552,6 +607,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
   // The venue data was downloaded or deleted: the layer reads the view again.
   private val stopVenues = VenueDownload.listen(() => venues.refresh())
 
+  /** Drawn without its online style, which is being fetched ([[OnlineStyles]]). */
+  private var awaitingStyle = false
+  private val stopStyles = OnlineStyles.listen(() => if awaitingStyle then refreshBaseMap(force = true))
+
   private val stopBasemap = BasemapDownload.listen { () =>
     val usesBasemap = shown.exists {
       case Outcome.Draw(s) => s == MapStyle.Offline || s.basemapFonts
@@ -585,23 +644,30 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         loadStyle(m, ms)
       }
 
+  /** Its loaded online style is of one of `dests`. */
+  def drawsFrom(dests: Set[Dest]): Boolean = shown.exists {
+    case Outcome.Draw(s) => s.dest.exists(dests)
+    case Outcome.NoBasemap => false
+  }
+
   /** Applies a choice from the picker. With the setting on, choosing an
     * online map is the explicit request to show it on this surface, and
     * remembered there; the offline map ends that.
     */
   private def choose(ms: MapStyle): Unit =
     MapStyle.current = ms
-    if Settings.blockExternalLocation then
-      setDetailed(ms.online, ms)
-      // Other maps keep what was chosen on them; only labels change (or a
-      // consent to the old custom URL ends).
-      TrackMap.all.filterNot(_ == this).foreach(_.refreshBaseMap())
-      if ms == MapStyle.Custom then refreshBaseMap(force = true)
-    else TrackMap.all.foreach(_.refreshBaseMap(force = ms == MapStyle.Custom))
+    // An on-action map chosen here is the explicit request to show it on
+    // this surface; any other choice (offline, automatic) ends that. Other maps keep what was
+    // chosen on them (or a consent to the old custom URL ends).
+    if ms.online && MapStyle.when(ms) == When.OnAction then setDetailed(true, Some(ms))
+    else setDetailed(false)
+    TrackMap.all.foreach(t => t.refreshBaseMap(force = ms == MapStyle.Custom && (t eq this)))
 
   /** Picker as a 2-column grid of thumbnails rendered at the current view.
-    * With the setting on, only the offline map gets a thumbnail; the online
-    * ones are marked as sending the visible area and render nothing.
+    * A thumbnail of an online map is rendered only where its destination is
+    * sent to automatically, under a permit of its own holder
+    * (`thumb:<dest>`); the others show a bundled sample, and a map that is
+    * never sent to is marked so and opens its destination's settings.
     */
   private def pickBaseMap(): Unit =
     val dialog = com.google.android.material.bottomsheet.BottomSheetDialog(act)
@@ -610,12 +676,12 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     val snapshotters = scala.collection.mutable.ArrayBuffer.empty[org.maplibre.android.snapshotter.MapSnapshotter]
     val thumbW = (act.getResources.getDisplayMetrics.widthPixels - Ui.dp(64)) / 2
     val thumbH = (thumbW * 0.7).toInt
-    val block = Settings.blockExternalLocation
     val cards = MapStyle.values.toSeq.map { ms =>
       val img = android.widget.ImageView(act)
       img.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP)
       img.setBackgroundColor(Ui.color(Ui.attr.surfaceContainerHigh))
       img.setContentDescription(ms.label)
+      val never = ms.online && MapStyle.when(ms) == When.Never
       val thumbnail = MapStyle.thumbnailAllowed(ms)
       // A sample at a fixed area stands in where a thumbnail at the current
       // view would send that area.
@@ -657,8 +723,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
             t
       face.setLayoutParams(android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbH))
       val selected =
-        if !block then ms == MapStyle.current
-        else MapStyle.forView(surface, active) match
+        MapStyle.forView(surface, active) match
           case Outcome.Draw(s) => ms == s
           // The offline map, without its data.
           case Outcome.NoBasemap => ms == MapStyle.Offline
@@ -669,21 +734,28 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       card.setCardElevation(0)
       val texts = Ui.vbox(Ui.text(ms.label, 15f, bold = true), Ui.caption(ms.note))
       // Under a sample: what choosing it does, as the second line.
-      if sample.isDefined then texts.addView(Ui.text("表示範囲を送信", 12f, colorAttr = Ui.attr.tertiary))
+      if never then texts.addView(Ui.text("送信しない設定", 12f, colorAttr = Ui.attr.onSurfaceVariant))
+      else if sample.isDefined then texts.addView(Ui.text("表示範囲を送信", 12f, colorAttr = Ui.attr.tertiary))
       card.addView(Ui.vbox(face, Ui.padded(texts, 10, 6)))
       val lp = android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
       lp.setMargins(Ui.dp(6), Ui.dp(6), Ui.dp(6), Ui.dp(6))
       card.setLayoutParams(lp)
       card.setOnClickListener { _ =>
         dialog.dismiss()
-        if ms == MapStyle.Custom then editCustomTiles()
+        if never then ms.dest.foreach(d => act.push(OutboundDestScreen(act, d)))
+        else if ms == MapStyle.Custom then MapStyle.editCustom(act)(() => choose(MapStyle.Custom))
         else choose(ms)
       }
       if sample.isDefined then ()
       else if !thumbnail || (ms == MapStyle.Custom && MapStyle.custom._1.isEmpty) then img.setImageDrawable(null)
-      else camera.foreach { cam =>
+      else for
+        cam <- camera
+        d <- ms.dest
+        p <- Settings.gate.permit(d, Mode.Auto)
+        json <- ms.styleJson(s"thumb:${d.key}", dialog, Some(p))
+      do
         val opts = org.maplibre.android.snapshotter.MapSnapshotter.Options(thumbW, thumbH)
-          .withStyleBuilder(ms.builder)
+          .withStyleBuilder(Style.Builder().fromJson(json))
           .withCameraPosition(cam)
           .withLogo(false)
         val snap = org.maplibre.android.snapshotter.MapSnapshotter(act, opts)
@@ -691,51 +763,19 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         MapStyle.track(snap)
         snap.start(s => { MapStyle.untrack(snap); img.setImageBitmap(s.getBitmap) },
           (_: String) => MapStyle.untrack(snap))
-      }
       card
     }
     val grid = Ui.vbox(cards.grouped(2).map(row => Ui.hbox(row*)).toSeq*)
     // The thumbnails were chosen under the setting as it was: a change closes the picker.
-    val stop = Settings.gate.onChange(() => act.runOnUiThread(() => dialog.dismiss()))
+    val stop = Settings.gate.onChange(ds => if ds.exists(Dest.Tiles) then act.runOnUiThread(() => dialog.dismiss()))
     dialog.setOnDismissListener { _ =>
       stop()
       snapshotters.foreach { s => s.cancel(); MapStyle.untrack(s) }
+      Dest.Tiles.foreach(d => Net.guard.release(s"thumb:${d.key}", dialog))
     }
     val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
     dialog.show()
-
-  /** Any XYZ raster tile server: the URL template and a credit line. */
-  private def editCustomTiles(): Unit =
-    given Ui.Ctx = act
-    val (url0, credit0) = MapStyle.custom
-    val url = android.widget.EditText(act)
-    url.setHint("https://example.com/tiles/{z}/{x}/{y}.png")
-    url.setText(url0)
-    url.setSingleLine(true)
-    url.setInputType(android.text.InputType.TYPE_TEXT_VARIATION_URI)
-    val credit = android.widget.EditText(act)
-    credit.setHint("出典の表記（例: © 〇〇）")
-    credit.setText(credit0)
-    credit.setSingleLine(true)
-    val body = Ui.padded(Ui.vbox(
-      Ui.caption("{z} {x} {y} を含むラスタータイルの URL"),
-      url, credit
-    ), 20, 8)
-    val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
-      .setTitle("カスタム地図")
-      .setView(body)
-      .setNegativeButton("キャンセル", null)
-      .setPositiveButton("適用", null)
-      .show()
-    // A bad URL keeps the dialog open with the error on the field.
-    dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
-      val u = url.getText.toString.trim
-      if MapStyle.setCustom(u, credit.getText.toString) then
-        dialog.dismiss()
-        choose(MapStyle.Custom)
-      else url.setError("URL の形式が正しくありません")
-    }
 
   /** Runs `f` now, or once a style has loaded, replacing an earlier queued `kind`. */
   private def withStyle(kind: String)(f: (MapLibreMap, Style) => Unit): Unit =
@@ -937,6 +977,8 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     act.unregisterMap(this)
     // The grant ends with the view; the surface's consent stays.
     Settings.gate.revoke(this)
+    Net.guard.release(surface, this)
+    stopStyles()
     TrackMap.all -= this
     // A closed detailed view no longer allows the network.
     MapStyle.applyNetworkPolicy(act)
@@ -953,8 +995,10 @@ object TrackMap:
     case Focus(at: LatLng, zoom: Double)
 
   val DefaultLine = "#006B5B"
-  /** The explicit request for this view's online map (setting on). */
-  val DetailLabel = "オンライン地図で表示（表示範囲を送信）"
+  /** The explicit request for this view's online map, with the level it is sent at. */
+  def detailLabel(detail: Option[MapStyle]): String =
+    val level = detail.flatMap(_.dest).map(Settings.gate.rule(_).level).fold("")(OutboundUi.levelSuffix)
+    s"オンライン地図で表示（表示範囲を送信$level）"
   /** Second line of the detail button while the choice holds. */
   val KeptOnLine = "再起動後も継続"
 
@@ -991,15 +1035,17 @@ object TrackMap:
   /** Live maps, so a base map change applies everywhere. */
   val all = scala.collection.mutable.ArrayBuffer.empty[TrackMap]
 
-  /** After 「位置情報を外部サービスに送らない」 changes (the setting already
-    * ended every detail grant, see [[SendGate.setBlock]]): snapshots rendered
-    * outside the day map queue are cancelled, and every open map shows what
-    * the new setting allows.
+  /** After a map destination's rule or the pause changed (which already
+    * ended its grants, see [[SendGate.setRule]]): snapshots rendered outside
+    * the day map queue are cancelled, and every open map shows what the new
+    * rules allow.
     */
-  def privacyChanged(ctx: android.content.Context): Unit =
+  def privacyChanged(ctx: android.content.Context, dests: Set[Dest]): Unit =
     MapStyle.cancelSnapshots()
     MapStyle.applyNetworkPolicy(ctx)
-    all.foreach(_.refreshBaseMap())
+    // A map of a changed destination loads its style again, under a new
+    // permit and marks (also when only the level changed).
+    all.foreach(t => t.refreshBaseMap(force = t.drawsFrom(dests)))
   private var cacheSet = false
 
   /** Keep viewed tiles for offline use: places you have looked at stay

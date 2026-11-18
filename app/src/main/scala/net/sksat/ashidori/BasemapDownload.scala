@@ -2,8 +2,7 @@ package net.sksat.ashidori
 
 import android.content.Context
 import androidx.work.*
-import java.io.{File, IOException, InputStream}
-import java.net.{HttpURLConnection, URL}
+import java.io.{File, IOException}
 import java.util.concurrent.TimeUnit
 import scala.util.Try
 import ashidori.core.*
@@ -80,12 +79,19 @@ object VenueDownload extends PinnedDownload(VenueData, "venues", "venues-downloa
 
 /** Downloads a pinned archive ([[PinnedData]]) once, in the background.
   *
-  * The archive covers whole countries, so fetching it reveals nothing about
-  * where the user is: it is not one of the automatic location sends that
-  * 「位置情報を外部サービスに送らない」 stops ([[SendGate]]), and it runs
-  * whatever that setting is. It goes to GitHub Releases, or (`server`) to
-  * the paired sync server when that has the pinned version, without the
-  * device token; the bytes are accepted only with the pinned size and sha256.
+  * The archive covers whole countries, so fetching it reveals no position,
+  * but it is a send to an external destination: [[Dest.Data]]. It starts by
+  * itself at app start only while that rule is automatic ([[autoStart]]),
+  * and on the user's request while it is not never ([[start]]). Each run
+  * keeps the mode and generation it was queued under (WorkManager input)
+  * and takes a new permit when it runs; without one it ends without
+  * sending or retrying. Every request, retry and redirect goes through
+  * [[Net.outbound]]. A change of the rule cancels queued runs
+  * ([[rulesChanged]]).
+  *
+  * It goes to GitHub Releases, or (`server`) to the paired sync server when
+  * that has the pinned version, without the device token; the bytes are
+  * accepted only with the pinned size and sha256.
   *
   * By default it waits for an unmetered network; on a metered one it runs
   * only after the user confirms ([[start]] with `allowMetered`).
@@ -143,9 +149,17 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
   /** Tells the UI (on the main thread) that [[status]] or the installed data changed. */
   def changed(): Unit = AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
 
-  /** `delayMs`: not before then (the cool-down after a run given up). */
-  private def request(allowMetered: Boolean, delayMs: Long = 0): OneTimeWorkRequest =
+  /** The user may ask for the download now. */
+  def allowed: Boolean = Settings.gate.permit(Dest.Data, Mode.OnAction).isDefined
+
+  /** `delayMs`: not before then (the cool-down after a run given up). The
+    * run keeps `mode` and the generation of `permit` ([[PinnedWorker]]).
+    */
+  private def request(allowMetered: Boolean, permit: Permit, delayMs: Long = 0): OneTimeWorkRequest =
     val b = OneTimeWorkRequest.Builder(worker)
+      .setInputData(Data.Builder()
+        .putString(BasemapWorker.ModeKey, permit.mode.toString)
+        .putString(BasemapWorker.GenKey, java.lang.Long.toHexString(permit.gen)).build())
       .setConstraints(Constraints.Builder()
         .setRequiredNetworkType(if allowMetered then NetworkType.CONNECTED else NetworkType.UNMETERED)
         .setRequiresStorageNotLow(true)
@@ -160,10 +174,12 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     * failure stays shown until it succeeds; its cool-down starts over.
     */
   def start(ctx: Context, allowMetered: Boolean): Unit =
-    if data.pin.nonEmpty then
+    val permit = Settings.gate.permit(Dest.Data, Mode.OnAction)
+    if permit.isEmpty then Net.log(s"block dest=data reason=permit ${data.kind.name} start")
+    for p <- permit if data.pin.nonEmpty do
       val e = prefs.edit().putBoolean("queued", true).putBoolean("metered", allowMetered).putBoolean("declined", false)
       putFailure(e, DownloadRetry.userRetry(failure)).apply()
-      WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.REPLACE, request(allowMetered))
+      WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.REPLACE, request(allowMetered, p))
       changed()
 
   /** At app start: queue the download on an unmetered network, unless it is
@@ -171,13 +187,26 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     * cool-down ends. Leaves queued work (also a scheduled retry) as it is.
     */
   def autoStart(ctx: Context): Unit =
-    data.pin.foreach { p =>
+    for p <- data.pin; permit <- Settings.gate.permit(Dest.Data, Mode.Auto) do
       if !data.installed && !prefs.getBoolean("declined", false) then
         val metered = prefs.getBoolean("queued", false) && prefs.getBoolean("metered", false)
         prefs.edit().putBoolean("queued", true).putBoolean("metered", metered).remove("error").apply()
         val delay = DownloadRetry.autoStartDelay(storedFailure, p.version, System.currentTimeMillis())
-        WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(metered, delay))
-    }
+        WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(metered, permit, delay))
+
+  /** The rule of [[Dest.Data]] changed, or the pause started or ended:
+    * queued runs (also a scheduled retry) go, as they would not send under
+    * their old generation anyway; with the rule automatic it is queued
+    * again as at app start.
+    */
+  def rulesChanged(ctx: Context): Unit =
+    WorkManager.getInstance(ctx).cancelUniqueWork(WorkName)
+    if prefs.getBoolean("queued", false) && !data.installed then
+      Net.log(s"cancel dest=data ${data.kind.name}")
+      prefs.edit().putBoolean("queued", false).apply()
+    progress = None
+    autoStart(ctx)
+    changed()
 
   /** Debug builds: installs `file` (pushed with adb) instead of downloading. */
   def importFile(ctx: Context, file: File): Unit =
@@ -220,52 +249,26 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     * then end as a success, or WorkManager would drop the appended run).
     */
   private[ashidori] def failed(ctx: Context, version: String, cause: DownloadCause,
-                               sources: Seq[(String, DownloadCause)], runAttempt: Int): DownloadRetry.Next =
+                               sources: Seq[(String, DownloadCause)], runAttempt: Int, permit: Option[Permit]): DownloadRetry.Next =
     progress = None
     val now = System.currentTimeMillis()
     val (f, next) = DownloadRetry.afterFailure(version, now, cause, sources, runAttempt, storedFailure)
     putFailure(prefs.edit().putBoolean("queued", true), Some(f)).commit()
     next match
       case DownloadRetry.Next.Later(at) =>
-        WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.APPEND_OR_REPLACE,
-          request(prefs.getBoolean("metered", false), math.max(0L, at - now)))
+        // Under the run's own generation (an imported file's: automatic now).
+        permit.orElse(Settings.gate.permit(Dest.Data, Mode.Auto)).foreach { p =>
+          WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.APPEND_OR_REPLACE,
+            request(prefs.getBoolean("metered", false), p, math.max(0L, at - now)))
+        }
       case DownloadRetry.Next.Backoff => ()
     changed()
     next
-
-/** HttpURLConnection for [[ResumableDownload]]: a plain GET (no token, no
-  * cookies), uncompressed so byte ranges mean bytes of the file.
-  */
-object PlainHttp extends RangeHttp:
-  def get(url: String, from: Long): RangeHttp.Response =
-    val c = URL(url).openConnection().asInstanceOf[HttpURLConnection]
-    c.setConnectTimeout(15_000)
-    c.setReadTimeout(30_000)
-    c.setInstanceFollowRedirects(true)
-    c.setRequestProperty("User-Agent", s"ashidori/${BuildInfo.versionName}")
-    c.setRequestProperty("Accept-Encoding", "identity")
-    if from > 0 then c.setRequestProperty("Range", s"bytes=$from-")
-    val st = c.getResponseCode
-    new RangeHttp.Response:
-      def code: Int = st
-      def header(name: String): Option[String] = Option(c.getHeaderField(name))
-      def body: InputStream = if st < 400 then c.getInputStream else InputStream.nullInputStream()
-      def close(): Unit = c.disconnect()
-
-  /** A small response body (e.g. `/v1/info`), or None. */
-  def small(url: String): Option[String] =
-    Try {
-      val c = URL(url).openConnection().asInstanceOf[HttpURLConnection]
-      try
-        c.setConnectTimeout(10_000)
-        c.setReadTimeout(10_000)
-        c.setRequestProperty("User-Agent", s"ashidori/${BuildInfo.versionName}")
-        if c.getResponseCode != 200 then None
-        else
-          val in = c.getInputStream
-          try Some(String(in.readNBytes(64 * 1024), java.nio.charset.StandardCharsets.UTF_8)) finally in.close()
-      finally c.disconnect()
-    }.toOption.flatten
+  /** A run found no permit (the rule changed since it was queued): it ends without sending. */
+  private[ashidori] def dropped(): Unit =
+    progress = None
+    prefs.edit().putBoolean("queued", false).commit()
+    changed()
 
 /** Downloads the basemap; see [[BasemapDownload]]. The class name is kept:
   * WorkManager stores it with queued work.
@@ -283,20 +286,38 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
   private def data = dl.data
   private def name = data.kind.name
 
+  /** A permit for this run: of the mode and generation it was queued
+    * under, if those are still current. A run queued by an older version
+    * (no generation) counts as automatic, under the rule now.
+    */
+  private def permit(): Option[Permit] =
+    val in = getInputData
+    val mode = Option(in.getString(ModeKey)).flatMap(m => Mode.values.find(_.toString == m))
+    val gen = Option(in.getString(GenKey)).flatMap(g => scala.util.Try(java.lang.Long.parseUnsignedLong(g, 16)).toOption)
+    (mode, gen) match
+      case (Some(m), Some(g)) => Settings.gate.permitFor(Dest.Data, m, g)
+      case _ => Settings.gate.permit(Dest.Data, Mode.Auto)
+
   override def doWork(): ListenableWorker.Result =
     data.pin match
       case None => ListenableWorker.Result.success()
       case Some(pin) =>
+        val imported = Option(getInputData.getString(ImportKey)).filter(_ => dl.debuggable)
+        val p = if imported.nonEmpty || data.installed then None else permit()
+        if imported.isEmpty && !data.installed && p.isEmpty then
+          Net.log(s"block dest=data reason=permit ${name} run")
+          dl.dropped()
+          return ListenableWorker.Result.success()
         try
           if data.installed then
             dl.succeeded(dl.installedSource.getOrElse(BasemapSource.GitHub))
           else
-            val (archive, source) = Option(getInputData.getString(ImportKey)).filter(_ => dl.debuggable) match
+            val (archive, source) = imported match
               case Some(path) =>
                 val f = File(path)
                 if !Sha256.matches(f, pin) then throw PinnedFailure(DownloadCause.Mismatch)
                 (f, BasemapSource.LocalFile)
-              case None => download(pin)
+              case None => download(pin, p.get)
             data.lock.synchronized {
               data.changedOnDisk()
               data.store.install(archive, pin)
@@ -311,6 +332,11 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
             dl.succeeded(source)
           ListenableWorker.Result.success()
         catch
+          // The rule changed (or the pause started) meanwhile: no retry.
+          case _: Outbound.Blocked =>
+            Net.log(s"block dest=data reason=permit ${name} transfer")
+            dl.dropped()
+            ListenableWorker.Result.success()
           case _: ResumableDownload.Cancelled =>
             dl.reportProgress(None)
             ListenableWorker.Result.retry()
@@ -324,13 +350,13 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
               case f: PinnedFailure => (f.problem, f.sources)
               case other => (DownloadCause.of(other), Seq.empty)
             Log.w(s"$name ${pin.version} failed (attempt ${getRunAttemptCount + 1}): ${DownloadCause.label(cause)}", e)
-            dl.failed(getApplicationContext, pin.version, cause, sources, getRunAttemptCount) match
+            dl.failed(getApplicationContext, pin.version, cause, sources, getRunAttemptCount, p) match
               case DownloadRetry.Next.Backoff => ListenableWorker.Result.retry()
               // The next run is appended to this one: it must end as a success.
               case DownloadRetry.Next.Later(_) => ListenableWorker.Result.success()
 
   /** The pinned archive in the download directory, and where it came from. */
-  private def download(pin: BasemapPin): (File, BasemapSource) =
+  private def download(pin: BasemapPin, permit: Permit): (File, BasemapSource) =
     val store = data.store
     val part = store.partFile(pin)
     part.getParentFile.mkdirs()
@@ -346,18 +372,19 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
         import net.sksat.ashidori.sync.SyncConfig
         val server = Some(SyncConfig.serverUrl).filter(u => dl.server && u.nonEmpty && SyncConfig.paired)
         // Unauthenticated: the device token is not sent for this.
-        val listed = server.flatMap(u => PlainHttp.small(s"${u.stripSuffix("/")}/v1/info"))
+        val listed = server.flatMap(u => Net.outbound.small(permit, s"${u.stripSuffix("/")}/v1/info", Seq("User-Agent" -> ua)))
           .exists(info => BasemapSource.serverVersions(info).contains(pin.version))
         BasemapSource.order(server.nonEmpty, listed).map {
           case BasemapSource.Server => BasemapSource.Server -> BasemapSource.serverUrl(server.get, pin)
           case s => s -> BasemapSource.githubUrl(pin)
         }
 
+    val http = Net.outbound.rangeHttp(permit, ua)
     val errors = scala.collection.mutable.ArrayBuffer.empty[(BasemapSource, DownloadCause)]
     val found = sources.iterator.map { (source, url) =>
       try
         var shown = -1L
-        ResumableDownload.run(PlainHttp, url, part, pin.bytes, () => isStopped, n => {
+        ResumableDownload.run(http, url, part, pin.bytes, () => isStopped, n => {
           // About every 1 %.
           if n == pin.bytes || n - shown >= pin.bytes / 100 then
             shown = n
@@ -372,6 +399,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
           None
       catch
         case e: ResumableDownload.Cancelled => throw e
+        case e: Outbound.Blocked => throw e
         case e: Exception =>
           Log.w(s"$name from ${source.key} failed", e)
           errors += source -> DownloadCause.of(e)
@@ -383,6 +411,10 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
 
 object BasemapWorker:
   val ImportKey = "import"
+  /** The mode and generation ([[Permit]]) a run was queued under. */
+  val ModeKey = "mode"
+  val GenKey = "gen"
+  private[ashidori] def ua = s"ashidori/${BuildInfo.versionName}"
 
 /** A failed run, with the cause shown and each source's cause. */
 final class PinnedFailure(val problem: DownloadCause, val sources: Seq[(String, DownloadCause)] = Seq.empty)

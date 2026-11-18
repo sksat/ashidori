@@ -180,6 +180,8 @@ final class PlaceSheet(
 
   /** 「オンラインで検索」: the only way to the online search. Sending is the exception: tertiary colours. */
   private def latestButton(shown: Seq[(Venue, Double)]): Unit =
+    // Not offered while the venue search is never sent to (or paused).
+    if !VenueSearch.allowed then return
     lazy val once: View = outlined("オンラインで検索（位置を送信）") {
       candidates.removeView(once)
       searchOnline(shown)

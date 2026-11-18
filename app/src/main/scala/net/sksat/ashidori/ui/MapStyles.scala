@@ -3,8 +3,8 @@ package net.sksat.ashidori.ui
 import android.content.Context
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
-import net.sksat.ashidori.{AshidoriApp, Basemap, Settings}
-import ashidori.core.{BaseMapPolicy, OfflineBasemapStyle}
+import net.sksat.ashidori.{AshidoriApp, Basemap, Log, Net, Settings}
+import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Permit, Precision, TileStyle, When}
 import ashidori.core.BaseMapPolicy.Outcome
 
 /** Selectable base maps. "オフライン地図" is drawn from data in the app and never
@@ -29,6 +29,16 @@ enum MapStyle(val key: String, val label: String, val note: String):
 
   /** Fetches tiles from a server (and so reveals the visible area). */
   def online: Boolean = this != Offline
+
+  /** What is drawn: [[Custom]] without a URL is [[Standard]]. */
+  def resolved: MapStyle = if this == Custom && MapStyle.custom._1.isEmpty then Standard else this
+
+  /** Where its tiles come from; None for the offline map. */
+  def dest: Option[Dest] = resolved match
+    case Offline => None
+    case Standard | Light => Some(Dest.Ofm)
+    case GsiStd | GsiPale | GsiPhoto | GsiRelief => Some(Dest.Gsi)
+    case Custom => Some(Dest.CustomTiles)
 
   /** A raster map whose style takes the offline map's fonts ([[Basemap.glyphs]]). */
   def basemapFonts: Boolean = this match
@@ -61,38 +71,32 @@ enum MapStyle(val key: String, val label: String, val note: String):
     case GsiStd | GsiPale | GsiPhoto | GsiRelief => "地理院タイル"
     case _ => ""
 
-  /** Style document: a URL, or inline JSON. The policy picks [[Offline]]
-    * only while its data is there ([[Basemap.available]]); should it be gone
-    * meanwhile, the map shows no base map rather than an online one.
+  /** The style of this map for `holder` (a map surface, `snapshot`,
+    * `thumb:<dest>`), drawn by `owner`: an online map only under permit `p`
+    * of its destination, with every remote URL marked for the holder and
+    * the zoom limited to the permit's level ([[TileStyle]]). None while
+    * OpenFreeMap's style is not on the device yet ([[OnlineStyles]]: it is
+    * fetched now, under `p`, and the maps are told when it is there).
     */
-  private def source: Either[String, String] = this match
-    case Offline   => Right(Basemap.styleJson.getOrElse(MapStyle.blankJson))
-    case Standard  => Left("https://tiles.openfreemap.org/styles/liberty")
-    case Light     => Left("https://tiles.openfreemap.org/styles/positron")
-    case GsiStd    => Right(MapStyle.raster(MapStyle.gsi("std", "png")))
-    case GsiPale   => Right(MapStyle.raster(MapStyle.gsi("pale", "png")))
-    case GsiPhoto  => Right(MapStyle.raster(MapStyle.gsi("seamlessphoto", "jpg")))
-    case GsiRelief => Right(MapStyle.raster(MapStyle.gsi("relief", "png"), maxZoom = 15))
-    case Custom =>
-      val (url, credit) = MapStyle.custom
-      if url.isEmpty then Standard.source
-      // Without a credit line, at least name where the tiles come from.
-      else Right(MapStyle.raster(url, credit = if credit.nonEmpty then credit else url.takeWhile(_ != '{')))
-
-  /** MapLibre style for this base map. */
-  def builder: Style.Builder = source match
-    case Left(uri)   => Style.Builder().fromUri(uri)
-    case Right(json) => Style.Builder().fromJson(json)
-
-  /** Style for a [[org.maplibre.android.snapshotter.MapSnapshotter]] whose
-    * builder also adds sources. An inline JSON style finishes loading inside
-    * the snapshotter's constructor, before its native peer exists, so adding
-    * those sources fails ("invalid native peer"). Loading the same JSON from a
-    * local file makes it asynchronous like a URL style.
-    */
-  def snapshotBuilder: Style.Builder = source match
-    case Left(uri)   => Style.Builder().fromUri(uri)
-    case Right(json) => Style.Builder().fromUri(MapStyle.styleFile(key, json))
+  def styleJson(holder: String, owner: AnyRef, p: Option[Permit]): Option[String] =
+    resolved match
+      case Offline => Some(Basemap.styleJson.getOrElse(MapStyle.blankJson))
+      case ms =>
+        p.filter(q => ms.dest.contains(q.dest)).flatMap { p =>
+          val token = Net.guard.hold(holder, owner, p)
+          val cap = Precision.maxZoom(p.level)
+          ms match
+            case Standard => OnlineStyles.build("liberty", p, cap, token)
+            case Light => OnlineStyles.build("positron", p, cap, token)
+            case GsiStd => Some(MapStyle.raster(MapStyle.gsi("std", "png"), cap, token))
+            case GsiPale => Some(MapStyle.raster(MapStyle.gsi("pale", "png"), cap, token))
+            case GsiPhoto => Some(MapStyle.raster(MapStyle.gsi("seamlessphoto", "jpg"), cap, token))
+            case GsiRelief => Some(MapStyle.raster(MapStyle.gsi("relief", "png"), cap, token, maxZoom = 15))
+            case _ =>
+              val (url, credit) = MapStyle.custom
+              // Without a credit line, at least name where the tiles come from.
+              Some(MapStyle.raster(url, cap, token, credit = if credit.nonEmpty then credit else url.takeWhile(_ != '{')))
+        }
 
 object MapStyle:
   private def prefs = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -122,28 +126,55 @@ object MapStyle:
   /** The online map a consent names, if it is still that map ([[consentId]]). */
   def fromConsent(id: String): Option[MapStyle] = values.find(s => s.online && s.consentId == id)
 
-  /** The online map an explicit request for detail shows (see [[BaseMapPolicy.detailMap]]). */
-  def detailMap: MapStyle = BaseMapPolicy.detailMap(current, lastOnline, Offline)
+  /** When this map's destination may be sent to now (the offline map: always, nothing is sent). */
+  def when(s: MapStyle): When = s.dest.fold(When.Auto)(Settings.gate.when)
 
-  /** Base map of an interactive map on `surface`: with the setting on, the
-    * online map remembered there, else the offline one (see
-    * [[BaseMapPolicy]]). [[Outcome.NoBasemap]] when it would be the offline
-    * map and that is not downloaded.
+  /** The online map an explicit request for detail shows (see
+    * [[BaseMapPolicy.detailMap]]); None when every online map is never sent to.
+    */
+  def detailMap: Option[MapStyle] = BaseMapPolicy.detailMap(when, current, lastOnline, Offline, values.toSeq.filter(_.online))
+
+  /** The online map remembered on `surface` ([[SendGate.consent]]), if still valid. */
+  def consented(surface: String): Option[MapStyle] = Settings.gate.consent(surface).flatMap(c => fromConsent(c.map))
+
+  /** Base map of an interactive map on `surface` (see [[BaseMapPolicy]]).
+    * [[Outcome.NoBasemap]] when it would be the offline map and that is not
+    * downloaded.
     */
   def forView(surface: String, onScreen: Boolean): Outcome[MapStyle] =
-    BaseMapPolicy.interactive(Settings.blockExternalLocation, current, Offline, Basemap.available,
-      Settings.gate.consent(surface).flatMap(fromConsent), onScreen)
+    BaseMapPolicy.interactive(when, current, Offline, Basemap.available, consented(surface), onScreen)
 
-  /** Base map of a still image (feed, period, other devices), with the
-    * setting as it is now (or `block`, as taken right before a job starts).
+  /** Base map of a still image (feed, period, other devices) by the rules
+    * now; a job takes its permit right before it starts ([[snapshot]]).
     * With [[Outcome.NoBasemap]] the image is drawn without MapLibre.
     */
-  def forSnapshot: Outcome[MapStyle] = forSnapshot(Settings.blockExternalLocation)
-  def forSnapshot(block: Boolean): Outcome[MapStyle] = BaseMapPolicy.snapshot(block, current, Offline, Basemap.available)
+  def forSnapshot: Outcome[MapStyle] = BaseMapPolicy.snapshot(when, current, Offline, Basemap.available)
+
+  /** What a snapshot about to start draws: the base map with its style (an
+    * online one under a permit taken now; the offline map when there is no
+    * permit), or None while OpenFreeMap's style is fetched.
+    */
+  def snapshot(owner: AnyRef): Option[(Outcome[MapStyle], Option[String])] =
+    forSnapshot match
+      case Outcome.NoBasemap => Some(Outcome.NoBasemap -> None)
+      case o @ Outcome.Draw(s) if s.online =>
+        s.dest.flatMap(Settings.gate.permit(_, Mode.Auto)) match
+          case Some(p) => s.styleJson("snapshot", owner, Some(p)).map(j => o -> Some(j))
+          case None =>
+            if Basemap.available then Some(Outcome.Draw(Offline) -> Offline.styleJson("snapshot", owner, None))
+            else Some(Outcome.NoBasemap -> None)
+      case o @ Outcome.Draw(s) => Some(o -> s.styleJson("snapshot", owner, None))
 
   /** Whether the picker may render this map's thumbnail at the current view. */
   def thumbnailAllowed(s: MapStyle): Boolean =
-    BaseMapPolicy.thumbnail(Settings.blockExternalLocation, s, Offline, Basemap.available)
+    BaseMapPolicy.thumbnail(when, s, Offline, Basemap.available)
+
+  /** A builder for a snapshotter whose builder also adds sources. An inline
+    * JSON style finishes loading inside the snapshotter's constructor, before
+    * its native peer exists, so adding those sources fails ("invalid native
+    * peer"). Loading the same JSON from a local file makes it asynchronous.
+    */
+  def snapshotBuilder(key: String, json: String): Style.Builder = Style.Builder().fromUri(styleFile(key, json))
 
   /** Canvas of an interactive map without a base map: its routes and stays
     * on the app's neutral surface color, as in the feed's sketches.
@@ -163,6 +194,8 @@ object MapStyle:
     */
   def applyNetworkPolicy(ctx: Context): Unit =
     MapLibre.getInstance(ctx)
+    // Before any map or snapshot is made: every request through the guard.
+    Net.mapClient(ctx)
     MapLibre.setConnected(if Settings.gate.networkAllowed then null else java.lang.Boolean.FALSE)
 
   /** Snapshotters rendering now outside the [[DayMap]] queue (picker
@@ -192,6 +225,38 @@ object MapStyle:
       true
     }
 
+  /** Any XYZ raster tile server: the URL template and a credit line. `saved` runs after a valid URL is stored. */
+  def editCustom(act: net.sksat.ashidori.MainActivity)(saved: () => Unit): Unit =
+    given Ui.Ctx = act
+    val (url0, credit0) = custom
+    val url = android.widget.EditText(act)
+    url.setHint("https://tiles.example.net/{z}/{x}/{y}.png")
+    url.setText(url0)
+    url.setSingleLine(true)
+    url.setInputType(android.text.InputType.TYPE_TEXT_VARIATION_URI)
+    val credit = android.widget.EditText(act)
+    credit.setHint("出典の表記（例: © 〇〇）")
+    credit.setText(credit0)
+    credit.setSingleLine(true)
+    val body = Ui.padded(Ui.vbox(
+      Ui.caption("{z} {x} {y} を含むラスタータイルの URL"),
+      url, credit
+    ), 20, 8)
+    val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("カスタム地図")
+      .setView(body)
+      .setNegativeButton("キャンセル", null)
+      .setPositiveButton("適用", null)
+      .show()
+    // A bad URL keeps the dialog open with the error on the field.
+    dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener { _ =>
+      val u = url.getText.toString.trim
+      if setCustom(u, credit.getText.toString) then
+        dialog.dismiss()
+        saved()
+      else url.setError("URL の形式が正しくありません")
+    }
+
   /** Writes `json` to the cache (once per content) and returns its file:// URI. */
   private def styleFile(key: String, json: String): String =
     val bytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8)
@@ -209,22 +274,56 @@ object MapStyle:
   /** GSI tiles must carry this attribution (terms of use). */
   private val gsiCredit = "<a href=\"https://maps.gsi.go.jp/development/ichiran.html\">地理院タイル</a>"
 
-  /** A raster map; with the offline map installed, its fonts on the device
-    * for the venue layer's labels ([[Basemap.glyphs]]).
+  /** A raster map, marked with `token` and limited to `cap`; with the
+    * offline map installed, its fonts on the device for the venue layer's
+    * labels ([[Basemap.glyphs]]).
     */
-  private def raster(url: String, maxZoom: Int = 18, credit: String = gsiCredit): String =
-    val style = ujson.Obj(
-      "version" -> 8,
-      "sources" -> ujson.Obj(
-        "base" -> ujson.Obj(
-          "type" -> "raster",
-          "tiles" -> ujson.Arr(url),
-          "tileSize" -> 256,
-          "maxzoom" -> maxZoom,
-          "attribution" -> credit
-        )
-      ),
-      "layers" -> ujson.Arr(ujson.Obj("id" -> "base", "type" -> "raster", "source" -> "base"))
-    )
-    Basemap.glyphs.foreach(g => style("glyphs") = g)
-    ujson.write(style)
+  private def raster(url: String, cap: Option[Int], token: String, maxZoom: Int = 18, credit: String = gsiCredit): String =
+    TileStyle.raster(url, maxZoom, credit, cap, token, Basemap.glyphs)
+
+/** OpenFreeMap's styles and their TileJSON, fetched by the app (under a
+  * permit of [[Dest.Ofm]], through [[Net.outbound]]) and kept in the cache
+  * directory: the map library is given them with the TileJSON's tiles
+  * inlined and every URL marked ([[TileStyle.vector]]). They hold no
+  * position. Fetched again after a day; the copy on the device is used meanwhile.
+  */
+object OnlineStyles:
+  private val MaxAgeMs = 24 * 3600_000L
+  private def dir = java.io.File(AshidoriApp.app.getCacheDir, "online-styles")
+  private def file(name: String) = java.io.File(dir, s"$name.json")
+  private val fetching = scala.collection.mutable.Set.empty[String]
+  private val net = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-styles"))
+
+  private val listeners = scala.collection.mutable.LinkedHashSet.empty[() => Unit]
+  /** Called (main thread) when a style was fetched. Returns the function that stops it. */
+  def listen(f: () => Unit): () => Unit =
+    listeners += f
+    () => listeners -= f
+
+  /** The style `name` for MapLibre, from the copy on the device; fetched
+    * (under `p`) when there is none or it is old.
+    */
+  def build(name: String, p: Permit, cap: Option[Int], token: String): Option[String] =
+    val f = file(name)
+    val bundle = scala.util.Try(ujson.read(java.nio.file.Files.readString(f.toPath))).toOption
+    if bundle.isEmpty || System.currentTimeMillis() - f.lastModified() > MaxAgeMs then fetch(name, p)
+    bundle.flatMap { b =>
+      scala.util.Try(TileStyle.vector(b("style").str, u => b("tilejson")(u).str, cap, token)).toOption
+    }
+
+  private def fetch(name: String, p: Permit): Unit =
+    if synchronized(fetching.add(name)) then
+      net.execute { () =>
+        try
+          val ua = Seq("User-Agent" -> s"ashidori/${_root_.net.sksat.ashidori.BuildInfo.versionName} (Android)")
+          val style = Net.outbound.small(p, s"https://tiles.openfreemap.org/styles/$name", ua).getOrElse(throw java.io.IOException("style"))
+          val urls = ujson.read(style)("sources").obj.values.flatMap(_.obj.get("url").flatMap(_.strOpt)).filter(_.startsWith("http")).toSeq.distinct
+          val tj = urls.map(u => u -> ujson.Str(Net.outbound.small(p, u, ua).getOrElse(throw java.io.IOException("tilejson"))))
+          dir.mkdirs()
+          val tmp = java.io.File(dir, s"$name.json.tmp")
+          java.nio.file.Files.writeString(tmp.toPath, ujson.write(ujson.Obj("style" -> style, "tilejson" -> ujson.Obj.from(tj))))
+          tmp.renameTo(file(name))
+          AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
+        catch case e: Exception => Log.w(s"online style $name: ${e.getMessage}")
+        finally synchronized(fetching -= name)
+      }

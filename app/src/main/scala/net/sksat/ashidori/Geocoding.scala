@@ -13,7 +13,7 @@ import ashidori.core.*
   * [[AssetPath]], or from [[downloaded]] if the asset is absent. The platform
   * `android.location.Geocoder`, which may send the position to Google or
   * another provider, is asked only when the index has no answer and
-  * [[Settings.blockExternalLocation]] is off. Call off the main thread.
+  * the rule of [[Dest.Geocoder]] is automatic ([[platformAddress]]). Call off the main thread.
   */
 object Geocoding:
   val AssetPath = "geocoder/index.bin"
@@ -65,13 +65,15 @@ object Geocoding:
     * skips the platform fallback even when it is allowed (to bound slow calls).
     */
   def area(lat: Double, lon: Double, platform: Boolean = true): Option[String] =
-    GeocodePolicy.resolve(offline(lat, lon).flatMap(_.area), Settings.blockExternalLocation, platform && platformPresent) {
+    // At 地域 (a 0.1° grid) the answer is only good for the city: no 「…付近」 from it.
+    val allowed = Settings.gate.when(Dest.Geocoder) == When.Auto && Settings.gate.rule(Dest.Geocoder).level != Level.Area
+    GeocodePolicy.resolve(offline(lat, lon).flatMap(_.area), !allowed, platform && platformPresent) {
       platformAddress(lat, lon).flatMap(a => Option(a.getAddressLine(0)).flatMap(AreaName.fromAddressLine).orElse(Option(a.getLocality)))
     }
 
   /** (city, country) for period summaries, e.g. ("渋谷区", "日本"). */
   def region(lat: Double, lon: Double, platform: Boolean = true): Option[(String, String)] =
-    GeocodePolicy.resolve(offline(lat, lon).map(p => (p.city, p.country)), Settings.blockExternalLocation, platform && platformPresent) {
+    GeocodePolicy.resolve(offline(lat, lon).map(p => (p.city, p.country)), Settings.gate.when(Dest.Geocoder) != When.Auto, platform && platformPresent) {
       platformAddress(lat, lon).map { a =>
         (Option(a.getLocality).orElse(Option(a.getSubAdminArea)).getOrElse(""), Option(a.getCountryName).getOrElse(""))
       }
@@ -104,7 +106,30 @@ object Geocoding:
         Log.i(s"area names recomputed offline: ${areas.size} areas, ${regions.size} regions")
       catch case e: Exception => Log.w("recomputing cached area names failed", e)
 
+  /** One platform call at a time (design 4.4): a call handed to the OS
+    * cannot be taken back, so at most one is in flight when a rule changes.
+    */
+  private val platformThread = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-geocoder"))
+
+  /** The platform geocoder's answer for (lat, lon), asked under a permit
+    * taken right before the call, with the position on the grid of its
+    * level ([[Precision.snap]]). An answer that comes back after the permit
+    * ended is dropped.
+    */
   @annotation.nowarn("cat=deprecation")
   private def platformAddress(lat: Double, lon: Double): Option[android.location.Address] =
-    val g = android.location.Geocoder(AshidoriApp.app, java.util.Locale.JAPANESE)
-    Try(g.getFromLocation(lat, lon, 1)).toOption.flatMap(Option(_)).flatMap(_.asScala.headOption)
+    val task: java.util.concurrent.Callable[Option[android.location.Address]] = () =>
+      Settings.gate.permit(Dest.Geocoder, Mode.Auto) match
+        case None =>
+          Net.log("block dest=geocoder reason=permit")
+          None
+        case Some(p) =>
+          val (qLat, qLon) = Precision.snap(lat, lon, p.level)
+          Net.log(f"send dest=geocoder mode=${p.mode} level=${p.level.key} lat=$qLat%.6f lon=$qLon%.6f")
+          val g = android.location.Geocoder(AshidoriApp.app, java.util.Locale.JAPANESE)
+          val a = Try(g.getFromLocation(qLat, qLon, 1)).toOption.flatMap(Option(_)).flatMap(_.asScala.headOption)
+          if Settings.gate.valid(p) then a
+          else
+            Net.log("drop dest=geocoder reason=permit ended")
+            None
+    Try(platformThread.submit(task).get()).toOption.flatten

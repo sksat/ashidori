@@ -128,7 +128,9 @@ object BasemapUi:
     * otherwise it waits for Wi-Fi.
     */
   def requestDownload(act: MainActivity): Unit =
-    if !metered(act) then BasemapDownload.start(act, allowMetered = false)
+    // Never sent to (or paused): the setting instead.
+    if !BasemapDownload.allowed then act.push(OutboundDestScreen(act, ashidori.core.Dest.Data))
+    else if !metered(act) then BasemapDownload.start(act, allowMetered = false)
     else
       MaterialAlertDialogBuilder(act)
         .setTitle("モバイルデータ通信でダウンロードしますか")

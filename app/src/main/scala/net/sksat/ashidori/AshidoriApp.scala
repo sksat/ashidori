@@ -47,6 +47,8 @@ class AshidoriApp extends Application:
       .foreach(e => Log.w("archive recovery failed", e)), "ashidori-recover").start()
     LoggerWatchdog.schedule(this)
     Settings.migrate()
+    // Every request of the map library through the third line of defence.
+    Net.install(this)
     // An unpairing cut short by a crash is finished before anything syncs.
     Thread(() => net.sksat.ashidori.sync.SyncConfig.resumeUnpair(this), "ashidori-unpair").start()
     // The offline basemap: drop older versions (and the copy older APKs made),
@@ -118,47 +120,45 @@ object Settings:
   def lastDetailStart: Long = prefs.getLong("lastDetailStart", 0L)
   def lastDetailStart_=(t: Long): Unit = prefs.edit().putLong("lastDetailStart", t).apply()
 
-  /** Never send positions, current or past, to external services on the
-    * app's own initiative: no platform geocoder, and maps and their
-    * snapshots drawn from the on-device basemap only. An explicit user
-    * action may still send: a venue search (「最新を取得」, whatever this
-    * setting says; there is no automatic one),
-    * the online map on the one map where the user chose it ("この範囲を詳しい
-    * 地図で表示" or an online map in its picker; remembered for that map until
-    * switched back or this setting changes), opening a position in another app (`geo:`), sharing an
-    * export. Off: the platform geocoder fills names the offline index
-    * lacks, and the chosen base map is used.
+  /** The external-send settings (docs/design/outbound-and-offline.md):
+    * per destination, when and how finely it may be sent to, the pause over
+    * them, consents of map surfaces and the generations of permits
+    * ([[SendGate]]). Read from [[ExternalSettings]]' keys fail-safe, migrated
+    * from `blockExternalLocation` the first time, and stored in one write
+    * with the values older versions read. Work in flight follows a change
+    * at once ([[Net]]).
     *
-    * It does not cover the OS location services: fixes come from the
-    * fused / network providers as the device settings allow. Check-ins
-    * shared with followers are readable by the server operator and the
-    * followers, so they count as sending and need an explicit share action
-    * whatever this setting is.
-    *
-    * Work in flight follows a change at once ([[gate]]).
-    */
-  def blockExternalLocation: Boolean = gate.block
-  def blockExternalLocation_=(b: Boolean): Unit =
-    // A change is stored with the (cleared) map consents in one write.
-    if !gate.setBlock(b) then prefs.edit().putBoolean("blockExternalLocation", b).apply()
-
-  /** The setting's generation, grants, the maps' remembered consents and
-    * listeners (see [[SendGate]]). The setting and the consents are stored
-    * together ([[MapConsents]]), and read back fail-safe.
+    * It does not cover the OS location services (fixes come from the fused
+    * / network providers as the device settings allow), the sync server,
+    * or what the user hands to another app (`geo:`, sharing an export).
     */
   lazy val gate: SendGate =
     import MapConsents.Stored
     def read[A](key: String)(get: => A): Stored[A] =
       if !prefs.contains(key) then Stored.Missing
       else try Stored.Ok(get) catch case _: ClassCastException => Stored.Bad
-    val (block, consents) = MapConsents.load(
-      read("blockExternalLocation")(prefs.getBoolean("blockExternalLocation", true)),
-      read("mapConsents")(prefs.getString("mapConsents", "")),
-      ui.MapStyle.Surfaces,
-      id => ui.MapStyle.fromConsent(id).isDefined
-    )
-    SendGate(block, consents, (b, c) =>
-      prefs.edit().putBoolean("blockExternalLocation", b).putString("mapConsents", MapConsents.encode(c)).apply())
+    def str(key: String) = read(key)(prefs.getString(key, ""))
+    def bool(key: String) = read(key)(prefs.getBoolean(key, true))
+    import ExternalSettings.*
+    val values = Values(str(PolicyKey), str(ConsentsKey), str(GensKey), bool(PausedKey), bool(LegacyBlockKey), str(LegacyConsentsKey))
+    val rnd = java.security.SecureRandom()
+    val (state, writes) = load(values, ui.MapStyle.Surfaces, id => ui.MapStyle.fromConsent(id).flatMap(_.dest), rnd)
+    writes.foreach(store)
+    SendGate(state, s => store(ExternalSettings.writes(s)), rnd)
+
+  /** Writes the external-send settings at once (work cancelled after a
+    * change must find the new generations stored).
+    */
+  private def store(w: ExternalSettings.Writes): Unit =
+    val e = prefs.edit()
+    w.strings.foreach((k, v) => e.putString(k, v))
+    w.booleans.foreach((k, v) => e.putBoolean(k, v))
+    e.commit()
+
+  /** The marks of MapLibre's requests ([[TokenTable]]), kept across restarts. */
+  lazy val tokens: TokenTable =
+    val stored = try Option(prefs.getString(ExternalSettings.TokensKey, null)) catch case _: ClassCastException => None
+    TokenTable(stored.fold(Map.empty)(TokenTable.read), t => prefs.edit().putString(ExternalSettings.TokensKey, TokenTable.encode(t)).apply())
 
   /** Upgrades stored settings; call once at start. */
   def migrate(): Unit =
@@ -168,4 +168,7 @@ object Settings:
     if prefs.contains("onlineVenues") then
       val e = prefs.edit()
       if !prefs.getBoolean("onlineVenues", true) then e.putBoolean("blockExternalLocation", true)
-      e.remove("onlineVenues").apply()
+      e.remove("onlineVenues").commit()
+    // Then the per-destination settings, from blockExternalLocation the
+    // first time (on reading them).
+    val _ = gate

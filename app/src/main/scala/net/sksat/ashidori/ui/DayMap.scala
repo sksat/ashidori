@@ -30,20 +30,23 @@ import Ui.*
   * basemap is installed (or removed), the snapshots of the offline map are
   * dropped and the cards drawn again.
   *
-  * Jobs pick their base map right before they start, and a change of
-  * 「位置情報を外部サービスに送らない」 drops the queued ones and cancels the
-  * running one ([[SnapshotQueue]]); every card is then drawn again, so none
-  * is left waiting for a dropped job. Main thread only.
+  * Jobs pick their base map right before they start, an online one only
+  * under a permit taken then (holder `snapshot`, [[MapGuard]]), and a change
+  * of a map destination's rule or the pause drops the queued ones and
+  * cancels the running one ([[SnapshotQueue]]); every card is then drawn
+  * again, so none is left waiting for a dropped job. Main thread only.
   */
 object DayMap:
   private val cache = android.util.LruCache[String, Bitmap](40)
   /** The running snapshotter is its handle: referenced until it calls back. */
   private val queue = SnapshotQueue[MapSnapshotter](Settings.gate)
-  Settings.gate.onChange(() => AshidoriApp.app.getMainExecutor.execute { () =>
+  Settings.gate.onChange(ds => if ds.exists(Dest.Tiles) then AshidoriApp.app.getMainExecutor.execute { () =>
     queue.invalidate().foreach(_.cancel())
     // Cards whose job was dropped would keep the plain sketch.
     cards.asScala.toSeq.foreach(_.invalidateMap())
   })
+  // OpenFreeMap's style arrived: cards waiting for it are drawn.
+  OnlineStyles.listen(() => cards.asScala.toSeq.foreach(_.invalidateMap()))
 
   /** A card's frame; `redraw` picks its base map again. */
   private final class MapCard(c: Context) extends FrameLayout(c):
@@ -147,7 +150,7 @@ object DayMap:
       sketch.grid = false
       chip.show(false)
 
-    def start(style: MapStyle): Option[MapSnapshotter] =
+    def start(style: MapStyle, json: String): Option[MapSnapshotter] =
       val density = dm.density
       // Fit everything with a margin; at least ~400 m across.
       val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
@@ -158,7 +161,7 @@ object DayMap:
         .include(MLatLng(lat0 - padLat, lon0 - padLon))
         .include(MLatLng(lat1 + padLat, lon1 + padLon))
         .build()
-      val builder = style.snapshotBuilder
+      val builder = MapStyle.snapshotBuilder(style.key, json)
         .withSource(GeoJsonSource("day-route", TrackMap.lineFeatures(paths ++ gaps)))
         .withSource(GeoJsonSource("day-stays", FeatureCollection.fromFeatures(
           stays.map(s => Feature.fromGeometry(Point.fromLngLat(s.lon, s.lat))).asJava)))
@@ -210,15 +213,17 @@ object DayMap:
           case Some(b) => show(b)
           case None =>
             pending()
-            queue.enqueue { block =>
-              // Rendered while scrolling, without the user asking for that area:
-              // the offline map while 「位置情報を外部サービスに送らない」 is on,
-              // as the setting is now, not when the card was laid out.
-              MapStyle.forSnapshot(block) match
-                case Outcome.Draw(s) => start(s)
-                case Outcome.NoBasemap =>
+            queue.enqueue { () =>
+              // Rendered while scrolling, without the user asking for that
+              // area: an online map only if its destination is automatic, by
+              // the rules now, not when the card was laid out.
+              MapStyle.snapshot(DayMap) match
+                case Some((Outcome.Draw(s), Some(json))) => start(s, json)
+                case Some((_, _)) =>
                   sketchOnly()
                   None
+                // OpenFreeMap's style is being fetched: drawn when it arrives.
+                case None => None
             }
 
     frame.redraw = () => render()

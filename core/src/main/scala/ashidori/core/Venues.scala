@@ -69,6 +69,24 @@ object Overpass:
     val keys = CategoryKeys.filterNot(_ == "building").mkString("|")
     s"""[out:json][timeout:10];nwr["name"][~"^($keys)$$"~"."](around:$radiusM,$lat,$lon);out center $Limit;"""
 
+  /** Elements per answer of a box query: the whole box is asked for and
+    * the device keeps those near the position, so it needs more of them.
+    */
+  val BoxLimit = 1000
+
+  /** [[query]] at [[Level.District]] (design 3.2): the box of the 0.01°
+    * cell and its eight neighbours ([[Precision.districtBox]]), not the
+    * position. The answer is narrowed down on the device.
+    */
+  def queryBox(lat: Double, lon: Double): String =
+    val keys = CategoryKeys.filterNot(_ == "building").mkString("|")
+    val (s, w, n, e) = Precision.districtBox(lat, lon)
+    s"""[out:json][timeout:15];nwr["name"][~"^($keys)$$"~"."]($s,$w,$n,$e);out center $BoxLimit;"""
+
+  /** The query for `level`, and the most elements a complete answer has. */
+  def queryAt(level: Level, lat: Double, lon: Double, radiusM: Int): (String, Int) =
+    if level == Level.District then (queryBox(lat, lon), BoxLimit) else (query(lat, lon, radiusM), Limit)
+
   /** `maxDistM` drops large areas (parks, reserves) that touch the search
     * circle but whose center is far away.
     */
@@ -80,7 +98,7 @@ object Overpass:
     * 200 with a "remark" and what it found so far; with nothing found that
     * is a failure (another server may answer), not an empty spot.
     */
-  def parseAnswer(json: String, lat: Double, lon: Double, maxDistM: Double = 600): (Vector[(Venue, Double)], Boolean) =
+  def parseAnswer(json: String, lat: Double, lon: Double, maxDistM: Double = 600, limit: Int = Limit): (Vector[(Venue, Double)], Boolean) =
     val root = ujson.read(json)
     val elements = root("elements").arr.toVector
     val error = root.obj.get("remark").flatMap(_.strOpt).exists(_.contains("error"))
@@ -100,7 +118,7 @@ object Overpass:
         val v = Venue(s"${e("type").str}/${e("id").num.toLong}", n, cat, vlat, vlon)
         v -> Geo.distance(lat, lon, vlat, vlon)
     }.filter(_._2 <= maxDistM).distinctBy(_._1.name).sortBy(_._2)
-    (venues, !error && elements.size < Limit)
+    (venues, !error && elements.size < limit)
 
   private val Labels = Map(
     "restaurant" -> "レストラン", "cafe" -> "カフェ", "fast_food" -> "ファストフード", "bar" -> "バー", "pub" -> "居酒屋",

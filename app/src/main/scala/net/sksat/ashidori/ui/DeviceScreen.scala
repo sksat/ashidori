@@ -37,9 +37,11 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     unobserve()
     unobserve = PeerStatus.observe(() => render())
     unwatch()
-    // A change of 「位置情報を外部サービスに送らない」 cancels the map and
-    // renders it again under the new setting.
-    unwatch = Settings.gate.onChange(() => act.runOnUiThread(() => { stopMap(); render() }))
+    // A change of a map destination's rule (or the pause) cancels the map
+    // and renders it again under the new rules; so does OpenFreeMap's style arriving.
+    val stopRules = Settings.gate.onChange(ds => if ds.exists(Dest.Tiles) then act.runOnUiThread(() => { stopMap(); render() }))
+    val stopStyles = OnlineStyles.listen(() => { stopMap(); render() })
+    unwatch = () => { stopRules(); stopStyles() }
     unwatchBasemap()
     // Installed or removed: draw the map with or without it.
     var version = Basemap.installedVersion
@@ -173,10 +175,15 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     val hex = f"#${dotColor & 0xffffff}%06x"
     // Show the circle with room around it; at least ~600 m across.
     val half = math.max(acc * 2.5, 300.0)
-    // Another device's position: offline map while the setting is on.
-    val style = MapStyle.forSnapshot match
-      case Outcome.Draw(s) => s
-      case Outcome.NoBasemap =>
+    // Another device's position: an online map only if its destination is
+    // automatic, under a permit taken now (holder `snapshot`).
+    val (style, json) = MapStyle.snapshot(this) match
+      case Some((Outcome.Draw(s), Some(j))) => (s, j)
+      // OpenFreeMap's style is being fetched: blank until it arrives.
+      case None =>
+        stopMap()
+        return frame
+      case Some(_) =>
         stopMap()
         frame.addView(PositionSketchView(act, acc / (2 * half), dotColor),
           FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -190,7 +197,7 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       .include(MLatLng(f.lat - dLat, f.lon - dLon))
       .include(MLatLng(f.lat + dLat, f.lon + dLon))
       .build()
-    var builder = style.snapshotBuilder
+    var builder = MapStyle.snapshotBuilder(style.key, json)
       .withSource(GeoJsonSource("peer-dot", Point.fromLngLat(f.lon, f.lat)))
     if acc > 0 then
       builder = builder
