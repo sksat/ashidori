@@ -34,6 +34,26 @@ object RegionsUi:
     val d = Instant.ofEpochMilli(ms).atZone(AshidoriApp.zone).toLocalDate
     f"${d.getYear}/${d.getMonthValue}%02d/${d.getDayOfMonth}%02d"
 
+  /** Fetches the pinned catalog if it is not on the device (it holds no
+    * position), when the user opens a screen of the regions: under a
+    * permit of that action, and on a metered network only with
+    * 「モバイルデータ通信でも取得」. `done` (main thread) hears None when it
+    * is there, or why not.
+    */
+  def ensureCatalog(act: MainActivity)(done: Option[String] => Unit): Unit =
+    if Regions.catalog.nonEmpty then done(None)
+    else
+      val metered = scala.util.Try(act.getSystemService(classOf[android.net.ConnectivityManager]).isActiveNetworkMetered).getOrElse(true)
+      if metered && !Regions.metered then done(Some("Wi-Fi 接続時にカタログを取得"))
+      else Settings.gate.permit(Dest.Data, Mode.OnAction).filter(_.level == Level.Cell) match
+        case None => done(Some("カタログなし"))
+        case Some(p) =>
+          AshidoriApp.io.execute { () =>
+            val r = scala.util.Try(Regions.fetchCatalog(p))
+            r.failed.foreach(e => Log.w("regions: catalog", e))
+            act.runOnUiThread(() => done(r.failed.toOption.map(_ => "カタログを取得できません")))
+          }
+
   /** Where the packs come from, as the screens name it (design 6.14). */
   def source: String = if Regions.debugUrl.nonEmpty then "開発用 URL" else "GitHub"
 
@@ -54,6 +74,9 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
   override def onShow(): Unit =
     stops = Seq(Regions.listen(() => refresh()), BasemapDownload.listen(() => refresh()), VenueDownload.listen(() => refresh()))
     refresh()
+    // A newer catalog of an app update: its 新しい版 marks.
+    if Regions.offered && Regions.state.regions.nonEmpty && Regions.catalog.isEmpty then
+      RegionsUi.ensureCatalog(act)(_ => if act.showing(this) then refresh())
   override def onHide(): Unit =
     stops.foreach(_())
     stops = Seq.empty
@@ -377,21 +400,11 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
     * only with 「モバイルデータ通信でも取得」.
     */
   private def fetchCatalog(): Unit =
-    val metered = scala.util.Try(act.getSystemService(classOf[android.net.ConnectivityManager]).isActiveNetworkMetered).getOrElse(true)
-    if metered && !Regions.metered then
-      fetchError = Some("Wi-Fi 接続時にカタログを取得")
-      return
-    Settings.gate.permit(Dest.Data, Mode.OnAction).filter(_.level == Level.Cell).foreach { p =>
-      fetching = true
-      AshidoriApp.io.execute { () =>
-        val r = scala.util.Try(Regions.fetchCatalog(p))
-        r.failed.foreach(e => Log.w("regions: catalog", e))
-        act.runOnUiThread { () =>
-          fetching = false
-          fetchError = r.failed.toOption.map(_ => "カタログを取得できません")
-          update()
-        }
-      }
+    fetching = true
+    RegionsUi.ensureCatalog(act) { e =>
+      fetching = false
+      fetchError = e
+      update()
     }
 
   /** The frame's box on the map now. */

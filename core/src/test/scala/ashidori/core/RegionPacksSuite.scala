@@ -589,6 +589,7 @@ class RegionPacksSuite extends munit.FunSuite:
     val book = RegionBook(store, () => Some(p.catalog), () => 7L)
     assertEquals(book.state.regions.map(_.cells), Seq(Seq(tokyo)))
     assertEquals(book.state.trash, Seq.empty)
+    assertEquals(book.state.packs(tokyo).installed.map(_.bytes), Some(store.packFile(tokyo, "20261117").length))
     assert(store.packFile(tokyo, "20261117").isFile && store.stylePresent("s1"))
 
     val fresh = RegionStore(File(tmpDir(), "regions"))

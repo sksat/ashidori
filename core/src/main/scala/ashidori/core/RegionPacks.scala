@@ -334,7 +334,9 @@ final case class RegionScan(
   /** Complete style bundles. */
   styles: Set[String],
   /** Everything else under the root that is not the state: partial downloads, extractions, unknown entries. */
-  other: Seq[String]
+  other: Seq[String],
+  /** Pack directory -> the size of its archive. */
+  bytes: Map[String, Long] = Map.empty
 )
 
 /** Brings the state and the files together at start and after a step
@@ -397,7 +399,7 @@ object RegionReconcile:
     val packs = scan.packs.toSeq.flatMap { (c, vs) =>
       vs.keys.maxOption.map { v =>
         val style = vs(v).orElse(catalog.filter(_.version == v).flatMap(_.cells.get(c)).map(_.style)).getOrElse("unknown")
-        c -> PackState(Some(Installed(v, style, 0L, now)), None)
+        c -> PackState(Some(Installed(v, style, scan.bytes.getOrElse(RegionStore.packDir(c, v), 0L), now)), None)
       }
     }.toMap
     val regions = packs.keys.toSeq.sorted.zipWithIndex.map((c, i) => Region(s"r${i + 1}", s"地域 ${i + 1}", Seq(c), now))
@@ -562,7 +564,8 @@ class RegionStore(val root: File):
     }.toSet
     for n <- list(downloadDir) do other += s"$DownloadDir/$n"
     for n <- list(root) if !Set(StateFile, PacksDir, StylesDir, DownloadDir, CatalogDir)(n) do other += n
-    RegionScan(packs, styles, other.toSeq.sorted)
+    val bytes = for (c, vs) <- packs; v <- vs.keys yield packDir(c, v) -> packFile(c, v).length
+    RegionScan(packs, styles, other.toSeq.sorted, bytes.toMap)
 
   /** Deletes `rel` (a path [[RegionScan]] or [[RegionReconcile]] named). */
   def delete(rel: String): Unit =
