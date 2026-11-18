@@ -38,6 +38,15 @@ class PlaceEditSuite extends munit.FunSuite:
     assertEquals(venue.revert(p1).map(_.externalId), Some(""))
   }
 
+  test("undo after the same name and id were set again with another source does nothing") {
+    // A venue set 「駅前店」; the user then typed the same name (the id stays): the name is now the user's.
+    val venue = PlaceEdit.rename(p0, "駅前店", Some("node/1"))
+    val p1 = venue.applyTo(p0)
+    val p2 = p1.copy(nameSource = NameSource.Typed)
+    assertEquals(venue.revert(p2), None)
+    assertEquals(venue.revert(p1).map(p => (p.name, p.nameSource)), Some(("", p0.nameSource)))
+  }
+
   test("an edit that sets the value already there is a no-op") {
     assert(PlaceEdit.kind(p0, PlaceKind.Other).isNoop)
     assert(!PlaceEdit.rename(p0, "x").isNoop)

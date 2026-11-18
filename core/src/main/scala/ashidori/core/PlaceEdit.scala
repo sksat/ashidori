@@ -21,7 +21,8 @@ enum PlaceEdit:
     * holds what this change set (a later change wins).
     */
   def revert(p: Place): Option[Place] = this match
-    case Rename(b, bid, n, id, bs, _) => Option.when(p.name == n && p.externalId == id)(p.copy(name = b, externalId = bid, nameSource = bs))
+    case Rename(b, bid, n, id, bs, as) =>
+      Option.when(p.name == n && p.externalId == id && p.nameSource == as)(p.copy(name = b, externalId = bid, nameSource = bs))
     case SetKind(b, k)         => Option.when(p.kind == k)(p.copy(kind = b))
 
   /** Nothing changes (the field already holds the value). */
