@@ -265,7 +265,10 @@ final class CheckInSheet(act: MainActivity, at: Option[(LatLng, Long)] = None, o
   /** Places and past check-in venues near `p`, from the local DB. Works offline. */
   private def localCandidates(p: LatLng): Vector[(Venue, Double)] =
     val db = AshidoriApp.db
-    val fromPlaces = db.places().filter(_.name.nonEmpty).map(pl => Venue(pl.externalId, pl.name, "よく行く場所", pl.lat, pl.lon))
+    // A place's own name is offered as it is: with its venue id only when a
+    // venue gave it, so a typed name never passes for a venue's.
+    val fromPlaces = db.places().filter(_.name.nonEmpty).map(pl =>
+      Venue(if pl.nameSource == NameSource.FromVenue then pl.externalId else "", pl.name, "よく行く場所", pl.lat, pl.lon))
     val fromCheckIns = db.checkIns(0, Long.MaxValue).map(c => Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon))
     (fromPlaces ++ fromCheckIns)
       .map(v => v -> v.latLng.distanceTo(p))
@@ -441,7 +444,8 @@ object CheckIns:
         val row = ci.copy(placeId = Some(pl.id))
         Action(VenueCheckIn.Done(row.copy(id = db.insertCheckIn(row)), None), named.map(pl.id -> _).toSeq)
       case None =>
-        val place = Place(0, ci.lat, ci.lon, 50, v.name, PlaceKind.Other, v.id)
+        val src = if v.id.nonEmpty then NameSource.FromVenue else NameSource.Typed
+        val place = Place(0, ci.lat, ci.lon, 50, v.name, PlaceKind.Other, v.id, nameSource = src)
         val placeId = db.insertPlace(place)
         val row = ci.copy(placeId = Some(placeId))
         Action(VenueCheckIn.Done(row.copy(id = db.insertCheckIn(row)), None, Some(place.copy(id = placeId))))
@@ -520,11 +524,8 @@ object CheckIns:
       val db = AshidoriApp.db
       val a = db.atomically {
         val plan = VenueCheckIn.correction(db.checkIns(visit.start - 60_000, visit.end + 60_001), visit, v, at)
-        val replaced = plan match
-          case VenueCheckIn.Plan.Replace(before, _) => Some(before)
-          case VenueCheckIn.Plan.Add(_)             => None
         val renamed = visit.placeId.flatMap(id => db.places().find(_.id == id))
-          .filter(p => VenueCheckIn.renames(p, replaced, venueName(p)))
+          .filter(VenueCheckIn.renames)
           .flatMap(p => edit(p.id, now => PlaceEdit.rename(now, v.name, Some(v.id))))
         plan match
           case VenueCheckIn.Plan.Replace(before, after) =>
@@ -537,14 +538,6 @@ object CheckIns:
       Log.d(s"check-ins: stay ${visit.start}, ${if a.done.before.isDefined then "replaced" else "added"} ${a.done.written.id}" +
         (if a.placeEdits.nonEmpty then ", place named" else ""))
       done(act, a, message, onDone)
-    }
-
-  /** The name of the venue the place was named after (its id), from the venue index near it. */
-  private def venueName(p: Place): Option[String] =
-    Option.when(p.externalId.nonEmpty)(p.externalId).flatMap { id =>
-      val e = 0.003
-      VenueData.index().flatMap(ix => Try(ix.within(p.lat - e, p.lon - e, p.lat + e, p.lon + e)).toOption)
-        .flatMap(_.find(_.venue.id == id)).map(_.venue.name)
     }
 
   /** 「「スターバックス」にチェックイン（12:10 の滞在）」, or without the stay for now. */

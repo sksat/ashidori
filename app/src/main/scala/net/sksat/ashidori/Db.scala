@@ -85,6 +85,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       db.beginTransaction()
       try
         createArchiveBookkeeping(db)
+        // A pre-release build of version 9 lacked some of its columns: only what is missing.
+        addTombstones(db)
         // Rows an older app version inserted (it ignores the floor) are below it again.
         Db.ArchivedTables.keys.foreach(t => db.execSQL(ArchiveSql.raiseFloor(t)))
         db.setTransactionSuccessful()
@@ -583,11 +585,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   // --- places -------------------------------------------------------------
 
   def places(): Vector[Place] =
-    query(s"SELECT id,lat,lon,radius,name,kind,external_id,area FROM places WHERE ${DbSchema.Live}") { c =>
+    query(s"SELECT id,lat,lon,radius,name,kind,external_id,area,name_source FROM places WHERE ${DbSchema.Live}") { c =>
       Place(c.getLong(0), c.getDouble(1), c.getDouble(2), c.getDouble(3), Option(c.getString(4)).getOrElse(""),
         PlaceKind.fromKey(Option(c.getString(5)).getOrElse("")), Option(c.getString(6)).getOrElse(""),
-        Option(c.getString(7)).getOrElse(""))
+        Option(c.getString(7)).getOrElse(""), NameSource.fromKey(Option(c.getString(8)).getOrElse("")))
     }
+
+  /** `name_source`: NULL where not known. */
+  private def putNameSource(cv: ContentValues, s: NameSource): Unit =
+    if s == NameSource.Unknown then cv.putNull("name_source") else cv.put("name_source", s.key)
 
   def insertPlace(p: Place): Long =
     val cv = ContentValues()
@@ -597,6 +603,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("name", p.name)
     cv.put("kind", p.kind.key)
     cv.put("external_id", p.externalId)
+    putNameSource(cv, p.nameSource)
     cv.put("updated_at", java.lang.Long.valueOf(System.currentTimeMillis()))
     w.insert("places", null, cv)
 
@@ -608,6 +615,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("name", p.name)
     cv.put("kind", p.kind.key)
     cv.put("external_id", p.externalId)
+    putNameSource(cv, p.nameSource)
     cv.put("updated_at", java.lang.Long.valueOf(System.currentTimeMillis()))
     w.update("places", cv, "id=?", Array(p.id.toString))
 

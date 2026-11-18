@@ -67,14 +67,12 @@ object VenueCheckIn:
     checkIns.filter(during(_, v)).minByOption(c => math.abs(c.time - stayTime(v)))
 
   /** A correction names the stay's place after the venue too, only when its
-    * name is not the user's: the place has no name (nor a kind, such as
-    * 自宅), or its name is the venue name of the check-in being replaced, or
-    * the name of the venue it was named after (`venueName`: that venue's
-    * name in the venue index, if found). A typed name never matches.
+    * name is a venue's ([[NameSource.FromVenue]]) or it has none (nor a
+    * kind, such as 自宅). A typed name, and a name of unknown origin
+    * (stored before database version 9), stay.
     */
-  def renames(p: Place, replaced: Option[CheckIn], venueName: Option[String]): Boolean =
-    p.kind == PlaceKind.Other &&
-      (p.name.isEmpty || replaced.exists(_.venueName == p.name) || venueName.contains(p.name))
+  def renames(p: Place): Boolean =
+    p.kind == PlaceKind.Other && (p.name.isEmpty || p.nameSource == NameSource.FromVenue)
 
   /** What a correction of `visit` to `v` (at `at`) writes, from the
     * check-ins as stored now, read in the same transaction.

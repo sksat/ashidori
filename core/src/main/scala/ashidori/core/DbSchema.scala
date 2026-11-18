@@ -134,13 +134,15 @@ object DbSchema:
 
   /** Version 9: check-ins and places are deleted by a tombstone, `deleted`
     * 1 on the same row, so that the deletion is synced as the row's latest
-    * snapshot (a deleted row is never uploaded). `checkins`, `places`: the
-    * columns the tables have now.
+    * snapshot (a deleted row is never uploaded); and a place's name keeps
+    * where it came from, `name_source` ([[NameSource]]: "user", "venue";
+    * NULL, not known, for the names stored before). `checkins`, `places`:
+    * the columns the tables have now.
     */
   def toV9(checkins: Set[String], places: Set[String]): Seq[String] =
     Seq("checkins" -> checkins, "places" -> places).collect {
       case (t, cols) if !cols("deleted") => s"ALTER TABLE $t ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
-    }
+    } ++ Option.when(!places("name_source"))("ALTER TABLE places ADD COLUMN name_source TEXT")
 
   /** The rows that are not deleted (an SQL condition). */
   val Live = "deleted=0"

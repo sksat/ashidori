@@ -43,12 +43,14 @@ class TombstoneSuite extends munit.FunSuite:
   private def migrate(db: File): Unit =
     run(db, ("BEGIN" +: DbSchema.toV9(columns(db, "checkins"), columns(db, "places")) :+ "COMMIT").map(_ + ";").mkString("\n"))
 
-  test("version 9 adds deleted (0 for the rows there) to both tables, and runs again without change") {
+  test("version 9 adds deleted (0 for the rows there) to both tables and name_source to places, and runs again without change") {
     val db = v8()
     migrate(db)
     assert(columns(db, "checkins")("deleted"))
     assert(columns(db, "places")("deleted"))
-    assertEquals(run(db, "SELECT deleted, sync_rev FROM checkins; SELECT deleted, sync_rev FROM places;"), Vector("0|2", "0|1"))
+    // The names stored before: of unknown origin (NULL), so the user's.
+    assertEquals(run(db, "SELECT deleted, sync_rev FROM checkins; SELECT deleted, sync_rev, name_source IS NULL FROM places;"),
+      Vector("0|2", "0|1|1"))
     assertEquals(DbSchema.toV9(columns(db, "checkins"), columns(db, "places")), Nil)
   }
 

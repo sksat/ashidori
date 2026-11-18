@@ -87,18 +87,37 @@ class VenueCheckInSuite extends munit.FunSuite:
     assertEquals(VenueCheckIn.ofStay(Seq(cs(0)), v), None)
   }
 
-  test("a correction renames the place only when its name is not the user's") {
+  test("a correction renames the place only when its name is a venue's, or it has none") {
     val p = Place(1, venue.lat, venue.lon, 50, "")
-    val old = CheckIn(1, day, venue.lat, venue.lon, "スターバックス", venueExternalId = "node/1")
-    assert(VenueCheckIn.renames(p, None, None))
-    // Named after the replaced check-in's venue, or after the venue its id names.
-    assert(VenueCheckIn.renames(p.copy(name = "スターバックス", externalId = "node/1"), Some(old), None))
-    assert(VenueCheckIn.renames(p.copy(name = "ドトール", externalId = "node/9"), None, Some("ドトール")))
-    // Typed: a venue id stays after a typed rename, and it does not count.
-    assert(!VenueCheckIn.renames(p.copy(name = "自宅", externalId = "node/1"), Some(old), Some("スターバックス")))
-    assert(!VenueCheckIn.renames(p.copy(name = "研究室"), None, None))
+    assert(VenueCheckIn.renames(p))
+    assert(VenueCheckIn.renames(p.copy(name = "ドトール", externalId = "node/9", nameSource = NameSource.FromVenue)))
+    // Typed (a venue id stays after a typed rename), or of unknown origin (stored before version 9).
+    assert(!VenueCheckIn.renames(p.copy(name = "自宅", externalId = "node/1", nameSource = NameSource.Typed)))
+    assert(!VenueCheckIn.renames(p.copy(name = "スターバックス", externalId = "node/1")))
     // A kind set by the user (自宅) without a name.
-    assert(!VenueCheckIn.renames(p.copy(kind = PlaceKind.Home), None, None))
+    assert(!VenueCheckIn.renames(p.copy(kind = PlaceKind.Home)))
+  }
+
+  test("a typed 「研究室」 stays: typed, checked in there, then the stay's venue changed to a cafe") {
+    val p0 = Place(1, venue.lat, venue.lon, 50, "スターバックス", PlaceKind.Other, "node/1", nameSource = NameSource.FromVenue)
+    // Typed in the place sheet: the venue id stays, the name is the user's.
+    val p1 = PlaceEdit.rename(p0, "研究室").applyTo(p0)
+    assertEquals((p1.name, p1.externalId, p1.nameSource), ("研究室", "node/1", NameSource.Typed))
+    // A check-in to 「研究室」 (a place offered as a candidate: no venue id) names nothing: the place has a name.
+    val v = stay(venue, 12, 1).copy(placeId = Some(1))
+    val t = Table()
+    t.correct(v, Venue("", "研究室", "", venue.lat, venue.lon))
+    // The stay's venue changed to a cafe: the check-in is replaced, the place keeps its name.
+    t.correct(v, tully)
+    assertEquals(t.rows.map(_.venueName), Vector("タリーズ"))
+    assert(!VenueCheckIn.renames(p1))
+    // A name a venue set follows the next venue; its 取り消し gives the source back.
+    val e = PlaceEdit.rename(p0, "タリーズ", Some("node/2"))
+    val p2 = e.applyTo(p0)
+    assertEquals(p2.nameSource, NameSource.FromVenue)
+    assertEquals(e.revert(p2).map(_.nameSource), Some(NameSource.FromVenue))
+    val typed = PlaceEdit.rename(p1, "タリーズ", Some("node/2"))
+    assertEquals(typed.revert(typed.applyTo(p1)).map(p => (p.name, p.nameSource)), Some(("研究室", NameSource.Typed)))
   }
 
   // ---- corrections and their 取り消し, against a table of rows ----

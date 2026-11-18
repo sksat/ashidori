@@ -104,6 +104,18 @@ enum PlaceKind(val key: String, val label: String):
 object PlaceKind:
   def fromKey(k: String): PlaceKind = values.find(_.key == k).getOrElse(Other)
 
+/** Where a place's name came from (database version 9, `name_source`). */
+enum NameSource(val key: String):
+  /** Not known: no name, or a name stored before version 9. Treated as the user's. */
+  case Unknown extends NameSource("")
+  /** Typed or chosen by the user (also a venue name without a venue id). */
+  case Typed extends NameSource("user")
+  /** A venue's name, set with its id (a check-in, a candidate, the venue picker). */
+  case FromVenue extends NameSource("venue")
+
+object NameSource:
+  def fromKey(k: String): NameSource = values.find(v => v.key == k && k.nonEmpty).getOrElse(Unknown)
+
 final case class Place(
     id: Long,
     lat: Double,
@@ -114,7 +126,9 @@ final case class Place(
     /** OSM element id like `node/123`, when the place came from venue search */
     externalId: String = "",
     /** approximate area from reverse geocoding, e.g. "天王台" */
-    area: String = ""
+    area: String = "",
+    /** where `name` came from */
+    nameSource: NameSource = NameSource.Unknown
 ):
   def latLng: LatLng = LatLng(lat, lon)
   /** Best available label: the user's name, the kind, the area, or a placeholder. */
