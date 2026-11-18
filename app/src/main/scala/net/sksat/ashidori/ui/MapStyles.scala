@@ -4,7 +4,7 @@ import android.content.Context
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
 import net.sksat.ashidori.{AshidoriApp, Basemap, Log, Net, Settings}
-import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Outbound, Permit, Precision, TileStyle, When}
+import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Outbound, Permit, Precision, Refetch, TileStyle, When}
 import ashidori.core.BaseMapPolicy.Outcome
 
 /** Selectable base maps. "オフライン地図" is drawn from data in the app and never
@@ -86,8 +86,8 @@ enum MapStyle(val key: String, val label: String, val note: String):
           val token = Net.guard.hold(holder, owner, p)
           val cap = Precision.maxZoom(p.level)
           ms match
-            case Standard => OnlineStyles.build("liberty", p, cap, token)
-            case Light => OnlineStyles.build("positron", p, cap, token)
+            case Standard => OnlineStyles.build("liberty", holder, owner, p, cap, token)
+            case Light => OnlineStyles.build("positron", holder, owner, p, cap, token)
             case GsiStd => Some(MapStyle.raster(MapStyle.gsi("std", "png"), cap, token))
             case GsiPale => Some(MapStyle.raster(MapStyle.gsi("pale", "png"), cap, token))
             case GsiPhoto => Some(MapStyle.raster(MapStyle.gsi("seamlessphoto", "jpg"), cap, token))
@@ -286,13 +286,34 @@ object MapStyle:
   * directory: the map library is given them with the TileJSON's tiles
   * inlined and every URL marked ([[TileStyle.vector]]). They hold no
   * position. Fetched again after a day; the copy on the device is used meanwhile.
+  *
+  * A failed fetch is retried ([[Refetch]]: 5 s doubling to 5 min, and at
+  * once when a network becomes available), only for the maps that still
+  * show that style under their permit and, on action, their screen grant
+  * ([[MapGuard.allows]], checked before each request); a map that leaves the
+  * screen or goes away is forgotten ([[forget]]).
   */
 object OnlineStyles:
   private val MaxAgeMs = 24 * 3600_000L
   private def dir = java.io.File(AshidoriApp.app.getCacheDir, "online-styles")
   private def file(name: String) = java.io.File(dir, s"$name.json")
-  private val fetching = scala.collection.mutable.Set.empty[String]
   private val net = java.util.concurrent.Executors.newSingleThreadExecutor(r => Thread(r, "ashidori-styles"))
+  private val timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-styles-retry"))
+
+  /** A map (or snapshot) that wants a style: its holder, the one drawing it, and its permit. */
+  final case class Wanted(holder: String, owner: AnyRef, permit: Permit)
+  private def allowed(w: Wanted): Boolean = Net.guard.allows(w.holder, w.owner, w.permit)
+
+  private lazy val refetch: Refetch[String, Wanted] =
+    val r = Refetch[String, Wanted](fetch, allowed, f => net.execute(() => f()),
+      (ms, f) => {
+        val t = timer.schedule((() => f()): Runnable, ms, java.util.concurrent.TimeUnit.MILLISECONDS)
+        () => { t.cancel(false); () }
+      })
+    val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
+    cm.registerDefaultNetworkCallback(new android.net.ConnectivityManager.NetworkCallback:
+      override def onAvailable(n: android.net.Network): Unit = r.retryNow())
+    r
 
   private val listeners = scala.collection.mutable.LinkedHashSet.empty[() => Unit]
   /** Called (main thread) when a style was fetched. Returns the function that stops it. */
@@ -301,63 +322,38 @@ object OnlineStyles:
     () => listeners -= f
 
   /** The style `name` for MapLibre, from the copy on the device; fetched
-    * (under `p`) when there is none or it is old.
+    * for `holder` drawn by `owner` (under `p`) when there is none or it is old.
     */
-  def build(name: String, p: Permit, cap: Option[Int], token: String): Option[String] =
+  def build(name: String, holder: String, owner: AnyRef, p: Permit, cap: Option[Int], token: String): Option[String] =
     val f = file(name)
     val bundle = scala.util.Try(ujson.read(java.nio.file.Files.readString(f.toPath))).toOption
-    if bundle.isEmpty || System.currentTimeMillis() - f.lastModified() > MaxAgeMs then fetch(name, p)
+    if bundle.isEmpty || System.currentTimeMillis() - f.lastModified() > MaxAgeMs then
+      refetch.request(name, Wanted(holder, owner, p))
     bundle.flatMap { b =>
       scala.util.Try(TileStyle.vector(b("style").str, u => b("tilejson")(u).str, cap, token)).toOption
     }
 
-  /** Failed fetches waiting for their retry: the permit and the attempts so far. */
-  private val waiting = scala.collection.mutable.Map.empty[String, (Permit, Int)]
-  private val timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-styles-retry"))
-  private var watching = false
+  /** Retry the waiting fetches now (what a network becoming available does). */
+  def retryNow(): Unit = refetch.retryNow()
 
-  /** A failed fetch is tried again after 5 s, doubling to 5 min, and at once
-    * when a network becomes available, while its permit holds (a map that
-    * gets a new permit asks again by itself).
-    */
-  private def retryLater(name: String, p: Permit, attempt: Int): Unit =
-    synchronized {
-      waiting(name) = (p, attempt)
-      if !watching then
-        watching = true
-        val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
-        cm.registerDefaultNetworkCallback(new android.net.ConnectivityManager.NetworkCallback:
-          override def onAvailable(n: android.net.Network): Unit = retryNow())
-    }
-    val delay = math.min(300_000L, 5_000L << math.min(attempt, 6))
-    timer.schedule((() => retry(name)): Runnable, delay, java.util.concurrent.TimeUnit.MILLISECONDS)
+  /** `owner` no longer shows an online style (left the screen, gone): no fetch or retry for it. */
+  def forget(owner: AnyRef): Unit = refetch.forgetWhere(_.owner eq owner)
 
-  private def retryNow(): Unit = synchronized(waiting.keys.toSeq).foreach(retry)
-
-  private def retry(name: String): Unit =
-    synchronized(waiting.remove(name)).foreach { (p, attempt) =>
-      if Settings.gate.valid(p) then fetch(name, p, attempt + 1)
-    }
-
-  private def fetch(name: String, p: Permit, attempt: Int = 0): Unit =
-    if synchronized(fetching.add(name)) then
-      net.execute { () =>
-        try
-          val ua = Seq("User-Agent" -> s"ashidori/${_root_.net.sksat.ashidori.BuildInfo.versionName} (Android)")
-          val style = Net.outbound.small(p, s"https://tiles.openfreemap.org/styles/$name", ua).getOrElse(throw java.io.IOException("style"))
-          val urls = ujson.read(style)("sources").obj.values.flatMap(_.obj.get("url").flatMap(_.strOpt)).filter(_.startsWith("http")).toSeq.distinct
-          val tj = urls.map(u => u -> ujson.Str(Net.outbound.small(p, u, ua).getOrElse(throw java.io.IOException("tilejson"))))
-          dir.mkdirs()
-          val tmp = java.io.File(dir, s"$name.json.tmp")
-          java.nio.file.Files.writeString(tmp.toPath, ujson.write(ujson.Obj("style" -> style, "tilejson" -> ujson.Obj.from(tj))))
-          tmp.renameTo(file(name))
-          synchronized(waiting -= name)
-          AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
-        catch
-          // Not allowed (any more): no retry under this permit.
-          case e: (Outbound.Blocked | Outbound.Refused) => Log.w(s"online style $name: ${e.getMessage}")
-          case e: Exception =>
-            Log.w(s"online style $name (attempt ${attempt + 1}): ${e.getMessage}")
-            retryLater(name, p, attempt)
-        finally synchronized(fetching -= name)
-      }
+  /** One fetch of `name` for the first of `wanted` still allowed, checked again before each request. */
+  private def fetch(name: String, wanted: Seq[Wanted]): Boolean =
+    def who = wanted.find(allowed).getOrElse(throw Outbound.Blocked(s"style $name: no map wants it any more"))
+    try
+      val ua = Seq("User-Agent" -> s"ashidori/${_root_.net.sksat.ashidori.BuildInfo.versionName} (Android)")
+      val style = Net.outbound.small(who.permit, s"https://tiles.openfreemap.org/styles/$name", ua).getOrElse(throw java.io.IOException("style"))
+      val urls = ujson.read(style)("sources").obj.values.flatMap(_.obj.get("url").flatMap(_.strOpt)).filter(_.startsWith("http")).toSeq.distinct
+      val tj = urls.map(u => u -> ujson.Str(Net.outbound.small(who.permit, u, ua).getOrElse(throw java.io.IOException("tilejson"))))
+      dir.mkdirs()
+      val tmp = java.io.File(dir, s"$name.json.tmp")
+      java.nio.file.Files.writeString(tmp.toPath, ujson.write(ujson.Obj("style" -> style, "tilejson" -> ujson.Obj.from(tj))))
+      tmp.renameTo(file(name))
+      AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
+      true
+    catch case e: Exception =>
+      Log.w(s"online style $name: ${e.getMessage}")
+      Net.log(s"style fetch failed name=$name reason=${e.getClass.getSimpleName}")
+      false

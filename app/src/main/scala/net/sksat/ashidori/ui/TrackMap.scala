@@ -282,7 +282,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       case Some(p) => Settings.gate.grant(this, p)
       // Without the grant its on-action requests are refused ([[MapGuard]]);
       // an automatic map keeps its registration.
-      case None => Settings.gate.revoke(this)
+      case None =>
+        Settings.gate.revoke(this)
+        // Off screen: no retry of a style fetch for it either.
+        if !active then OnlineStyles.forget(this)
     if !active then
       refreshBaseMap()
       MapStyle.applyNetworkPolicy(act)
@@ -773,6 +776,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       stop()
       snapshotters.foreach { s => s.cancel(); MapStyle.untrack(s) }
       Dest.Tiles.foreach(d => Net.guard.release(s"thumb:${d.key}", dialog))
+      OnlineStyles.forget(dialog)
     }
     val head = Ui.vbox(Ui.text("地図の種類", 20f, bold = true))
     dialog.setContentView(Ui.scroll(Ui.padded(Ui.vbox(head, Ui.spacer(8), grid), 14, 12)))
@@ -979,6 +983,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     // The grant ends with the view; the surface's consent stays.
     Settings.gate.revoke(this)
     Net.guard.release(surface, this)
+    OnlineStyles.forget(this)
     stopStyles()
     TrackMap.all -= this
     // A closed detailed view no longer allows the network.

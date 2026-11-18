@@ -178,6 +178,13 @@ final class MapGuard(gate: SendGate, tokens: TokenTable, urlType: Dest => Option
     */
   def recheck(k: TokenKey, url: String): MapGuard.Verdict = verify(k, url)
 
+  /** `owner` still renders for `holder` under `p`, which is valid, and on
+    * action its view holds the grant: what a retry on its behalf needs.
+    */
+  def allows(holder: String, owner: AnyRef, p: Permit): Boolean =
+    this.synchronized(held.get((holder, p.dest))).exists(h => h.permit == p && h.owners.contains(owner)) &&
+      gate.valid(p) && (p.mode == Mode.Auto || gate.granted(owner).contains(p))
+
   /** Hosts the map library may look up now: those of the destinations' URLs. */
   def hosts: Set[String] = Dest.Tiles.flatMap(d => urlType(d).toSeq.flatMap(_.hosts))
 
