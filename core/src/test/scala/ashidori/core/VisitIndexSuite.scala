@@ -31,19 +31,36 @@ class VisitIndexSuite extends munit.FunSuite:
     def putStays(d: Long, ss: Seq[(Visit, Seq[Long])]): Unit = stays(d) = ss.toVector
     def removeStays(from: Long, to: Long): Unit =
       for (d, ss) <- stays do stays(d) = ss.filterNot((v, _) => v.start < to && v.end > from)
-    def candidates(cells: Seq[Long]): Vector[(Long, Visit)] =
-      stays.toVector.flatMap((d, ss) => ss.collect { case (v, cs) if cs.exists(cells.contains) => (d, v) })
+    var pagesRead = 0
+    def candidateDays(cells: Seq[Long], before: Long, limit: Int): Vector[Long] =
+      pagesRead += 1
+      stays.toVector.collect { case (d, ss) if d < before && ss.exists((_, cs) => cs.exists(cells.contains)) => d }
+        .sorted.reverse.take(limit)
+    def candidates(cells: Seq[Long], days: Seq[Long]): Vector[(Long, Visit)] =
+      stays.toVector.filter((d, _) => days.contains(d))
+        .flatMap((d, ss) => ss.collect { case (v, cs) if cs.exists(cells.contains) => (d, v) })
     def clear(): Unit = { meta.clear(); dayStates.clear(); stays.clear() }
 
-  /** A record: stays per day, marks moved by hand, changes as given. */
+  /** A record: stays per day; position rows (rowid -> time) in "SQLite"
+    * until archived; deleted ranges in sequence.
+    */
   class FakeSource(var first: Option[LocalDate]) extends Source:
     val stays = mutable.Map.empty[LocalDate, Vector[Visit]]
-    var now = Marks(0, 0, 0)
-    var pendingChanges = Changes(Set.empty, Seq.empty)
+    val rows = mutable.Map.empty[Long, Long]
+    var high = 0L
+    val deletions = mutable.ArrayBuffer.empty[(Long, Long)]
+    /** Marks as if of another record. */
+    var forced: Option[Marks] = None
     val reads = mutable.ArrayBuffer.empty[LocalDate]
     var failing = Set.empty[LocalDate]
-    def marks(): Marks = now
-    def changes(from: Marks, to: Marks): Changes = pendingChanges
+    var changesRead = 0
+    def marks(): Marks = forced.getOrElse(Marks(high, 0, deletions.size))
+    def changes(from: Marks, to: Marks): Changes =
+      changesRead += 1
+      Changes(rows.collect { case (id, t) if id > from.fixes && id <= to.fixes => t / H }.toSet,
+        deletions.slice(from.deletions.toInt, to.deletions.toInt).toSeq)
+    /** Archiving moves the rows of `d` out of "SQLite". */
+    def archive(d: LocalDate): Unit = rows.filterInPlace((_, t) => t < startOf(d) || t >= startOf(d.plusDays(1)))
     def firstDay(): Option[LocalDate] = first
     def stays(day: LocalDate): Vector[Visit] =
       reads += day
@@ -51,8 +68,10 @@ class VisitIndexSuite extends munit.FunSuite:
       stays.getOrElse(day, Vector.empty)
     /** New rows at `times` (and deleted ranges): the marks move on. */
     def add(times: Seq[Long], deleted: Seq[(Long, Long)] = Nil): Unit =
-      now = now.copy(fixes = now.fixes + times.size, deletions = now.deletions + deleted.size)
-      pendingChanges = Changes(times.map(_ / H).toSet, deleted)
+      for t <- times do
+        high += 1
+        rows(high) = t
+      deletions ++= deleted
 
   private def fixture(days: Int = 10) =
     val src = FakeSource(Some(today.minusDays(days - 1)))
@@ -257,10 +276,14 @@ class VisitIndexSuite extends munit.FunSuite:
     build(store, src, zone, today, maxDays = 100)
     assertEquals(query(store, venue).size, 1)
     // The record went back (another database): emptied.
-    src.now = Marks(0, 0, 0)
+    src.forced = Some(Marks(0, 0, 0))
     note(store, src, zone)
     assertEquals(query(store, venue), Vector.empty)
     assertEquals(unbuilt(store, today.minusDays(2), today), 3)
+    build(store, src, zone, today, maxDays = 100)
+    assertEquals(query(store, venue).size, 1)
+    src.forced = None
+    note(store, src, zone)
     build(store, src, zone, today, maxDays = 100)
     assertEquals(query(store, venue).size, 1)
     note(store, src, ZoneId.of("UTC"))
@@ -279,4 +302,90 @@ class VisitIndexSuite extends munit.FunSuite:
     val src = FakeSource(None)
     assertEquals(build(store, src, zone, today, maxDays = 10), Run(1, Vector.empty, 0))
     assertEquals(pending(store, today.plusDays(1), today), Vector.empty)
+  }
+
+  // --- review: no permanent misses, bounded steps, the cap, paging --------------------------
+
+  test("a row added after the marks were read and archived before it is read: its days are built again") {
+    val (store, src) = fixture(10)
+    build(store, src, zone, today, maxDays = 100)
+    val d = today.minusDays(4)
+    // Without the mark before archiving the day is missed: the hazard.
+    src.add(Seq(startOf(d) + 13 * H))
+    src.archive(d)
+    assertEquals(note(store, src, zone), Set.empty[Long])
+    assertEquals(pending(store, today.minusDays(9), today), Vector.empty)
+    // Archiving marks the day and its neighbours first: the row is never needed.
+    src.add(Seq(startOf(d) + 13 * H))
+    archiving(store, d)
+    src.archive(d)
+    note(store, src, zone)
+    assertEquals(pending(store, today.minusDays(9), today), Vector(d.plusDays(1), d, d.minusDays(1)))
+    src.stays(d) = Vector(stay(d, venue, 13, 1))
+    build(store, src, zone, today, maxDays = 100)
+    assertEquals(query(store, venue).map(_.day), Vector(d))
+  }
+
+  test("the marks are read in bounded steps, each its own transaction, until stopped; then resumed") {
+    val (store, src) = fixture(10)
+    build(store, src, zone, today, maxDays = 100)
+    val d = today.minusDays(6)
+    src.add(Seq.fill((NoteStep * 2 + 5).toInt)(startOf(d) + 13 * H))
+    src.changesRead = 0
+    var steps = 0
+    note(store, src, zone, stop = () => { steps += 1; steps > 1 })
+    assertEquals(src.changesRead, 1)
+    assertEquals(store.meta.get("fixes"), Some(NoteStep.toString))
+    assertEquals(note(store, src, zone), Set(d.toEpochDay, d.plusDays(1).toEpochDay))
+    assertEquals(src.changesRead, 3)
+    assertEquals(store.meta.get("fixes"), Some((NoteStep * 2 + 5).toString))
+  }
+
+  test("a 2.5 km radius: registration and the list use the same 2 km reach") {
+    val d = today
+    val wide = stay(d, venue, 9, 1, radius = 2_500)
+    val (store, src) = fixture(1)
+    src.stays(d) = Vector(wide)
+    build(store, src, zone, today, maxDays = 1)
+    val in = north(venue, 1_950)
+    val out = north(venue, 2_200)
+    assertEquals(query(store, in).map(_.day), Vector(d))
+    assertEquals(refine(in, Seq(d -> wide)).map(_.day), Vector(d))
+    assertEquals(query(store, out), Vector.empty)
+    assertEquals(refine(out, Seq(d -> wide)), Vector.empty)
+    // The check-in's own test is not capped (a different question).
+    assert(VenueCheckIn.near(out, wide))
+  }
+
+  test("near a pole the cut registration and the list agree with brute force") {
+    val rnd = scala.util.Random(11)
+    val base = LatLng(89.8, 30)
+    val stays = (0 until 200).map { i =>
+      val p = east(north(base, rnd.between(-3000.0, 3000.0)), rnd.between(-3000.0, 3000.0))
+      (LocalDate.ofEpochDay(20_000L + i % 50), Visit(i * H, i * H + H, p.lat.min(89.999), p.lon, rnd.between(5.0, 2_500.0), 10))
+    }
+    val keyed = stays.map((d, v) => (d, v, cellsOf(v).map(_.key).toSet))
+    for _ <- 0 until 100 do
+      val q = east(north(base, rnd.between(-3000.0, 3000.0)), rnd.between(-3000.0, 3000.0))
+      val ven = LatLng(q.lat.min(89.999), q.lon)
+      val cells = neighbourhood(cellOf(ven)).map(_.key).toSet
+      assertEquals(refine(ven, keyed.filter((_, _, cs) => cs.exists(cells)).map((d, v, _) => (d, v)), Int.MaxValue),
+        refine(ven, stays, Int.MaxValue))
+  }
+
+  test("the query reads candidate days newest first, a page at a time, and stops at 50") {
+    val (store, src) = fixture(400)
+    for i <- 0 until 400 do
+      val d = today.minusDays(i)
+      // Every day a stay nearby (a candidate); every other day one at the venue.
+      src.stays(d) = Vector(stay(d, north(venue, 200), 8, 1)) ++
+        (if i % 2 == 0 then Vector(stay(d, venue, 12, 1)) else Vector.empty)
+    build(store, src, zone, today, maxDays = 1_000)
+    store.pagesRead = 0
+    val r = query(store, venue)
+    assertEquals(r.size, 50)
+    assertEquals(r.head.day, today)
+    assertEquals(r.last.day, today.minusDays(98))
+    // 50 days found among the first 99 candidates: two pages of 64, not all 400 days.
+    assertEquals(store.pagesRead, 2)
   }

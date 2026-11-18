@@ -8,11 +8,12 @@ import java.time.{Instant, LocalDate, ZoneId}
   *
   * Content: for each local day, its stays ([[Visit]]: centre, radius,
   * times) as the timeline builder makes them for the day view, and the
-  * coarse cells ([[CellDeg]] square) each stay can be "at a venue" in
-  * ([[VenueCheckIn.near]]): every cell the box of its centre ± its reach
-  * ([[reach]]) touches. A venue's days are then the stays registered in the
-  * venue's cell and its neighbours, refined by the exact distance
-  * ([[refine]]).
+  * coarse cells ([[CellDeg]] square) each stay can be at a venue in: every
+  * cell the box of its centre ± its reach ([[reach]]) touches. A venue's
+  * days are then the stays registered in the venue's cell and its
+  * neighbours, refined by [[at]] (the same reach, and the cells as
+  * registered), read newest first a page of days at a time until
+  * [[MaxDays]] are found ([[query]]).
   *
   * Freshness: the index remembers how far it has read the record
   * ([[Marks]]: the largest rowid of positions and motion, and the deletion
@@ -20,7 +21,10 @@ import java.time.{Instant, LocalDate, ZoneId}
   * mark the days they can change ([[MarginMs]] on both sides, as a day is
   * built with that context) as changed: a generation ([[DayState.want]])
   * that the stored stays ([[DayState.built]]) no longer match. A deleted
-  * range also removes the stays it overlaps at once. Today is marked
+  * range also removes the stays it overlaps at once. The marks are read in
+  * bounded steps ([[note]]). Rows moved out of SQLite before they are read
+  * there would be missed: so before archiving moves a day's rows, that day
+  * and its neighbours are marked changed ([[archiving]]). Today is marked
   * changed whenever the list is opened ([[touch]]). Days are built newest
   * first ([[pending]]), changed days before never-built ones, a bounded
   * number per run ([[build]]); a day's stays are stored only if no change
@@ -33,6 +37,10 @@ object VisitIndex:
   val MaxReachM = 2_000.0
   /** Days listed at most. */
   val MaxDays = 50
+  /** Candidate days read at a time by [[query]]. */
+  val QueryPage = 64
+  /** Rowids of each table read per step of [[note]] (each step one short transaction). */
+  val NoteStep = 20_000L
   /** Context read on both sides of a day to build it (as the day view's). */
   val MarginMs: Long = 12 * 3_600_000L
   /** The layout and derivation of the stored index: another value empties it. */
@@ -59,7 +67,11 @@ object VisitIndex:
     (for dy <- -1 to 1; dx <- -1 to 1 if c.y + dy >= 0 && c.y + dy < Rows
     yield Cell(c.y + dy, Math.floorMod(c.x + dx, Cols))).toVector.distinct
 
-  /** How far from its centre a venue may be for the stay to be at it ([[VenueCheckIn.near]]), capped at [[MaxReachM]]. */
+  /** How far from its centre a venue may be for the stay to be at it: as
+    * [[VenueCheckIn.near]] (150 m, or its radius if larger), capped at
+    * [[MaxReachM]]. The list uses the cap too ([[at]]): a stay of a larger
+    * radius is at the venues within 2 km of its centre, not farther.
+    */
   def reach(v: Visit): Double = math.min(math.max(VenueCheckIn.StayM, v.radius), MaxReachM)
 
   /** The cells a stay is registered in: every cell the box of its centre ±
@@ -88,9 +100,16 @@ object VisitIndex:
     def end: Long = stays.last.end
     def durationMs: Long = stays.map(_.durationMs).sum
 
-  /** The days of `rows` (day, stay) with a stay at `venue`, newest first, at most `max`. */
+  /** The stay is at the venue for the list: its centre within [[reach]],
+    * and the venue's cell one the stay is registered in (the same thing but
+    * near a pole, where [[cellsOf]] is cut: the list and the index agree).
+    */
+  def at(venue: LatLng, v: Visit): Boolean =
+    v.latLng.distanceTo(venue) <= reach(v) && cellsOf(v).contains(cellOf(venue))
+
+  /** The days of `rows` (day, stay) with a stay at `venue` ([[at]]), newest first, at most `max`. */
   def refine(venue: LatLng, rows: Seq[(LocalDate, Visit)], max: Int = MaxDays): Vector[DayVisit] =
-    rows.filter((_, v) => VenueCheckIn.near(venue, v)).distinct.groupBy(_._1).toVector
+    rows.filter((_, v) => at(venue, v)).distinct.groupBy(_._1).toVector
       .sortBy((d, _) => -d.toEpochDay).take(max)
       .map((d, vs) => DayVisit(d, vs.map(_._2).sortBy(_.start).toVector))
 
@@ -130,8 +149,10 @@ object VisitIndex:
     def putStays(d: Long, stays: Seq[(Visit, Seq[Long])]): Unit
     /** Removes the stays that overlap [from, to). */
     def removeStays(from: Long, to: Long): Unit
-    /** The stays registered in any of `cells`, each once, with its day. */
-    def candidates(cells: Seq[Long]): Vector[(Long, Visit)]
+    /** The newest `limit` days before `before` with a stay registered in any of `cells`, newest first. */
+    def candidateDays(cells: Seq[Long], before: Long, limit: Int): Vector[Long]
+    /** The stays of `days` registered in any of `cells`, each once, with its day. */
+    def candidates(cells: Seq[Long], days: Seq[Long]): Vector[(Long, Visit)]
     /** Empties the index: stays, cells, days and meta (not the generation). */
     def clear(): Unit
 
@@ -178,36 +199,65 @@ object VisitIndex:
       for d <- days do store.setDay(d, DayState(g, store.day(d).flatMap(_.built)))
     days
 
-  /** Brings the index up to the record's marks ([[mark]]). An index of
-    * another [[Version]] or zone, or one whose marks are ahead of the record
-    * (not this record: restored, or the data cleared), is emptied first.
-    * Returns the days marked.
+  /** Brings the index up to the record's marks ([[mark]]), [[NoteStep]]
+    * rowids of each table per step, each step one short transaction, until
+    * `stop`. An index of another [[Version]] or zone, or one whose marks are
+    * ahead of the record (not this record: restored, or the data cleared),
+    * is emptied first. Returns the days marked; the marks are up to date
+    * unless stopped.
     */
-  def note(store: Store, source: Source, zone: ZoneId): Set[Long] =
-    store.transaction {
-      val now = source.marks()
-      val mine = marksOf(store).filter(_ =>
-        store.meta("version").contains(Version.toString) && store.meta("zone").contains(zone.getId))
-      mine match
-        case Some(m) if !now.behind(m) =>
-          if m == now then Set.empty
-          else
-            val days = mark(store, source.changes(m, now), zone)
-            setMarks(store, now)
-            days
+  def note(store: Store, source: Source, zone: ZoneId, stop: () => Boolean = () => false): Set[Long] =
+    def current: Option[Marks] =
+      marksOf(store).filter(_ => store.meta("version").contains(Version.toString) && store.meta("zone").contains(zone.getId))
+    // The record's marks read under the index's write lock: marks another
+    // process stored before are never ahead of them (rowids only grow).
+    var now: Marks = null
+    val ok = store.transaction {
+      now = source.marks()
+      current match
+        case Some(m) if !now.behind(m) => true
         case _ =>
           store.clear()
           store.setMeta("version", Version.toString)
           store.setMeta("zone", zone.getId)
           setMarks(store, now)
-          Set.empty
+          false
+    }
+    var days = Set.empty[Long]
+    var go = ok
+    while go && !stop() do
+      // Read again in each step: the other process may have moved them on.
+      go = store.transaction {
+        current match
+          case Some(m) if m.fixes < now.fixes || m.motion < now.motion || m.deletions < now.deletions =>
+            val next = Marks(math.min(now.fixes, m.fixes + NoteStep), math.min(now.motion, m.motion + NoteStep),
+              math.max(m.deletions, now.deletions))
+            days ++= mark(store, source.changes(m, next), zone)
+            setMarks(store, next)
+            true
+          case _ => false
+      }
+    days
+
+  /** Marks `days` changed (those with a state), in one transaction. */
+  def touchDays(store: Store, days: Seq[LocalDate]): Unit =
+    store.transaction {
+      val states = days.flatMap(d => store.day(d.toEpochDay).map(d.toEpochDay -> _))
+      if states.nonEmpty then
+        val g = store.nextGen()
+        for (d, s) <- states do store.setDay(d, DayState(g, s.built))
     }
 
   /** Today is built again whenever asked for: marked changed (if built). */
-  def touch(store: Store, today: LocalDate): Unit =
-    store.transaction {
-      store.day(today.toEpochDay).foreach(s => store.setDay(today.toEpochDay, DayState(store.nextGen(), s.built)))
-    }
+  def touch(store: Store, today: LocalDate): Unit = touchDays(store, Seq(today))
+
+  /** Before archiving moves rows of `day` out of SQLite: that day and the
+    * days whose build reads it ([[MarginMs]]) are marked changed. Rows the
+    * marks have not read yet would otherwise leave SQLite unseen; this may
+    * mark days that did not change (built again once), never miss one.
+    */
+  def archiving(store: Store, day: LocalDate): Unit =
+    touchDays(store, Seq(day.minusDays(1), day, day.plusDays(1)))
 
   /** Days to build, newest first: changed days first, then never-built ones. */
   def pending(store: Store, first: LocalDate, today: LocalDate): Vector[LocalDate] =
@@ -236,7 +286,7 @@ object VisitIndex:
     */
   def build(store: Store, source: Source, zone: ZoneId, today: LocalDate, maxDays: Int,
             stop: () => Boolean = () => false, skip: Set[LocalDate] = Set.empty): Run =
-    note(store, source, zone)
+    note(store, source, zone, stop)
     val first = source.firstDay().getOrElse(today)
     val todo = pending(store, first, today).filterNot(skip)
     var built = 0
@@ -262,7 +312,23 @@ object VisitIndex:
         case None => failed += d
     Run(built, failed.result(), pending(store, first, today).size)
 
-  /** The days with a stay at `venue` that the index holds, newest first, at most `max`. */
+  /** The days with a stay at `venue` that the index holds, newest first, at
+    * most `max`: candidate days read newest first, [[QueryPage]] at a time,
+    * until `max` are found (the cost does not grow with the years kept).
+    */
   def query(store: Store, venue: LatLng, max: Int = MaxDays): Vector[DayVisit] =
-    val rows = store.candidates(neighbourhood(cellOf(venue)).map(_.key))
-    refine(venue, rows.map((d, v) => (LocalDate.ofEpochDay(d), v)), max)
+    val cells = neighbourhood(cellOf(venue)).map(_.key)
+    val out = Vector.newBuilder[DayVisit]
+    var found = 0
+    var before = Long.MaxValue
+    var more = true
+    while more && found < max do
+      val days = store.candidateDays(cells, before, QueryPage)
+      if days.isEmpty then more = false
+      else
+        val page = refine(venue, store.candidates(cells, days).map((d, v) => (LocalDate.ofEpochDay(d), v)), max - found)
+        out ++= page
+        found += page.size
+        before = days.min
+        more = days.size == QueryPage
+    out.result()
