@@ -20,7 +20,7 @@ final case class DayTimeline(
 
 /** Builds timelines from stored raw signals. Must run off the main thread. */
 object TimelineRepo:
-  private val Margin = 12 * 3_600_000L
+  private val Margin = VisitIndex.MarginMs
   /** Finished days do not change unless the user edits something. */
   private val cache = java.util.concurrent.ConcurrentHashMap[LocalDate, DayTimeline]()
 
@@ -38,7 +38,12 @@ object TimelineRepo:
       }
     else compute(date)
 
-  private def compute(date: LocalDate): DayTimeline =
+  /** The timeline around `date` as built from the record (with [[Margin]]
+    * of context on both sides), before places are linked: what the day
+    * view shows of it and the stays of the 「訪れた日」 index
+    * ([[VisitDays]]) come from this one build. Reads only.
+    */
+  def built(date: LocalDate): Vector[Segment] =
     val zone = AshidoriApp.zone
     val db = AshidoriApp.db
     val dayStart = date.atStartOfDay(zone).toInstant.toEpochMilli
@@ -54,7 +59,18 @@ object TimelineRepo:
     val motion = db.motion(dayStart - Margin, dayEnd + Margin)
     // Corrections are applied while building: before adjacent legs of the
     // same mode are merged, so each keeps the span it was saved for.
-    val built = TimelineBuilder.build(fixes, motion, overrides = db.modeOverrides(dayStart - Margin, dayEnd + Margin))
+    TimelineBuilder.build(fixes, motion, overrides = db.modeOverrides(dayStart - Margin, dayEnd + Margin))
+
+  /** The stays of `date` as the day view shows them (cut at midnight). */
+  def stays(date: LocalDate): Vector[Visit] =
+    Stats.shown(Stats.splitByDay(built(date), AshidoriApp.zone).getOrElse(date, Vector.empty)).collect { case v: Visit => v }
+
+  private def compute(date: LocalDate): DayTimeline =
+    val zone = AshidoriApp.zone
+    val db = AshidoriApp.db
+    val dayStart = date.atStartOfDay(zone).toInstant.toEpochMilli
+    val dayEnd = date.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
+    val built = this.built(date)
 
     // Link visits to places, persisting newly discovered ones.
     val known = db.places()

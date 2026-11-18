@@ -237,3 +237,53 @@ object DebugData:
     progress = s"完了 $n 行"
     Log.i(s"synthetic raw lines: $n for $day")
     n
+
+  /** 「訪れた日」 checks (DebugReceiver VISITS): `reset` deletes the index; `rebuild` deletes it
+    * and builds every day, timed; `check` times the index's answer for each
+    * of `at` and compares it with every day of the record built and
+    * filtered (the scan the index replaces).
+    */
+  def visits(op: String, at: Seq[ashidori.core.LatLng]): Unit =
+    import ashidori.core.*
+    def ms(t0: Long) = (System.nanoTime() - t0) / 1e6
+    op match
+      case "reset" =>
+        VisitDays.reset()
+        Log.i("visits bench: reset")
+      case "rebuild" =>
+        VisitDays.reset()
+        val t0 = System.nanoTime()
+        var days = 0
+        var go = true
+        while go do
+          VisitDays.run(Int.MaxValue, () => false) match
+            case Some(r) =>
+              days += r.built
+              go = r.built > 0 && r.left > r.failed.size
+            case None => go = false
+        val size = VisitDays.file(AshidoriApp.app).length
+        Log.i(f"visits bench: built $days days in ${ms(t0)}%.0f ms, index file $size bytes")
+      case _ =>
+        VisitDays.opened()
+        val today = java.time.LocalDate.now(AshidoriApp.zone)
+        val first = AshidoriApp.db.firstDataDate().getOrElse(today)
+        val t0 = System.nanoTime()
+        val all = Iterator.iterate(today)(_.minusDays(1)).takeWhile(!_.isBefore(first))
+          .flatMap(d => TimelineRepo.stays(d).map(d -> _)).toVector
+        Log.i(f"visits bench: brute force built ${today.toEpochDay - first.toEpochDay + 1} days in ${ms(t0)}%.0f ms")
+        while VisitDays.run(Int.MaxValue, () => false).exists(r => r.built > 0 && r.left > r.failed.size) do ()
+        for v <- at do
+          val times = (0 until 5).map { _ =>
+            val t = System.nanoTime()
+            val a = VisitDays.query(v)
+            (ms(t), a)
+          }
+          val got = times.last._2.map(_.days).getOrElse(Vector.empty)
+          val want = VisitIndex.refine(v, all)
+          // The index keeps a stay's times, centre and radius (not its fix count).
+          def key(ds: Seq[VisitIndex.DayVisit]) = ds.map(d => d.day -> d.stays.map(s => (s.start, s.end, s.lat, s.lon, s.radius)))
+          val same = key(got) == key(want)
+          def show(ds: Seq[VisitIndex.DayVisit]) = ds.map(d => s"${d.day}x${d.stays.size}").mkString(" ")
+          Log.i(f"visits bench: ${v.lat}%.4f,${v.lon}%.4f: ${got.size} days, query ${times.map(x => f"${x._1}%.1f").mkString("/")} ms, " +
+            s"brute force ${want.size} days, ${if same then "same" else "DIFFERENT"}: ${show(got)}" +
+            (if same then "" else s" | want ${show(want)}"))

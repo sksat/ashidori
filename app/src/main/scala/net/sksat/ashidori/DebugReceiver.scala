@@ -49,6 +49,10 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
   *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
   *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
+  *   ... -a ashidori.debug.VISITS --es op rebuild     「訪れた日」: the index deleted and built whole (timed);
+  *                                                    `--es op reset`: only deleted
+  *   ... -a ashidori.debug.VISITS --es op check --es at "35.63,139.79;35.68,139.76"  the index's answer for
+  *                                                    each venue (timed) against every day built and filtered
   *
   * A commit that recovery cannot finish: create `files/maintenance/stuck-delete-tmp`
   * (or `stuck-corrupt-tmp`) with run-as, then archive (see ArchiveStore.debugBreakRest).
@@ -263,6 +267,11 @@ class DebugReceiver extends BroadcastReceiver:
         val dl = if intent.getStringExtra("kind") == "venues" then VenueDownload else BasemapDownload
         dl.start(c, allowMetered = true)
         Log.i(s"data start ${dl.WorkName} allowed=${dl.allowed}")
+      case "ashidori.debug.VISITS" =>
+        val op = Option(intent.getStringExtra("op")).getOrElse("check")
+        val at = Option(intent.getStringExtra("at")).toSeq.flatMap(_.split(";")).flatMap(s =>
+          scala.util.Try { val Array(a, b) = s.split(",").map(_.trim.toDouble); ashidori.core.LatLng(a, b) }.toOption)
+        VisitDays.exec.execute(() => DebugData.visits(op, at))
       case other => Log.w(s"debug receiver: unknown action $other")
 
 /** Debug builds only (declared in the debug manifest, in the `:maintenance`

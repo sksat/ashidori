@@ -201,7 +201,8 @@ final class TimelineScreen(act: MainActivity, saved: Bundle, spans: Seq[Span] = 
     () => VenueCard.Context(selectedStay, current.toSeq.flatMap(_.segments.collect { case v: Visit => v }),
       current.exists(_.date == LocalDate.now(AshidoriApp.zone))),
     onClose = () => { map.pickVenue(None); liftFab() },
-    onChanged = () => load())
+    onChanged = () => load(),
+    openDay = d => act.openDay(d))
   map.onVenue = {
     case Some(p) =>
       venueCard.show(p)

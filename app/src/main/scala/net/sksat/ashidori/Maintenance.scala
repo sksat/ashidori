@@ -253,6 +253,9 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
+      // The 「訪れた日」 index notes new rows before archiving moves them out
+      // of SQLite (derived data: a failure is logged and changes nothing here).
+      VisitDays.noteBeforeArchiving()
       // A commit a crash interrupted is resolved first; one waiting for the
       // user stops the run (said so in the progress line).
       try archive.recover(db, progress = l => Progress.set(l))
@@ -325,6 +328,9 @@ object Maintenance:
           case NonFatal(e) => Log.w("monthly merge failed", e)
       if halt() then left = true
       Progress.set(if left then "中断（続きは次回）" else "完了", running = false)
+      // Then a bounded run of the 「訪れた日」 index (fewer days on battery).
+      // Never a reason to run again: it is built while its list is open too.
+      if !halt() then VisitDays.maintain(charging, halt)
       left
     finally running.set(false)
 

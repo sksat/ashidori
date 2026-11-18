@@ -39,8 +39,15 @@ class DbOpenSuite extends munit.FunSuite:
     assert(opens.nonEmpty)
     for (p, c) <- opens do assert(c.contains("KeepOnCorruption"), s"$p: $c")
     val helpers = src.flatMap((p, t) => calls(t, "extends SQLiteOpenHelper(").map(p -> _))
-    assertEquals(helpers.size, 1)
-    for (p, c) <- helpers do assert(c.contains("KeepOnCorruption"), s"$p: $c")
+    // The record's database, and the 「訪れた日」 index: derived data in its
+    // own file, which is deleted and made again when corrupt (and only that).
+    assertEquals(helpers.size, 2)
+    val (derived, record) = helpers.partition((p, _) => p.getFileName.toString == "VisitDays.scala")
+    assertEquals(record.size, 1)
+    for (p, c) <- record do assert(c.contains("KeepOnCorruption"), s"$p: $c")
+    for (p, c) <- derived do assert(c.contains("DerivedDeleteOnCorruption") && c.contains("file(c)"), s"$p: $c")
+    val visitDays = src.collectFirst { case (p, t) if p.getFileName.toString == "VisitDays.scala" => t }.get
+    assert(visitDays.contains("File(c.getNoBackupFilesDir, \"visit_index.db\")"))
     // The open parameters (which replace the constructor's) set it again.
     val params = src.flatMap((_, t) => calls(t, "setOpenParams("))
     assert(params.nonEmpty && params.forall(_.contains("setErrorHandler(Db.KeepOnCorruption)")), params.toString)

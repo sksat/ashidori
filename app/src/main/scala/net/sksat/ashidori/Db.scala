@@ -372,6 +372,24 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** The deletion sequence now: the largest `deleted_range` rowid (0: none). */
   def deletionSeq(): Long = query("SELECT COALESCE(MAX(rowid), 0) FROM deleted_range")(_.getLong(0)).head
 
+  // --- for the 「訪れた日」 index (VisitDays; reads only) ----------------------------
+
+  /** The largest rowid given in an archived table so far ([[claimRowids]]:
+    * rowids only grow, so a row with a larger one was added since).
+    */
+  def rowidHigh(table: String): Long = query(ArchiveSql.nextRowid(table))(_.getLong(0)).head - 1
+
+  /** The hours (time / 3,600,000) of the rows of an archived table with a
+    * rowid in (after, upTo]: what was added between two [[rowidHigh]].
+    */
+  def hoursAdded(table: String, after: Long, upTo: Long): Set[Long] =
+    val col = Db.ArchivedTables(table)
+    query(s"SELECT DISTINCT $col/3600000 FROM $table WHERE rowid>? AND rowid<=?", after, upTo)(_.getLong(0)).toSet
+
+  /** The ranges deleted with a sequence ([[deletionSeq]]) in (after, upTo]. */
+  def deletedBetween(after: Long, upTo: Long): Vector[(Long, Long)] =
+    query("SELECT start, end FROM deleted_range WHERE rowid>? AND rowid<=?", after, upTo)(c => (c.getLong(0), c.getLong(1)))
+
   /** Deleted ranges whose rows may still be in archive files: (rowid, from, to). */
   def archiveDeletionsPending(): Vector[(Long, Long, Long)] =
     query("SELECT rowid, start, end FROM deleted_range WHERE archived_at IS NULL ORDER BY start")(c =>
