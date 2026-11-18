@@ -23,8 +23,10 @@ import java.time.{Instant, LocalDate, ZoneId}
   * that the stored stays ([[DayState.built]]) no longer match. A deleted
   * range also removes the stays it overlaps at once. The marks are read in
   * bounded steps ([[note]]). Rows moved out of SQLite before they are read
-  * there would be missed: so before archiving moves a day's rows, that day
-  * and its neighbours are marked changed ([[archiving]]). Today is marked
+  * there would be missed: so archiving marks a day and its neighbours
+  * changed ([[archiving]]) both before it moves the day's rows and again
+  * after its commit (a build in between, then a late row moved by the same
+  * commit, is followed by another build). Today is marked
   * changed whenever the list is opened ([[touch]]). Days are built newest
   * first ([[pending]]), changed days before never-built ones, a bounded
   * number per run ([[build]]); a day's stays are stored only if no change
@@ -251,10 +253,13 @@ object VisitIndex:
   /** Today is built again whenever asked for: marked changed (if built). */
   def touch(store: Store, today: LocalDate): Unit = touchDays(store, Seq(today))
 
-  /** Before archiving moves rows of `day` out of SQLite: that day and the
-    * days whose build reads it ([[MarginMs]]) are marked changed. Rows the
-    * marks have not read yet would otherwise leave SQLite unseen; this may
-    * mark days that did not change (built again once), never miss one.
+  /** Archiving moves rows of `day` out of SQLite: that day and the days
+    * whose build reads it ([[MarginMs]]) are marked changed. Rows the marks
+    * have not read yet would otherwise leave SQLite unseen. Called before
+    * the move and again after its commit: a build between the two may have
+    * read the day before a late row came and left with the same commit; the
+    * mark after it makes the day built again from what is left. It may mark
+    * days that did not change (built again once), never miss one.
     */
   def archiving(store: Store, day: LocalDate): Unit =
     touchDays(store, Seq(day.minusDays(1), day, day.plusDays(1)))
@@ -275,6 +280,33 @@ object VisitIndex:
     else
       val built = store.days(first.toEpochDay, today.toEpochDay).count(_._2.built.isDefined)
       (today.toEpochDay - first.toEpochDay + 1).toInt - built
+
+  /** Days of [first, today] not up to date: never built, or changed since built. */
+  def stale(store: Store, first: LocalDate, today: LocalDate): Int = pending(store, first, today).size
+
+  /** What the list says under its days. */
+  enum Footer:
+    /** 「以前の日は集計中」: days are being built, some never built yet. */
+    case Building
+    /** 「なし」: every day is up to date and none has a stay at the venue. */
+    case NoDays
+    /** 「読み込めません」, or 「一部の日を読み込めません」 under days shown, with 「再試行」. */
+    case Failed(someShown: Boolean)
+    case Nothing
+
+  /** The footer: `answered`, the index was read; `shown`, days listed;
+    * `unbuilt`, `stale`: days never built, and not up to date (changed
+    * since built included); `building`: runs go on; `trouble`: noting the
+    * record's changes or a run failed. A day still not up to date once the
+    * runs end could not be built: a failure, not "no days" and not the
+    * old result as if current.
+    */
+  def footer(answered: Boolean, shown: Int, unbuilt: Int, stale: Int, building: Boolean, trouble: Boolean): Footer =
+    if !answered then Footer.Failed(shown > 0)
+    else if building then (if unbuilt > 0 then Footer.Building else Footer.Nothing)
+    else if trouble || stale > 0 then Footer.Failed(shown > 0)
+    else if shown == 0 then Footer.NoDays
+    else Footer.Nothing
 
   /** A run of [[build]]: days built, days that failed to read (`failed`),
     * and days still to build after it (`left`, the failed ones included).

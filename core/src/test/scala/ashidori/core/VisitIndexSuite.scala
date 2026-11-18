@@ -389,3 +389,61 @@ class VisitIndexSuite extends munit.FunSuite:
     // 50 days found among the first 99 candidates: two pages of 64, not all 400 days.
     assertEquals(store.pagesRead, 2)
   }
+
+  // --- re-review: the mark after the commit, failures not hidden ----------------------------
+
+  test("mark, a build, a late row, the same archiving: the mark after the commit builds the day again") {
+    val (store, src) = fixture(10)
+    val d = today.minusDays(3)
+    src.stays(d) = Vector(stay(d, north(venue, 500), 9, 1))
+    build(store, src, zone, today, maxDays = 100)
+    // 1. Archiving marks the day before it moves rows.
+    archiving(store, d)
+    // 2. The other process builds the day: the mark is used up.
+    build(store, src, zone, today, maxDays = 100)
+    assertEquals(pending(store, today.minusDays(9), today), Vector.empty)
+    // 3. A late spill brings a row of the day (and the day now has a stay at the venue).
+    src.add(Seq(startOf(d) + 13 * H))
+    src.stays(d) = Vector(stay(d, north(venue, 500), 9, 1), stay(d, venue, 13, 1))
+    // 4. The same commit moves it out of SQLite before the rowid scan reads it.
+    src.archive(d)
+    assertEquals(note(store, src, zone), Set.empty[Long])
+    assertEquals(query(store, venue), Vector.empty)
+    // 5. The mark after the commit: the day is built again from the final state.
+    archiving(store, d)
+    build(store, src, zone, today, maxDays = 100)
+    assertEquals(query(store, venue).map(_.day), Vector(d))
+    assertEquals(pending(store, today.minusDays(9), today), Vector.empty)
+  }
+
+  test("a changed day that cannot be built again: not up to date, and the list says so") {
+    val (store, src) = fixture(5)
+    val d = today.minusDays(2)
+    src.stays(d) = Vector(stay(d, venue, 9, 1))
+    build(store, src, zone, today, maxDays = 100)
+    src.add(Seq(startOf(d) + 13 * H))
+    src.failing = Set(d)
+    val r = build(store, src, zone, today, maxDays = 100)
+    assertEquals(r.failed, Vector(d))
+    // Its old stays are still listed; it is never built, but not up to date.
+    assertEquals(query(store, venue).map(_.day), Vector(d))
+    assertEquals(unbuilt(store, today.minusDays(4), today), 0)
+    assertEquals(stale(store, today.minusDays(4), today), 1)
+    assertEquals(footer(answered = true, shown = 1, unbuilt = 0, stale = 1, building = false, trouble = false), Footer.Failed(true))
+    // While runs go on nothing is said yet; once up to date, nothing.
+    assertEquals(footer(answered = true, shown = 1, unbuilt = 0, stale = 1, building = true, trouble = false), Footer.Nothing)
+    src.failing = Set.empty
+    build(store, src, zone, today, maxDays = 100)
+    assertEquals(footer(answered = true, shown = 1, unbuilt = 0, stale = stale(store, today.minusDays(4), today),
+      building = false, trouble = false), Footer.Nothing)
+  }
+
+  test("the footer: building, none, a failed read or update, never 'none' for a failure") {
+    assertEquals(footer(answered = true, shown = 0, unbuilt = 5, stale = 5, building = true, trouble = false), Footer.Building)
+    assertEquals(footer(answered = true, shown = 0, unbuilt = 0, stale = 0, building = false, trouble = false), Footer.NoDays)
+    assertEquals(footer(answered = false, shown = 0, unbuilt = 0, stale = 0, building = false, trouble = false), Footer.Failed(false))
+    assertEquals(footer(answered = false, shown = 3, unbuilt = 0, stale = 0, building = true, trouble = false), Footer.Failed(true))
+    // The update of the index failed (noting the changes): not "none".
+    assertEquals(footer(answered = true, shown = 0, unbuilt = 0, stale = 0, building = false, trouble = true), Footer.Failed(false))
+    assertEquals(footer(answered = true, shown = 2, unbuilt = 0, stale = 0, building = false, trouble = false), Footer.Nothing)
+  }
