@@ -96,8 +96,8 @@ class MapGuardSuite extends munit.FunSuite:
     assert(guard.check(gsiTile(t, 15)).isInstanceOf[Pass])
     assertEquals(guard.check(gsiTile(t, 16)), Reject("zoom 16 over the level"))
     val o = guard.hold("snapshot", Object(), g.permit(Dest.Ofm, Mode.Auto).get)
-    assertEquals(guard.check(TileStyle.withToken("https://tiles.openfreemap.org/planet/v/13/1/2.pbf", o)), Reject("zoom 13 over the level"))
-    assert(guard.check(TileStyle.withToken("https://tiles.openfreemap.org/planet/v/12/1/2.pbf", o)).isInstanceOf[Pass])
+    assertEquals(guard.check(TileStyle.withToken("https://tiles.openfreemap.org/planet/v1/13/1/2.pbf", o)), Reject("zoom 13 over the level"))
+    assert(guard.check(TileStyle.withToken("https://tiles.openfreemap.org/planet/v1/12/1/2.pbf", o)).isInstanceOf[Pass])
     for u <- Seq("https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json?ashidori-t=" + o,
                  TileStyle.withToken("https://tiles.openfreemap.org/fonts/Noto%20Sans%20Regular/0-255.pbf", o)) do
       assert(guard.check(u).isInstanceOf[Pass], u)
@@ -108,11 +108,55 @@ class MapGuardSuite extends munit.FunSuite:
   test("a redirect is checked again: same destination's URLs, permit still valid, zoom in the level") {
     val (g, _, guard) = setup()
     val t = guard.hold("snapshot", Object(), g.permit(Dest.Gsi, Mode.Auto).get)
-    val Pass(_, k, p, _) = guard.check(gsiTile(t)): @unchecked
-    assert(guard.recheck(k, p, "https://cyberjapandata.gsi.go.jp/xyz/std/14/1/2.png"))
-    assert(!guard.recheck(k, p, "https://evil.example.net/xyz/std/14/1/2.png"))
+    val Pass(_, k, _, _) = guard.check(gsiTile(t)): @unchecked
+    assert(guard.recheck(k, "https://cyberjapandata.gsi.go.jp/xyz/std/14/1/2.png").isInstanceOf[Pass])
+    assertEquals(guard.recheck(k, "https://evil.example.net/xyz/std/14/1/2.png"), Reject("not a gsi URL"))
     g.setPaused(true)
-    assert(!guard.recheck(k, p, "https://cyberjapandata.gsi.go.jp/xyz/std/14/1/2.png"))
+    assertEquals(guard.recheck(k, "https://cyberjapandata.gsi.go.jp/xyz/std/14/1/2.png"), Reject("permit no longer valid"))
+  }
+
+  test("a later hop needs the holder and its grant as the first: a revoke or release after the check refuses it") {
+    val (g, _, guard) = setup(Policy.fresh)
+    val view = Object()
+    g.remember("map", GsiStd, Dest.Gsi)
+    val p = g.permit(Dest.Gsi, Mode.OnAction).get
+    g.grant(view, p)
+    val t = guard.hold("map", view, p)
+    val Pass(_, k, _, _) = guard.check(gsiTile(t)): @unchecked
+    val next = "https://cyberjapandata.gsi.go.jp/xyz/std/14/1/3.png"
+    assert(guard.recheck(k, next).isInstanceOf[Pass])
+    g.revoke(view)
+    assertEquals(guard.recheck(k, next), Reject("map not on screen"))
+    g.grant(view, p)
+    assert(guard.recheck(k, next).isInstanceOf[Pass])
+    guard.release("map", view)
+    assertEquals(guard.recheck(k, next), Reject("map holds no permit"))
+  }
+
+  test("OpenFreeMap: each kind by its own path; any other path on its host is refused") {
+    val (g, _, guard) = setup(Policy.fromBlock(false).updated(Dest.Ofm, Rule(When.Auto, Level.District)))
+    val o = guard.hold("snapshot", Object(), g.permit(Dest.Ofm, Mode.Auto).get)
+    def verdict(u: String) = guard.check(TileStyle.withToken(u, o))
+    for u <- Seq("https://tiles.openfreemap.org/planet/20261115_080022_pt/14/1/2.pbf",
+                 "https://tiles.openfreemap.org/natural_earth/ne2sr/6/1/2.png",
+                 "https://tiles.openfreemap.org/sprites/ofm_f384/ofm@2x.json",
+                 "https://tiles.openfreemap.org/sprites/ofm_f384/ofm.png",
+                 "https://tiles.openfreemap.org/fonts/Noto%20Sans%20Regular/0-255.pbf") do
+      assert(verdict(u).isInstanceOf[Pass], u)
+    for u <- Seq("https://tiles.openfreemap.org/styles/liberty", "https://tiles.openfreemap.org/planet",
+                 "https://tiles.openfreemap.org/anything/else.json", "https://tiles.openfreemap.org/planet/v/14/1/2.pbf?x=1",
+                 "http://tiles.openfreemap.org/planet/v/14/1/2.pbf") do
+      assertEquals(verdict(u), Reject("not a ofm URL"), u)
+    // Any z/x/y-like segments carry a zoom, whatever the kind.
+    assertEquals(UrlType.Ofm.classify("https://tiles.openfreemap.org/sprites/18/1/2.png"), None)
+    assertEquals(UrlType.zxy("https://t.example.net/a/18/1/2.pbf?x=1"), Some(18))
+    assertEquals(UrlType.template("https://t.example.net/x/17/1/2/{z}/{x}/{y}.png").flatMap(_.classify("https://t.example.net/x/17/1/2/12/1/2.png")),
+      Some("tile" -> Some(17)))
+    // A redirect target with a zoom over the level, of a known kind or not.
+    val Pass(_, k, _, _) = verdict("https://tiles.openfreemap.org/planet/v/14/1/2.pbf"): @unchecked
+    assertEquals(guard.recheck(k, "https://tiles.openfreemap.org/planet/v/18/1/2.pbf"), Reject("zoom 18 over the level"))
+    assertEquals(guard.recheck(k, "https://tiles.openfreemap.org/planet/v/18/1/2.pbf?x=1"), Reject("not a ofm URL"))
+    assertEquals(UrlType.Ofm.hosts, Set("tiles.openfreemap.org"))
   }
 
   test("tokens: one per key, kept across a restart, dropped with their generation") {

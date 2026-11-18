@@ -53,19 +53,29 @@ object TokenTable:
       }.toMap
     catch case _: Exception => Map.empty
 
-/** The URLs a map destination may be asked for: https (http only if the
-  * user's URL is) on `origin`; `tile` matches a tile URL with the zoom as its
-  * first group. With `tilesOnly`, nothing but tiles (raster maps); otherwise
-  * also the style's other resources on that host (sprites, fonts).
+/** One kind of resource a map destination serves (a tile, a sprite, a
+  * font range): its URLs match `pattern` as a whole. For a tile the first
+  * group is the zoom.
   */
-final case class UrlType(origin: String, tile: Regex, tilesOnly: Boolean):
-  /** None if `url` is not of this type; Some(zoom) of a tile, Some(None) another resource. */
-  def classify(url: String): Option[Option[Int]] =
-    UrlType.origin(url).filter(_ == origin).flatMap { _ =>
-      tile.unapplySeq(url: CharSequence) match
-        case Some(z :: _) => z.toIntOption.map(Some(_))
-        case _ => if tilesOnly then None else Some(None)
-    }
+final case class UrlKind(name: String, pattern: Regex, tile: Boolean)
+
+/** The URLs a map destination may be asked for, kind by kind ([[UrlKind]]);
+  * any other URL, also on the same host, is not one of them. A URL with
+  * z/x/y-like path segments carries the largest such zoom as well, so the
+  * zoom limit holds whatever kind it is taken for.
+  */
+final case class UrlType(kinds: Seq[UrlKind]):
+  /** None if `url` is not of this type; else its kind and the zoom it carries, if any. */
+  def classify(url: String): Option[(String, Option[Int])] =
+    kinds.iterator.flatMap { k =>
+      k.pattern.unapplySeq(url: CharSequence).map { groups =>
+        val z = if k.tile then groups.headOption.flatMap(_.toIntOption) else None
+        k.name -> (z.toSeq ++ UrlType.zxy(url)).maxOption
+      }
+    }.nextOption()
+
+  /** Whether `host` serves one of the kinds (for the name lookup). */
+  def hosts: Set[String] = kinds.flatMap(k => UrlType.hostOf(k.pattern.regex)).toSet
 
 object UrlType:
   /** `scheme://host[:port]`, lower case, or None (not http(s), user info, no host). */
@@ -77,31 +87,58 @@ object UrlType:
       else Some(s"${scheme.get}://${u.getHost.toLowerCase}${if u.getPort >= 0 then s":${u.getPort}" else ""}")
     catch case _: Exception => None
 
+  private val Triple = """/(\d{1,2})/(\d+)/(\d+)(?=[./?#]|$)""".r
+  /** The largest zoom of z/x/y-like path segments in `url`. */
+  def zxy(url: String): Option[Int] =
+    val path = url.takeWhile(c => c != '?' && c != '#')
+    Triple.findAllMatchIn(path).flatMap(_.group(1).toIntOption).maxOption
+
+  /** The literal host a pattern starts with (for [[UrlType.hosts]]). */
+  private[core] def hostOf(pattern: String): Option[String] =
+    val rest = pattern.stripPrefix("\\Q").dropWhile(_ != '/').drop(2)
+    val host = rest.takeWhile(c => c != '/' && c != ':').replace("\\", "")
+    Option(host).filter(h => h.nonEmpty && h.forall(c => c.isLetterOrDigit || c == '.' || c == '-'))
+
   /** The tiles of an XYZ template ({z} {x} {y}): exactly that URL with numbers in. */
   def template(t: String): Option[UrlType] =
-    origin(Seq("{z}", "{x}", "{y}").foldLeft(t)(_.replace(_, "0"))).map { o =>
+    origin(Seq("{z}", "{x}", "{y}").foldLeft(t)(_.replace(_, "0"))).map { _ =>
       val parts = java.util.regex.Pattern.quote(t).replace("{z}", "\\E(\\d+)\\Q").replace("{x}", "\\E\\d+\\Q").replace("{y}", "\\E\\d+\\Q")
-      UrlType(o, parts.r, tilesOnly = true)
+      UrlType(Seq(UrlKind("tile", parts.r, tile = true)))
     }
 
-  /** OpenFreeMap: its style's tiles, sprites and fonts on its host. */
-  val Ofm: UrlType = UrlType("https://tiles.openfreemap.org", """https://tiles\.openfreemap\.org/.*/(\d+)/\d+/\d+\.(?:pbf|mvt|png|jpg|webp)""".r, tilesOnly = false)
+  /** OpenFreeMap as its styles refer to it: vector tiles, the shaded relief
+    * raster, sprites and font ranges. Its style and TileJSON are fetched by
+    * the app ([[Outbound]]), not by the map library.
+    */
+  val Ofm: UrlType = UrlType(Seq(
+    UrlKind("tile", """https://tiles\.openfreemap\.org/planet/[0-9A-Za-z_]+/(\d{1,2})/\d+/\d+\.pbf""".r, tile = true),
+    UrlKind("relief", """https://tiles\.openfreemap\.org/natural_earth/[0-9a-z_]+/(\d{1,2})/\d+/\d+\.png""".r, tile = true),
+    UrlKind("sprite", """https://tiles\.openfreemap\.org/sprites/[0-9A-Za-z_]+/[0-9A-Za-z_]+(?:@[23]x)?\.(?:json|png)""".r, tile = false),
+    UrlKind("glyphs", """https://tiles\.openfreemap\.org/fonts/[^/?#]+/\d+-\d+\.pbf""".r, tile = false)
+  ))
+  /** What the app itself fetches from OpenFreeMap: a style and the TileJSON its sources name. */
+  val OfmStyles: UrlType = UrlType(Seq(
+    UrlKind("style", """https://tiles\.openfreemap\.org/styles/[0-9a-z_-]+""".r, tile = false),
+    UrlKind("tilejson", """https://tiles\.openfreemap\.org/(?:planet|natural_earth/[0-9a-z_]+)""".r, tile = false)
+  ))
   /** 地理院タイル: tiles only. */
-  val Gsi: UrlType = UrlType("https://cyberjapandata.gsi.go.jp", """https://cyberjapandata\.gsi\.go\.jp/xyz/[a-z0-9_]+/(\d+)/\d+/\d+\.(?:png|jpg)""".r, tilesOnly = true)
+  val Gsi: UrlType = UrlType(Seq(
+    UrlKind("tile", """https://cyberjapandata\.gsi\.go\.jp/xyz/[a-z0-9_]+/(\d{1,2})/\d+/\d+\.(?:png|jpg)""".r, tile = true)))
 
 /** The third line of defence for MapLibre (design 4.4, 4.6): every request
   * of the map library passes [[check]] in an HTTP interceptor before it is
-  * sent. A map holder registers the permit it renders under ([[hold]]) and
-  * gets the token to mark its URLs with; a request passes only when
+  * sent, and every redirect hop passes [[recheck]] before it connects. A
+  * map holder registers the permit it renders under ([[hold]]) and gets
+  * the token to mark its URLs with; a request passes only when
   *
   *  1. it carries a known token,
-  *  2. its URL is of the token's destination ([[UrlType]]: the token, not
-  *     the host, decides the destination, so a custom URL on a built-in
-  *     map's host is told apart),
+  *  2. its URL is one of the token's destination's kinds ([[UrlType]]: the
+  *     token, not the host, decides the destination, so a custom URL on a
+  *     built-in map's host is told apart),
   *  3. the holder's permit of this process matches the token and is valid,
   *     and for an explicit (on-action) map, a view of that holder holds a
   *     grant for it ([[SendGate.grant]]),
-  *  4. a tile is within the level's zoom ([[Precision.maxZoom]]).
+  *  4. any zoom it carries is within the level's ([[Precision.maxZoom]]).
   *
   * The token is taken out of the URL sent. Thread-safe.
   */
@@ -127,30 +164,38 @@ final class MapGuard(gate: SendGate, tokens: TokenTable, urlType: Dest => Option
 
   /** Whether `url` may be sent now, and what to send instead. */
   def check(url: String): MapGuard.Verdict =
-    import MapGuard.Verdict.{Pass, Reject}
+    import MapGuard.Verdict.Reject
     TileStyle.strip(url) match
       case (_, None) => Reject("no token")
       case (clean, Some(t)) =>
         tokens.lookup(t) match
           case None => Reject("unknown token")
-          case Some(k) =>
-            urlType(k.dest).flatMap(_.classify(clean)) match
-              case None => Reject(s"not a ${k.dest.key} URL")
-              case Some(zoom) =>
-                this.synchronized(held.get((k.holder, k.dest))) match
-                  case None => Reject(s"${k.holder} holds no permit")
-                  case Some(h) =>
-                    val p = h.permit
-                    if p.mode != k.mode || p.level != k.level || p.gen != k.gen then Reject("stale token")
-                    else if !gate.valid(p) then Reject("permit no longer valid")
-                    else if p.mode == Mode.OnAction && !h.owners.exists(o => gate.granted(o).contains(p)) then
-                      Reject(s"${k.holder} not on screen")
-                    else if zoom.exists(z => Precision.maxZoom(p.level).exists(z > _)) then Reject(s"zoom ${zoom.get} over the level")
-                    else Pass(clean, k, p, zoom)
+          case Some(k) => verify(k, clean)
 
-  /** A redirect or retry of a request [[check]] passed: still valid, and to the same destination's URLs. */
-  def recheck(k: TokenKey, p: Permit, url: String): Boolean =
-    gate.valid(p) && urlType(k.dest).flatMap(_.classify(url)).exists(z => z.forall(z => Precision.maxZoom(p.level).forall(z <= _)))
+  /** A further hop (a redirect, or the request on the network) of a request
+    * [[check]] passed with key `k`: everything checked again for `url` now,
+    * the holder, its permit and grant included.
+    */
+  def recheck(k: TokenKey, url: String): MapGuard.Verdict = verify(k, url)
+
+  /** Hosts the map library may look up now: those of the destinations' URLs. */
+  def hosts: Set[String] = Dest.Tiles.flatMap(d => urlType(d).toSeq.flatMap(_.hosts))
+
+  private def verify(k: TokenKey, clean: String): MapGuard.Verdict =
+    import MapGuard.Verdict.{Pass, Reject}
+    urlType(k.dest).flatMap(_.classify(clean)) match
+      case None => Reject(s"not a ${k.dest.key} URL")
+      case Some((_, zoom)) =>
+        this.synchronized(held.get((k.holder, k.dest))) match
+          case None => Reject(s"${k.holder} holds no permit")
+          case Some(h) =>
+            val p = h.permit
+            if p.mode != k.mode || p.level != k.level || p.gen != k.gen then Reject("stale token")
+            else if !gate.valid(p) then Reject("permit no longer valid")
+            else if p.mode == Mode.OnAction && !h.owners.exists(o => gate.granted(o).contains(p)) then
+              Reject(s"${k.holder} not on screen")
+            else if zoom.exists(z => Precision.maxZoom(p.level).exists(z > _)) then Reject(s"zoom ${zoom.get} over the level")
+            else Pass(clean, k, p, zoom)
 
 object MapGuard:
   enum Verdict:

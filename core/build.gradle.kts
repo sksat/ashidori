@@ -14,6 +14,8 @@ dependencies {
     implementation(libs.zxing.core)
     // HPKE seal of the browser grant (ViewerPairing). Apache License 2.0.
     implementation(libs.tink.android)
+    // The map library's HTTP client is given MapHttp's interceptors (the OkHttp MapLibre brings). Apache-2.0.
+    api(libs.okhttp)
     testImplementation(libs.munit)
 }
 

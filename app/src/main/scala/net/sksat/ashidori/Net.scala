@@ -1,12 +1,10 @@
 package net.sksat.ashidori
 
 import android.content.Context
-import java.io.IOException
-import okhttp3.{Call, Dispatcher, Interceptor, OkHttpClient}
+import okhttp3.{Call, Dispatcher}
 import org.maplibre.android.module.http.HttpRequestUtil
 import scala.jdk.CollectionConverters.*
 import ashidori.core.*
-import ashidori.core.MapGuard.Verdict
 
 /** The app's paths to external destinations (docs/design/outbound-and-offline.md 4):
   *
@@ -42,7 +40,8 @@ object Net:
   private def hostOf(url: String): Option[String] =
     try Option(java.net.URI(url).getHost).map(_.toLowerCase) catch case _: Exception => None
 
-  lazy val outbound: Outbound = Outbound(Settings.gate, hosts, log)
+  /** OpenFreeMap: only its styles and TileJSON. */
+  lazy val outbound: Outbound = Outbound(Settings.gate, hosts, log, d => Option.when(d == Dest.Ofm)(UrlType.OfmStyles))
 
   /** The URLs of a map destination (the custom one from the user's URL now). */
   def urlType(d: Dest): Option[UrlType] = d match
@@ -59,43 +58,18 @@ object Net:
     d.setMaxRequestsPerHost(20)
     d
 
-  /** The map library's HTTP client: every request passes [[MapGuard.check]]
-    * (marked, of its destination, under a valid permit, within the zoom of
-    * its level) and goes out without its mark; each redirect hop is checked
-    * again. A refusal is a plain IOException, which the map library treats
-    * as a permanent failure and does not retry (prototypes 2.3).
+  /** The map library's HTTP client ([[MapHttp]]): every request passes
+    * [[MapGuard.check]] before any name is looked up or connection made, and
+    * goes out without its mark; redirects are followed by the interceptor,
+    * each hop checked again (holder, permit, grant, URL kind, zoom) before
+    * it connects; only the map destinations' hosts are looked up.
     */
   def mapClient(ctx: Context): Unit = synchronized {
     if !installed then
       installed = true
       // The map library must be set up before its HTTP client is replaced.
       org.maplibre.android.MapLibre.getInstance(ctx.getApplicationContext)
-      val check: Interceptor = chain =>
-        val req = chain.request()
-        guard.check(req.url.toString) match
-          case p: Verdict.Pass =>
-            val u = java.net.URI(p.url)
-            log(s"pass holder=${p.key.holder} dest=${p.key.dest.key} mode=${p.permit.mode} level=${p.permit.level.key} " +
-              s"z=${p.zoom.fold("-")(_.toString)} host=${u.getHost} path=${u.getRawPath}")
-            chain.proceed(req.newBuilder().url(p.url).tag(classOf[Verdict.Pass], p).build())
-          case Verdict.Reject(reason) =>
-            log(s"reject reason=$reason url=${Outbound.redact(TileStyle.strip(req.url.toString)._1)}")
-            throw IOException(s"ashidori: $reason")
-      // Each hop on the network, redirects included.
-      val hop: Interceptor = chain =>
-        val req = chain.request()
-        Option(req.tag(classOf[Verdict.Pass])) match
-          case Some(p) if guard.recheck(p.key, p.permit, req.url.toString) => chain.proceed(req)
-          case _ =>
-            log(s"reject reason=redirect url=${Outbound.redact(req.url.toString)}")
-            throw IOException("ashidori: redirect not allowed")
-      val client = OkHttpClient.Builder()
-        .dispatcher(dispatcher)
-        .addInterceptor(check)
-        .addNetworkInterceptor(hop)
-        .retryOnConnectionFailure(false)
-        .build()
-      HttpRequestUtil.setOkHttpClient(client)
+      HttpRequestUtil.setOkHttpClient(MapHttp(guard, log).client(dispatcher))
   }
 
   /** At app start: a change of a rule or the pause cuts what is in flight. */

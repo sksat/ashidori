@@ -134,3 +134,30 @@ class OutboundSuite extends munit.FunSuite:
       finally part.delete()
     }
   }
+
+  test("a change right after the check and registration: cut before it connects, no request reaches the server") {
+    withServer(ex => reply(ex, 200, "ok")) { s =>
+      for at <- Seq("registered", "connected") do
+        val (g, out, log) = setup()
+        val p = g.permit(Dest.Data, Mode.Auto).get
+        // The interleaving forced: the rules change (and the cut runs) at this step.
+        out.step = st => if st == at then g.setPaused(true)
+        intercept[Outbound.Blocked](out.request(p, s.local("/a"), "POST", Some("lat=35.681236".getBytes)))
+        assertEquals(s.hits.get, 0, at)
+        assertEquals(out.openCount, 0, at)
+        assert(!log.exists(_.startsWith("send ")), s"$at: $log")
+    }
+  }
+
+  test("only the URLs a destination lists, where it lists them") {
+    withServer(ex => reply(ex, 200, "ok")) { s =>
+      val g = gate()
+      val only = UrlType(Seq(UrlKind("style", s"http://localhost:${s.port}/styles/[a-z]+".r, tile = false)))
+      val out = Outbound(g, _ => Set("localhost"), urls = d => Option.when(d == Dest.Data)(only))
+      val p = g.permit(Dest.Data, Mode.Auto).get
+      assertEquals(out.small(p, s.local("/styles/liberty")), Some("ok"))
+      intercept[Outbound.Refused](out.request(p, s.local("/elsewhere")))
+      assertEquals(s.hits.get, 1)
+    }
+  }
+
