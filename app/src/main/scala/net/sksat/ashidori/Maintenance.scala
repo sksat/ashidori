@@ -123,6 +123,8 @@ object Maintenance:
             if had then "中断された整理を解決しました" else "未完了の整理はありません"
         catch
           case _: ArchiveStore.CommitStuck => "自動では解決できません（「整理を修復」で解決）"
+          // Its record stays; finished when there is room.
+          case _: StorageBudget.NoRoom => "空き容量が記録用の予備に近いため中断（続きは次回）"
           case NonFatal(e) =>
             Log.w("archive repair failed", e)
             LifeLog.add(LifeKind.ArchiveRepair, s"整理の修復に失敗（記録は端末内に保持）: ${LifeLog.describe(e)}")
@@ -130,7 +132,9 @@ object Maintenance:
       Progress.set(result, running = false)
       // Archiving stopped while the commit was unfinished: queued again.
       if !archive.commitPending then schedule(ctx)
-    finally running.set(false)
+    finally
+      Try(AshidoriApp.db.checkpoint())
+      running.set(false)
 
   // --- progress (written by the maintenance process, shown by the UI) ---------------------
 
@@ -267,18 +271,26 @@ object Maintenance:
       if low.compareAndSet(false, true) then
         Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
         LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が記録用の予備（${Try(Storage.reserve() / 1_000_000).getOrElse(0L)} MB）に近い")
+    Log.i(s"maintenance: floor ${Try(Storage.reserve()).getOrElse(-1L)} (file ${Try(ReserveFile.read(Storage.reserveFile, System.currentTimeMillis())).getOrElse(-1L)})")
     val stopOrLow = () => stop() || low.get
     val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
-      // Every file this process writes goes through the guard of the logging reserve.
-      archive.guard = Some(Storage.maintenanceGuard)
+      // Every file this process writes, and every bulk write of its database
+      // that is not the record, goes through the guard of the logging reserve
+      // (AshidoriApp.archive, Db.bulk).
       // A commit a crash interrupted is resolved first; one waiting for the
       // user stops the run (said so in the progress line).
       try archive.recover(db, progress = l => Progress.set(l))
       catch
+        // Finishing an interrupted commit needs room it does not have now: its
+        // record stays, and the next run finishes it.
+        case _: StorageBudget.NoRoom =>
+          noRoom("中断された整理の続き")
+          Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）", running = false)
+          return true
         case _: ArchiveStore.CommitStuck =>
           // Not a failure of this run: nothing to archive until it is resolved.
           Progress.set("記録の整理が停止（要確認）", running = false)
@@ -377,7 +389,11 @@ object Maintenance:
       // Never a reason to run again: it is built while its list is open too.
       if !halt() then VisitDays.maintain(charging, halt)
       left
-    finally running.set(false)
+    finally
+      // The WAL its deletes grew is written back and truncated (when the free
+      // space holds it above the floor; best effort).
+      Try(AshidoriApp.db.checkpoint())
+      running.set(false)
 
 /** Runs [[Maintenance.run]] in the `:maintenance` process. */
 class ArchiveJobService extends JobService:

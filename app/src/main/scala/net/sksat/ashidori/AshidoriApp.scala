@@ -10,6 +10,8 @@ class AshidoriApp extends Application:
   override def onCreate(): Unit =
     super.onCreate()
     AshidoriApp.instance = this
+    // Debug builds: storage I/O on the main thread logged (IoCheck).
+    IoCheck.install()
     // Lifecycle log for 設定 › 端末診断: crashes on any thread, this start,
     // and the exits the OS recorded since the last start.
     LifeLog.installCrashHandler()
@@ -61,8 +63,8 @@ class AshidoriApp extends Application:
     // The region packs: the state and the files reconciled before any use,
     // then (with the data rule automatic) updates and packs left planned.
     RegionDownload.autoStart(this)
-    // The logging reserve, for the large writes of every process.
-    Storage.modeChanged()
+    // The floor of the logging reserve, for the large writes of every process.
+    Storage.start()
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
 
@@ -77,7 +79,11 @@ object AshidoriApp:
   lazy val db: Db =
     newerDatabase.foreach(v => throw NewerDatabase.Refused(v))
     Db(instance)
-  lazy val archive: ArchiveStore = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
+  /** Every file it writes goes through the guard of the logging reserve (design 6.8), in either process. */
+  lazy val archive: ArchiveStore =
+    val a = ArchiveStore(java.io.File(instance.getFilesDir, "archive"), java.time.ZoneId.systemDefault())
+    a.guard = Some(Storage.guard)
+    a
 
   /** The version of the database on disk when it is newer than this app's. */
   lazy val newerDatabase: Option[Int] = Db.versionOnDisk(instance).filter(_ > Db.Version)
@@ -97,10 +103,10 @@ object Settings:
   private def prefs: SharedPreferences = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
   def mode: LoggingMode = LoggingMode.fromKey(prefs.getString("mode", LoggingMode.Balanced.key))
-  def mode_=(m: LoggingMode): Unit =
-    prefs.edit().putString("mode", m.key).apply()
-    // The logging reserve of every large write follows the mode (design 6.8).
-    Storage.modeChanged()
+  /** Sets the mode: the storage floor for it is written first (design 6.8), off the main thread. */
+  def mode_=(m: LoggingMode): Unit = Storage.changeMode(m)
+  /** Stores the mode (after the floor for it is written: [[Storage.changeMode]]). */
+  private[ashidori] def storeMode(m: LoggingMode): Unit = prefs.edit().putString("mode", m.key).commit()
 
   /** First-run onboarding finished. */
   def onboarded: Boolean = prefs.getBoolean("onboarded", false)

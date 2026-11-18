@@ -83,9 +83,11 @@ class DebugReceiver extends BroadcastReceiver:
         Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()
       case "ashidori.debug.LOG" =>
         Settings.onboarded = true
-        Settings.mode = ashidori.core.LoggingMode.fromKey(Option(intent.getStringExtra("mode")).getOrElse("max"))
         Settings.loggingEnabled = true
-        LoggerService.send(c, LoggerService.ActionStart)
+        Storage.changeMode(ashidori.core.LoggingMode.fromKey(Option(intent.getStringExtra("mode")).getOrElse("max")), () => {
+          LoggerService.send(c, LoggerService.ActionStart)
+          LoggerService.send(c, LoggerService.ActionRefresh)
+        })
       case "ashidori.debug.STOP" =>
         Settings.loggingEnabled = false
         LoggerService.send(c, LoggerService.ActionStop)
@@ -120,6 +122,25 @@ class DebugReceiver extends BroadcastReceiver:
           Log.i(s"vacuum cancel after $ms ms: ${r.fold(e => e.getClass.getSimpleName, _ => "completed")} in ${System.currentTimeMillis() - t0} ms, copy ${dest.length} bytes")
           dest.delete()
         Thread(run, "ashidori-vacuum-test").start()
+      case "ashidori.debug.HOLD_READ" =>
+        // A long-running reader for `seconds`: a query that never ends on its
+        // own, cancelled then. Its snapshot keeps SQLite from reusing the WAL.
+        val s = intent.getIntExtra("seconds", 60).toLong
+        val run: Runnable = () =>
+          val ro = android.database.sqlite.SQLiteDatabase.openDatabase(AshidoriApp.db.getReadableDatabase.getPath, null,
+            android.database.sqlite.SQLiteDatabase.OPEN_READONLY, Db.KeepOnCorruption)
+          val sig = android.os.CancellationSignal()
+          val stop: Runnable = () => { Thread.sleep(s * 1000); sig.cancel() }
+          Thread(stop).start()
+          val t0 = System.currentTimeMillis()
+          Log.i(s"hold read: started for $s s")
+          val r = scala.util.Try { val c = ro.rawQuery("SELECT COUNT(*) FROM raw_lines a, raw_lines b, raw_lines c", null, sig); try c.moveToFirst() finally c.close() }
+          ro.close()
+          Log.i(s"hold read: ended after ${System.currentTimeMillis() - t0} ms (${r.fold(_.getClass.getSimpleName, _ => "completed")})")
+        Thread(run, "ashidori-hold-read").start()
+      case "ashidori.debug.FLOOR" =>
+        // The floor each process sees: the file's (or the conservative L), and this process's L.
+        AshidoriApp.io.execute(() => Log.i(s"floor: file ${Storage.reserveFile.length} bytes, read ${ashidori.core.ReserveFile.read(Storage.reserveFile, System.currentTimeMillis())}, maintenance floor ${Storage.maintenanceFloor()}, main L ${Storage.reserve()}, outstanding ${Storage.budget.outstanding}"))
       case "ashidori.debug.RESCUE" =>
         val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("rescue.zip"))
         Thread(() =>

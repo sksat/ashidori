@@ -17,8 +17,20 @@ trait PinnedData:
   def store: BasemapStore
   /** Serializes installation, cleanup and deletion (one process). */
   val lock: Object = new Object
-  /** Directory of the installed pinned version. */
-  def dir: Option[File] = pin.flatMap(store.installed)
+  @volatile private var known: Option[Option[File]] = None
+  /** Directory of the installed pinned version: looked up (and kept) off
+    * the main thread; on the main thread the one last looked up (looked up
+    * there only if never yet, which [[IoCheck]] reports; it is looked up in
+    * the background at app start and after every change).
+    */
+  def dir: Option[File] =
+    if android.os.Looper.myLooper() == android.os.Looper.getMainLooper then known.getOrElse(look())
+    else look()
+  private def look(): Option[File] =
+    IoCheck.offMain(s"${kind.name} installed")
+    val d = pin.flatMap(store.installed)
+    known = Some(d)
+    d
   def installed: Boolean = dir.nonEmpty
   def installedVersion: Option[String] = dir.map(_.getName)
   /** Removes other versions and leftovers. Blocking. */
@@ -30,6 +42,7 @@ trait PinnedData:
   def deleteAll(): Unit = lock.synchronized {
     changedOnDisk()
     store.deleteAll()
+    look()
   }
   /** Approximate size for the UI, e.g. "約 64 MB". */
   def sizeLabel: String = pin.fold("")(p => s"約 ${math.max(1, math.round(p.bytes / 1e6))} MB")
@@ -146,8 +159,16 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
   def listen(f: () => Unit): () => Unit =
     listeners += f
     () => listeners -= f
-  /** Tells the UI (on the main thread) that [[status]] or the installed data changed. */
-  def changed(): Unit = AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
+  /** Tells the UI (on the main thread) that [[status]] or the installed data
+    * changed; the installed version is looked up first, off the main thread.
+    */
+  def changed(): Unit =
+    val tell: Runnable = () => listeners.toSeq.foreach(_())
+    if android.os.Looper.myLooper() == android.os.Looper.getMainLooper then
+      AshidoriApp.io.execute { () => data.dir; AshidoriApp.app.getMainExecutor.execute(tell) }
+    else
+      data.dir
+      AshidoriApp.app.getMainExecutor.execute(tell)
 
   /** The user may ask for the download now. */
   def allowed: Boolean = Settings.gate.permit(Dest.Data, Mode.OnAction).isDefined
@@ -186,13 +207,17 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     * there or the user deleted it; after a run given up, not before its
     * cool-down ends. Leaves queued work (also a scheduled retry) as it is.
     */
-  def autoStart(ctx: Context): Unit =
+  def autoStart(ctx: Context): Unit = AshidoriApp.io.execute { () =>
+    // The installed version looked up here, off the main thread, first.
+    data.dir
     for p <- data.pin; permit <- Settings.gate.permit(Dest.Data, Mode.Auto) do
       if !data.installed && !prefs.getBoolean("declined", false) then
         val metered = prefs.getBoolean("queued", false) && prefs.getBoolean("metered", false)
         prefs.edit().putBoolean("queued", true).putBoolean("metered", metered).remove("error").apply()
         val delay = DownloadRetry.autoStartDelay(storedFailure, p.version, System.currentTimeMillis())
         WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(metered, permit, delay))
+    changed()
+  }
 
   /** The rule of [[Dest.Data]] changed, or the pause started or ended:
     * queued runs (also a scheduled retry) go, as they would not send under

@@ -925,10 +925,23 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       // one transaction: an import cut short resumes after the last chunk.
       val key = s"${f.getName}|${f.length}|${f.lastModified}"
       var done = db.legacyImported(key)
+      // Batches sized by what the last one made the database and its WAL
+      // grow: about 1 MiB each (text bytes per byte of growth, measured).
+      var textBudget = 256L * 1024
+      var skipped = 0
       Using.resource(scala.io.Source.fromFile(f, "UTF-8")) { src =>
         var last = f.lastModified()
         var seen = 0L
-        LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty)).foreach { chunk =>
+        LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty), () => textBudget).foreach { chunk0 =>
+          // A line longer than any batch: checked with its size and a margin
+          // (indexes, the WAL); one beyond reason is left out, and the file kept.
+          val chunk = chunk0.filter { l =>
+            val b = LegacyBatches.utf8(l)
+            if b > LegacyBatches.MaxLineBytes then
+              skipped += 1
+              false
+            else true
+          }
           val timed = chunk.map { l =>
             GnssLogMerge.timeOf(l).foreach(last = _)
             (last, l)
@@ -936,16 +949,27 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           val fresh = timed.drop(math.max(0L, done - seen).toInt)
           seen += timed.size
           if fresh.nonEmpty then
-            // The database grows by about the text of a batch (at most 1 MiB):
-            // checked against the free space now and L before it is inserted.
-            // Stopped here, the import resumes after the last batch.
-            guard.foreach(_.check(fresh.map(_._2.length.toLong).sum))
+            // Checked against the free space now and L before it is inserted:
+            // the batch's text with a margin of 3 (one long line alone may be
+            // larger than the budget). Stopped here, the import resumes after
+            // the last batch.
+            val text = fresh.map((_, l) => LegacyBatches.utf8(l)).sum
+            guard.foreach(_.check(math.max(SpaceGuard.Chunk.toLong, text * 3)))
             done = seen
+            val before = db.fileBytes
             db.insertLegacyChunk(fresh, key, done)
+            val grown = db.fileBytes - before
+            textBudget =
+              if grown <= 0 then math.min(LegacyBatches.MaxBytes, textBudget * 2)
+              else math.max(16L * 1024, math.min(LegacyBatches.MaxBytes, text * SpaceGuard.Chunk / grown))
             n += fresh.size
         }
       }
-      f.delete()
+      // The input is never deleted with lines left out: kept beside, not imported again.
+      if skipped > 0 then
+        f.renameTo(File(f.getPath + ".skipped"))
+        LifeLog.add(LifeKind.Note, s"旧形式のログ ${f.getName}: 長すぎる行 $skipped 行を取り込まず（ファイルは残す）")
+      else f.delete()
       db.legacyDone(key)
     n
 

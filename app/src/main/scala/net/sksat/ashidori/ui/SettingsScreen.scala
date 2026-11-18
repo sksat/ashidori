@@ -90,8 +90,11 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       .setSingleChoiceItems(items, modes.indexOf(Settings.mode), (d, i) => {
         val m = modes(i)
         if Settings.mode != m then
-          Settings.mode = m
-          if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+          // Stored after the storage floor for it is written (design 6.8); then applied.
+          Storage.changeMode(m, () => {
+            if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+            showMode(row)
+          })
         showMode(row)
         d.dismiss()
       })

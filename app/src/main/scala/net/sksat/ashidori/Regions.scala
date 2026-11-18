@@ -259,16 +259,19 @@ object Regions:
     catch case _: Throwable => false
 
   private val layerCache = scala.collection.mutable.Map.empty[String, String]
-  private def layers(style: String): Option[String] = layerCache.synchronized {
-    layerCache.get(style).orElse {
-      // Read in the background ([[refresh]]); the main thread uses what is there.
+  /** A style's layers: what is cached (under the lock), else read outside
+    * the lock and off the main thread only ([[refresh]] reads them in the
+    * background; the main thread uses what is there and never waits).
+    */
+  private def layers(style: String): Option[String] =
+    layerCache.synchronized(layerCache.get(style)).orElse {
       if onMain then None
-      else Try(String(Files.readAllBytes(File(store.styleRoot(style), RegionStore.StyleLayers).toPath), UTF_8)).toOption.map { l =>
-        layerCache(style) = l
-        l
-      }
+      else
+        IoCheck.offMain("regions layers")
+        Try(String(Files.readAllBytes(File(store.styleRoot(style), RegionStore.StyleLayers).toPath), UTF_8)).toOption.map { l =>
+          layerCache.synchronized(layerCache.getOrElseUpdate(style, l))
+        }
     }
-  }
 
   private val Credit = """<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a> <a href="https://protomaps.com/">Protomaps</a>"""
 

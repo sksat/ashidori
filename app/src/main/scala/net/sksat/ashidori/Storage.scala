@@ -27,11 +27,38 @@ object Storage:
   private def app = AshidoriApp.app
   lazy val reserveFile: File = File(app.getFilesDir, "logging-reserve")
 
-  /** The main process's reservations. */
-  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve())
+  /** The main process's reservations; each admission and release publishes the floor. */
+  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve(), () => publish())
 
-  /** The maintenance process's guard: L read from [[reserveFile]] at every check. */
-  lazy val maintenanceGuard: SpaceGuard = SpaceGuard(() => free(), () => ReserveFile.read(reserveFile))
+  /** The guard of this process's bulk writes that hold no reservation (SQLite batches). */
+  def guard: SpaceGuard =
+    if AshidoriApp.isMaintenanceProcess then maintenanceGuard else budget.guard
+
+  /** The maintenance process's guard: the larger of the floor the main
+    * process published (L and its reservations; the conservative L when the
+    * file is stale or unreadable) and its own L measured from the record.
+    */
+  lazy val maintenanceGuard: SpaceGuard = SpaceGuard(() => free(), () => maintenanceFloor())
+
+  def maintenanceFloor(): Long =
+    math.max(ReserveFile.read(reserveFile, System.currentTimeMillis()), ownL())
+
+  @volatile private var ownAt = 0L
+  @volatile private var ownValue = StorageBudget.MinReserve
+  /** L the maintenance process derives itself: a day at the higher of what
+    * the logger recorded in the last hour (rows and text in the database)
+    * and the rate the main process last measured, at least 最高精度's
+    * default when neither can be read; measured at most every 10 minutes.
+    */
+  private def ownL(): Long =
+    val now = System.currentTimeMillis()
+    if now - ownAt > 10L * 60 * 1000 then
+      ownAt = now
+      ownValue = scala.util.Try {
+        val rate = math.max(AshidoriApp.db.recentLoggingBytesPerHour(now), LoggingRate.stored(now).getOrElse(0L))
+        StorageBudget.loggingReserve(LoggingMode.Eco, Some(rate))
+      }.getOrElse(ReserveFile.Conservative)
+    ownValue
 
   /** Debug builds: free bytes to pretend (DebugReceiver STORAGE_FREE); None: the real ones. */
   @volatile var debugFree: Option[Long] = None
@@ -42,37 +69,70 @@ object Storage:
   @volatile private var reserveAt = 0L
   @volatile private var reserveMode: Option[LoggingMode] = None
   @volatile private var reserveValue = ReserveFile.Conservative
-  @volatile private var written = -1L
+  @volatile private var published = (-1L, 0L)
+  private val publishLock = new Object
 
-  /** L of the main process: measured at most once a minute, and at once
-    * when the logging mode changes; written to [[reserveFile]] when it
-    * changes. In the maintenance process, the file's.
+  /** L of the main process for its mode (measured at most once a minute,
+    * at once for another mode). In the maintenance process, its floor.
     */
   def reserve(): Long =
-    if AshidoriApp.isMaintenanceProcess then ReserveFile.read(reserveFile)
-    else synchronized {
+    if AshidoriApp.isMaintenanceProcess then maintenanceFloor()
+    else lFor(Settings.mode)
+
+  private def lFor(mode: LoggingMode): Long = synchronized {
+    val now = System.currentTimeMillis()
+    if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
+      reserveAt = now
+      reserveMode = Some(mode)
+      reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
+    reserveValue
+  }
+
+  /** Writes the floor (L of `mode` and what the reservations will still
+    * write) for the maintenance process. Never throws: a failure (of any
+    * step, the directory's sync included) is logged and the file removed,
+    * so that the other process falls back to the conservative L.
+    */
+  def publish(mode: LoggingMode = Settings.mode): Unit =
+    // Its own lock (taken before the budget's; never inside it).
+    if !AshidoriApp.isMaintenanceProcess then publishLock.synchronized {
       val now = System.currentTimeMillis()
-      val mode = Settings.mode
-      if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
-        reserveAt = now
-        reserveMode = Some(mode)
-        reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
-        if reserveValue != written then
-          scala.util.Try(ReserveFile.write(reserveFile, reserveValue)).fold(
-            e => Log.w("logging reserve not written", e),
-            _ => written = reserveValue)
-      reserveValue
+      val floor = lFor(mode) + budget.outstanding
+      if floor != published._1 || now - published._2 >= ReserveFile.HeartbeatMs / 2 then
+        try
+          ReserveFile.write(reserveFile, floor, now)
+          published = (floor, now)
+        catch case e: Exception =>
+          published = (-1L, 0L)
+          Log.w("logging reserve not published; removed (the other process uses the conservative L)", e)
+          scala.util.Try(reserveFile.delete())
     }
 
-  /** The logging mode changed (or the app started): L measured and written at once. */
-  def modeChanged(): Unit =
+  /** One thread for the floor's writes and the mode changes (never the main thread). */
+  private lazy val executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r =>
+    val t = Thread(r, "ashidori-storage")
+    t.setDaemon(true)
+    t
+  }
+
+  /** The main process at start: the floor published, then every [[ReserveFile.HeartbeatMs]]. */
+  def start(): Unit =
     if !AshidoriApp.isMaintenanceProcess then
-      AshidoriApp.io.execute { () =>
-        synchronized { reserveAt = 0L }
-        scala.util.Try(reserve())
+      executor.scheduleWithFixedDelay(() => scala.util.Try(publish()), 0, ReserveFile.HeartbeatMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+      executor.execute { () =>
         // The shared reservation ledger of a development build before this one.
         for n <- Seq("storage-budget.json", "storage-budget.json.lock", "storage-budget.json.tmp") do File(app.getFilesDir, n).delete()
       }
+
+  /** A new logging mode: the floor for it is written first, then the mode is
+    * stored (it takes effect then), then `after` runs on the main thread.
+    */
+  def changeMode(m: LoggingMode, after: () => Unit = () => ()): Unit =
+    executor.execute { () =>
+      publish(m)
+      Settings.storeMode(m)
+      app.getMainExecutor.execute(() => after())
+    }
 
   private def debuggable: Boolean =
     (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -80,17 +140,35 @@ object Storage:
   /** 「空き容量不足（記録用の予備を除いて N MB 必要）」 */
   def shortage(need: Long): String = s"空き容量不足（記録用の予備を除いて ${math.max(1L, need / 1_000_000)} MB 必要）"
 
-/** Debug builds: storage I/O on the main thread is logged (as StrictMode
-  * would) and counted; the regions' code calls it before each such access.
+/** Debug builds: storage I/O on the main thread is logged and counted, in
+  * two ways. [[offMain]] marks the accesses of the regions, the free space,
+  * the floor and the installed basemap and venue data (logged as
+  * `main-thread storage I/O: <what>`); StrictMode ([[install]]) catches
+  * every file and database access through the platform's I/O on the main
+  * thread, of any code (logged as `main-thread disk (StrictMode)` with the
+  * app's first frame). Neither sees I/O in native code (MapLibre).
   */
 object IoCheck:
   @volatile var count = 0
+  @volatile var strict = 0
   private lazy val debuggable =
     (AshidoriApp.app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
   def offMain(what: String): Unit =
     if debuggable && android.os.Looper.myLooper() == android.os.Looper.getMainLooper then
       count += 1
       Log.w(s"main-thread storage I/O: $what", Throwable("here"))
+
+  /** Debug builds: StrictMode on the main thread, disk reads and writes logged (never a crash). */
+  def install(): Unit =
+    if debuggable then
+      android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder()
+        .detectDiskReads().detectDiskWrites()
+        .penaltyListener(java.util.concurrent.Executors.newSingleThreadExecutor(), v => {
+          strict += 1
+          val app = v.getStackTrace.find(_.getClassName.startsWith("net.sksat.ashidori")).fold("?")(f =>
+            s"${f.getClassName.stripPrefix("net.sksat.ashidori.")}.${f.getMethodName}:${f.getLineNumber}")
+          Log.w(s"main-thread disk (StrictMode) #$strict: ${v.getClass.getSimpleName} at $app")
+        }).build())
 
 /** The logger's write rate, from samples of the size of its data (the
   * database, its WAL, the archive and the overflow files) kept in prefs.

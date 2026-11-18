@@ -256,8 +256,12 @@ final class LoggerScreen(act: MainActivity) extends Screen:
 
   private def selectMode(m: LoggingMode): Unit =
     if Settings.mode != m then
-      Settings.mode = m
-      if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+      // Stored after the storage floor for it is written (design 6.8); then applied.
+      Storage.changeMode(m, () => {
+        if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+        paintModes()
+        refresh()
+      })
     paintModes()
     refresh()
 

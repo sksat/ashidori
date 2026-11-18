@@ -954,9 +954,18 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val (where, args) = ArchiveSql.rawPortion(from, to, maxRowid, after, upTo)
     deleteChunked("raw_lines", ArchiveSql.except(where, except), args)
 
-  /** Deletes raw lines by rowid (late lines archived in a sorted pass). */
+  /** Deletes raw lines by rowid (late lines archived in a sorted pass), in batches sized as [[bulk]]. */
   def deleteRawById(rowids: Seq[Long]): Long =
-    rowids.grouped(500).map(ids => tx(_.delete("raw_lines", s"rowid IN (${ids.mkString(",")})", null).toLong)).sum
+    var rest = rowids
+    var total = 0L
+    while rest.nonEmpty do
+      total += bulk { n =>
+        val (ids, more) = rest.splitAt(n)
+        rest = more
+        val d = tx(_.delete("raw_lines", s"rowid IN (${ids.mkString(",")})", null))
+        (d, ids.size)
+      }
+    total
 
   /** Whether any archived table still holds rows of [from, to) in SQLite. */
   def hasHotRows(from: Long, to: Long): Boolean =
@@ -981,16 +990,68 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     n
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
-    val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, Db.DeleteChunk))
-    try
-      args.zipWithIndex.foreach((v, i) => st.bindLong(i + 1, v))
-      var total = 0L
-      var n = Db.DeleteChunk
-      while n == Db.DeleteChunk do
-        n = st.executeUpdateDelete()
-        total += n
-      total
-    finally st.close()
+    var total = 0L
+    var full = true
+    while full do
+      total += bulk { n =>
+        val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, n))
+        try
+          args.zipWithIndex.foreach((v, i) => st.bindLong(i + 1, v))
+          val d = st.executeUpdateDelete()
+          full = d == n
+          (d, n)
+        finally st.close()
+      }
+    total
+
+  // --- bulk writes that are not the record (design 6.8) -----------------------
+
+  /** The guard of the logging reserve, of the process this runs in
+    * ([[Storage.guard]]). Every batch of a bulk write that is not the record
+    * (deleting archived rows) is checked against it first, and sized by what
+    * the batches before made the database and its WAL grow ([[BatchSizer]]:
+    * at most about 1 MiB a batch). A delete also writes (the WAL; SQLite
+    * reuses freed pages, so the files may grow first). The logger's own
+    * writes never go through it.
+    */
+  private def bulkGuard: SpaceGuard = Storage.guard
+  private val sizer = BatchSizer(max = Db.DeleteChunk)
+
+  /** The database and its WAL, as they take room now. */
+  def fileBytes: Long =
+    val p = java.io.File(w.getPath)
+    p.length + java.io.File(p.getPath + "-wal").length
+
+  /** One batch of a bulk write: `f(rows)` does it and gives the rows it
+    * wrote and the rows it was given; checked before, measured after.
+    */
+  private def bulk(f: Int => (Int, Int)): Int =
+    bulkGuard.check(SpaceGuard.Chunk)
+    val before = fileBytes
+    val (done, asked) = f(sizer.rows)
+    sizer.observe(asked, fileBytes - before)
+    done
+
+  /** The WAL written back into the database and truncated (after a
+    * maintenance run), if the free space holds the WAL's size above the
+    * floor (the database may grow by up to that much); best effort. First
+    * without blocking the logger (PASSIVE), then TRUNCATE, which then has
+    * little left to copy while it holds the write lock (busy: left as is).
+    */
+  def checkpoint(): Unit =
+    val wal = java.io.File(w.getPath + "-wal").length
+    if wal > 0 && bulkGuard.allows(wal) then
+      for mode <- Seq("PASSIVE", "TRUNCATE") do
+        scala.util.Try { val c = w.rawQuery(s"PRAGMA wal_checkpoint($mode)", null); try c.moveToFirst() finally c.close() }
+
+  /** Bytes per hour the logger wrote in the last hour, from the raw lines
+    * and positions stored (their text and about 64 bytes a row beside it).
+    */
+  def recentLoggingBytesPerHour(now: Long): Long =
+    val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=?", now - 3_600_000L)(c =>
+      c.getLong(0) * 64 + c.getLong(1)).headOption.getOrElse(0L)
+    val fixes = query("SELECT COUNT(*) FROM fixes WHERE time>=?", now - 3_600_000L)(_.getLong(0) * 128).headOption.getOrElse(0L)
+    raw + fixes
 
   /** Earliest time still held in SQLite for an archived table (None if empty). */
   def oldestHot(): Option[Long] =
@@ -1267,6 +1328,25 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * rows in the range are not shown ([[ArchiveStore.read]]).
     */
   def deleteRange(from: Long, to: Long): Unit =
+    // One transaction (the range and its mark go together): a bulk write
+    // that is not the record, admitted only if the free space holds twice
+    // the rows' estimated size above the floor, reserved while it runs
+    // (design 6.8; published, so archive maintenance sees it).
+    val need = math.max(SpaceGuard.Chunk.toLong, 2 * rangeBytes(from, to))
+    val held = Storage.budget.reserve(need).getOrElse(throw StorageBudget.NoRoom())
+    try deleteRange0(from, to) finally held.release()
+
+  /** The rows of [from, to) in the tables a deletion empties: their text
+    * and about 128 bytes a row (the row, its index entries).
+    */
+  def rangeBytes(from: Long, to: Long): Long =
+    val tables = Seq("fixes", "battery", "gnss_status", "pressure", "fix_msl")
+    val rows = tables.map(t => query(s"SELECT COUNT(*) FROM $t WHERE time>=? AND time<?", from, to)(_.getLong(0)).head).sum
+    val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=? AND time<?", from, to)(c =>
+      c.getLong(0) * 128 + c.getLong(1)).head
+    rows * 128 + raw
+
+  private def deleteRange0(from: Long, to: Long): Unit =
     tx { db =>
       val a = Array(from.toString, to.toString)
       db.execSQL("INSERT INTO deleted_range(start, end, deleted_at) VALUES(?, ?, ?)",

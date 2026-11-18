@@ -306,7 +306,13 @@ object VisitDays:
       }
     private def exec(sql: String, args: Any*): Unit = w.execSQL(sql, args.map(_.asInstanceOf[AnyRef]).toArray)
 
+    /** Every transaction of the index (a day's stays, a range, all) is
+      * checked first against the guard of the logging reserve (design 6.8):
+      * 1 MiB above the floor (a day's stays are far smaller). The rest are
+      * single rows.
+      */
     def transaction[A](f: => A): A =
+      Storage.guard.check(ashidori.core.SpaceGuard.Chunk)
       val db = w
       db.beginTransaction()
       try

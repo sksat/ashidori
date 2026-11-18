@@ -59,34 +59,61 @@ final class GuardedOutputStream(out: OutputStream, guard: SpaceGuard) extends Ou
   override def flush(): Unit = out.flush()
   override def close(): Unit = out.close()
 
-/** L for every process: the main process writes it to a small file
-  * whenever the logging mode or the measured rate changes (a temporary
-  * file, synced, renamed, the directory synced); another process (archive
-  * maintenance) reads it at every check. A file that is missing, cannot be
-  * read or is not a number gives the most conservative L ([[Conservative]]),
-  * never the floor.
+/** The floor for every process: the main process writes it to a small
+  * file (floor = L + what its reservations will still write, and when it
+  * wrote it) when the logging mode or the measured rate changes (before a
+  * new mode takes effect), when a reservation is made or released, and
+  * every [[HeartbeatMs]] as a heartbeat. Written as a temporary file,
+  * synced, renamed, the directory synced; a failure of any step (the
+  * directory's sync included) is thrown. Another process (archive
+  * maintenance) reads it at every check: a file that is missing, cannot be
+  * read, is not two numbers or is older than [[StaleMs]] gives the most
+  * conservative L ([[Conservative]]), never the 256 MB floor.
   */
 object ReserveFile:
   /** L of 最高精度 at its default rate: what nothing measured can exceed by default. */
   val Conservative: Long = StorageBudget.loggingReserve(LoggingMode.Max, None)
+  val HeartbeatMs: Long = 10L * 60 * 1000
+  val StaleMs: Long = 30L * 60 * 1000
 
-  def write(f: File, bytes: Long): Unit =
+  def write(f: File, floor: Long, now: Long): Unit =
     f.getParentFile.mkdirs()
     val tmp = File(f.getPath + ".tmp")
     val ch = FileChannel.open(tmp.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
     try
-      ch.write(java.nio.ByteBuffer.wrap(s"$bytes\n".getBytes(UTF_8)))
+      ch.write(java.nio.ByteBuffer.wrap(s"$floor $now\n".getBytes(UTF_8)))
       ch.force(true)
     finally ch.close()
     Files.move(tmp.toPath, f.toPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-    // The rename is durable once the directory is synced (where the platform allows it).
-    Try {
-      val d = FileChannel.open(f.getParentFile.toPath, StandardOpenOption.READ)
-      try d.force(true) finally d.close()
-    }
+    // The rename is durable once the directory is synced; a failure is the caller's to report.
+    val d = FileChannel.open(f.getParentFile.toPath, StandardOpenOption.READ)
+    try d.force(true) finally d.close()
 
-  def read(f: File): Long =
-    Try(String(Files.readAllBytes(f.toPath), UTF_8).trim.toLong).toOption.filter(_ > 0).getOrElse(Conservative)
+  /** The floor in the file, or [[Conservative]]. */
+  def read(f: File, now: Long): Long =
+    Try {
+      val Array(a, b) = String(Files.readAllBytes(f.toPath), UTF_8).trim.split(' ')
+      (a.toLong, b.toLong)
+    }.toOption.filter((floor, at) => floor > 0 && at <= now + 60_000 && now - at <= StaleMs)
+      .map(_._1).getOrElse(Conservative)
+
+/** Sizes the batches of a bulk SQLite write (deleting archived rows) by
+  * what they made the files grow: the database and its WAL measured before
+  * and after each batch. A batch is meant to change at most `target`
+  * (1 MiB) of pages: its rows are `target` over the bytes per row, the
+  * larger of `assumed` (2 KiB: deleting 5,000 raw lines changed 8.46 MiB of
+  * pages) and what the last batch that grew the files took per row (that
+  * includes what the logger wrote meanwhile: smaller batches). A batch that
+  * did not grow them (SQLite reused the WAL or freed pages) still counts
+  * `assumed`: the next one may not be reused. The first batch is 8 times
+  * smaller. Between 1 and `max` rows.
+  */
+final class BatchSizer(target: Long = SpaceGuard.Chunk.toLong, assumed: Long = 2048, max: Int = 5000):
+  private var rate = assumed * 8
+  def rows: Int = math.max(1L, math.min(max.toLong, target / rate)).toInt
+  /** A batch of `rows` made the files grow by `grown` bytes. */
+  def observe(rows: Int, grown: Long): Unit =
+    rate = if rows > 0 && grown > 0 then math.max(assumed, (grown + rows - 1) / rows) else assumed
 
 /** The main process's reservations of its large writes (downloads,
   * extractions, backups), in memory only: a write of `r` bytes starts only
@@ -95,7 +122,7 @@ object ReserveFile:
   * [[SpaceGuard]] with `held` = [[outstanding]]. Releasing cannot fail.
   * Thread-safe.
   */
-final class StorageBudget(free: () => Long, reserve: () => Long):
+final class StorageBudget(free: () => Long, reserve: () => Long, changed: () => Unit = () => ()):
   final class Reservation private[StorageBudget] (private var bytes: Long, start: Long):
     private var written = start
     private var open = true
@@ -131,21 +158,37 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
       */
     def guard: SpaceGuard = SpaceGuard(free, reserve, () => StorageBudget.this.synchronized(active.filterNot(_ eq this).map(_.rest).sum))
 
-    def release(): Unit = StorageBudget.this.synchronized {
-      open = false
-      active = active.filterNot(_ eq this)
-    }
+    /** Gives the rest back; then the floor is published again (`changed`, outside the lock). */
+    def release(): Unit =
+      val was = StorageBudget.this.synchronized {
+        val o = open
+        open = false
+        active = active.filterNot(_ eq this)
+        o
+      }
+      if was then try changed() catch case _: Exception => ()
 
   private var active = List.empty[Reservation]
   private def okLocked: Boolean = free() - active.map(_.rest).sum >= reserve()
 
-  private def admit(bytes: Long, start: Long): Option[Reservation] = synchronized {
-    if free() - active.map(_.rest).sum - reserve() < math.max(0L, bytes - start) then None
-    else
-      val x = Reservation(bytes, start)
-      active = x :: active
-      Some(x)
-  }
+  /** Admitted reservations are published (`changed`) before they are given out, so another
+    * process sees them in the floor before anything is written.
+    */
+  private def admit(bytes: Long, start: Long): Option[Reservation] =
+    val r = synchronized {
+      if free() - active.map(_.rest).sum - reserve() < math.max(0L, bytes - start) then None
+      else
+        val x = Reservation(bytes, start)
+        active = x :: active
+        Some(x)
+    }
+    r.foreach { x =>
+      try changed()
+      catch case e: Exception =>
+        x.release()
+        throw e
+    }
+    r
 
   /** A reservation of `r` bytes, or None: `r` does not fit above the
     * logging reserve and what the other writes will still take.
@@ -202,21 +245,29 @@ object StorageBudget:
   /** The guard stopped a write (it would cut into the logging reserve). */
   final class NoRoom extends IOException("no room above the logging reserve")
 
-/** Old text logs imported in batches of at most 5,000 lines and 1 MiB of
-  * text (a longer line alone), so that each insert is checked against the
+/** Old text logs imported in batches of at most 5,000 lines and a budget
+  * of text (a longer line alone) that the importer adapts to what each
+  * batch made the database grow, so that each insert is checked against the
   * free space before it (design 6.8).
   */
 object LegacyBatches:
   val MaxLines = 5000
   val MaxBytes: Long = SpaceGuard.Chunk.toLong
+  /** A line longer than this (UTF-8) is no NMEA or GNSS record: left out of an import. */
+  val MaxLineBytes: Long = 64L * 1024
 
-  def apply(lines: Iterator[String]): Iterator[Seq[String]] = new Iterator[Seq[String]]:
+  /** Batches of at most `maxBytes()` bytes of text (asked before each
+    * batch, so it can follow what the last batch made the database grow)
+    * and 5,000 lines; a longer line alone.
+    */
+  def apply(lines: Iterator[String], maxBytes: () => Long = () => MaxBytes): Iterator[Seq[String]] = new Iterator[Seq[String]]:
     private val it = lines.buffered
     def hasNext: Boolean = it.hasNext
     def next(): Seq[String] =
+      val limit = maxBytes()
       val b = scala.collection.mutable.ArrayBuffer.empty[String]
       var bytes = 0L
-      while it.hasNext && b.size < MaxLines && (b.isEmpty || bytes + utf8(it.head) <= MaxBytes) do
+      while it.hasNext && b.size < MaxLines && (b.isEmpty || bytes + utf8(it.head) <= limit) do
         val l = it.next()
         bytes += utf8(l)
         b += l
