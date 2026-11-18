@@ -506,11 +506,11 @@ class RegionStore(val root: File):
   /** Extracts a verified style bundle and renames it into place; `written`
     * hears every write and stops it by answering false (the budget).
     */
-  def placeStyle(zip: File, style: String, maxBytes: Long, written: Long => Boolean = _ => true): File =
+  def placeStyle(zip: File, style: String, maxBytes: Long, wrap: java.io.OutputStream => java.io.OutputStream = identity): File =
     val tmp = File(root, s"${TmpPrefix}style-$style")
     BasemapStore.deleteTree(tmp)
     try
-      BasemapStore.extract(zip, tmp, maxBytes, written)
+      BasemapStore.extract(zip, tmp, maxBytes, wrap)
       for r <- Seq(StyleLayers, "manifest.json", "sprites/light.json") if !File(tmp, r).isFile do
         throw IOException(s"style bundle lacks $r")
       val target = styleRoot(style)
@@ -742,10 +742,10 @@ object RegionRun:
         case Right(zip) =>
           val size = BasemapStore.extractedSize(zip)
           val r = env.budget.reserve(size).getOrElse(throw NoRoom())
-          try store.placeStyle(zip, t.style, size + 1, n => r.wrote(n))
+          try store.placeStyle(zip, t.style, size + 1, o => GuardedOutputStream(o, r.guard))
           catch
-            // The budget stopped it: the verified bundle stays for the next run.
-            case _: BasemapStore.NoRoom => throw NoRoom()
+            // The guard stopped it: the verified bundle stays for the next run.
+            case _: StorageBudget.NoRoom => throw NoRoom()
             case e: IOException =>
               zip.delete()
               return fail(env, c, t, HeaderReason)
@@ -797,10 +797,12 @@ object RegionRun:
       try
         // Every write reports the file's size, also after a restart from the
         // start (HTTP 200 to a Range request, a discarded partial file).
-        ResumableDownload.run(env.http, env.url(version, f.file), part, f.bytes, () => env.cancelled(), n => {
+        // Each chunk of at most 1 MiB is checked before it is written (the guard).
+        try ResumableDownload.run(env.http, env.url(version, f.file), part, f.bytes, () => env.cancelled(), n => {
           if !r.at(n) then throw NoRoom()
           cell.foreach(c => env.progress(Some(c), n))
-        })
+        }, o => GuardedOutputStream(o, r.guard))
+        catch case _: StorageBudget.NoRoom => throw NoRoom()
       finally r.release()
     if part.isFile && part.length == f.bytes && Sha256.file(part) == f.sha256 then Right(part)
     else

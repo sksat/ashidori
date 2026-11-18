@@ -63,10 +63,14 @@ object Regions:
   @volatile private var catalogCache: Option[(RegionPin, RegionCatalog)] = None
   private def catalogFile(p: RegionPin) = File(root, s"${RegionStore.CatalogDir}/${p.file}")
 
-  /** The pinned catalog if it is on the device (downloaded before). */
+  /** The pinned catalog if it is on the device (downloaded before). On the
+    * main thread only what was read before ([[refresh]]): no file is read there.
+    */
   def catalog: Option[RegionCatalog] =
     pin.flatMap { p =>
       catalogCache.filter(_._1 == p).map(_._2).orElse {
+        if onMain then return None
+        IoCheck.offMain("regions catalog")
         val f = catalogFile(p)
         Try(Files.readAllBytes(f.toPath)).toOption.filter(p.matches).flatMap(b => RegionCatalog.parse(String(b, UTF_8)).toOption).map { c =>
           catalogCache = Some(p -> c)
@@ -140,7 +144,7 @@ object Regions:
     else book.peek.getOrElse {
       if !loadAsked then
         loadAsked = true
-        AshidoriApp.io.execute(() => { book.ensureLoaded(); changed() })
+        changed()
       RegionState.empty
     }
 
@@ -163,6 +167,7 @@ object Regions:
     if onMain && book.peek.isEmpty then
       state
       return Left("読み込み中")
+    IoCheck.offMain("regions state write")
     val r = book.update(f)
     changed()
     r
@@ -170,7 +175,9 @@ object Regions:
   /** After a change that may leave files unused (a deletion, an update):
     * they go to the trash, deleted at once if nothing needs them.
     */
-  def tidy(): Unit = book.tidy()
+  def tidy(): Unit =
+    IoCheck.offMain("regions tidy")
+    book.tidy()
 
   /** Deletes what is in the trash and needed by nothing now. */
   def collect(): Unit = book.collect()
@@ -185,10 +192,37 @@ object Regions:
   def listen(f: () => Unit): () => Unit =
     listeners += f
     () => listeners -= f
-  /** Tells the UI and the maps (on the main thread). */
-  def changed(): Unit = app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
+  /** Tells the UI and the maps (on the main thread), after what they read
+    * on that thread was read again in the background ([[refresh]]).
+    */
+  def changed(): Unit = AshidoriApp.io.execute { () =>
+    refresh()
+    app.getMainExecutor.execute(() => listeners.toSeq.foreach(l => try l() catch case e: Exception => Log.w("regions: listener", e)))
+  }
 
-  def styles: Set[String] = scala.util.Try(store.scan().styles).getOrElse(Set.empty)
+  @volatile private var stylesSeen: Set[String] = Set.empty
+
+  /** Off the main thread: the state loaded, the bundles on the device, the
+    * catalog and the bundles' layers read, for the main thread to use as
+    * they are. Never throws.
+    */
+  def refresh(): Unit =
+    try
+      book.ensureLoaded()
+      pin
+      stylesSeen = store.scan().styles
+      Try(catalog)
+      stylesSeen.foreach(layers)
+    catch case e: Exception => Log.w("regions: refresh", e)
+
+  /** The style bundles on the device (on the main thread, as last read). */
+  def styles: Set[String] =
+    if onMain then stylesSeen
+    else
+      IoCheck.offMain("regions scan")
+      val s = Try(store.scan().styles).getOrElse(Set.empty)
+      stylesSeen = s
+      s
 
   def status(r: Region): RegionStatus = RegionStatus.of(r, state, styles, scala.util.Try(catalog).toOption.flatten, progress)
 
@@ -227,7 +261,9 @@ object Regions:
   private val layerCache = scala.collection.mutable.Map.empty[String, String]
   private def layers(style: String): Option[String] = layerCache.synchronized {
     layerCache.get(style).orElse {
-      Try(String(Files.readAllBytes(File(store.styleRoot(style), RegionStore.StyleLayers).toPath), UTF_8)).toOption.map { l =>
+      // Read in the background ([[refresh]]); the main thread uses what is there.
+      if onMain then None
+      else Try(String(Files.readAllBytes(File(store.styleRoot(style), RegionStore.StyleLayers).toPath), UTF_8)).toOption.map { l =>
         layerCache(style) = l
         l
       }

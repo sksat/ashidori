@@ -256,10 +256,12 @@ object Maintenance:
       return false
     if !running.compareAndSet(false, true) then return false
     val deadline = System.currentTimeMillis() + BudgetMs
-    // The logging reserve (design 6.8): every file this process writes is
-    // reserved in the budget it shares with the main process, which
-    // publishes L there; a write that does not fit, or would cut into L,
-    // stops the run (keeping all data; the rest is done next time).
+    // The logging reserve (design 6.8): every file this process writes goes
+    // through the guard, each chunk of at most 1 MiB checked against the
+    // free space and L (as the main process last wrote it) before it is
+    // written; one that does not fit stops the run. The file being written
+    // is dropped (portions committed before stay committed), no data is
+    // lost, it is not counted as a failure, and the rest is done next time.
     val low = AtomicBoolean(false)
     def noRoom(what: String): Unit =
       if low.compareAndSet(false, true) then
@@ -271,7 +273,8 @@ object Maintenance:
     try
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
-      archive.budget = Try(Storage.budget).toOption
+      // Every file this process writes goes through the guard of the logging reserve.
+      archive.guard = Some(Storage.maintenanceGuard)
       // A commit a crash interrupted is resolved first; one waiting for the
       // user stops the run (said so in the progress line).
       try archive.recover(db, progress = l => Progress.set(l))
@@ -334,7 +337,6 @@ object Maintenance:
             try
               val r = archive.compactDay(db, d, stopOrLow, line => Progress.set(line), until = deadline, portionMs = portionMs)
               if r.unconverted > 0 then LifeLog.add(LifeKind.Note, s"$d: 生データのうち ${r.unconverted} 行は変換できないため端末内に残す")
-              if r.noRoom then noRoom(s"$d")
               if r.done then
                 Guard.clear(d)
                 Complete.mark(d)

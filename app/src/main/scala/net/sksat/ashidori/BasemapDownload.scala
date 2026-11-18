@@ -326,8 +326,8 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
             }
             try data.lock.synchronized {
               data.changedOnDisk()
-              try data.store.install(archive, pin, n => room.wrote(n))
-              catch case _: BasemapStore.NoRoom => throw PinnedFailure(DownloadCause.Storage)
+              try data.store.install(archive, pin, o => GuardedOutputStream(o, room.guard))
+              catch case _: StorageBudget.NoRoom => throw PinnedFailure(DownloadCause.Storage)
               // Deleted (or replaced) meanwhile: do not leave it installed.
               if isStopped then
                 data.store.deleteAll()
@@ -408,7 +408,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
           if n == pin.bytes || n - shown >= pin.bytes / 100 then
             shown = n
             dl.reportProgress(Some((n, pin.bytes, source)))
-        })
+        }, o => GuardedOutputStream(o, room.guard))
         if Sha256.matches(part, pin) then Some(part -> source)
         else
           // Bytes from either source must be the pinned ones; start over.
@@ -420,6 +420,8 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
         case e: ResumableDownload.Cancelled => throw e
         case e: Outbound.Blocked => throw e
         case e: PinnedFailure => throw e
+        // Each chunk is checked before it is written: no room, the partial file stays.
+        case _: StorageBudget.NoRoom => throw PinnedFailure(DownloadCause.Storage)
         case e: Exception =>
           Log.w(s"$name from ${source.key} failed", e)
           errors += source -> DownloadCause.of(e)

@@ -6,147 +6,104 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, StandardCopyOption, StandardOpenOption}
 import scala.util.Try
 
-/** Where the budget's reservations and the logging reserve live: in this
-  * process ([[BudgetLedger.Memory]]), or in a small file every process of
-  * the app uses under a file lock ([[BudgetLedger.Shared]]).
+/** Guards the logging reserve against the app's large writes (design 6.8).
+  *
+  * The guarantee: the free space never goes below the logging reserve `L`
+  * by more than (number of large writers running at once) × 1 MiB. Every
+  * large writer, in either process, writes through a [[SpaceGuard]]: each
+  * write is split into chunks of at most [[SpaceGuard.Chunk]] (1 MiB), and
+  * before each chunk the free space now must leave `L`, what the main
+  * process's reservations still hold ([[StorageBudget]], main process
+  * only) and the chunk itself. Otherwise the write stops
+  * ([[StorageBudget.NoRoom]]). A check sees what the other writers wrote
+  * before it; what they write between two checks is at most their own
+  * chunk each, hence the bound.
+  *
+  * `free`: the free space now; `reserve`: L now; `held`: bytes the main
+  * process's reservations will still write (0 in another process).
   */
-trait BudgetLedger:
-  /** Runs `f` on the ledger as it is now and stores what it returns, as one step. */
-  def transact[A](f: BudgetLedger.State => (BudgetLedger.State, A)): A
-  /** How many bytes a reservation may write between its reports (and
-    * between its readings of the others and of L).
-    */
-  def flushBytes: Long
+final class SpaceGuard(free: () => Long, reserve: () => Long, held: () => Long = () => 0L):
+  /** The chunk `n` (at most [[SpaceGuard.Chunk]]) may be written now. */
+  def allows(n: Long): Boolean = free() - reserve() - held() >= n
+  /** As [[allows]], or NoRoom. */
+  def check(n: Long): Unit = if !allows(n) then throw StorageBudget.NoRoom()
 
-object BudgetLedger:
-  /** One reservation: `owner` (a process, [[StorageBudget]]), `bytes` it may
-    * write in all, `written` so far.
-    */
-  final case class Entry(id: String, owner: String, bytes: Long, written: Long):
-    def outstanding: Long = math.max(0L, bytes - written)
+object SpaceGuard:
+  val Chunk: Int = 1 << 20
 
-  /** `reserve`: the logging reserve L as the main process last published it. */
-  final case class State(reserve: Option[Long], entries: Vector[Entry])
-  val Empty: State = State(None, Vector.empty)
+/** An output stream for a large writer: every write is split into chunks
+  * of at most 1 MiB, each checked against the guard before it is written
+  * (a single row group, ZIP entry or downloaded buffer larger than that
+  * included). A single byte is checked on its own.
+  */
+final class GuardedOutputStream(out: OutputStream, guard: SpaceGuard) extends OutputStream:
+  /** Checks done (for tests). */
+  var checks = 0
 
-  final class Memory extends BudgetLedger:
-    def flushBytes: Long = 0L
-    private var s = Empty
-    def transact[A](f: State => (State, A)): A = synchronized {
-      val (n, a) = f(s)
-      s = n
-      a
-    }
+  def write(b: Int): Unit =
+    guard.check(1)
+    checks += 1
+    out.write(b)
 
-  /** The ledger in `file`, written whole under an exclusive lock of
-    * `<file>.lock` (FileChannel.lock between processes, a monitor between
-    * the threads of one) and replaced by rename. A file that cannot be read
-    * counts as empty.
-    */
-  final class Shared(file: File, val flushBytes: Long = 1L << 20) extends BudgetLedger:
-    private val lockFile = File(file.getPath + ".lock")
-    private val monitor = Shared.monitor(file)
-    def transact[A](f: State => (State, A)): A = monitor.synchronized {
-      file.getParentFile.mkdirs()
-      val ch = FileChannel.open(lockFile.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-      try
-        val lock = ch.lock()
-        try
-          val now = Try(String(Files.readAllBytes(file.toPath), UTF_8)).toOption.flatMap(decode).getOrElse(Empty)
-          val (n, a) = f(now)
-          if n != now then
-            val tmp = File(file.getPath + ".tmp")
-            Files.write(tmp.toPath, encode(n).getBytes(UTF_8))
-            Files.move(tmp.toPath, file.toPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-          a
-        finally lock.release()
-      finally ch.close()
-    }
+  override def write(b: Array[Byte], off: Int, len: Int): Unit =
+    var at = off
+    var left = len
+    while left > 0 do
+      val n = math.min(left, SpaceGuard.Chunk)
+      guard.check(n)
+      checks += 1
+      out.write(b, at, n)
+      at += n
+      left -= n
 
-  object Shared:
-    private val monitors = scala.collection.mutable.Map.empty[String, Object]
-    private def monitor(f: File): Object = synchronized(monitors.getOrElseUpdate(f.getCanonicalPath, new Object))
+  override def flush(): Unit = out.flush()
+  override def close(): Unit = out.close()
 
-  val Format = "ashidori storage budget v1"
+/** L for every process: the main process writes it to a small file
+  * whenever the logging mode or the measured rate changes (a temporary
+  * file, synced, renamed, the directory synced); another process (archive
+  * maintenance) reads it at every check. A file that is missing, cannot be
+  * read or is not a number gives the most conservative L ([[Conservative]]),
+  * never the floor.
+  */
+object ReserveFile:
+  /** L of 最高精度 at its default rate: what nothing measured can exceed by default. */
+  val Conservative: Long = StorageBudget.loggingReserve(LoggingMode.Max, None)
 
-  def encode(s: State): String =
-    val o = ujson.Obj("format" -> Format,
-      "entries" -> ujson.Arr(s.entries.map(e => ujson.Obj("id" -> e.id, "owner" -> e.owner,
-        "bytes" -> e.bytes.toDouble, "written" -> e.written.toDouble))*))
-    s.reserve.foreach(r => o("reserve") = r.toDouble)
-    ujson.write(o)
-
-  def decode(json: String): Option[State] =
+  def write(f: File, bytes: Long): Unit =
+    f.getParentFile.mkdirs()
+    val tmp = File(f.getPath + ".tmp")
+    val ch = FileChannel.open(tmp.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
+    try
+      ch.write(java.nio.ByteBuffer.wrap(s"$bytes\n".getBytes(UTF_8)))
+      ch.force(true)
+    finally ch.close()
+    Files.move(tmp.toPath, f.toPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+    // The rename is durable once the directory is synced (where the platform allows it).
     Try {
-      val o = ujson.read(json).obj
-      require(o("format").str == Format)
-      State(o.get("reserve").map(_.num.toLong),
-        o("entries").arr.map(e => Entry(e("id").str, e("owner").str, e("bytes").num.toLong, e("written").num.toLong)).toVector)
-    }.toOption
+      val d = FileChannel.open(f.getParentFile.toPath, StandardOpenOption.READ)
+      try d.force(true) finally d.close()
+    }
 
-/** The storage budget of the app's large writes (design 6.8), shared by all
-  * of them and by the app's processes when its ledger is shared: the main
-  * process (the basemap and venue downloads and extractions, the backups,
-  * the region packs) and the maintenance process (compaction, the monthly
-  * merge, cutting deleted ranges, the import of old logs).
-  *
-  * A write of `r` bytes starts only if `F - ΣO - L >= r`, and stops while it
-  * runs once `F - ΣO < L`, where `F` is the free space now (`free`), `O`
-  * each reservation's unwritten rest and `L` the logging reserve: the
-  * larger of this process's own (`reserve`) and the one the main process
-  * published in the ledger ([[publish]]), read at every check.
-  *
-  * Reservations carry their `owner` (a process: id and start); entries of
-  * owners no longer alive (`alive`) are dropped under the lock, so a
-  * process that died leaves nothing reserved. A reservation reports its
-  * writes to a shared ledger at least every MiB (and at every truncation),
-  * reading the others and L then; between, it checks the free space now
-  * against what the ledger said last.
+  def read(f: File): Long =
+    Try(String(Files.readAllBytes(f.toPath), UTF_8).trim.toLong).toOption.filter(_ > 0).getOrElse(Conservative)
+
+/** The main process's reservations of its large writes (downloads,
+  * extractions, backups), in memory only: a write of `r` bytes starts only
+  * if `F - ΣO - L >= r` (F the free space now, O each reservation's
+  * unwritten rest, L the logging reserve). Each write itself goes through a
+  * [[SpaceGuard]] with `held` = [[outstanding]]. Releasing cannot fail.
   * Thread-safe.
   */
-final class StorageBudget(free: () => Long, reserve: () => Long, ledger: BudgetLedger = BudgetLedger.Memory(),
-                          owner: String = "local", alive: String => Boolean = _ => true):
-  import BudgetLedger.{Entry, State}
-  private val ids = java.util.concurrent.atomic.AtomicLong()
-
-  private def pruned(s: State): State =
-    val keep = s.entries.filter(e => e.owner == owner || alive(e.owner))
-    if keep.size == s.entries.size then s else s.copy(entries = keep)
-  private def l(s: State): Long = math.max(reserve(), s.reserve.getOrElse(0L))
-  private def outstanding(s: State): Long = s.entries.map(_.outstanding).sum
-  private def read[A](f: State => A): A = ledger.transact { s0 =>
-    val s = pruned(s0)
-    (s, f(s))
-  }
-
-  /** A reservation of a write of `bytes` in all, `start` of them written already. */
-  final class Reservation private[StorageBudget] (val id: String, private var bytes: Long, start: Long):
+final class StorageBudget(free: () => Long, reserve: () => Long):
+  final class Reservation private[StorageBudget] (private var bytes: Long, start: Long):
     private var written = start
-    private var flushed = start
-    private var cached = (0L, 0L) // others' outstanding, L
     private var open = true
 
-    private def refresh(s: State): Unit =
-      cached = (s.entries.filterNot(_.id == id).map(_.outstanding).sum, l(s))
-    private[StorageBudget] def seen(s: State): Unit = synchronized(refresh(s))
-    /** Writes this reservation's state to the ledger and reads the others'. */
-    private def flush(): Unit =
-      ledger.transact { s0 =>
-        val s = pruned(s0)
-        val n = s.copy(entries = s.entries.map(e => if e.id == id then e.copy(bytes = bytes, written = written) else e))
-        refresh(n)
-        (n, ())
-      }
-      flushed = written
-    private def okNow: Boolean = free() - cached._1 - math.max(0L, bytes - written) >= cached._2
-
-    /** `n` more bytes written. False once the write must stop: the free
-      * space would cut into the logging reserve.
-      */
-    def wrote(n: Long): Boolean = synchronized {
+    /** `n` more bytes written. False once the write must stop. */
+    def wrote(n: Long): Boolean = StorageBudget.this.synchronized {
       written += n
-      if math.abs(written - flushed) >= ledger.flushBytes then flush()
-      okNow
+      okLocked
     }
 
     /** For a file being brought to `bytes`: it is `size` bytes long now. A
@@ -155,58 +112,43 @@ final class StorageBudget(free: () => Long, reserve: () => Long, ledger: BudgetL
       * reservation, against what the others hold now. False once the write
       * must stop.
       */
-    def at(size: Long): Boolean = synchronized {
+    def at(size: Long): Boolean = StorageBudget.this.synchronized {
       if size < written then
         written = size
-        flush()
-        free() - cached._1 - math.max(0L, bytes - written) >= cached._2
+        val others = active.filterNot(_ eq this).map(_.rest).sum
+        free() - others - reserve() >= rest && okLocked
       else
         written = size
-        if written - flushed >= ledger.flushBytes then flush()
-        okNow
+        okLocked
     }
 
-    /** `n` more bytes to write than reserved (more input came): admitted
-      * like a new reservation. False (nothing changed) if it does not fit.
+    private[StorageBudget] def rest: Long = if open then math.max(0L, bytes - written) else 0L
+    def outstanding: Long = StorageBudget.this.synchronized(rest)
+
+    /** The guard of this reservation's writes: L and what the other
+      * reservations will still write (each chunk of its own is checked as
+      * it comes, so its own rest is not counted twice).
       */
-    def grow(n: Long): Boolean = synchronized {
-      ledger.transact { s0 =>
-        val s = pruned(s0)
-        val others = s.entries.filterNot(_.id == id).map(_.outstanding).sum
-        if free() - others - math.max(0L, bytes - written) - l(s) < n then
-          refresh(s)
-          (s, false)
-        else
-          bytes += n
-          val ns = s.copy(entries = s.entries.map(e => if e.id == id then e.copy(bytes = bytes, written = written) else e))
-          refresh(ns)
-          flushed = written
-          (ns, true)
-      }
+    def guard: SpaceGuard = SpaceGuard(free, reserve, () => StorageBudget.this.synchronized(active.filterNot(_ eq this).map(_.rest).sum))
+
+    def release(): Unit = StorageBudget.this.synchronized {
+      open = false
+      active = active.filterNot(_ eq this)
     }
 
-    def outstanding: Long = synchronized(if open then math.max(0L, bytes - written) else 0L)
+  private var active = List.empty[Reservation]
+  private def okLocked: Boolean = free() - active.map(_.rest).sum >= reserve()
 
-    def release(): Unit = synchronized {
-      if open then
-        open = false
-        ledger.transact(s => (s.copy(entries = s.entries.filterNot(_.id == id)), ()))
-    }
-
-  private def admit(bytes: Long, start: Long): Option[Reservation] =
-    val id = s"$owner#${ids.incrementAndGet()}#${System.nanoTime()}"
-    ledger.transact { s0 =>
-      val s = pruned(s0)
-      if free() - outstanding(s) - l(s) < math.max(0L, bytes - start) then (s, None)
-      else
-        val x = Reservation(id, bytes, start)
-        val n = s.copy(entries = s.entries :+ Entry(id, owner, bytes, start))
-        x.seen(n)
-        (n, Some(x))
-    }
+  private def admit(bytes: Long, start: Long): Option[Reservation] = synchronized {
+    if free() - active.map(_.rest).sum - reserve() < math.max(0L, bytes - start) then None
+    else
+      val x = Reservation(bytes, start)
+      active = x :: active
+      Some(x)
+  }
 
   /** A reservation of `r` bytes, or None: `r` does not fit above the
-    * logging reserve and what the other writes (of any process) will still take.
+    * logging reserve and what the other writes will still take.
     */
   def reserve(r: Long): Option[Reservation] = admit(r, 0L)
 
@@ -216,39 +158,16 @@ final class StorageBudget(free: () => Long, reserve: () => Long, ledger: BudgetL
     */
   def reserveFile(target: Long, have: Long): Option[Reservation] = admit(target, math.min(have, target))
 
-  /** The main process publishes L (its logging mode and measured rate) for every process. */
-  def publish(reserveBytes: Long): Unit =
-    ledger.transact { s0 =>
-      val s = pruned(s0)
-      if s.reserve.contains(reserveBytes) then (s, ()) else (s.copy(reserve = Some(reserveBytes)), ())
-    }
-
-  /** L now: the larger of this process's and the published one. */
-  def loggingReserve: Long = read(l)
-
+  /** What the reservations will still write. */
+  def outstanding: Long = synchronized(active.map(_.rest).sum)
   /** The free space, less what reservations will still write, stays at or above the reserve. */
-  def ok: Boolean = read(s => free() - outstanding(s) >= l(s))
+  def ok: Boolean = synchronized(okLocked)
   /** What a new reservation may take now. */
-  def available: Long = read(s => math.max(0L, free() - outstanding(s) - l(s)))
-  def busy: Boolean = read(_.entries.nonEmpty)
-  /** Reservations of every process (for diagnostics). */
-  def entries: Seq[Entry] = read(_.entries)
+  def available: Long = synchronized(math.max(0L, free() - active.map(_.rest).sum - reserve()))
+  def busy: Boolean = synchronized(active.nonEmpty)
 
-
-/** An output stream that reports what it writes to a reservation (every
-  * write, through [[StorageBudget.Reservation.wrote]]) and fails with
-  * [[StorageBudget.NoRoom]] once the budget says stop: whatever writes
-  * through it (Parquet, ZIP) stops before it cuts into the logging reserve.
-  */
-final class BudgetedOutputStream(out: OutputStream, room: StorageBudget#Reservation) extends OutputStream:
-  def write(b: Int): Unit =
-    out.write(b)
-    if !room.wrote(1) then throw StorageBudget.NoRoom()
-  override def write(b: Array[Byte], off: Int, len: Int): Unit =
-    out.write(b, off, len)
-    if !room.wrote(len) then throw StorageBudget.NoRoom()
-  override def flush(): Unit = out.flush()
-  override def close(): Unit = out.close()
+  /** The guard of this process's writes: L and every reservation's rest. */
+  def guard: SpaceGuard = SpaceGuard(free, reserve, () => outstanding)
 
 object StorageBudget:
   /** The reserve's floor: 256 MB, the monitoring threshold. */
@@ -280,5 +199,27 @@ object StorageBudget:
   def loggingReserve(mode: LoggingMode, measured: Option[Long]): Long =
     math.max(MinReserve, math.max(measured.getOrElse(0L), defaultRate(mode)) * 24)
 
-  /** The budget stopped a write (it would cut into the logging reserve). */
+  /** The guard stopped a write (it would cut into the logging reserve). */
   final class NoRoom extends IOException("no room above the logging reserve")
+
+/** Old text logs imported in batches of at most 5,000 lines and 1 MiB of
+  * text (a longer line alone), so that each insert is checked against the
+  * free space before it (design 6.8).
+  */
+object LegacyBatches:
+  val MaxLines = 5000
+  val MaxBytes: Long = SpaceGuard.Chunk.toLong
+
+  def apply(lines: Iterator[String]): Iterator[Seq[String]] = new Iterator[Seq[String]]:
+    private val it = lines.buffered
+    def hasNext: Boolean = it.hasNext
+    def next(): Seq[String] =
+      val b = scala.collection.mutable.ArrayBuffer.empty[String]
+      var bytes = 0L
+      while it.hasNext && b.size < MaxLines && (b.isEmpty || bytes + utf8(it.head) <= MaxBytes) do
+        val l = it.next()
+        bytes += utf8(l)
+        b += l
+      b.toSeq
+
+  def utf8(s: String): Long = s.getBytes(UTF_8).length.toLong

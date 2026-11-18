@@ -112,7 +112,8 @@ object Backup:
     var accounted = 0L
     val floor = if mode == Mode.Quarantine then QuarantineFloor else LoggingMargin
     // What has been written on this storage (the copy, then the ZIP's
-    // output bytes) goes to the budget; false once it cuts into the reserve.
+    // output bytes) goes to the reservation; false once the free space
+    // would cut into the reserve.
     // Its own lock: the copy's watcher calls it while this object's lock is held.
     val spaceLock = new Object
     def space(written: Long): Boolean = spaceLock.synchronized {
@@ -165,7 +166,10 @@ object Backup:
             try
               while !Thread.currentThread().isInterrupted do
                 Thread.sleep(200)
-                if !space(snapshot.length) then
+                // Its reservation covers the copy; others (the other process,
+                // the logger) may still take room: cancelled once less than
+                // 1 MiB is left above L and the other reservations.
+                if !space(snapshot.length) || reserved.exists(r => !r.guard.allows(ashidori.core.SpaceGuard.Chunk)) then
                   breached = true
                   sig.cancel()
             catch case _: InterruptedException => ()
@@ -227,9 +231,11 @@ object Backup:
       // The ZIP's output bytes (compressed), what takes room.
       var zipBytes = 0L
       Using.resource(c.getContentResolver.openOutputStream(uri, "wt")) { raw0 =>
-        val raw = new java.io.FilterOutputStream(raw0):
-          override def write(b: Int): Unit = { raw0.write(b); zipBytes += 1 }
-          override def write(b: Array[Byte], off: Int, len: Int): Unit = { raw0.write(b, off, len); zipBytes += len }
+        // Each chunk of at most 1 MiB checked against L and the other reservations before it is written.
+        val checked = reserved.fold[java.io.OutputStream](raw0)(r => ashidori.core.GuardedOutputStream(raw0, r.guard))
+        val raw = new java.io.FilterOutputStream(checked):
+          override def write(b: Int): Unit = { checked.write(b); zipBytes += 1 }
+          override def write(b: Array[Byte], off: Int, len: Int): Unit = { checked.write(b, off, len); zipBytes += len }
         val zip = ZipOutputStream(BufferedOutputStream(raw, 1 << 16))
         zip.setLevel(Deflater.BEST_SPEED)
         def tick(): Unit =

@@ -91,6 +91,13 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
     }
 
   private def refresh(): Unit =
+    try show()
+    catch case e: Exception =>
+      Log.w("regions: list", e)
+      list.removeAllViews()
+      list.addView(supportingText("読み込めません"))
+
+  private def show(): Unit =
     checkWork()
     list.removeAllViews()
     val s = Regions.state
@@ -223,10 +230,18 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
     }
     p.show()
 
-  /** Runs `andThen` if the change was written; else says it was not. */
-  private def saved[A](r: Either[String, A])(andThen: => Unit): Unit = r match
-    case Right(_) => andThen
-    case Left(_) => Toast.makeText(act, "保存できませんでした", Toast.LENGTH_SHORT).show()
+  /** Runs the change in the background (it writes the state), then
+    * `andThen` on the main thread if it was written; else says it was not.
+    */
+  private def saved[A](change: => Either[String, A])(andThen: => Unit): Unit =
+    AshidoriApp.io.execute { () =>
+      val r = try change catch case e: Exception => Left(e.toString)
+      act.runOnUiThread { () =>
+        r match
+          case Right(_) => andThen
+          case Left(_) => Toast.makeText(act, "保存できませんでした", Toast.LENGTH_SHORT).show()
+      }
+    }
 
   private def rename(r: Region): Unit =
     val e = EditText(act)
@@ -423,7 +438,30 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
       val se = p.fromScreenLocation(android.graphics.PointF(x0 + frameView.getWidth, y0 + frameView.getHeight))
       Some(Bounds(nw.getLongitude, se.getLatitude, se.getLongitude, nw.getLatitude))
 
+  /** Free space and what a new reservation may take, read in the background. */
+  @volatile private var space: Option[(Long, Long)] = None
+  @volatile private var spaceAt = 0L
+  private def askSpace(): Unit =
+    val now = System.currentTimeMillis()
+    if now - spaceAt > 1000 then
+      spaceAt = now
+      AshidoriApp.io.execute { () =>
+        val s = scala.util.Try((Storage.free(), Storage.budget.available)).toOption
+        act.runOnUiThread { () =>
+          space = s.orElse(space)
+          if act.showing(this) then update()
+        }
+      }
+
   private def update(): Unit =
+    try show()
+    catch case e: Exception =>
+      Log.w("regions: selection", e)
+      sizeLine.setText("読み込めません")
+      download.setEnabled(false)
+
+  private def show(): Unit =
+    askSpace()
     val cat = Regions.catalog
     val s = Regions.state
     val cells = map.flatMap(frameBounds).map(Cell.covering).getOrElse(Seq.empty)
@@ -450,7 +488,6 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
         f
       }
       src.setGeoJson(FeatureCollection.fromFeatures(fs.asJava))
-    val free = Storage.free()
     cat match
       case None =>
         sizeLine.setText(if fetching then "カタログを取得中…" else fetchError.getOrElse("カタログなし"))
@@ -459,12 +496,13 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
       case Some(c) =>
         val e = RegionEstimate(cells, s, c, Regions.styles)
         val known = cells.filter(c.cells.contains)
-        val fits = e.bytes <= Storage.budget.available
         val (line, ok) =
           if cells.size > Regions.MaxCells then ("範囲を狭めてください", false)
           else if known.isEmpty then ("この範囲の地図はありません", false)
-          else if !fits then ("空き容量が不足", false)
-          else (s"${RegionsUi.size(e.bytes)} · 空き ${RegionsUi.size(free)}", true)
+          else space match
+            case None => (s"${RegionsUi.size(e.bytes)} · 空き容量を確認中", false)
+            case Some((_, available)) if e.bytes > available => ("空き容量が不足", false)
+            case Some((free, _)) => (s"${RegionsUi.size(e.bytes)} · 空き ${RegionsUi.size(free)}", true)
         sizeLine.setText(line)
         sizeLine.setTextColor(color(if ok then attr.onSurface else attr.error))
         sendLine.setText(s"${RegionsUi.source} に伝わる範囲: 区画 ${e.fetch.size} 個")
@@ -479,8 +517,10 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
         download.setEnabled(false)
         AshidoriApp.io.execute { () =>
           val name = Regions.defaultName(center.getLatitude, center.getLongitude)
+          // The state is written here, off the main thread.
+          val added = try Regions.add(name, cells, c) catch case e: Exception => Left(e.toString)
           act.runOnUiThread { () =>
-            Regions.add(name, cells, c) match
+            added match
               case Right(_) => RegionDownload.start(act)
               case Left(_) => Toast.makeText(act, "保存できませんでした", Toast.LENGTH_SHORT).show()
             act.pop()

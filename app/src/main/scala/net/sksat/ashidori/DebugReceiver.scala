@@ -316,7 +316,7 @@ class DebugReceiver extends BroadcastReceiver:
       case "ashidori.debug.REGIONS_DELETE" =>
         // As 削除 in the list: --es id r1.
         val id = Option(intent.getStringExtra("id")).getOrElse("")
-        AshidoriApp.app.getMainExecutor.execute(() => Regions.delete(id))
+        AshidoriApp.io.execute(() => Regions.delete(id))
         Log.i(s"regions delete $id")
       case "ashidori.debug.REGIONS_STATE" =>
         AshidoriApp.io.execute { () =>

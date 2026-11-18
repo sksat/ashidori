@@ -170,7 +170,8 @@ object ResumableDownload:
     * stays for the next attempt in every case but a wrong one.
     */
   def run(http: RangeHttp, url: String, part: File, total: Long,
-          cancelled: () => Boolean = () => false, progress: Long => Unit = _ => ()): Unit =
+          cancelled: () => Boolean = () => false, progress: Long => Unit = _ => (),
+          wrap: java.io.OutputStream => java.io.OutputStream = identity): Unit =
     if part.length > total then part.delete()
     var attempts = 0
     var done = false
@@ -182,8 +183,8 @@ object ResumableDownload:
         val res = http.get(url, have)
         try
           plan(have, total, res.code, res.header("Content-Range")) match
-            case Plan.Append => copy(res.body, part, append = true, have, total, cancelled, progress)
-            case Plan.Restart => copy(res.body, part, append = false, 0L, total, cancelled, progress)
+            case Plan.Append => copy(res.body, part, append = true, have, total, cancelled, progress, wrap)
+            case Plan.Restart => copy(res.body, part, append = false, 0L, total, cancelled, progress, wrap)
             case Plan.Complete => ()
             case Plan.Discard =>
               part.delete()
@@ -201,9 +202,9 @@ object ResumableDownload:
         else if attempts >= 3 then throw IOException(s"incomplete: $now of $total bytes")
 
   private def copy(in: InputStream, part: File, append: Boolean, start: Long, total: Long,
-                   cancelled: () => Boolean, progress: Long => Unit): Unit =
+                   cancelled: () => Boolean, progress: Long => Unit, wrap: java.io.OutputStream => java.io.OutputStream): Unit =
     part.getParentFile.mkdirs()
-    val out = FileOutputStream(part, append)
+    val out = wrap(FileOutputStream(part, append))
     try
       val buf = new Array[Byte](64 * 1024)
       var n = start
@@ -257,15 +258,15 @@ final class BasemapStore(val root: File, required: Seq[String] = BasemapStore.Re
     Some(versionDir(pin.version)).filter(d => required.forall(r => File(d, r).isFile))
 
   /** Extracts a verified archive and moves it into place as `pin.version`;
-    * `written` hears every write and stops it by answering false (the
-    * storage budget): the extraction is then removed.
+    * `wrap` wraps every file it writes (the storage guard, which may stop
+    * it: the extraction is then removed).
     */
-  def install(archive: File, pin: BasemapPin, written: Long => Boolean = _ => true): File =
+  def install(archive: File, pin: BasemapPin, wrap: java.io.OutputStream => java.io.OutputStream = identity): File =
     root.mkdirs()
     val tmp = File(root, s"$TmpPrefix${pin.version}")
     deleteTree(tmp)
     try
-      extract(archive, tmp, MaxExtracted, written)
+      extract(archive, tmp, MaxExtracted, wrap)
       val missing = required.filterNot(r => File(tmp, r).isFile)
       if missing.nonEmpty then throw IOException(s"archive lacks ${missing.mkString(", ")}")
       val target = versionDir(pin.version)
@@ -290,8 +291,6 @@ final class BasemapStore(val root: File, required: Seq[String] = BasemapStore.Re
   def deleteAll(): Unit = deleteTree(root)
 
 object BasemapStore:
-  /** The storage budget stopped an extraction. */
-  final class NoRoom extends IOException("no room above the logging reserve")
   /** The size an archive extracts to (its entries' declared sizes). */
   def extractedSize(archive: File): Long =
     import scala.jdk.CollectionConverters.*
@@ -319,7 +318,8 @@ object BasemapStore:
     * copying (`maxTotal`), so an archive that inflates far beyond what it
     * declares cannot fill the disk.
     */
-  def extract(archive: File, dest: File, maxTotal: Long = MaxExtracted, written: Long => Boolean = _ => true): Unit =
+  def extract(archive: File, dest: File, maxTotal: Long = MaxExtracted,
+              wrap: java.io.OutputStream => java.io.OutputStream = identity): Unit =
     import scala.jdk.CollectionConverters.*
     val zip = java.util.zip.ZipFile(archive)
     try
@@ -340,7 +340,7 @@ object BasemapStore:
           val in = zip.getInputStream(e)
           var n = 0L
           try
-            val out = java.io.FileOutputStream(f)
+            val out = wrap(java.io.FileOutputStream(f))
             try
               var r = in.read(buf)
               while r >= 0 do
@@ -349,7 +349,6 @@ object BasemapStore:
                 if total > maxTotal then throw IOException("archive too large")
                 if e.getSize >= 0 && n > e.getSize then throw IOException(s"${e.getName}: size mismatch")
                 out.write(buf, 0, r)
-                if !written(r) then throw NoRoom()
                 r = in.read(buf)
             finally out.close()
           finally in.close()

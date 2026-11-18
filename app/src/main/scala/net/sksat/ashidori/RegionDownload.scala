@@ -60,7 +60,8 @@ object RegionDownload:
     // On the io thread, which other work shares: a failure here stays here.
     AshidoriApp.io.execute { () =>
       try
-        Regions.ensureLoaded()
+        Regions.refresh()
+        Regions.changed()
         val s = Regions.state
         val placed = s.packs.values.exists(_.installed.nonEmpty)
         val planned = s.queue.nonEmpty

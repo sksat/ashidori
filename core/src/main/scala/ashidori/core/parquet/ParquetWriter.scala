@@ -172,7 +172,12 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
     require(bytes.length.toLong == g.end - g.start, "bytes are not the group")
     flushGroup()
     val base = sink.count
-    sink.write(bytes)
+    // In writes of at most 1 MiB: a guarded stream below checks each before it is written.
+    var at = 0
+    while at < bytes.length do
+      val n = math.min(bytes.length - at, CopyChunk)
+      sink.write(bytes, at, n)
+      at += n
     val chunks = schema.zip(g.chunks).zipWithIndex.map { case ((c, ch), i) =>
       ChunkMeta(c, base + (ch.offset - g.start), ch.uncompressed.toInt, ch.length.toInt, g.rows, ch.encoding,
         if i == 0 && timeStats then g.time else None, ch.codec)
@@ -255,6 +260,8 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
     sink.flush()
 
 object ParquetWriter:
+  /** The largest single write of a copied row group. */
+  val CopyChunk: Int = 1 << 20
   private val Magic = "PAR1".getBytes(UTF_8)
 
   private final case class ChunkMeta(column: Column, offset: Long, uncompressed: Int, compressed: Int, rows: Int, encoding: Int,

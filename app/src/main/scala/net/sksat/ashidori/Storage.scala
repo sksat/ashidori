@@ -4,86 +4,74 @@ import android.content.Context
 import java.io.File
 import ashidori.core.*
 
-/** The storage budget shared by every large write of the app (design 6.8),
-  * in both of its processes: the basemap and venue downloads and their
-  * extraction, the backups and the region packs (main process), and
-  * archive maintenance (`:maintenance`: compaction, the monthly merge,
-  * cutting deleted ranges, the import of old logs). Each reserves what it
-  * will write and reports what it writes; none starts or goes on once the
-  * free space would cut into the logging reserve `L` (the logger itself
-  * never asks).
+/** The logging reserve against the app's large writes (design 6.8).
   *
-  * The reservations and L live in `files/storage-budget.json`, read and
-  * written under a file lock by both processes ([[BudgetLedger.Shared]]);
-  * a reservation of a process that died is dropped. The main process
-  * computes L (the logging mode and the measured rate) and publishes it
-  * there whenever it changes; the maintenance process reads it from there
-  * at every report of its writes (at least every MiB).
+  * The guarantee: the free space never goes below the logging reserve L by
+  * more than (number of large writers running at once) × 1 MiB. Every large
+  * writer, in either process, writes through a [[SpaceGuard]]: each write
+  * in chunks of at most 1 MiB, each checked against the free space now
+  * before it is written.
+  *
+  *  - Main process (downloads, extractions, backups, region packs): a
+  *    reservation in [[budget]] (in memory) first, then every chunk is
+  *    checked against L and what the other reservations will still write.
+  *  - Maintenance process (compaction, the monthly merge, cutting deleted
+  *    ranges, the import of old logs): every chunk is checked against L as
+  *    the main process last wrote it to [[reserveFile]] ([[maintenanceGuard]]).
+  *
+  * The main process computes L (the logging mode and the measured rate) and
+  * writes it whenever it changes; a file that cannot be read gives the most
+  * conservative L ([[ReserveFile.Conservative]]).
   */
 object Storage:
   private def app = AshidoriApp.app
-  lazy val ledgerFile: File = File(app.getFilesDir, "storage-budget.json")
+  lazy val reserveFile: File = File(app.getFilesDir, "logging-reserve")
 
-  lazy val budget: StorageBudget =
-    StorageBudget(() => free(), () => ownReserve(), BudgetLedger.Shared(ledgerFile), owner, alive)
+  /** The main process's reservations. */
+  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve())
 
-  /** This process: the boot, its pid and its start (clock ticks since boot, /proc/<pid>/stat). */
-  lazy val owner: String = s"${bootCount()}:${android.os.Process.myPid()}:${startTicks(android.os.Process.myPid()).getOrElse(0L)}"
-
-  private def bootCount(): Int =
-    scala.util.Try(android.provider.Settings.Global.getInt(app.getContentResolver, android.provider.Settings.Global.BOOT_COUNT)).getOrElse(-1)
-
-  /** Field 22 of /proc/<pid>/stat (after the command in parentheses). */
-  private def startTicks(pid: Int): Option[Long] =
-    scala.util.Try {
-      val st = String(java.nio.file.Files.readAllBytes(File(s"/proc/$pid/stat").toPath))
-      st.substring(st.lastIndexOf(')') + 2).split(' ')(19).toLong
-    }.toOption
-
-  /** A reservation's owner is alive: this boot, and its pid still the same process. */
-  private def alive(o: String): Boolean = o.split(':') match
-    case Array(boot, pid, start) =>
-      boot.toIntOption.contains(bootCount()) &&
-        pid.toIntOption.flatMap(startTicks).exists(t => start.toLongOption.contains(t))
-    case _ => false
+  /** The maintenance process's guard: L read from [[reserveFile]] at every check. */
+  lazy val maintenanceGuard: SpaceGuard = SpaceGuard(() => free(), () => ReserveFile.read(reserveFile))
 
   /** Debug builds: free bytes to pretend (DebugReceiver STORAGE_FREE); None: the real ones. */
   @volatile var debugFree: Option[Long] = None
-  def free(): Long = debugFree.filter(_ => debuggable).getOrElse(app.getFilesDir.getUsableSpace)
+  def free(): Long =
+    IoCheck.offMain("free space")
+    debugFree.filter(_ => debuggable).getOrElse(app.getFilesDir.getUsableSpace)
 
   @volatile private var reserveAt = 0L
   @volatile private var reserveMode: Option[LoggingMode] = None
-  @volatile private var reserveValue = StorageBudget.MinReserve
+  @volatile private var reserveValue = ReserveFile.Conservative
+  @volatile private var written = -1L
 
-  /** This process's own L: in the main process measured (at most once a
-    * minute, and at once when the logging mode changes) and published; in
-    * the maintenance process only the floor (the published one counts).
+  /** L of the main process: measured at most once a minute, and at once
+    * when the logging mode changes; written to [[reserveFile]] when it
+    * changes. In the maintenance process, the file's.
     */
-  private def ownReserve(): Long =
-    if AshidoriApp.isMaintenanceProcess then StorageBudget.MinReserve
-    else
+  def reserve(): Long =
+    if AshidoriApp.isMaintenanceProcess then ReserveFile.read(reserveFile)
+    else synchronized {
       val now = System.currentTimeMillis()
       val mode = Settings.mode
       if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
         reserveAt = now
         reserveMode = Some(mode)
         reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
-        // Outside the ledger's lock (this is called under it): published next.
-        val v = reserveValue
-        AshidoriApp.io.execute(() => scala.util.Try(budget.publish(v)))
+        if reserveValue != written then
+          scala.util.Try(ReserveFile.write(reserveFile, reserveValue)).fold(
+            e => Log.w("logging reserve not written", e),
+            _ => written = reserveValue)
       reserveValue
+    }
 
-  /** L now (published or this process's). */
-  def reserve(): Long = budget.loggingReserve
-
-  /** The main process: the logging mode changed (or the app started):
-    * L is measured and published at once.
-    */
+  /** The logging mode changed (or the app started): L measured and written at once. */
   def modeChanged(): Unit =
     if !AshidoriApp.isMaintenanceProcess then
       AshidoriApp.io.execute { () =>
-        reserveAt = 0L
-        scala.util.Try(budget.publish(ownReserve()))
+        synchronized { reserveAt = 0L }
+        scala.util.Try(reserve())
+        // The shared reservation ledger of a development build before this one.
+        for n <- Seq("storage-budget.json", "storage-budget.json.lock", "storage-budget.json.tmp") do File(app.getFilesDir, n).delete()
       }
 
   private def debuggable: Boolean =
@@ -91,6 +79,18 @@ object Storage:
 
   /** 「空き容量不足（記録用の予備を除いて N MB 必要）」 */
   def shortage(need: Long): String = s"空き容量不足（記録用の予備を除いて ${math.max(1L, need / 1_000_000)} MB 必要）"
+
+/** Debug builds: storage I/O on the main thread is logged (as StrictMode
+  * would) and counted; the regions' code calls it before each such access.
+  */
+object IoCheck:
+  @volatile var count = 0
+  private lazy val debuggable =
+    (AshidoriApp.app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+  def offMain(what: String): Unit =
+    if debuggable && android.os.Looper.myLooper() == android.os.Looper.getMainLooper then
+      count += 1
+      Log.w(s"main-thread storage I/O: $what", Throwable("here"))
 
 /** The logger's write rate, from samples of the size of its data (the
   * database, its WAL, the archive and the overflow files) kept in prefs.

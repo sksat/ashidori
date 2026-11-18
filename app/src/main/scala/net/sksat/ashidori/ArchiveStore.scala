@@ -226,30 +226,22 @@ final class ArchiveStore(val root: File, zone: ZoneId):
 
   // --- writing --------------------------------------------------------------------
 
-  /** The shared storage budget (design 6.8), set by the maintenance
-    * process: every file it writes here is reserved first, with an upper
-    * bound of its size (the sizes of what it is written from), and every
-    * write is reported. A reservation that does not fit, or a write that
-    * would cut into the logging reserve, throws [[StorageBudget.NoRoom]]
-    * before anything is committed: all data stays, and the work is done
+  /** The guard of the logging reserve (design 6.8), set by the maintenance
+    * process: every file written here goes through it, in chunks of at
+    * most 1 MiB, each checked against the free space and L before it is
+    * written. A chunk that does not fit throws [[StorageBudget.NoRoom]]:
+    * the file being written is dropped (its rows stay where they were: in
+    * SQLite, or in the files it would have replaced), and the work is done
     * by a later run.
     */
-  @volatile var budget: Option[StorageBudget] = None
+  @volatile var guard: Option[SpaceGuard] = None
 
-  /** A reservation of at most `bytes`, or NoRoom (nothing written yet); None without a budget. */
-  private def room(bytes: Long): Option[StorageBudget#Reservation] =
-    budget.map(b => b.reserve(math.max(0L, bytes)).getOrElse(throw StorageBudget.NoRoom()))
-
-  /** What one new row may take in a file at most (bytes): the reservation's bound. */
-  private val RowBound = 256L
-
-  private def sizeOf(f: File): Long = if f.isFile then f.length else 0L
+  private def guarded(o: java.io.OutputStream): java.io.OutputStream = guard.fold(o)(g => GuardedOutputStream(o, g))
 
   /** One archive file being rewritten: the existing rows (streamed) merged
     * with the new ones into `<dest>.tmp`.
     */
-  private final class Rewrite(val t: Archive.TableDef, val dest: File, tooLate: ((IndexedSeq[Any], Long)) => Unit,
-                              room: Option[StorageBudget#Reservation] = None):
+  private final class Rewrite(val t: Archive.TableDef, val dest: File, tooLate: ((IndexedSeq[Any], Long)) => Unit):
     ensureDir(dest.getParentFile)
     val tmp = File(dest.getParentFile, dest.getName + ".tmp")
     private val existing = if dest.exists then Some(Archive.open(t, dest.getPath, whole = true)) else None
@@ -272,9 +264,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           tmpLock.unlock()
           existing.foreach(x => Try(x.close()))
           throw e
-    // Every byte of the new version goes to the budget (when there is one),
-    // also what finish() writes after a stop: the reservation bounds it.
-    private val out = BufferedOutputStream(room.fold[java.io.OutputStream](fos)(r => BudgetedOutputStream(fos, r)), 1 << 16)
+    // Every byte of the new version goes through the guard (when there is
+    // one), in checked chunks of at most 1 MiB: also what finish() writes,
+    // and a copied row group.
+    private val out = BufferedOutputStream(guarded(fos), 1 << 16)
     private val writer = Archive.writer(t, out, groupRows(t))
     // Archived groups wholly before the new rows are copied as stored.
     val merge = ArchiveMerge.FileMerge(existing, writer)
@@ -740,9 +733,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       val rows = db.hotRows(t, from, to, max(table))
       if rows.nonEmpty then
         progress(s"$d ${t.name}")
-        // At most the file as it is and the new rows.
-        val r = room(sizeOf(file(Archive.dayFile(t, d))) + rows.size * RowBound)
-        val rw = try Rewrite(t, file(Archive.dayFile(t, d)), _ => (), r) catch case e: Throwable => { r.foreach(_.release()); throw e }
+        val rw = Rewrite(t, file(Archive.dayFile(t, d)), _ => ())
         try
           rows.foreach { r =>
             val row = r.toIndexedSeq
@@ -758,23 +749,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           case e: Throwable =>
             rw.abort()
             throw e
-        finally r.foreach(_.release())
     var done = false
-    // The budget had no room for more input of a portion: what was read is
-    // written (within the reservation) and the day stops there.
-    var noRoom = false
     var at = ArchiveMerge.Cursor(from, Long.MinValue)
     var total = 0L
     var unconverted = 0L
     // Rows too far out of order, for the sorted pass: rowids.
     val late = mutable.ArrayBuffer.empty[Long]
-    while !done && !noRoom && !stop() && System.currentTimeMillis() < until do
+    while !done && !stop() && System.currentTimeMillis() < until do
       // One portion: chunks until the time is up or the day is read.
       val start = at
       val open = mutable.LinkedHashMap.empty[Archive.TableDef, Rewrite]
-      // One reservation for the portion: the day files it may rewrite, then
-      // each chunk's lines as they are read (a new row is never larger).
-      val portionRoom = room(Archive.RawTables.map(t => sizeOf(file(Archive.dayFile(t, d)))).sum)
       // Lines that became no row stay in SQLite: never delete what was not archived.
       val kept = mutable.ArrayBuffer.empty[Long]
       var lateHere = 0
@@ -786,17 +770,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       var read = 0L
       try
         var more = true
-        while more && !noRoom && System.currentTimeMillis() < portionEnd && read < PortionLines && kept.size < MaxKept && !stop() do
+        while more && System.currentTimeMillis() < portionEnd && read < PortionLines && kept.size < MaxKept && !stop() do
           val lines = db.rawLinesAfter(from, to, max("raw_lines"), at, chunk)
           if lines.isEmpty then more = false
-          else if portionRoom.exists(r => !r.grow(lines.map(_._3.length.toLong + 32).sum)) then noRoom = true
           else
             for (rowid, time, line) <- lines do
               // A line without a time of its own (navigation messages) has
               // the preceding record's, stored with it.
               Archive.parse(line, time) match
                 case Right((t, row)) =>
-                  open.getOrElseUpdate(t, Rewrite(t, file(Archive.dayFile(t, d)), tooLate, portionRoom)).push(row, rowid, time)
+                  open.getOrElseUpdate(t, Rewrite(t, file(Archive.dayFile(t, d)), tooLate)).push(row, rowid, time)
                 case Left(why) =>
                   if kept.isEmpty then Log.w(s"archive $d: raw line kept in SQLite: $why")
                   kept += rowid
@@ -820,17 +803,15 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         case e: Throwable =>
           open.values.foreach(_.abort())
           throw e
-      finally portionRoom.foreach(_.release())
     // The rows that came too late for the window, sorted and merged in.
     if done && late.nonEmpty && !stop() then
       progress(s"$d 順序の遅れた ${late.size} 行")
       val rows = db.rawLinesById(late.toSeq).flatMap((rowid, time, line) =>
         Archive.parse(line, time).toOption.map((t, row) => (t, row, rowid))).sortBy((_, row, _) => ArchiveMerge.key(row))
       val open = mutable.LinkedHashMap.empty[Archive.TableDef, Rewrite]
-      val lateRoom = room(rows.map(_._1).distinct.map(t => sizeOf(file(Archive.dayFile(t, d)))).sum + rows.size * RowBound)
       try
         for (t, row, rowid) <- rows do
-          open.getOrElseUpdate(t, Rewrite(t, file(Archive.dayFile(t, d)), _ => throw IllegalStateException("sorted rows came late"), lateRoom))
+          open.getOrElseUpdate(t, Rewrite(t, file(Archive.dayFile(t, d)), _ => throw IllegalStateException("sorted rows came late")))
             .push(row, rowid, ArchiveMerge.key(row))
         val targets = open.values.map(rw => rw.target(rw.finish())).toSeq
         commit(db, CommitIntent(targets, CommitIntent.Delete.Ids(rows.map(_._3))), Archive.RawTables.map(_.name))
@@ -839,8 +820,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         case e: Throwable =>
           open.values.foreach(_.abort())
           throw e
-      finally lateRoom.foreach(_.release())
-    DayResult(done, total, unconverted, noRoom)
+    DayResult(done, total, unconverted)
 
   /** Merges the day files of the small tables of finished months into one
     * file per month (row group by row group). The raw tables keep their day
@@ -851,9 +831,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     for t <- MonthTables if !stop() do
       val days = archivedFiles(t).filter(isDayFile)
       for (month, files) <- days.groupBy(f => YearMonth.parse(f.getName.take(7))).toSeq.sortBy(_._1) if month.isBefore(current) && !stop() do
-        // At most the day files and the month file there is.
-        val r = room(files.map(sizeOf).sum + sizeOf(file(Archive.monthFile(t, month))))
-        val rw = try Rewrite(t, file(Archive.monthFile(t, month)), _ => (), r) catch case e: Throwable => { r.foreach(_.release()); throw e }
+        val rw = Rewrite(t, file(Archive.monthFile(t, month)), _ => ())
         try
           val readers = files.sortBy(_.getName).map(f => Archive.open(t, f.getPath, whole = true))
           try readers.foreach(_.rowIterator.foreach(r => rw.push(r, 0L, ArchiveMerge.key(r))))
@@ -865,7 +843,6 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           case e: Throwable =>
             rw.abort()
             throw e
-        finally r.foreach(_.release())
 
   // --- a range the user deleted ---------------------------------------------------------
 
@@ -905,8 +882,6 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     if !reading(t)(ArchiveCut.touches(t, f.getPath, from, to)) then return
     progress(s"削除した期間を $rel から除く")
     val tmp = tmpOf(rel)
-    // At most the file as it is (rows only leave it), and some room for its footer.
-    val r = room(f.length + (1L << 20))
     // Held while the tmp is written: no rescue backup takes it half written.
     val written =
       try
@@ -915,7 +890,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           if tmp.exists && !tmp.delete() then throw java.io.IOException(s"cannot replace $tmp")
           val fos = FileOutputStream(tmp)
           try
-            val out = BufferedOutputStream(r.fold[java.io.OutputStream](fos)(x => BudgetedOutputStream(fos, x)), 1 << 16)
+            val out = BufferedOutputStream(guarded(fos), 1 << 16)
             val w = ArchiveCut.write(t, f.getPath, out, groupRows(t), from, to)
             out.flush()
             fos.getFD.sync()
@@ -924,10 +899,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         finally tmpLock.unlock()
       catch case e: Throwable =>
         // Not committed: the tmp goes, the file stays (the range is cut again next time).
-        r.foreach(_.release())
         if !intentNames(rel) then tmp.delete()
         throw e
-    r.foreach(_.release())
     try
       ArchiveCut.check(t, tmp.getPath, written, from, to).left.foreach(why => throw IllegalStateException(s"$rel: $why"))
       val prev = before.fold(CommitIntent.Prev.Absent)((r, s) => CommitIntent.Prev.File(r, s))
@@ -952,12 +925,10 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       // one transaction: an import cut short resumes after the last chunk.
       val key = s"${f.getName}|${f.length}|${f.lastModified}"
       var done = db.legacyImported(key)
-      // The database grows by about the text imported: reserved as twice the file.
-      val r = room(f.length * 2)
-      try Using.resource(scala.io.Source.fromFile(f, "UTF-8")) { src =>
+      Using.resource(scala.io.Source.fromFile(f, "UTF-8")) { src =>
         var last = f.lastModified()
         var seen = 0L
-        src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty).grouped(5000).foreach { chunk =>
+        LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty)).foreach { chunk =>
           val timed = chunk.map { l =>
             GnssLogMerge.timeOf(l).foreach(last = _)
             (last, l)
@@ -965,14 +936,15 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           val fresh = timed.drop(math.max(0L, done - seen).toInt)
           seen += timed.size
           if fresh.nonEmpty then
-            // Each chunk within the budget: stopped before it, the import resumes after the last chunk.
-            if r.exists(x => !x.wrote(fresh.map(_._2.length.toLong * 2).sum)) then throw StorageBudget.NoRoom()
+            // The database grows by about the text of a batch (at most 1 MiB):
+            // checked against the free space now and L before it is inserted.
+            // Stopped here, the import resumes after the last batch.
+            guard.foreach(_.check(fresh.map(_._2.length.toLong).sum))
             done = seen
             db.insertLegacyChunk(fresh, key, done)
             n += fresh.size
         }
       }
-      finally r.foreach(_.release())
       f.delete()
       db.legacyDone(key)
     n
@@ -1011,7 +983,7 @@ object ArchiveStore:
     * what does not convert), or more is left; raw lines archived, and lines
     * that do not convert (kept in SQLite).
     */
-  final case class DayResult(done: Boolean, lines: Long, unconverted: Long, noRoom: Boolean = false)
+  final case class DayResult(done: Boolean, lines: Long, unconverted: Long)
 
   /** Raw lines read from SQLite at a time (a few hundred bytes each: well
     * inside one 2 MB cursor window).

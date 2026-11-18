@@ -488,8 +488,10 @@ class RegionPacksSuite extends munit.FunSuite:
     Files.write(zip.toPath, bundle())
     val store = BasemapStore(File(dir, "basemap"), Seq("layers.json"))
     val pin = BasemapPin("v1", "ashidori-basemap-v1.zip", zip.length, sha(Files.readAllBytes(zip.toPath)))
-    var calls = 0
-    intercept[BasemapStore.NoRoom](store.install(zip, pin, _ => { calls += 1; calls < 2 }))
+    // Room for the first file only: the guard stops the second before it is written.
+    var free = 1L << 21
+    val guard = SpaceGuard(() => free, () => 0L)
+    intercept[StorageBudget.NoRoom](store.install(zip, pin, o => { val g = GuardedOutputStream(o, guard); free = 0L; g }))
     assertEquals(Option(store.root.list()).map(_.toSeq).getOrElse(Seq.empty), Seq.empty[String])
     assert(store.install(zip, pin).isDirectory)
     assert(BasemapStore.extractedSize(zip) > 0)
