@@ -103,11 +103,22 @@ object Backup:
         (if rescue then size(Maintenance.dir) else 0L)
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量不足（${need >> 20} MB 必要）")
+    // The shared budget (design 6.8): what it writes here, above the
+    // logging reserve and what the other large writes will still take
+    // (the quarantine export asks for none, as above).
+    val reserved = if mode == Mode.Quarantine then None else
+      val r = need - LoggingMargin
+      Some(Storage.budget.reserve(r).getOrElse(throw java.io.IOException(Storage.shortage(r))))
+    var accounted = 0L
     val floor = if mode == Mode.Quarantine then QuarantineFloor else LoggingMargin
     // While it runs: stop before the logger has no room left.
-    def checkSpace(): Unit =
+    def checkSpace(written: Long): Unit =
       if dir.getUsableSpace < floor then
         throw java.io.IOException(s"空き容量が ${floor >> 20} MB 未満のため中断（記録用の領域を確保）")
+      for r <- reserved do
+        val more = written - accounted
+        accounted = written
+        if !r.wrote(more) then throw java.io.IOException("空き容量が記録用の予備を下回るため中断")
     val opened = scala.collection.mutable.ArrayBuffer.empty[(String, File, FileInputStream)]
     // The files to write, opened under the locks. Every writer of them
     // makes a new file (a tmp file is deleted before it is written again,
@@ -139,6 +150,7 @@ object Backup:
         overflow.lock.lock()
         try
           db.snapshotTo(snapshot)
+          checkSpace(snapshot.length)
           // Completed spill files never change (OverflowFiles): consistent
           // copies. A `.tmp` may be being written (the logger never waits
           // for a backup) or left by a process that died: taken as it is,
@@ -189,7 +201,7 @@ object Backup:
         def tick(): Unit =
           if done - reported >= (4 << 20) then
             reported = done
-            checkSpace()
+            checkSpace(snapshot.length + done)
             progress(done, total)
         def copy(in: java.io.InputStream, name: String, time: Long): Unit =
           val sha = java.security.MessageDigest.getInstance("SHA-256")
@@ -303,4 +315,5 @@ object Backup:
     finally
       opened.foreach(o => Try(o._3.close()))
       snapshot.delete()
+      reserved.foreach(_.release())
   }

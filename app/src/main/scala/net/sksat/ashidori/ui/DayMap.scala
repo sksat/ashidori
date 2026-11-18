@@ -285,13 +285,16 @@ object DayMap:
               // Rendered while scrolling, without the user asking for that
               // area: an online map only if its destination is automatic, by
               // the rules now, not when the card was laid out.
-              else MapStyle.snapshot(frame) match
-                case Some((Outcome.Draw(s), Some(json))) => start(s, json)
-                case Some((_, _)) =>
-                  sketchOnly()
-                  None
-                // OpenFreeMap's style is being fetched: drawn when it arrives.
-                case None => None
+              else
+                // The region packs around the day, if more are placed than one style draws.
+                Regions.view(frame, Bounds(pts.map(_.lon).min, pts.map(_.lat).min, pts.map(_.lon).max, pts.map(_.lat).max))
+                MapStyle.snapshot(frame) match
+                  case Some((Outcome.Draw(s), Some(json))) => start(s, json)
+                  case Some((_, _)) =>
+                    sketchOnly()
+                    None
+                  // OpenFreeMap's style is being fetched: drawn when it arrives.
+                  case None => None
             }
 
     frame.redraw = () => render()

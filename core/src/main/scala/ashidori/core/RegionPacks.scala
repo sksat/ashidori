@@ -215,6 +215,18 @@ final case class PackState(installed: Option[Installed], target: Option[Target],
 final case class RegionState(regions: Seq[Region], packs: Map[Cell, PackState], trash: Seq[String] = Seq.empty):
   /** Cells some region refers to. */
   def referenced: Set[Cell] = regions.flatMap(_.cells).toSet
+  /** Pack and style directories the state needs: placed and planned
+    * versions of the referenced cells, and their bundles.
+    */
+  def dirs: Set[String] =
+    packs.toSeq.filter((c, _) => referenced(c)).flatMap { (c, p) =>
+      p.installed.toSeq.flatMap(i => Seq(RegionStore.packDir(c, i.version), RegionStore.styleDir(i.style))) ++
+        p.target.toSeq.flatMap(t => Seq(RegionStore.packDir(c, t.version), RegionStore.styleDir(t.style)))
+    }.toSet
+  /** `rel` is, holds or lies in a directory the state needs. */
+  def needs(rel: String): Boolean = dirs.exists(d => d == rel || d.startsWith(rel + "/") || rel.startsWith(d + "/"))
+  /** The trash without what the state needs again (a cell added back, a planned version). */
+  def withoutNeededTrash: RegionState = copy(trash = trash.filterNot(needs))
   /** Planned downloads, in cell order (design 6.9). */
   def queue: Seq[(Cell, Target)] = packs.toSeq.collect { case (c, PackState(_, Some(t), _)) => c -> t }.sortBy(_._1)
 
@@ -395,25 +407,40 @@ object RegionReconcile:
 enum RegionStatus:
   /** Every pack is placed and drawable. `newer`: the catalog has a newer version of one. */
   case Ready(newer: Boolean)
-  /** Packs wait or download: `done` of `total` bytes. */
+  /** Packs not on the device yet wait or download: `done` of `total` bytes. */
   case Downloading(done: Long, total: Long)
-  /** A pack's download failed (`reason`), or a pack's style bundle is missing ([[Unusable]]). */
+  /** The download of a pack not on the device yet failed (`reason`). */
   case Failed(reason: String)
   /** Packs are complete but their style bundle is not on the device: not drawn. */
   case Unusable
+  /** Every pack is drawable, and newer versions of some wait or download (the old ones stay in use). */
+  case Updating(done: Long, total: Long)
+  /** Every pack is drawable, and the update of one failed (`reason`); the old version stays in use. */
+  case UpdateFailed(reason: String)
 
 object RegionStatus:
   def of(r: Region, s: RegionState, styles: Set[String], catalog: Option[RegionCatalog],
          progress: Map[Cell, Long]): RegionStatus =
     val ps = r.cells.flatMap(c => s.packs.get(c).map(c -> _))
-    val failed = ps.flatMap(_._2.failure).headOption
-    val waiting = ps.filter(_._2.target.nonEmpty)
-    if failed.nonEmpty then Failed(failed.get)
-    else if waiting.nonEmpty && ps.exists(_._2.installed.isEmpty) then
-      val total = waiting.map(_._2.target.get.file.bytes).sum
-      Downloading(waiting.map((c, _) => progress.getOrElse(c, 0L)).sum.min(total), total)
-    else if ps.exists(_._2.installed.exists(i => !styles(i.style))) then Unusable
-    else Ready(catalog.exists(cat => ps.exists((c, p) => cat.cells.contains(c) && RegionState.newer(cat.version, p))))
+    // Packs not on the device yet, and newer versions of packs that are.
+    val (added, updated) = ps.filter(_._2.target.nonEmpty).partition(_._2.installed.isEmpty)
+    def progressOf(xs: Seq[(Cell, PackState)]) =
+      val total = xs.map(_._2.target.get.file.bytes).sum
+      (xs.map((c, _) => progress.getOrElse(c, 0L)).sum.min(total), total)
+    added.flatMap(_._2.failure).headOption match
+      case Some(f) => Failed(f)
+      case None =>
+        if added.nonEmpty then
+          val (d, t) = progressOf(added)
+          Downloading(d, t)
+        else if ps.exists(_._2.installed.exists(i => !styles(i.style))) then Unusable
+        else updated.flatMap(_._2.failure).headOption match
+          case Some(f) => UpdateFailed(f)
+          case None =>
+            if updated.nonEmpty then
+              val (d, t) = progressOf(updated)
+              Updating(d, t)
+            else Ready(catalog.exists(cat => ps.exists((c, p) => cat.cells.contains(c) && RegionState.newer(cat.version, p))))
 
   /** Bytes of a region: every pack it refers to, shared ones included. */
   def bytes(r: Region, s: RegionState): Long =
@@ -450,7 +477,7 @@ object RegionEstimate:
   * A pack or style directory appears only by renaming a complete one, so
   * its presence means it is complete. The caller serializes the changes.
   */
-final class RegionStore(val root: File):
+class RegionStore(val root: File):
   import RegionStore.*
   def stateFile: File = File(root, StateFile)
   def downloadDir: File = File(root, DownloadDir)
@@ -474,12 +501,14 @@ final class RegionStore(val root: File):
     finally out.close()
     Files.move(tmp.toPath, stateFile.toPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
 
-  /** Extracts a verified style bundle and renames it into place. */
-  def placeStyle(zip: File, style: String, maxBytes: Long): File =
+  /** Extracts a verified style bundle and renames it into place; `written`
+    * hears every write and stops it by answering false (the budget).
+    */
+  def placeStyle(zip: File, style: String, maxBytes: Long, written: Long => Boolean = _ => true): File =
     val tmp = File(root, s"${TmpPrefix}style-$style")
     BasemapStore.deleteTree(tmp)
     try
-      BasemapStore.extract(zip, tmp, maxBytes)
+      BasemapStore.extract(zip, tmp, maxBytes, written)
       for r <- Seq(StyleLayers, "manifest.json", "sprites/light.json") if !File(tmp, r).isFile do
         throw IOException(s"style bundle lacks $r")
       val target = styleRoot(style)
@@ -576,6 +605,8 @@ final class RegionUse:
     held.values.exists(_.exists(d => d == rel || d.startsWith(rel + "/") || rel.startsWith(d + "/")))
   }
   def holders: Int = synchronized(held.size)
+  /** `owner` holds `rel`. */
+  def holds(owner: AnyRef, rel: String): Boolean = synchronized(held.get(owner).exists(_.contains(rel)))
 
 /** The offline style with the region packs (design 6.10): each pack's
   * source `r-<cell>` (bounds of its cell, zooms 8-14) and its style
@@ -627,11 +658,13 @@ object RegionStyle:
     if !st.obj.contains("sprite") then st("sprite") = s"file://$fonts/sprites/light"
     ujson.write(st)
 
-/** The storage budget of the app's large writes (design 6.8): a write of
-  * `r` bytes starts only if `F - ΣO - L >= r`, and stops while it runs once
-  * `F - ΣO < L`, where `F` is the free space now (`free`), `O` each other
-  * reservation's unwritten rest and `L` the logging reserve (`reserve`).
-  * One large write at a time. Thread-safe.
+/** The storage budget of the app's large writes (design 6.8), shared by
+  * all of them (the basemap and venue downloads and extractions, the
+  * backups, the region packs): a write of `r` bytes starts only if
+  * `F - ΣO - L >= r`, and stops while it runs once `F - ΣO < L`, where `F`
+  * is the free space now (`free`), `O` each reservation's unwritten rest
+  * and `L` the logging reserve (`reserve`). Writes may run at the same
+  * time: each counts the others' unwritten rest. Thread-safe.
   */
 final class StorageBudget(free: () => Long, reserve: () => Long):
   final class Reservation private[StorageBudget] (val bytes: Long):
@@ -641,7 +674,7 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
       * space would cut into the logging reserve.
       */
     def wrote(n: Long): Boolean =
-      written += n
+      StorageBudget.this.synchronized(written += n)
       StorageBudget.this.ok
     def outstanding: Long = if open then math.max(0L, bytes - written) else 0L
     def release(): Unit = StorageBudget.this.synchronized {
@@ -651,12 +684,11 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
 
   private var active = List.empty[Reservation]
 
-  /** A reservation of `r` bytes, or None: another large write runs, or
-    * `r` does not fit above the logging reserve.
+  /** A reservation of `r` bytes, or None: `r` does not fit above the
+    * logging reserve and what the other writes will still take.
     */
   def reserve(r: Long): Option[Reservation] = synchronized {
-    if active.nonEmpty then None
-    else if free() - active.map(_.outstanding).sum - reserve() < r then None
+    if free() - active.map(_.outstanding).sum - reserve() < r then None
     else
       val x = Reservation(r)
       active = x :: active
@@ -665,8 +697,8 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
 
   /** The free space, less what reservations will still write, stays at or above the reserve. */
   def ok: Boolean = synchronized(free() - active.map(_.outstanding).sum >= reserve())
-  /** What a new reservation may take now (0 if none fits or a write runs). */
-  def available: Long = synchronized(if active.nonEmpty then 0L else math.max(0L, free() - reserve()))
+  /** What a new reservation may take now. */
+  def available: Long = synchronized(math.max(0L, free() - active.map(_.outstanding).sum - reserve()))
   def busy: Boolean = synchronized(active.nonEmpty)
 
 object StorageBudget:
@@ -709,8 +741,11 @@ object StorageBudget:
 object RegionRun:
   trait Env:
     def http: RangeHttp
-    /** Where a file of the catalog is downloaded from. */
-    def url(file: String): String
+    /** Where a file of the catalog `version` is downloaded from (the
+      * version a pack was planned under, not the catalog now: a download
+      * planned before an app update resumes from its own release).
+      */
+    def url(version: String, file: String): String
     def store: RegionStore
     def budget: StorageBudget
     def cancelled(): Boolean
@@ -765,15 +800,18 @@ object RegionRun:
     val store = env.store
     // The bundle first: a pack is never placed before the style it is drawn with.
     if !store.stylePresent(t.style) then
-      fetch(env, t.bundle, None) match
+      fetch(env, t.version, t.bundle, None) match
         case Left(reason) => return fail(env, c, t, reason)
         case Right(zip) =>
-          val size = extractedSize(zip)
+          val size = BasemapStore.extractedSize(zip)
           val r = env.budget.reserve(size).getOrElse(throw NoRoom())
-          try store.placeStyle(zip, t.style, size + 1)
-          catch case e: IOException =>
-            zip.delete()
-            return fail(env, c, t, HeaderReason)
+          try store.placeStyle(zip, t.style, size + 1, n => r.wrote(n))
+          catch
+            // The budget stopped it: the verified bundle stays for the next run.
+            case _: BasemapStore.NoRoom => throw NoRoom()
+            case e: IOException =>
+              zip.delete()
+              return fail(env, c, t, HeaderReason)
           finally r.release()
           zip.delete()
           env.log(s"regions: style ${t.style} placed")
@@ -784,7 +822,7 @@ object RegionRun:
     if store.packFile(c, t.version).isFile then
       record(env, c, t)
       return
-    fetch(env, t.file, Some(c)) match
+    fetch(env, t.version, t.file, Some(c)) match
       case Left(reason) => fail(env, c, t, reason)
       case Right(part) =>
         PmtilesHeader.read(part).flatMap(PmtilesHeader.check(_, c, RegionCatalog.MinZoom, RegionCatalog.MaxZoom)) match
@@ -813,7 +851,7 @@ object RegionRun:
   /** Brings `f` to `.download/<file>.part`, under a reservation of what is
     * left, and checks its size and sha256 (a wrong file is deleted: Left).
     */
-  private def fetch(env: Env, f: RegionFile, cell: Option[Cell]): Either[String, File] =
+  private def fetch(env: Env, version: String, f: RegionFile, cell: Option[Cell]): Either[String, File] =
     val part = env.store.part(f.file)
     part.getParentFile.mkdirs()
     val have = if part.isFile then part.length else 0L
@@ -821,7 +859,7 @@ object RegionRun:
       val r = env.budget.reserve(f.bytes - have).getOrElse(throw NoRoom())
       try
         var last = have
-        ResumableDownload.run(env.http, env.url(f.file), part, f.bytes, () => env.cancelled(), n => {
+        ResumableDownload.run(env.http, env.url(version, f.file), part, f.bytes, () => env.cancelled(), n => {
           if n > last && !r.wrote(n - last) then throw NoRoom()
           last = math.max(last, n)
           cell.foreach(c => env.progress(Some(c), n))
@@ -832,7 +870,152 @@ object RegionRun:
       part.delete()
       Left(MismatchReason)
 
-  private def extractedSize(zip: File): Long =
-    import scala.jdk.CollectionConverters.*
-    val z = java.util.zip.ZipFile(zip)
-    try z.entries().asScala.map(e => math.max(0L, e.getSize)).sum finally z.close()
+
+/** The regions' state in memory and on disk (design 6.7), kept apart from
+  * everything else in the process: no method throws. A failure to read
+  * the files disables the regions ([[broken]]); a failure to write the
+  * state keeps the state as it was ([[update]] answers Left), so what is
+  * in memory is always what is on disk. Changes are serialized here.
+  *
+  * The state is reconciled with the files once ([[ensureLoaded]]). A
+  * missing `state.json` with packs or bundles on disk is recovered as an
+  * unreadable one (rebuilt from the files, nothing deleted); without any
+  * it is a fresh start. Files go to the trash and are deleted only when
+  * neither the state (regions and planned versions) nor a map
+  * ([[RegionUse]]) needs them at that moment.
+  */
+final class RegionBook(val store: RegionStore, catalog: () => Option[RegionCatalog], now: () => Long,
+                       log: String => Unit = _ => (), val use: RegionUse = RegionUse()):
+  private val lock = new Object
+  @volatile private var current = RegionState.empty
+  @volatile private var loaded = false
+  /** Why the regions are off (their files cannot be read); None: usable. */
+  @volatile var broken: Option[String] = None
+  /** The last write of the state failed (changes are refused until one succeeds). */
+  @volatile var writeError: Option[String] = None
+
+  def state: RegionState =
+    ensureLoaded()
+    current
+
+  def ensureLoaded(): Unit = if !loaded then lock.synchronized {
+    if !loaded then
+      loaded = true
+      try
+        val scan = store.scan()
+        val stored = store.readState() match
+          case None =>
+            if scan.packs.nonEmpty || scan.styles.nonEmpty then
+              log("regions: state.json missing with files on disk; rebuilt from the files")
+              None
+            else Some(RegionState.empty)
+          case Some(None) =>
+            log("regions: state.json unreadable; rebuilt from the files")
+            None
+          case Some(Some(s)) => Some(s)
+        val r = RegionReconcile(stored, scan, catalog(), now())
+        val next = r.state.copy(trash = (r.state.trash ++ r.delete).distinct).withoutNeededTrash
+        if next != RegionState.empty || store.root.exists then
+          try
+            store.writeState(next)
+            writeError = None
+          catch case e: Throwable =>
+            writeError = Some(message(e))
+            log(s"regions: state not written at start: ${message(e)}")
+        // What is on disk is what was stored: the reconciled state only if written.
+        current = if writeError.isEmpty then next else stored.getOrElse(r.state.copy(trash = Seq.empty))
+        if writeError.isEmpty then collectLocked()
+      catch case e: Throwable =>
+        broken = Some(message(e))
+        current = RegionState.empty
+        log(s"regions: off: ${message(e)}")
+  }
+
+  /** Applies `f` to the state and writes it; only then is it the state.
+    * Left (the state unchanged) when the regions are off or the write failed.
+    */
+  def update(f: RegionState => RegionState): Either[String, RegionState] =
+    ensureLoaded()
+    lock.synchronized {
+      broken match
+        case Some(b) => Left(b)
+        case None =>
+          try
+            val next = f(current).withoutNeededTrash
+            if next != current then
+              store.writeState(next)
+              writeError = None
+              current = next
+            Right(current)
+          catch case e: Throwable =>
+            writeError = Some(message(e))
+            log(s"regions: change not written: ${message(e)}")
+            Left(message(e))
+    }
+
+  /** After a change that may leave files unused: they go to the trash and
+    * are deleted now if nothing needs them. Partial downloads and
+    * placements in progress are left to the start.
+    */
+  def tidy(): Unit =
+    ensureLoaded()
+    lock.synchronized {
+      try
+        if broken.isEmpty then
+          val extra = RegionReconcile.deletable(current, store.scan())
+            .filterNot(d => d.startsWith(RegionStore.TmpPrefix) || d.startsWith(RegionStore.DownloadDir + "/"))
+            .filterNot(current.trash.contains)
+          if extra.nonEmpty then
+            val next = current.copy(trash = current.trash ++ extra).withoutNeededTrash
+            store.writeState(next)
+            current = next
+          collectLocked()
+      catch case e: Throwable => log(s"regions: tidy failed: ${message(e)}")
+    }
+
+  /** Deletes what is in the trash and needed by neither the state nor a map now. */
+  def collect(): Unit = lock.synchronized {
+    try collectLocked() catch case e: Throwable => log(s"regions: delete failed: ${message(e)}")
+  }
+
+  private def collectLocked(): Unit =
+    if broken.isEmpty then
+      // Needed again (re-added, planned): kept, and out of the trash.
+      val (needed, rest) = current.trash.partition(current.needs)
+      val (gone, held) = rest.partition(d => !use.inUse(d))
+      if needed.nonEmpty || gone.nonEmpty then
+        gone.foreach(store.delete)
+        val next = current.copy(trash = held)
+        try
+          store.writeState(next)
+          current = next
+        catch case e: Throwable =>
+          writeError = Some(message(e))
+          log(s"regions: trash not written: ${message(e)}")
+        log(s"regions: deleted ${gone.mkString(", ")}${if held.nonEmpty then s"; in use: ${held.mkString(", ")}" else ""}" +
+          s"${if needed.nonEmpty then s"; needed again: ${needed.mkString(", ")}" else ""}")
+
+  private def message(e: Throwable): String = Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
+
+
+/** Which placed packs a map draws (design 6.10): all of them up to `max`;
+  * beyond that, those that intersect the map's view widened by half of it
+  * on every side, nearest the view's centre first, so that a pack in view
+  * is never left out for another one.
+  */
+object RegionPick:
+  def apply[A](placed: Seq[(Cell, A)], view: Option[Bounds], max: Int): Seq[(Cell, A)] =
+    if placed.size <= max then placed
+    else view match
+      case None => placed.take(max)
+      case Some(v) =>
+        val w = (v.east - v.west) / 2
+        val h = (v.north - v.south) / 2
+        val wide = Bounds(v.west - w, v.south - h, v.east + w, v.north + h)
+        val (cx, cy) = ((v.west + v.east) / 2, (v.south + v.north) / 2)
+        def dist(c: Cell) =
+          val b = c.bounds
+          val dx = math.max(0.0, math.max(b.west - cx, cx - b.east))
+          val dy = math.max(0.0, math.max(b.south - cy, cy - b.north))
+          dx * dx + dy * dy
+        placed.filter((c, _) => c.bounds.intersects(wide)).sortBy((c, _) => dist(c)).take(max).sortBy(_._1)

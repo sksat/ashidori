@@ -281,11 +281,11 @@ class DebugReceiver extends BroadcastReceiver:
           "bytes" -> intent.getLongExtra("bytes", 0L).toDouble, "sha256" -> Option(intent.getStringExtra("sha256")).getOrElse("")))
         Regions.setDebugSource(url, pin)
         Log.i(s"regions source: ${Regions.debugUrl} pin ${Regions.pin}")
-      case "ashidori.debug.REGIONS_FREE" =>
-        // Pretends this many free bytes for the storage budget (0: the real free space).
+      case "ashidori.debug.REGIONS_FREE" | "ashidori.debug.STORAGE_FREE" =>
+        // Pretends this many free bytes for the shared storage budget (0: the real free space).
         val b = intent.getLongExtra("bytes", 0L)
-        RegionDownload.debugFree = Option.when(b > 0)(b)
-        Log.i(s"regions free: ${RegionDownload.free()} reserve ${RegionDownload.reserve()}")
+        Storage.debugFree = Option.when(b > 0)(b)
+        Log.i(s"regions free: ${Storage.free()} reserve ${Storage.reserve()}")
       case "ashidori.debug.REGIONS_ADD" =>
         // A region of --es cells "8-227-100,8-228-100" (--es name), planned and started as the screen does.
         val cells = Option(intent.getStringExtra("cells")).toSeq.flatMap(_.split(",")).flatMap(ashidori.core.Cell.parse)
@@ -309,7 +309,7 @@ class DebugReceiver extends BroadcastReceiver:
           val s = Regions.state
           Log.i(s"regions state: ${ashidori.core.RegionState.encode(s)}")
           Log.i(s"regions scan: ${Regions.store.scan()} holders ${Regions.use.holders} drawable ${Regions.placed.map(_._1)}")
-          Log.i(s"regions budget: free ${RegionDownload.free()} reserve ${RegionDownload.reserve()} available ${RegionDownload.budget.available}")
+          Log.i(s"regions budget: free ${Storage.free()} reserve ${Storage.reserve()} available ${Storage.budget.available}")
         }
       case "ashidori.debug.VISITS" =>
         val op = Option(intent.getStringExtra("op")).getOrElse("check")

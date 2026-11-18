@@ -152,7 +152,7 @@ class RegionPacksSuite extends munit.FunSuite:
     val up = placed.update(Set(tokyo, ishigaki), now)
     assertEquals(up.queue.map(_._1), Seq(tokyo))
     assertEquals(up.packs(tokyo).installed.map(_.version), Some("20261010"))
-    assertEquals(RegionStatus.of(r, up, Set("s1"), Some(now), Map.empty), RegionStatus.Ready(newer = false))
+    assertEquals(RegionStatus.of(r, up, Set("s1"), Some(now), Map.empty), RegionStatus.Updating(0, now.cells(tokyo).map.bytes))
   }
 
   test("the estimate: packs not on the device, the bundle if missing, cells outside the catalog apart") {
@@ -188,11 +188,14 @@ class RegionPacksSuite extends munit.FunSuite:
         def body: InputStream = ByteArrayInputStream(bytes.take(cut))
         def close() = ()
 
-  private final class Env(val store: RegionStore, val http: RangeHttp, val budget: StorageBudget) extends RegionRun.Env:
+  private class Env(val store: RegionStore, val http: RangeHttp, val budget: StorageBudget) extends RegionRun.Env:
     var state: RegionState = store.readState().flatten.getOrElse(RegionState.empty)
     var stopAfter: Option[Long] = None
     var progressed = 0L
-    def url(file: String) = file
+    val versions = scala.collection.mutable.ArrayBuffer.empty[String]
+    def url(version: String, file: String) =
+      versions += version
+      file
     def cancelled() = stopAfter.exists(progressed >= _)
     def now() = 42L
     override def progress(cell: Option[Cell], done: Long): Unit = if cell.nonEmpty then progressed = done
@@ -457,4 +460,186 @@ class RegionPacksSuite extends munit.FunSuite:
     val alone = ujson.read(RegionStyle.compose(None, packs.take(1), "c"))
     assertEquals(alone("layers").arr.head("type").str, "background")
     assertEquals(alone("sprite").str, "file:///r/styles/s1/sprites/light")
+  }
+
+  // ---- review 67 ----
+
+  test("budget: writes run side by side, each counting the others' unwritten rest; all stop under the reserve") {
+    var free = 10_000L
+    val b = StorageBudget(() => free, () => 2_000L)
+    val a = b.reserve(5_000).get
+    val c = b.reserve(3_000).get
+    // 10,000 - 8,000 outstanding - 2,000 reserve: nothing more fits.
+    assertEquals(b.reserve(1), None)
+    free -= 2_000
+    assert(a.wrote(2_000))
+    assertEquals(b.available, 0L)
+    // The logger takes 500: both writes must stop.
+    free -= 500
+    assert(!a.wrote(0) && !c.wrote(0))
+    a.release()
+    c.release()
+    assertEquals(b.available, 5_500L)
+  }
+
+  test("an extraction stops when the budget says so, and leaves nothing behind") {
+    val dir = tmpDir()
+    val zip = File(dir, "a.zip")
+    Files.write(zip.toPath, bundle())
+    val store = BasemapStore(File(dir, "basemap"), Seq("layers.json"))
+    val pin = BasemapPin("v1", "ashidori-basemap-v1.zip", zip.length, sha(Files.readAllBytes(zip.toPath)))
+    var calls = 0
+    intercept[BasemapStore.NoRoom](store.install(zip, pin, _ => { calls += 1; calls < 2 }))
+    assertEquals(Option(store.root.list()).map(_.toSeq).getOrElse(Seq.empty), Seq.empty[String])
+    assert(store.install(zip, pin).isDirectory)
+    assert(BasemapStore.extractedSize(zip) > 0)
+  }
+
+  /** A store whose writes of the state fail like a full disk. */
+  private final class FullStore(root: File) extends RegionStore(root):
+    var full = false
+    override def writeState(s: RegionState): Unit =
+      if full then throw java.io.IOException("write failed: ENOSPC (No space left on device)")
+      super.writeState(s)
+
+  test("state: a failed write (ENOSPC) keeps the state as it was, on disk and in memory; nothing throws") {
+    val p = publish("20261117", Seq(tokyo, osaka))
+    val store = FullStore(tmpDir())
+    val book = RegionBook(store, () => Some(p.catalog), () => 7L)
+    assert(book.update(_.add(Region("r1", "a", Seq(tokyo), 0), p.catalog)).isRight)
+    val before = book.state
+    store.full = true
+    val r = book.update(_.add(Region("r2", "b", Seq(osaka), 0), p.catalog))
+    assert(r.left.exists(_.contains("ENOSPC")), r.toString)
+    assertEquals(book.state, before)
+    assertEquals(store.readState(), Some(Some(before)))
+    assert(book.writeError.nonEmpty)
+    book.tidy()
+    book.collect()
+    store.full = false
+    assert(book.update(_.add(Region("r2", "b", Seq(osaka), 0), p.catalog)).isRight)
+    assertEquals(book.writeError, None)
+  }
+
+  test("state: unreadable files turn the regions off without throwing; a failed write at start keeps what was stored") {
+    val broken = new RegionStore(tmpDir()):
+      override def scan(): RegionScan = throw java.io.IOException("EIO")
+    val b1 = RegionBook(broken, () => None, () => 7L)
+    assertEquals(b1.state, RegionState.empty)
+    assert(b1.broken.exists(_.contains("EIO")))
+    assert(b1.update(identity).isLeft)
+    b1.tidy()
+    b1.collect()
+
+    val p = publish("20261117", Seq(tokyo))
+    val store = FullStore(tmpDir())
+    val s = RegionState.empty.add(Region("r1", "a", Seq(tokyo), 0), p.catalog).copy(trash = Seq("styles/old"))
+    store.writeState(s)
+    Files.createDirectories(store.styleRoot("old").toPath)
+    store.full = true
+    val b2 = RegionBook(store, () => Some(p.catalog), () => 7L)
+    assertEquals(b2.state, s)
+    assert(b2.writeError.nonEmpty)
+    // Nothing deleted while the state could not be written.
+    assert(store.styleRoot("old").isDirectory)
+  }
+
+  test("trash: a pack deleted while drawn and added back before it is let go survives") {
+    val p = publish("20261117", Seq(tokyo))
+    val store = RegionStore(tmpDir())
+    val book = RegionBook(store, () => Some(p.catalog), () => 7L)
+    val env = new Env(store, Http(p.files), budget()):
+      override def update(f: RegionState => RegionState): RegionState = book.update(f).toOption.get
+    book.update(_.add(Region("r1", "a", Seq(tokyo), 0), p.catalog))
+    assertEquals(RegionRun.run(env), RegionRun.Result.Done)
+    val map = new Object
+    val dirs = Set(RegionStore.packDir(tokyo, "20261117"), RegionStore.styleDir("s1"))
+    book.use.hold(map, dirs)
+    book.update(_.remove("r1"))
+    book.tidy()
+    assertEquals(book.state.trash.toSet, dirs)
+    assert(store.packFile(tokyo, "20261117").isFile)
+    // Added back while still drawn: planned, the file in place is recorded, not fetched again.
+    book.update(_.add(Region("r2", "a again", Seq(tokyo), 0), p.catalog))
+    assertEquals(book.state.trash, Seq.empty)
+    val http = Http(p.files)
+    val env2 = new Env(store, http, budget()):
+      override def update(f: RegionState => RegionState): RegionState = book.update(f).toOption.get
+    assertEquals(RegionRun.run(env2), RegionRun.Result.Done)
+    assertEquals(http.requests.toSeq, Seq.empty)
+    // Let go: the file stays.
+    book.use.release(map)
+    book.collect()
+    book.tidy()
+    assert(store.packFile(tokyo, "20261117").isFile)
+    assert(store.stylePresent("s1"))
+    assertEquals(book.state.packs(tokyo).installed.map(_.version), Some("20261117"))
+  }
+
+  test("state: a missing state.json with files on disk is rebuilt from them (nothing deleted); without files it is a fresh start") {
+    val p = publish("20261117", Seq(tokyo))
+    val store = RegionStore(tmpDir())
+    store.root.mkdirs()
+    val f = File(store.root, "x")
+    Files.write(f.toPath, pack(tokyo))
+    store.placePack(f, tokyo, "20261117", "s1")
+    Files.createDirectories(store.styleRoot("s1").toPath)
+    Files.write(File(store.styleRoot("s1"), "layers.json").toPath, layers.getBytes(UTF_8))
+    assert(!store.stateFile.exists)
+    val book = RegionBook(store, () => Some(p.catalog), () => 7L)
+    assertEquals(book.state.regions.map(_.cells), Seq(Seq(tokyo)))
+    assertEquals(book.state.trash, Seq.empty)
+    assert(store.packFile(tokyo, "20261117").isFile && store.stylePresent("s1"))
+
+    val fresh = RegionStore(File(tmpDir(), "regions"))
+    val b2 = RegionBook(fresh, () => None, () => 7L)
+    assertEquals(b2.state, RegionState.empty)
+    assert(!fresh.root.exists)
+  }
+
+  test("a download planned under an older catalog resumes from its own release after the catalog changed") {
+    val old = publish("20261117", Seq(tokyo))
+    val store = RegionStore(tmpDir())
+    val name = RegionCatalog.packName(tokyo, "20261117")
+    val env1 = Env(store, Http(old.files, cut = 1500), budget())
+    env1.update(_.add(Region("r1", "a", Seq(tokyo), 0), old.catalog))
+    env1.stopAfter = Some(1)
+    assertEquals(RegionRun.run(env1), RegionRun.Result.Cancelled)
+    // An app update brings a newer catalog; the planned pack keeps its version.
+    val newer = publish("20261124", Seq(tokyo))
+    assert(newer.catalog.version != old.catalog.version)
+    val env2 = Env(store, Http(old.files), budget())
+    assertEquals(RegionRun.run(env2), RegionRun.Result.Done)
+    assertEquals(env2.versions.distinct.toSeq, Seq("20261117"))
+    assert(store.packFile(tokyo, "20261117").isFile)
+    assertEquals(store.part(name).exists, false)
+  }
+
+  test("status: an update in progress, stopped or failed is told apart from a region that is ready") {
+    val now = publish("20261124", Seq(tokyo, osaka)).catalog
+    val r = Region("r1", "a", Seq(tokyo, osaka), 0)
+    val placed = RegionState(Seq(r), Map(
+      tokyo -> PackState(Some(Installed("20261117", "s1", 1, 1)), None),
+      osaka -> PackState(Some(Installed("20261117", "s1", 1, 1)), None)))
+    assertEquals(RegionStatus.of(r, placed, Set("s1"), Some(now), Map.empty), RegionStatus.Ready(newer = true))
+    val updating = placed.update(Set(tokyo), now)
+    val total = now.cells(tokyo).map.bytes
+    assertEquals(RegionStatus.of(r, updating, Set("s1"), Some(now), Map(tokyo -> 10L)), RegionStatus.Updating(10, total))
+    val failed = updating.copy(packs = updating.packs.updated(tokyo, updating.packs(tokyo).copy(failure = Some(RegionRun.MismatchReason))))
+    assertEquals(RegionStatus.of(r, failed, Set("s1"), Some(now), Map.empty), RegionStatus.UpdateFailed(RegionRun.MismatchReason))
+    // A pack never placed counts first.
+    val adding = failed.copy(packs = failed.packs.updated(osaka, PackState(None, Some(RegionCatalog.target(now, now.cells(osaka))))))
+    assertEquals(RegionStatus.of(r, adding, Set("s1"), Some(now), Map.empty), RegionStatus.Downloading(0, now.cells(osaka).map.bytes))
+  }
+
+  test("packs drawn: all up to the limit; beyond it those around the view, never one in view left out") {
+    val all = (0 until 20).map(i => Cell(200 + i, 100) -> i)
+    assertEquals(RegionPick(all.take(16), None, 16), all.take(16))
+    // A view over cells 218-219 (east of the first 16).
+    val v = Bounds(Cell(218, 100).bounds.west + 0.1, 35.6, Cell(219, 100).bounds.east - 0.1, 36.0)
+    val picked = RegionPick(all, Some(v), 16).map(_._1.x)
+    // Only the packs around the view (the last cell is 219), in cell order.
+    assertEquals(picked, Seq(217, 218, 219))
+    // With room for two, the two in view.
+    assertEquals(RegionPick(all, Some(v), 2).map(_._1.x), Seq(218, 219))
   }

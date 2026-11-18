@@ -31,10 +31,6 @@ object Regions:
 
   lazy val root: File = File(app.getFilesDir, "regions")
   lazy val store: RegionStore = RegionStore(root)
-  val use: RegionUse = RegionUse()
-  private val lock = new Object
-  @volatile private var current: RegionState = RegionState.empty
-  @volatile private var loaded = false
 
   def debuggable: Boolean = (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
@@ -110,7 +106,7 @@ object Regions:
   /** Region packs may be downloaded now: the data rule sends cells (区画), and nothing is paused. */
   def allowed: Boolean = Settings.gate.permit(Dest.Data, Mode.OnAction).exists(_.level == Level.Cell)
   /** Offered at all: this build pins a catalog. */
-  def offered: Boolean = pin.nonEmpty
+  def offered: Boolean = pin.nonEmpty && book.broken.isEmpty
   /** The data rule downloads by itself (automatic), so updates may run without the user. */
   def automatic: Boolean = Settings.gate.permit(Dest.Data, Mode.Auto).exists(_.level == Level.Cell)
 
@@ -123,65 +119,40 @@ object Regions:
 
   // ---- the state ----
 
-  /** The state now (reconciled on first use). */
-  def state: RegionState =
-    ensureLoaded()
-    current
+  /** The state and its files ([[RegionBook]]): nothing it does throws, so a
+    * failure of the regions never takes the process (and the logger) down.
+    */
+  lazy val book: RegionBook = RegionBook(store, () => scala.util.Try(catalog).toOption.flatten, () => System.currentTimeMillis(),
+    msg => Log.i(msg), use)
+  def use: RegionUse = useInstance
+  private val useInstance = RegionUse()
+
+  /** The state now (reconciled on first use; empty while the regions are off). */
+  def state: RegionState = book.state
 
   /** Reconciles the state with the files once per process, before any
     * other use of them: the download worker and the UI wait for it.
     */
-  def ensureLoaded(): Unit = if !loaded then lock.synchronized {
-    if !loaded then
-      val stored = store.readState() match
-        case None => Some(RegionState.empty)
-        case Some(s) =>
-          if s.isEmpty then Log.w("regions: state.json unreadable, rebuilt from the files")
-          s
-      val r = RegionReconcile(stored, store.scan(), catalog, System.currentTimeMillis())
-      current = r.state.copy(trash = (r.state.trash ++ r.delete).distinct)
-      if root.exists then store.writeState(current)
-      loaded = true
-      if r.delete.nonEmpty then Log.i(s"regions: to delete ${r.delete.mkString(", ")}")
-      collectLocked()
-  }
+  def ensureLoaded(): Unit = book.ensureLoaded()
 
-  /** Applies `f` to the state, writes it, and tells the UI. */
-  def update(f: RegionState => RegionState): RegionState =
-    val s = lock.synchronized {
-      ensureLoaded()
-      val before = current
-      current = f(current)
-      if current != before then store.writeState(current)
-      current
-    }
+  /** Why the regions cannot be used now (their files unreadable), or the last write failed. */
+  def problem: Option[String] = book.broken.orElse(book.writeError)
+
+  /** Applies `f` to the state and writes it, then tells the UI. Left (the
+    * state as it was) when it could not be written.
+    */
+  def update(f: RegionState => RegionState): Either[String, RegionState] =
+    val r = book.update(f)
     changed()
-    s
+    r
 
   /** After a change that may leave files unused (a deletion, an update):
-    * they go to the trash, deleted at once if no map draws from them.
-    * Partial downloads and placements in progress are left to the start.
+    * they go to the trash, deleted at once if nothing needs them.
     */
-  def tidy(): Unit = lock.synchronized {
-    ensureLoaded()
-    val extra = RegionReconcile.deletable(current, store.scan())
-      .filterNot(d => d.startsWith(RegionStore.TmpPrefix) || d.startsWith(RegionStore.DownloadDir + "/"))
-    if extra.exists(!current.trash.contains(_)) then
-      current = current.copy(trash = (current.trash ++ extra).distinct)
-      store.writeState(current)
-    collectLocked()
-  }
+  def tidy(): Unit = book.tidy()
 
-  /** Deletes what is in the trash and not drawn from now. */
-  def collect(): Unit = lock.synchronized(collectLocked())
-
-  private def collectLocked(): Unit =
-    val (gone, kept) = current.trash.partition(d => !use.inUse(d))
-    if gone.nonEmpty then
-      gone.foreach(store.delete)
-      current = current.copy(trash = kept)
-      store.writeState(current)
-      Log.i(s"regions: deleted ${gone.mkString(", ")}${if kept.nonEmpty then s"; in use: ${kept.mkString(", ")}" else ""}")
+  /** Deletes what is in the trash and needed by nothing now. */
+  def collect(): Unit = book.collect()
 
   // ---- what the UI shows ----
 
@@ -196,23 +167,41 @@ object Regions:
   /** Tells the UI and the maps (on the main thread). */
   def changed(): Unit = app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
 
-  def styles: Set[String] = store.scan().styles
+  def styles: Set[String] = scala.util.Try(store.scan().styles).getOrElse(Set.empty)
 
-  def status(r: Region): RegionStatus = RegionStatus.of(r, state, styles, catalog, progress)
+  def status(r: Region): RegionStatus = RegionStatus.of(r, state, styles, scala.util.Try(catalog).toOption.flatten, progress)
 
   // ---- drawing ----
 
-  /** Placed packs that can be drawn (their bundle is there), in cell order, at most [[MaxPacks]]. */
+  /** Placed packs that can be drawn (their bundle is there), in cell order. */
   def placed: Seq[(Cell, Installed)] =
     val s = state
     val st = styles
-    s.packs.toSeq.collect { case (c, PackState(Some(i), _, _)) if st(i.style) && s.referenced(c) => c -> i }
-      .sortBy(_._1).take(MaxPacks)
+    s.packs.toSeq.collect { case (c, PackState(Some(i), _, _)) if st(i.style) && s.referenced(c) => c -> i }.sortBy(_._1)
 
   /** The offline map draws packs. */
   def drawable: Boolean = placed.nonEmpty
-  /** Changes whenever the packs drawn change (snapshot cache keys). */
+  /** Changes whenever the packs on the device change (snapshot cache keys). */
   def key: String = placed.map((c, i) => s"${c.id}@${i.version}").mkString("+")
+
+  /** What each map shows (its view), so that a map with more packs than
+    * [[MaxPacks]] around draws those in and near its view ([[RegionPick]]).
+    */
+  private val views = java.util.Collections.synchronizedMap(java.util.WeakHashMap[AnyRef, Bounds]())
+  def view(owner: AnyRef, b: Bounds): Unit = views.put(owner, b)
+
+  /** The packs `owner` would draw for its view now. */
+  def pick(owner: AnyRef): Seq[(Cell, Installed)] = RegionPick(placed, Option(views.get(owner)), MaxPacks)
+
+  /** `owner`'s view moved to packs its style does not draw: it should load the style again. */
+  def stale(owner: AnyRef): Boolean =
+    try
+      val all = placed
+      all.size > MaxPacks && {
+        val want = RegionPick(all, Option(views.get(owner)), MaxPacks).map((c, i) => RegionStore.packDir(c, i.version)).toSet
+        !want.forall(use.holds(owner, _))
+      }
+    catch case _: Throwable => false
 
   private val layerCache = scala.collection.mutable.Map.empty[String, String]
   private def layers(style: String): Option[String] = layerCache.synchronized {
@@ -226,23 +215,29 @@ object Regions:
 
   private val Credit = """<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a> <a href="https://protomaps.com/">Protomaps</a>"""
 
-  /** The offline style with the packs over `base`, for `owner` (a map or a
-    * snapshot), who then holds those files until [[release]]. None without
-    * packs (the owner holds nothing).
+  /** The offline style with the packs around `owner`'s view over `base`,
+    * for `owner` (a map or a snapshot), who then holds those files until
+    * [[release]]. None without packs (or if they cannot be read): the
+    * owner holds nothing.
     */
   def style(owner: AnyRef, base: Option[String]): Option[String] =
-    val ps = placed.flatMap((c, i) => layers(i.style).map(l =>
-      (c, i, RegionStyle.Pack(c, store.packFile(c, i.version).getAbsolutePath, l, store.styleRoot(i.style).getAbsolutePath))))
-    if ps.isEmpty then
+    try
+      val ps = pick(owner).flatMap((c, i) => layers(i.style).map(l =>
+        (c, i, RegionStyle.Pack(c, store.packFile(c, i.version).getAbsolutePath, l, store.styleRoot(i.style).getAbsolutePath))))
+      if ps.isEmpty then
+        release(owner)
+        None
+      else
+        use.hold(owner, ps.flatMap((c, i, _) => Seq(RegionStore.packDir(c, i.version), RegionStore.styleDir(i.style))).toSet)
+        Some(RegionStyle.compose(base, ps.map(_._3), Credit))
+    catch case e: Throwable =>
+      Log.w("regions: style not composed", e)
       release(owner)
       None
-    else
-      use.hold(owner, ps.flatMap((c, i, _) => Seq(RegionStore.packDir(c, i.version), RegionStore.styleDir(i.style))).toSet)
-      Some(RegionStyle.compose(base, ps.map(_._3), Credit))
 
   /** `owner` no longer draws from the packs: unused files may go. */
   def release(owner: AnyRef): Unit =
-    if use.release(owner) && lock.synchronized(current.trash.nonEmpty) then AshidoriApp.io.execute(() => collect())
+    if use.release(owner) && state.trash.nonEmpty then AshidoriApp.io.execute(() => collect())
 
   // ---- regions ----
 
@@ -250,37 +245,37 @@ object Regions:
     * device's index (「つくば市周辺」), else 「地域 N」. No geocoder is asked.
     */
   def defaultName(lat: Double, lon: Double): String =
-    Geocoding.offline(lat, lon).map(_.city).filter(_.nonEmpty).map(_ + "周辺")
+    Try(Geocoding.offline(lat, lon)).toOption.flatten.map(_.city).filter(_.nonEmpty).map(_ + "周辺")
       .getOrElse(s"地域 ${state.regions.size + 1}")
 
   /** Adds a region of `cells` and plans its packs. */
-  def add(name: String, cells: Seq[Cell], c: RegionCatalog): Region =
+  def add(name: String, cells: Seq[Cell], c: RegionCatalog): Either[String, Region] =
     val r = Region(state.nextId, name, cells.distinct.sorted, System.currentTimeMillis())
-    update(_.add(r, c))
-    r
+    update(_.add(r, c)).map(_ => r)
 
-  def rename(id: String, name: String): Unit = update(_.rename(id, name))
+  def rename(id: String, name: String): Either[String, RegionState] = update(_.rename(id, name))
 
   /** Deletes a region: its own packs leave the maps first, then their files go once unused. */
-  def delete(id: String): Unit =
-    update(_.remove(id))
+  def delete(id: String): Either[String, RegionState] =
+    val r = update(_.remove(id))
     AshidoriApp.io.execute(() => tidy())
+    r
 
   /** Plans the catalog's newer version of a region's packs. */
-  def planUpdate(id: String, c: RegionCatalog): Unit =
+  def planUpdate(id: String, c: RegionCatalog): Either[String, RegionState] =
     update(s => s.update(s.regions.find(_.id == id).map(_.cells.toSet).getOrElse(Set.empty), c))
 
   /** Plans every placed pack with a newer version in the catalog (automatic updates). */
   def planAllUpdates(c: RegionCatalog): Boolean =
     val before = state.queue.size
-    update(s => s.update(s.referenced, c)).queue.size > before
+    update(s => s.update(s.referenced, c)).exists(_.queue.size > before)
 
   /** Clears a region's failures, so its packs are tried again; an unusable
     * pack whose bundle is missing is planned at its own version (only the
     * bundle is then downloaded).
     */
-  def retry(id: String): Unit =
-    val cat = catalog
+  def retry(id: String): Either[String, RegionState] =
+    val cat = Try(catalog).toOption.flatten
     update { s =>
       val cells = s.regions.find(_.id == id).map(_.cells.toSet).getOrElse(Set.empty)
       val st = styles

@@ -3,7 +3,7 @@ package net.sksat.ashidori.ui
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.view.{Gravity, View, ViewGroup}
-import android.widget.{EditText, FrameLayout, LinearLayout, PopupMenu, TextView}
+import android.widget.{EditText, FrameLayout, LinearLayout, PopupMenu, TextView, Toast}
 import androidx.lifecycle.{DefaultLifecycleObserver, LifecycleOwner}
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.time.Instant
@@ -79,6 +79,11 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
       b.setLayoutParams(lp)
       list.addView(b)
     list.addView(sectionHeader("地域"))
+    Regions.book.broken.map(_ => "地域データを読み込めません").orElse(Regions.book.writeError.map(_ => "地域データを保存できません")).foreach { p =>
+      val t = supportingText(p)
+      t.setTextColor(color(attr.error))
+      list.addView(t)
+    }
     if s.regions.isEmpty then list.addView(supportingText("なし"))
     else list.addView(listGroup(s.regions.map(row)*))
     list.addView(sectionHeader("全域"))
@@ -157,6 +162,14 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
         ("↓", attr.onSurfaceVariant, l, Regions.waiting.nonEmpty, None)
       case RegionStatus.Failed(reason) => ("!", attr.error, reason, true, None)
       case RegionStatus.Unusable => ("!", attr.error, "使用不可（スタイル未取得）", true, None)
+      // The old version stays drawn: ✓, and the update's state.
+      case RegionStatus.Updating(done, total) =>
+        val l =
+          if Regions.progress.keySet.exists(r.cells.contains) then s"更新中 · ${if total > 0 then done * 100 / total else 0}%"
+          else Regions.waiting.map("更新待ち · " + _).getOrElse(
+            if !workActive then "更新を中断" else if Regions.metered then "更新待ち" else "更新待ち · Wi-Fi 接続待ち")
+        ("✓", attr.primary, l, Regions.waiting.nonEmpty, None)
+      case RegionStatus.UpdateFailed(reason) => ("✓", attr.primary, s"更新に失敗（$reason）", true, None)
     regionLine(mark, markColor, r.name, chipText, line, error, Some(anchor => menu(anchor, r, st)))
 
   private def menu(anchor: View, r: Region, st: RegionStatus): Unit =
@@ -164,25 +177,28 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
     val m = p.getMenu
     val newer = st == RegionStatus.Ready(true)
     st match
-      case RegionStatus.Failed(_) | RegionStatus.Unusable => m.add(0, 4, 0, "再取得")
-      case RegionStatus.Downloading(_, _) if !workActive => m.add(0, 4, 0, "再開")
+      case RegionStatus.Failed(_) | RegionStatus.Unusable | RegionStatus.UpdateFailed(_) => m.add(0, 4, 0, "再取得")
+      case RegionStatus.Downloading(_, _) | RegionStatus.Updating(_, _) if !workActive => m.add(0, 4, 0, "再開")
       case _ => ()
     m.add(0, 1, 1, "更新").setEnabled(newer && Regions.allowed)
     m.add(0, 2, 2, "名前を変更")
     m.add(0, 3, 3, "削除")
     p.setOnMenuItemClickListener { item =>
       item.getItemId match
-        case 1 => Regions.catalog.foreach { c => Regions.planUpdate(r.id, c); RegionDownload.start(act) }
+        case 1 => Regions.catalog.foreach(c => saved(Regions.planUpdate(r.id, c))(RegionDownload.start(act)))
         case 2 => rename(r)
         case 3 => confirmDelete(r)
         case 4 =>
           if !Regions.allowed then act.push(OutboundDestScreen(act, Dest.Data))
-          else
-            Regions.retry(r.id)
-            RegionDownload.start(act)
+          else saved(Regions.retry(r.id))(RegionDownload.start(act))
       true
     }
     p.show()
+
+  /** Runs `andThen` if the change was written; else says it was not. */
+  private def saved[A](r: Either[String, A])(andThen: => Unit): Unit = r match
+    case Right(_) => andThen
+    case Left(_) => Toast.makeText(act, "保存できませんでした", Toast.LENGTH_SHORT).show()
 
   private def rename(r: Region): Unit =
     val e = EditText(act)
@@ -196,7 +212,7 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
       .setView(box)
       .setPositiveButton("変更", (_, _) => {
         val n = e.getText.toString.trim
-        if n.nonEmpty then Regions.rename(r.id, n.take(40))
+        if n.nonEmpty then saved(Regions.rename(r.id, n.take(40)))(())
       })
       .setNegativeButton("キャンセル", null)
       .show()
@@ -212,7 +228,7 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
     MaterialAlertDialogBuilder(act)
       .setTitle(s"「${r.name}」を削除しますか")
       .setMessage(line)
-      .setPositiveButton("削除", (_, _) => Regions.delete(r.id))
+      .setPositiveButton("削除", (_, _) => saved(Regions.delete(r.id))(()))
       .setNegativeButton("キャンセル", null)
       .show()
 
@@ -316,22 +332,32 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
       val (c, z) = TrackMap.all.headOption.flatMap(_.camera).map((p, z) => (p, math.min(z, 9.0))).getOrElse((LatLng(36.0, 138.5), 5.5))
       m.setCameraPosition(CameraPosition.Builder().target(MLatLng(c.lat, c.lon)).zoom(z).build())
       m.setMinZoomPreference(4.0)
-      // The offline map (and placed packs): this screen sends no area anywhere.
-      val json = MapStyle.Offline.styleJson("regions", this, None).get
-      m.setStyle(Style.Builder().fromJson(json), (st: Style) => {
-        st.addSource(GeoJsonSource("cells"))
-        st.addLayer(FillLayer("cells-fill", "cells").withProperties(
-          PropertyFactory.fillColor(Expression.get("color")),
-          PropertyFactory.fillOpacity(Expression.get("opacity"))))
-        st.addLayer(LineLayer("cells-line", "cells").withProperties(
-          PropertyFactory.lineColor("#3c4043"), PropertyFactory.lineWidth(1.5f), PropertyFactory.lineOpacity(0.7f)))
-        update()
-      })
+      loadStyle(m)
       m.addOnCameraMoveListener(() => update())
-      m.addOnCameraIdleListener(() => update())
+      m.addOnCameraIdleListener { () =>
+        update()
+        // More region packs placed than one style draws: the style follows the view.
+        val v = m.getProjection.getVisibleRegion.latLngBounds
+        Regions.view(this, Bounds(v.getLonWest, v.getLatSouth, v.getLonEast, v.getLatNorth))
+        if Regions.stale(this) then loadStyle(m)
+      }
     }
     if Regions.catalog.isEmpty then fetchCatalog()
     update()
+
+
+  /** The offline map (and placed packs around the view): this screen sends no area anywhere. */
+  private def loadStyle(m: MapLibreMap): Unit =
+    val json = MapStyle.Offline.styleJson("regions", this, None).get
+    m.setStyle(Style.Builder().fromJson(json), (st: Style) => {
+      st.addSource(GeoJsonSource("cells"))
+      st.addLayer(FillLayer("cells-fill", "cells").withProperties(
+        PropertyFactory.fillColor(Expression.get("color")),
+        PropertyFactory.fillOpacity(Expression.get("opacity"))))
+      st.addLayer(LineLayer("cells-line", "cells").withProperties(
+        PropertyFactory.lineColor("#3c4043"), PropertyFactory.lineWidth(1.5f), PropertyFactory.lineOpacity(0.7f)))
+      update()
+    })
 
   override def onHide(): Unit =
     RegionSelectScreen.shown = None
@@ -346,8 +372,15 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
     mapView = None
     Regions.release(this)
 
-  /** The catalog (no position in the request), under a permit of the user's action. */
+  /** The catalog (no position in the request), under a permit of the
+    * user's action, on the network the downloads may use: on a metered one
+    * only with 「モバイルデータ通信でも取得」.
+    */
   private def fetchCatalog(): Unit =
+    val metered = scala.util.Try(act.getSystemService(classOf[android.net.ConnectivityManager]).isActiveNetworkMetered).getOrElse(true)
+    if metered && !Regions.metered then
+      fetchError = Some("Wi-Fi 接続時にカタログを取得")
+      return
     Settings.gate.permit(Dest.Data, Mode.OnAction).filter(_.level == Level.Cell).foreach { p =>
       fetching = true
       AshidoriApp.io.execute { () =>
@@ -399,7 +432,7 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
         f
       }
       src.setGeoJson(FeatureCollection.fromFeatures(fs.asJava))
-    val free = RegionDownload.free()
+    val free = Storage.free()
     cat match
       case None =>
         sizeLine.setText(if fetching then "カタログを取得中…" else fetchError.getOrElse("カタログなし"))
@@ -408,7 +441,7 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
       case Some(c) =>
         val e = RegionEstimate(cells, s, c, Regions.styles)
         val known = cells.filter(c.cells.contains)
-        val fits = e.bytes <= RegionDownload.budget.available
+        val fits = e.bytes <= Storage.budget.available
         val (line, ok) =
           if cells.size > Regions.MaxCells then ("範囲を狭めてください", false)
           else if known.isEmpty then ("この範囲の地図はありません", false)
@@ -429,8 +462,9 @@ final class RegionSelectScreen(act: MainActivity) extends Screen:
         AshidoriApp.io.execute { () =>
           val name = Regions.defaultName(center.getLatitude, center.getLongitude)
           act.runOnUiThread { () =>
-            Regions.add(name, cells, c)
-            RegionDownload.start(act)
+            Regions.add(name, cells, c) match
+              case Right(_) => RegionDownload.start(act)
+              case Left(_) => Toast.makeText(act, "保存できませんでした", Toast.LENGTH_SHORT).show()
             act.pop()
             if !act.currentScreen.exists(_.isInstanceOf[OfflineDataScreen]) then act.push(OfflineDataScreen(act))
           }

@@ -318,14 +318,22 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
                 if !Sha256.matches(f, pin) then throw PinnedFailure(DownloadCause.Mismatch)
                 (f, BasemapSource.LocalFile)
               case None => download(pin, p.get)
-            data.lock.synchronized {
+            // Its extraction within the shared budget (design 6.8).
+            val size = BasemapStore.extractedSize(archive)
+            val room = Storage.budget.reserve(size).getOrElse {
+              Log.w(s"$name: ${Storage.shortage(size)}")
+              throw PinnedFailure(DownloadCause.Storage)
+            }
+            try data.lock.synchronized {
               data.changedOnDisk()
-              data.store.install(archive, pin)
+              try data.store.install(archive, pin, n => room.wrote(n))
+              catch case _: BasemapStore.NoRoom => throw PinnedFailure(DownloadCause.Storage)
               // Deleted (or replaced) meanwhile: do not leave it installed.
               if isStopped then
                 data.store.deleteAll()
                 throw ResumableDownload.Cancelled()
             }
+            finally room.release()
             if source != BasemapSource.LocalFile then archive.delete()
             data.cleanup()
             Log.i(s"$name ${pin.version} installed from ${source.key}")
@@ -360,11 +368,17 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     val store = data.store
     val part = store.partFile(pin)
     part.getParentFile.mkdirs()
-    // Room for the rest of the archive and its extraction.
-    val need = (pin.bytes - (if part.isFile then part.length else 0L)) + pin.bytes + 16L * 1024 * 1024
-    if part.getParentFile.getUsableSpace < need then
-      Log.w(s"$name: about ${need / 1_000_000} MB needed")
+    // The rest of the archive, within the shared budget (design 6.8); its
+    // extraction reserves again once it is verified.
+    val need = pin.bytes - (if part.isFile then part.length else 0L)
+    val room = Storage.budget.reserve(need).getOrElse {
+      Log.w(s"$name: ${Storage.shortage(need)}")
       throw PinnedFailure(DownloadCause.Storage)
+    }
+    try fetch(pin, permit, part, room)
+    finally room.release()
+
+  private def fetch(pin: BasemapPin, permit: Permit, part: File, room: StorageBudget#Reservation): (File, BasemapSource) =
 
     val sources: Seq[(BasemapSource, String)] = dl.debugUrl match
       case Some(base) => Seq(BasemapSource.DebugUrl -> BasemapSource.debugUrl(base, pin))
@@ -384,7 +398,13 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     val found = sources.iterator.map { (source, url) =>
       try
         var shown = -1L
+        var accounted = if part.isFile then part.length else 0L
         ResumableDownload.run(http, url, part, pin.bytes, () => isStopped, n => {
+          // Stops (the partial file stays) once it would cut into the logging reserve.
+          if n > accounted then
+            val ok = room.wrote(n - accounted)
+            accounted = n
+            if !ok then throw PinnedFailure(DownloadCause.Storage)
           // About every 1 %.
           if n == pin.bytes || n - shown >= pin.bytes / 100 then
             shown = n
@@ -400,6 +420,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
       catch
         case e: ResumableDownload.Cancelled => throw e
         case e: Outbound.Blocked => throw e
+        case e: PinnedFailure => throw e
         case e: Exception =>
           Log.w(s"$name from ${source.key} failed", e)
           errors += source -> DownloadCause.of(e)

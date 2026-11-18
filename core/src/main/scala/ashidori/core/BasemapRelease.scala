@@ -256,13 +256,16 @@ final class BasemapStore(val root: File, required: Seq[String] = BasemapStore.Re
   def installed(pin: BasemapPin): Option[File] =
     Some(versionDir(pin.version)).filter(d => required.forall(r => File(d, r).isFile))
 
-  /** Extracts a verified archive and moves it into place as `pin.version`. */
-  def install(archive: File, pin: BasemapPin): File =
+  /** Extracts a verified archive and moves it into place as `pin.version`;
+    * `written` hears every write and stops it by answering false (the
+    * storage budget): the extraction is then removed.
+    */
+  def install(archive: File, pin: BasemapPin, written: Long => Boolean = _ => true): File =
     root.mkdirs()
     val tmp = File(root, s"$TmpPrefix${pin.version}")
     deleteTree(tmp)
     try
-      extract(archive, tmp)
+      extract(archive, tmp, MaxExtracted, written)
       val missing = required.filterNot(r => File(tmp, r).isFile)
       if missing.nonEmpty then throw IOException(s"archive lacks ${missing.mkString(", ")}")
       val target = versionDir(pin.version)
@@ -287,6 +290,13 @@ final class BasemapStore(val root: File, required: Seq[String] = BasemapStore.Re
   def deleteAll(): Unit = deleteTree(root)
 
 object BasemapStore:
+  /** The storage budget stopped an extraction. */
+  final class NoRoom extends IOException("no room above the logging reserve")
+  /** The size an archive extracts to (its entries' declared sizes). */
+  def extractedSize(archive: File): Long =
+    import scala.jdk.CollectionConverters.*
+    val z = java.util.zip.ZipFile(archive)
+    try z.entries().asScala.map(e => math.max(0L, e.getSize)).sum finally z.close()
   val DownloadDir = ".download"
   val TmpPrefix = ".tmp-"
   /** Files every basemap archive has (tools/basemap/assemble.py). */
@@ -309,7 +319,7 @@ object BasemapStore:
     * copying (`maxTotal`), so an archive that inflates far beyond what it
     * declares cannot fill the disk.
     */
-  def extract(archive: File, dest: File, maxTotal: Long = MaxExtracted): Unit =
+  def extract(archive: File, dest: File, maxTotal: Long = MaxExtracted, written: Long => Boolean = _ => true): Unit =
     import scala.jdk.CollectionConverters.*
     val zip = java.util.zip.ZipFile(archive)
     try
@@ -339,6 +349,7 @@ object BasemapStore:
                 if total > maxTotal then throw IOException("archive too large")
                 if e.getSize >= 0 && n > e.getSize then throw IOException(s"${e.getName}: size mismatch")
                 out.write(buf, 0, r)
+                if !written(r) then throw NoRoom()
                 r = in.read(buf)
             finally out.close()
           finally in.close()

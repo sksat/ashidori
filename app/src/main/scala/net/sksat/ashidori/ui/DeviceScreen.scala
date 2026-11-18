@@ -179,6 +179,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     val hex = f"#${dotColor & 0xffffff}%06x"
     // Show the circle with room around it; at least ~600 m across.
     val half = math.max(acc * 2.5, 300.0)
+    // The region packs around it, if more are placed than one style draws.
+    Regions.view(this, ashidori.core.Bounds(f.lon - 0.05, f.lat - 0.05, f.lon + 0.05, f.lat + 0.05))
     // Another device's position: an online map only if its destination is
     // automatic, under a permit taken now (holder `snapshot`).
     val (style, json) = MapStyle.snapshot(this) match

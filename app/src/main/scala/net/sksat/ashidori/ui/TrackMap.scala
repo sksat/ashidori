@@ -408,7 +408,21 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         m.getUiSettings.setAttributionEnabled(false)
         initialCamera.foreach(c => m.moveCamera(CameraUpdateFactory.newLatLngZoom(MLatLng(c._1.lat, c._1.lon), c._2)))
         initialCamera = None
+        regionView(m)
+        // More region packs placed than one style draws: the style follows the view.
+        m.addOnCameraIdleListener(() => if mlMap.contains(m) then
+          regionView(m)
+          val offline = shown.exists {
+            case Outcome.Draw(s) => s == MapStyle.Offline
+            case Outcome.NoBasemap => false
+          }
+          if offline && Regions.stale(this) then refreshBaseMap(force = true))
         loadStyle(m, MapStyle.forView(surface, active))
+    }
+
+  private def regionView(m: MapLibreMap): Unit =
+    scala.util.Try(m.getProjection.getVisibleRegion.latLngBounds).foreach { v =>
+      Regions.view(this, ashidori.core.Bounds(v.getLonWest, v.getLatSouth, v.getLonEast, v.getLatNorth))
     }
 
   /** Destroys the map view, keeping the camera for [[makeMapView]].

@@ -57,14 +57,17 @@ object RegionDownload:
     * packs if 自動更新 is on, and packs left planned (e.g. stopped by a pause).
     */
   def autoStart(ctx: Context): Unit =
+    // On the io thread, which other work shares: a failure here stays here.
     AshidoriApp.io.execute { () =>
-      Regions.ensureLoaded()
-      val s = Regions.state
-      val placed = s.packs.values.exists(_.installed.nonEmpty)
-      val planned = s.queue.nonEmpty
-      for p <- Settings.gate.permit(Dest.Data, Mode.Auto) if p.level == Level.Cell && Regions.offered do
-        if planned || (placed && Regions.autoUpdate) then
-          WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(p, update = Regions.autoUpdate))
+      try
+        Regions.ensureLoaded()
+        val s = Regions.state
+        val placed = s.packs.values.exists(_.installed.nonEmpty)
+        val planned = s.queue.nonEmpty
+        for p <- Settings.gate.permit(Dest.Data, Mode.Auto) if p.level == Level.Cell && Regions.offered do
+          if planned || (placed && Regions.autoUpdate) then
+            WorkManager.getInstance(ctx).enqueueUniqueWork(WorkName, ExistingWorkPolicy.KEEP, request(p, update = Regions.autoUpdate))
+      catch case e: Throwable => Log.w("regions: not started", e)
     }
 
   /** The rule of [[Dest.Data]] changed, or the pause started or ended: the
@@ -80,51 +83,8 @@ object RegionDownload:
   def networkChanged(ctx: Context): Unit =
     if Regions.state.queue.nonEmpty then start(ctx)
 
-  /** The budget of the app's large writes (design 6.8): the free space of
-    * filesDir less the logging reserve `L`. Debug builds can pretend less
-    * free space ([[debugFree]]).
-    */
-  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve())
-  /** Debug builds: free bytes to pretend (DebugReceiver REGIONS_FREE); None: the real ones. */
-  @volatile var debugFree: Option[Long] = None
-  def free(): Long = debugFree.filter(_ => Regions.debuggable).getOrElse(AshidoriApp.app.getFilesDir.getUsableSpace)
-
-  @volatile private var reserveAt = 0L
-  @volatile private var reserveMode: Option[LoggingMode] = None
-  @volatile private var reserveValue = StorageBudget.MinReserve
-  /** L, measured at most once a minute (the logger's data size is a walk of
-    * its files), and at once when the logging mode changes.
-    */
-  def reserve(): Long =
-    val now = System.currentTimeMillis()
-    val mode = Settings.mode
-    if now - reserveAt > 60_000 || !reserveMode.contains(mode) then
-      reserveAt = now
-      reserveMode = Some(mode)
-      reserveValue = StorageBudget.loggingReserve(mode, LoggingRate.measure(now))
-    reserveValue
-
-/** The logger's write rate, from samples of the size of its data (the
-  * database, its WAL, the archive and the overflow files) kept in prefs.
-  */
-object LoggingRate:
-  private def prefs = AshidoriApp.app.getSharedPreferences("regions", Context.MODE_PRIVATE)
-  private def size(f: File): Long = if f.isDirectory then Option(f.listFiles()).toSeq.flatten.map(size).sum else f.length
-
-  def loggerBytes(): Long =
-    val db = AshidoriApp.app.getDatabasePath("ashidori.db")
-    Seq(db, File(db.getPath + "-wal"), File(AshidoriApp.app.getFilesDir, "archive"), LoggerWrites.Overflow.dir).map(size).sum
-
-  /** Adds a sample (at most one per 10 minutes, the last 24 kept) and returns the rate. */
-  def measure(now: Long): Option[Long] =
-    val old = Option(prefs.getString("loggerSamples", "")).toSeq.flatMap(_.split(';')).flatMap { s =>
-      s.split(',') match
-        case Array(t, b) => scala.util.Try(t.toLong -> b.toLong).toOption
-        case _ => None
-    }
-    val samples = if old.lastOption.exists(_._1 > now - 600_000) then old else (old :+ (now -> loggerBytes())).takeRight(24)
-    if samples ne old then prefs.edit().putString("loggerSamples", samples.map((t, b) => s"$t,$b").mkString(";")).apply()
-    StorageBudget.measuredRate(samples, now)
+  /** The shared budget of the app's large writes ([[Storage]]). */
+  def budget: StorageBudget = Storage.budget
 
 /** One run over the planned packs; see [[RegionDownload]]. */
 class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, params):
@@ -152,7 +112,8 @@ class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, p
       val client = Net.outbound.rangeHttp(p.get, BasemapWorker.ua)
       val env = new RegionRun.Env:
         def http: RangeHttp = client
-        def url(file: String): String = Regions.url(catalog.version, file)
+        // The version each pack was planned under (its own release).
+        def url(version: String, file: String): String = Regions.url(version, file)
         def store: RegionStore = Regions.store
         def budget: StorageBudget = RegionDownload.budget
         def cancelled(): Boolean = isStopped
@@ -169,7 +130,9 @@ class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, p
               shown = done
               Regions.progress = Map(c -> done)
               Regions.changed()
-        def update(f: RegionState => RegionState): RegionState = Regions.update(f)
+        // A change that cannot be written stops the run (it is retried).
+        def update(f: RegionState => RegionState): RegionState =
+          Regions.update(f).fold(e => throw IOException(s"state not written: $e"), identity)
         override def log(s: String): Unit = Log.i(s)
       // One run at a time: a replaced run may still be ending its last write.
       RunLock.synchronized(RegionRun.run(env)) match
