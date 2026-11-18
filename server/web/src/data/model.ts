@@ -179,6 +179,9 @@ export interface Place {
   updatedAt: number;
   /** A tombstone: the place was deleted (never shown). */
   deleted: boolean;
+  /** The device's change counter (NaN: not carried), and the upload order: which version is later. */
+  rev: number;
+  order: number;
 }
 
 /** Place.displayName without the area (the viewer has no reverse geocoder). */
@@ -201,6 +204,9 @@ export interface CheckIn {
   updatedAt: number;
   /** A tombstone: the check-in was deleted (never shown). */
   deleted: boolean;
+  /** The device's change counter (NaN: not carried), and the upload order: which version is later. */
+  rev: number;
+  order: number;
 }
 
 export interface ModeOverride {

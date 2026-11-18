@@ -211,10 +211,10 @@ export class ViewerStore extends EventTarget {
     for (const { ref, records } of opened) {
       for (const r of records) {
         if (ref.stream === "places") {
-          const p = placeOf(ref.deviceId, r);
+          const p = placeOf(ref.deviceId, r, seq++);
           if (p) places.push(p);
         } else if (ref.stream === "checkins") {
-          const c = checkInOf(ref.deviceId, r);
+          const c = checkInOf(ref.deviceId, r, seq++);
           if (c) checkIns.push(c);
         } else {
           const o = overrideOf(r);

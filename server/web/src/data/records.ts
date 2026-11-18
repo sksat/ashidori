@@ -11,8 +11,15 @@ const str = (v: unknown) => (typeof v === "string" ? v : "");
 const KINDS: PlaceKind[] = ["HOME", "WORK", "SCHOOL", "UNKNOWN"];
 /** A tombstone (`deleted` 1, app database version 9); missing: not deleted. */
 const deletedOf = (v: unknown) => v === true || v === 1;
+/** The device's change counter of the row (`rev`, after app database version 9); NaN: not carried. */
+const revOf = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : NaN);
 
-export function placeOf(deviceId: string, x: unknown): Place | null {
+/**
+ * `order`: the record's place in the upload order (batches by cursor, then
+ * lines), which is each device's change-counter order; it orders the
+ * versions of records without `rev`.
+ */
+export function placeOf(deviceId: string, x: unknown, order = 0): Place | null {
   const r = obj(x);
   if (!r || (typeof r.id !== "number" && typeof r.id !== "string")) return null;
   const lat = num(r.lat);
@@ -28,10 +35,12 @@ export function placeOf(deviceId: string, x: unknown): Place | null {
     kind,
     updatedAt: num(r.updatedAt, 0),
     deleted: deletedOf(r.deleted),
+    rev: revOf(r.rev),
+    order,
   };
 }
 
-export function checkInOf(deviceId: string, x: unknown): CheckIn | null {
+export function checkInOf(deviceId: string, x: unknown, order = 0): CheckIn | null {
   const r = obj(x);
   if (!r || (typeof r.id !== "number" && typeof r.id !== "string")) return null;
   const t = num(r.t);
@@ -49,6 +58,8 @@ export function checkInOf(deviceId: string, x: unknown): CheckIn | null {
     isPrivate: r.private === true || r.private === 1,
     updatedAt: num(r.updatedAt, 0),
     deleted: deletedOf(r.deleted),
+    rev: revOf(r.rev),
+    order,
   };
 }
 
@@ -84,23 +95,44 @@ export function statusOf(x: unknown): DeviceStatus | null {
   };
 }
 
-/** The latest snapshot per key wins (by updatedAt, then by upload order). */
-export function latestByKey<T extends { key: string; updatedAt: number }>(rows: Iterable<T>): Map<string, T> {
-  const out = new Map<string, T>();
-  for (const r of rows) {
-    const prev = out.get(r.key);
-    if (!prev || r.updatedAt >= prev.updatedAt) out.set(r.key, r);
-  }
-  return out;
+/** A version of a row of an editable stream (key: `${deviceId}/${id}`). */
+export interface Version {
+  key: string;
+  deleted: boolean;
+  rev: number;
+  order: number;
 }
 
 /**
- * The rows as they are now: the latest snapshot per key, without the
- * deleted ones. A tombstone is a snapshot like any other, so it wins over
- * the earlier ones and then takes the row out.
+ * `a` is a later version of its row than `b`: by the device's change
+ * counter (`rev`) when both carry it; a version with `rev` is later than
+ * one without (written by an app version before 9, so uploaded before);
+ * else the later upload. The device clock (`updatedAt`) is never used: a
+ * clock set back must not bring an older version back.
  */
-export function liveByKey<T extends { key: string; updatedAt: number; deleted: boolean }>(rows: Iterable<T>): T[] {
-  return [...latestByKey(rows).values()].filter((r) => !r.deleted);
+export function laterVersion(a: Version, b: Version): boolean {
+  const ar = Number.isFinite(a.rev);
+  const br = Number.isFinite(b.rev);
+  if (ar && br && a.rev !== b.rev) return a.rev > b.rev;
+  if (ar !== br) return ar;
+  return a.order > b.order;
+}
+
+/**
+ * The rows as they are now: per key the latest version (laterVersion),
+ * without the deleted rows. A tombstone is terminal: a row with a deleted
+ * version anywhere is deleted, whatever came after it (the app never
+ * changes a deleted row; nothing undeletes one).
+ */
+export function liveByKey<T extends Version>(rows: Iterable<T>): T[] {
+  const latest = new Map<string, T>();
+  const deleted = new Set<string>();
+  for (const r of rows) {
+    if (r.deleted) deleted.add(r.key);
+    const prev = latest.get(r.key);
+    if (!prev || laterVersion(r, prev)) latest.set(r.key, r);
+  }
+  return [...latest.values()].filter((r) => !deleted.has(r.key));
 }
 
 /** Overrides have no id: the app replaces one by its (start, end). The one first in compareOverrides wins. */

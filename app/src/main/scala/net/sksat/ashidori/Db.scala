@@ -1377,9 +1377,9 @@ object Db:
     "motion" -> Seq("start" -> "s", "end" -> "e", "std" -> "std", "mean" -> "mean", "steps" -> "steps"),
     "battery" -> Seq("time" -> "t", "pct" -> "pct", "charging" -> "chg", "screen_on" -> "scr"),
     "places" -> Seq("id" -> "id", "lat" -> "lat", "lon" -> "lon", "radius" -> "r", "name" -> "name", "kind" -> "kind",
-      "external_id" -> "ext", "updated_at" -> "updatedAt", "deleted" -> "deleted"),
+      "external_id" -> "ext", "updated_at" -> "updatedAt", "deleted" -> "deleted", "sync_rev" -> "rev"),
     "checkins" -> Seq("id" -> "id", "time" -> "t", "lat" -> "lat", "lon" -> "lon", "venue" -> "venue", "category" -> "cat",
       "external_id" -> "ext", "place_id" -> "place", "comment" -> "comment", "private" -> "private",
-      "updated_at" -> "updatedAt", "deleted" -> "deleted"),
+      "updated_at" -> "updatedAt", "deleted" -> "deleted", "sync_rev" -> "rev"),
     "mode_overrides" -> Seq("start" -> "s", "end" -> "e", "mode" -> "mode", "updated_at" -> "updatedAt")
   )
