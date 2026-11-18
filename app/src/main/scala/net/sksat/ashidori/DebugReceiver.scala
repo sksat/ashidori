@@ -37,8 +37,10 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.CORRUPT_POLICY [--es value '{"v":9}']  store an unreadable policy (read at the next start)
   *   ... -a ashidori.debug.GEOCODE --ef lat 35.68 --ef lon 139.76   area and region names (the platform geocoder if allowed)
   *   ... -a ashidori.debug.VENUES --ef lat 35.68 --ef lon 139.76    the online venue search, as its button does
-  *   ... -a ashidori.debug.CUSTOM_TILES --es url http://10.0.2.2:8799/{z}/{x}/{y}.png   the custom map's URL ('' removes it)
-  *   ... -a ashidori.debug.DATA_URL --es url http://10.0.2.2:8799   the data's debug source ('' removes it)
+  *   ... -a ashidori.debug.CUSTOM_TILES --es url http://10.0.2.2:8799/{z}/{x}/{y}.png   the custom map's URL (none removes it)
+  *   ... -a ashidori.debug.DATA_URL --es url http://10.0.2.2:8799   the data's debug source (none removes it)
+  *   ... -a ashidori.debug.MAP_STYLE --es key gsi-std    the chosen base map (no consent)
+  *   ... -a ashidori.debug.DETAIL --es key gsi-std       「オンライン地図で表示」 on every open map (none: back)
   *   ... -a ashidori.debug.FETCH --es dest data --es url URL         one request through Outbound
   *   ... -a ashidori.debug.DATA_START [--es kind basemap|venues]    the download, as its button does
   *   ... -a ashidori.debug.CAMERA --ef lat 35.68 --ef lon 139.76 --ef zoom 17   move every open map
@@ -178,13 +180,24 @@ class DebugReceiver extends BroadcastReceiver:
         AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.moveTo(p, z)))
       case "ashidori.debug.CUSTOM_TILES" =>
         // An empty URL removes it (as before the user set one).
-        val url = Option(intent.getStringExtra("url")).getOrElse("")
+        val url = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
         if url.isEmpty then c.getSharedPreferences("settings", Context.MODE_PRIVATE).edit().remove("customTileUrl").commit()
         else ui.MapStyle.setCustom(url, "")
         Log.i(s"custom tiles: ${ui.MapStyle.custom._1}")
         AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.refreshBaseMap(force = true)))
+      case "ashidori.debug.MAP_STYLE" =>
+        // The chosen base map, as the picker stores it (no consent: for automatic maps).
+        ui.MapStyle.values.find(_.key == intent.getStringExtra("key")).foreach { ms =>
+          ui.MapStyle.current = ms
+          AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.refreshBaseMap(force = true)))
+        }
+        Log.i(s"map style: ${ui.MapStyle.current.key}")
+      case "ashidori.debug.DETAIL" =>
+        // As 「オンライン地図で表示」 on every open map, for the map `key`.
+        val ms = ui.MapStyle.values.find(_.key == intent.getStringExtra("key"))
+        AshidoriApp.app.getMainExecutor.execute(() => ui.TrackMap.all.foreach(_.setDetailed(ms.nonEmpty, ms)))
       case "ashidori.debug.DATA_URL" =>
-        BasemapDownload.debugUrl = Option(intent.getStringExtra("url")).getOrElse("")
+        BasemapDownload.debugUrl = Option(intent.getStringExtra("url")).filterNot(_ == "none").getOrElse("")
         Log.i(s"data debug url: ${BasemapDownload.debugUrl}")
       case "ashidori.debug.FETCH" =>
         // One request through Outbound under a permit of `dest` (a redirect test).
