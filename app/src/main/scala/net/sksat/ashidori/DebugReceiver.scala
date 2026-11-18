@@ -106,6 +106,20 @@ class DebugReceiver extends BroadcastReceiver:
             Log.i(s"backup done: ${n.bytes} bytes to $f, missing ${n.missing.size}")
           catch case e: Throwable => Log.e("backup failed", e)
         , "ashidori-backup").start()
+      case "ashidori.debug.VACUUM_CANCEL" =>
+        // The backup's database copy, cancelled after `ms` (as its watcher does
+        // when the room is gone): shows that VACUUM INTO stops part-way.
+        val ms = intent.getIntExtra("ms", 50).toLong
+        val run: Runnable = () =>
+          val dest = java.io.File(c.getNoBackupFilesDir, "vacuum-test.db")
+          val sig = android.os.CancellationSignal()
+          val cancel: Runnable = () => { Thread.sleep(ms); sig.cancel() }
+          val t0 = System.currentTimeMillis()
+          Thread(cancel).start()
+          val r = scala.util.Try(AshidoriApp.db.snapshotTo(dest, Some(sig)))
+          Log.i(s"vacuum cancel after $ms ms: ${r.fold(e => e.getClass.getSimpleName, _ => "completed")} in ${System.currentTimeMillis() - t0} ms, copy ${dest.length} bytes")
+          dest.delete()
+        Thread(run, "ashidori-vacuum-test").start()
       case "ashidori.debug.RESCUE" =>
         val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("rescue.zip"))
         Thread(() =>
