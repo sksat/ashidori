@@ -65,6 +65,8 @@ object Maintenance:
     Progress.set("開始待ち")
 
   @volatile private var repairAsked = 0L
+  /** The last run stopped for the room above the logging reserve. */
+  @volatile var stoppedLow = false
 
   /** An unfinished commit cannot be finished (seen in the main process):
     * the maintenance process resolves it now where it can do so safely
@@ -267,7 +269,9 @@ object Maintenance:
     // is dropped (portions committed before stay committed), no data is
     // lost, it is not counted as a failure, and the rest is done next time.
     val low = AtomicBoolean(false)
+    stoppedLow = false
     def noRoom(what: String): Unit =
+      stoppedLow = true
       if low.compareAndSet(false, true) then
         Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
         LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が記録用の予備（${Try(Storage.reserve() / 1_000_000).getOrElse(0L)} MB）に近い")

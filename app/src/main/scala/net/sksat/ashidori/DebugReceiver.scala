@@ -365,7 +365,8 @@ class DebugMaintenanceService extends android.app.Service:
       Thread(() =>
         try
           if repair then Maintenance.repair(manual = true)
-          else while Maintenance.run(manual = true, () => false) do ()
+          // Again while work is left, but not after a stop for the room (as the job's backoff would).
+          else while Maintenance.run(manual = true, () => false) && !Maintenance.stoppedLow do ()
         catch case e: Throwable => Log.w("debug maintenance failed", e)
         finally stopSelf(id)
       , "ashidori-maintenance").start()
