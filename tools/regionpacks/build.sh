@@ -5,6 +5,9 @@
 #
 #   tools/regionpacks/build.sh <work dir> [<dist dir>]
 #
+# The work dir holds one subdirectory per build (build-<BUILD>); use a new
+# or empty dist dir for each version.
+#
 # Environment (defaults are the pinned, tested values):
 #   BUILD     Protomaps daily build, YYYYMMDD (https://build.protomaps.com/);
 #             the builds are removed after a while, so a later rebuild needs a new one
@@ -29,6 +32,9 @@ dist=${2:-$here/dist}
 
 BUILD=${BUILD:-20261117}
 VERSION=${VERSION:-$BUILD}
+# Everything cached (the extracted cells above all) is kept per build: data
+# of one build can never be packed under another build's date.
+work="$work/build-$BUILD"
 JOBS=${JOBS:-4}
 
 # The same tools and assets as tools/basemap/build.sh.

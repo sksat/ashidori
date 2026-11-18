@@ -1,8 +1,10 @@
 #!/bin/sh
 # Prints the commands that publish the region packs of a catalog (build.sh)
-# on GitHub Releases; runs nothing. Checks first that every file is the one
-# the catalog lists (size and sha256), that the catalog is the one the app
-# pins, and GitHub's limits (1,000 assets per release, each under 2 GiB).
+# on GitHub Releases; runs nothing. Checks first, and fails on any mismatch,
+# that every file is the one the catalog lists (size and sha256), that the
+# catalog is the one the app pins, and GitHub's limits (1,000 assets per
+# release, each under 2 GiB). Run it again on a directory of the published
+# assets (`gh release download`) to check them before a pinned APK goes out.
 #
 #   tools/regionpacks/release.sh [<version>] [<dist dir>]
 #
@@ -44,12 +46,11 @@ for name, n, h in files:
         sys.exit(f"{name}: 2 GiB or more")
 if len(files) + 1 > 1000:
     sys.exit(f"{len(files) + 1} assets (at most 1000)")
-if os.path.isfile(pin):
-    p = json.load(open(pin))
-    if p.get("sha256") != hashlib.sha256(raw).hexdigest():
-        print(f"warning: the app pins another catalog ({p.get('version')} {p.get('sha256')})", file=sys.stderr)
-else:
-    print("warning: the app pins no catalog (run tools/regionpacks/package.sh)", file=sys.stderr)
+if not os.path.isfile(pin):
+    sys.exit("the app pins no catalog (run tools/regionpacks/package.sh)")
+p = json.load(open(pin))
+if p.get("sha256") != hashlib.sha256(raw).hexdigest() or p.get("bytes") != len(raw) or p.get("version") != cat.get("version"):
+    sys.exit(f"the app pins another catalog ({p.get('version')} {p.get('sha256')})")
 print(os.path.join(dist, os.path.basename(catalog)))
 for name, _, _ in files:
     print(os.path.join(dist, name))
