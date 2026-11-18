@@ -19,13 +19,22 @@ trait PinnedData:
   val lock: Object = new Object
   @volatile private var known: Option[Option[File]] = None
   /** Directory of the installed pinned version: looked up (and kept) off
-    * the main thread; on the main thread the one last looked up (looked up
-    * there only if never yet, which [[IoCheck]] reports; it is looked up in
-    * the background at app start and after every change).
+    * the main thread; on the main thread the one last looked up. Never
+    * looked up yet (a cold start, before the background look-up): None for
+    * now ([[known]] false), looked up in the background, then [[looked]]
+    * tells the listeners.
     */
   def dir: Option[File] =
-    if android.os.Looper.myLooper() == android.os.Looper.getMainLooper then known.getOrElse(look())
+    if android.os.Looper.myLooper() == android.os.Looper.getMainLooper then
+      known.getOrElse {
+        AshidoriApp.io.execute { () => look(); looked() }
+        None
+      }
     else look()
+  /** Whether the installed version has been looked up (on the main thread, [[dir]] may not know yet). */
+  def isKnown: Boolean = known.nonEmpty
+  /** Set by the download: tells its listeners once a background look-up is done. */
+  @volatile var looked: () => Unit = () => ()
   private def look(): Option[File] =
     IoCheck.offMain(s"${kind.name} installed")
     val d = pin.flatMap(store.installed)
@@ -68,6 +77,8 @@ trait PinnedData:
 enum BasemapStatus:
   /** This build pins no archive. */
   case Unavailable
+  /** Not known yet whether it is installed (looked up in the background). */
+  case Checking
   case Missing
   /** Queued; waits for an unmetered network unless `metered` is allowed. */
   case Waiting(metered: Boolean)
@@ -136,9 +147,14 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
 
   @volatile private var progress: Option[(Long, Long, BasemapSource)] = None
 
+  data.looked = () => changed()
+
   def status: BasemapStatus =
     data.pin match
       case None => BasemapStatus.Unavailable
+      case Some(p) if !data.isKnown && android.os.Looper.myLooper() == android.os.Looper.getMainLooper =>
+        data.dir
+        BasemapStatus.Checking
       case Some(p) =>
         data.installedVersion match
           case Some(v) => BasemapStatus.Installed(v, installedSource)

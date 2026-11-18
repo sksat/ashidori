@@ -275,7 +275,7 @@ object Maintenance:
       if low.compareAndSet(false, true) then
         Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
         LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が記録用の予備（${Try(Storage.reserve() / 1_000_000).getOrElse(0L)} MB）に近い")
-    Log.i(s"maintenance: floor ${Try(Storage.reserve()).getOrElse(-1L)} (file ${Try(ReserveFile.read(Storage.reserveFile, System.currentTimeMillis())).getOrElse(-1L)})")
+    Log.i(s"maintenance: floor ${Try(Storage.reserve()).getOrElse(-1L)} (file ${ReserveFile.read(Storage.reserveFile)})")
     val stopOrLow = () => stop() || low.get
     val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false

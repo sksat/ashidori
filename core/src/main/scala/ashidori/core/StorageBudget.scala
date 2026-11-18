@@ -8,7 +8,7 @@ import scala.util.Try
 
 /** Guards the logging reserve against the app's large writes (design 6.8).
   *
-  * The guarantee: the free space never goes below the logging reserve `L`
+  * The guarantee for files: the free space never goes below the logging reserve `L`
   * by more than (number of large writers running at once) × 1 MiB. Every
   * large writer, in either process, writes through a [[SpaceGuard]]: each
   * write is split into chunks of at most [[SpaceGuard.Chunk]] (1 MiB), and
@@ -59,29 +59,29 @@ final class GuardedOutputStream(out: OutputStream, guard: SpaceGuard) extends Ou
   override def flush(): Unit = out.flush()
   override def close(): Unit = out.close()
 
-/** The floor for every process: the main process writes it to a small
-  * file (floor = L + what its reservations will still write, and when it
-  * wrote it) when the logging mode or the measured rate changes (before a
-  * new mode takes effect), when a reservation is made or released, and
-  * every [[HeartbeatMs]] as a heartbeat. Written as a temporary file,
-  * synced, renamed, the directory synced; a failure of any step (the
-  * directory's sync included) is thrown. Another process (archive
-  * maintenance) reads it at every check: a file that is missing, cannot be
-  * read, is not two numbers or is older than [[StaleMs]] gives the most
-  * conservative L ([[Conservative]]), never the 256 MB floor.
+/** The floor published by the main process for the other one: L of the
+  * logging mode in effect and what the main process's reservations will
+  * still write, kept apart, and when it was written.
+  */
+final case class Published(l: Long, held: Long, at: Long):
+  def floor: Long = l + held
+
+/** The floor file. The main process writes it ([[FloorPublisher]]) as a
+  * temporary file, synced, renamed, the directory synced; a failure of any
+  * step (the directory's sync included) is thrown. Another process (archive
+  * maintenance) reads it at every check ([[floor]]).
   */
 object ReserveFile:
   /** L of 最高精度 at its default rate: what nothing measured can exceed by default. */
   val Conservative: Long = StorageBudget.loggingReserve(LoggingMode.Max, None)
   val HeartbeatMs: Long = 10L * 60 * 1000
-  val StaleMs: Long = 30L * 60 * 1000
 
-  def write(f: File, floor: Long, now: Long): Unit =
+  def write(f: File, p: Published): Unit =
     f.getParentFile.mkdirs()
     val tmp = File(f.getPath + ".tmp")
     val ch = FileChannel.open(tmp.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
     try
-      ch.write(java.nio.ByteBuffer.wrap(s"$floor $now\n".getBytes(UTF_8)))
+      ch.write(java.nio.ByteBuffer.wrap(s"${p.l} ${p.held} ${p.at}\n".getBytes(UTF_8)))
       ch.force(true)
     finally ch.close()
     Files.move(tmp.toPath, f.toPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
@@ -89,31 +89,132 @@ object ReserveFile:
     val d = FileChannel.open(f.getParentFile.toPath, StandardOpenOption.READ)
     try d.force(true) finally d.close()
 
-  /** The floor in the file, or [[Conservative]]. */
-  def read(f: File, now: Long): Long =
+  /** The file's content; None if it is missing, cannot be read, or is not three numbers as written. */
+  def read(f: File): Option[Published] =
     Try {
-      val Array(a, b) = String(Files.readAllBytes(f.toPath), UTF_8).trim.split(' ')
-      (a.toLong, b.toLong)
-    }.toOption.filter((floor, at) => floor > 0 && at <= now + 60_000 && now - at <= StaleMs)
-      .map(_._1).getOrElse(Conservative)
+      val Array(l, h, t) = String(Files.readAllBytes(f.toPath), UTF_8).trim.split(' ')
+      Published(l.toLong, h.toLong, t.toLong)
+    }.toOption.filter(p => p.l > 0 && p.held >= 0 && p.at > 0)
 
-/** Sizes the batches of a bulk SQLite write (deleting archived rows) by
-  * what they made the files grow: the database and its WAL measured before
-  * and after each batch. A batch is meant to change at most `target`
-  * (1 MiB) of pages: its rows are `target` over the bytes per row, the
-  * larger of `assumed` (2 KiB: deleting 5,000 raw lines changed 8.46 MiB of
-  * pages) and what the last batch that grew the files took per row (that
-  * includes what the logger wrote meanwhile: smaller batches). A batch that
-  * did not grow them (SQLite reused the WAL or freed pages) still counts
-  * `assumed`: the next one may not be reused. The first batch is 8 times
-  * smaller. Between 1 and `max` rows.
+  /** The floor another process uses: the larger of what the main process
+    * published and `ownL` (its own L, measured from the record). Missing,
+    * unreadable or corrupt: [[Conservative]] (also when from the future: a
+    * clock set back). However old, a readable file holds the last floor the
+    * main process published (every raise is published before it takes
+    * effect): its L stands. Its reservations stand while the main process
+    * lives (`mainAlive`: it holds its lock, [[MainAlive]]); once it is gone,
+    * they can write nothing more and are dropped.
+    */
+  def floor(p: Option[Published], now: Long, mainAlive: => Boolean, ownL: Long): Long =
+    p.filter(_.at <= now + 60_000) match
+      case None => math.max(Conservative, ownL)
+      case Some(x) => math.max(if mainAlive then x.floor else x.l, ownL)
+
+/** The main process's liveness, for the other process: it holds a lock on a
+  * file for as long as it lives (the system releases it when the process
+  * ends, however it ends). Another process that can take the lock knows it
+  * is gone.
   */
-final class BatchSizer(target: Long = SpaceGuard.Chunk.toLong, assumed: Long = 2048, max: Int = 5000):
-  private var rate = assumed * 8
-  def rows: Int = math.max(1L, math.min(max.toLong, target / rate)).toInt
-  /** A batch of `rows` made the files grow by `grown` bytes. */
-  def observe(rows: Int, grown: Long): Unit =
-    rate = if rows > 0 && grown > 0 then math.max(assumed, (grown + rows - 1) / rows) else assumed
+object MainAlive:
+  /** Takes the lock (waiting for an ending process that still holds it) and keeps it. */
+  def hold(f: File): FileChannel =
+    f.getParentFile.mkdirs()
+    val ch = FileChannel.open(f.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+    ch.lock()
+    ch
+
+  /** Whether another process holds the lock (true also if it cannot be told). */
+  def alive(f: File): Boolean =
+    try
+      val ch = FileChannel.open(f.toPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+      try
+        val l = ch.tryLock()
+        if l == null then true
+        else
+          l.release()
+          false
+      finally ch.close()
+    catch
+      // Held in this process (a test).
+      case _: java.nio.channels.OverlappingFileLockException => true
+      case _: Exception => true
+
+/** Publishes the floor ([[ReserveFile]]): L of the mode in effect and what
+  * the reservations hold. One lock orders every publication and every mode
+  * change: a reservation's publication reads the mode inside it, and a mode
+  * change publishes the floor of the new mode, then stores the mode (it
+  * takes effect then), before any other publication. A failure removes the
+  * file (the other process then uses the conservative L) and is thrown.
+  */
+final class FloorPublisher(file: File, mode: () => LoggingMode, lOf: LoggingMode => Long, held: () => Long,
+                           now: () => Long = () => System.currentTimeMillis(),
+                           write: (File, Published) => Unit = ReserveFile.write):
+  @volatile private var last: Option[Published] = None
+
+  private def put(m: LoggingMode): Unit =
+    val p = Published(lOf(m), held(), now())
+    try
+      write(file, p)
+      last = Some(p)
+    catch case e: Exception =>
+      last = None
+      Try(file.delete())
+      throw e
+
+  /** The floor of the mode in effect, now; thrown if it could not be written. */
+  def publish(): Unit = synchronized(put(mode()))
+
+  /** As [[publish]], unless the same floor was written less than `maxAgeMs` ago. */
+  def refresh(maxAgeMs: Long): Unit = synchronized {
+    val m = mode()
+    val t = now()
+    if !last.exists(p => p.l == lOf(m) && p.held == held() && t - p.at < maxAgeMs) then put(m)
+  }
+
+  /** A new mode: its floor published, then `store` (the mode takes effect).
+    * Stored also if the floor could not be written (it was removed: the
+    * other process uses the conservative L); the failure is then thrown.
+    */
+  def changeMode(m: LoggingMode)(store: => Unit): Unit = synchronized {
+    val failed = Try(put(m)).failed.toOption
+    store
+    failed.foreach(throw _)
+  }
+
+/** Bulk SQLite writes that are not the record (deleting archived rows,
+  * importing old logs): what a batch may change is known only afterwards,
+  * so a batch is bounded twice. Its rows are capped so that even if every
+  * row is on its own pages it changes at most [[Margin]] (16 MiB) of pages:
+  * a row's table page and one page per index, twice over for interior and
+  * free-list pages, of [[PageBytes]]. Within that cap, [[BatchSizer]] sizes
+  * the batches by what they made the files grow. Before each batch, the
+  * free space must leave the floor and [[Margin]].
+  */
+object SqliteBatch:
+  val Margin: Long = 16L << 20
+  /** A batch that grew the files by more than this makes the next one smaller at once. */
+  val Grow: Long = 4L << 20
+  val PageBytes: Long = 4096
+  /** Rows of a table with `indexes` indexes that change at most [[Margin]] of pages, however scattered. */
+  def maxRows(indexes: Int): Int = (Margin / (PageBytes * (1 + indexes) * 2)).toInt
+
+/** Sizes the batches of a bulk SQLite write, in rows or bytes of text, by
+  * what each made the database and its WAL grow: from `start`, doubled only
+  * while a batch grows them by less than half [[SqliteBatch.Grow]] (so the
+  * next stays under it), kept between that and [[SqliteBatch.Grow]], made
+  * smaller at once (in proportion) after a batch that grew them by more;
+  * between `min` and `max`. A batch that did not grow them (SQLite reused
+  * the WAL or freed pages) counts as small: `max` bounds it.
+  */
+final class BatchSizer(start: Int = 64, min: Int = 1, max: Int = SqliteBatch.maxRows(1)):
+  private var n = math.max(min, math.min(max, start))
+  def rows: Int = n
+  /** A batch of `size` made the files grow by `grown` bytes. */
+  def observe(size: Int, grown: Long): Unit =
+    if grown > SqliteBatch.Grow then
+      n = math.max(min, math.min(n, (size.toLong * (SqliteBatch.Grow / 2) / grown).toInt))
+    else if grown < SqliteBatch.Grow / 2 && size.toLong * 2 >= n then
+      n = math.min(max, n.toLong * 2).toInt
 
 /** The main process's reservations of its large writes (downloads,
   * extractions, backups), in memory only: a write of `r` bytes starts only
@@ -139,15 +240,18 @@ final class StorageBudget(free: () => Long, reserve: () => Long, changed: () => 
       * reservation, against what the others hold now. False once the write
       * must stop.
       */
-    def at(size: Long): Boolean = StorageBudget.this.synchronized {
-      if size < written then
-        written = size
-        val others = active.filterNot(_ eq this).map(_.rest).sum
-        free() - others - reserve() >= rest && okLocked
-      else
-        written = size
-        okLocked
-    }
+    def at(size: Long): Boolean =
+      val (ok, grew) = StorageBudget.this.synchronized {
+        if size < written then
+          written = size
+          val others = active.filterNot(_ eq this).map(_.rest).sum
+          (free() - others - reserve() >= rest && okLocked, true)
+        else
+          written = size
+          (okLocked, false)
+      }
+      // More to write again: published before it is written (or it stops).
+      ok && (!grew || Try(changed()).isSuccess)
 
     private[StorageBudget] def rest: Long = if open then math.max(0L, bytes - written) else 0L
     def outstanding: Long = StorageBudget.this.synchronized(rest)
@@ -171,8 +275,9 @@ final class StorageBudget(free: () => Long, reserve: () => Long, changed: () => 
   private var active = List.empty[Reservation]
   private def okLocked: Boolean = free() - active.map(_.rest).sum >= reserve()
 
-  /** Admitted reservations are published (`changed`) before they are given out, so another
-    * process sees them in the floor before anything is written.
+  /** Admitted reservations are published (`changed`) before they are given
+    * out, so another process sees them in the floor before anything is
+    * written; one whose publication fails is refused.
     */
   private def admit(bytes: Long, start: Long): Option[Reservation] =
     val r = synchronized {
@@ -182,13 +287,14 @@ final class StorageBudget(free: () => Long, reserve: () => Long, changed: () => 
         active = x :: active
         Some(x)
     }
-    r.foreach { x =>
-      try changed()
-      catch case e: Exception =>
+    // Not published: refused (the floor file is gone; the other process uses
+    // the conservative L, which does not include this reservation).
+    r.filter { x =>
+      try { changed(); true }
+      catch case _: Exception =>
         x.release()
-        throw e
+        false
     }
-    r
 
   /** A reservation of `r` bytes, or None: `r` does not fit above the
     * logging reserve and what the other writes will still take.
@@ -245,13 +351,14 @@ object StorageBudget:
   /** The guard stopped a write (it would cut into the logging reserve). */
   final class NoRoom extends IOException("no room above the logging reserve")
 
-/** Old text logs imported in batches of at most 5,000 lines and a budget
+/** Old text logs imported in batches of at most 2,000 lines and a budget
   * of text (a longer line alone) that the importer adapts to what each
   * batch made the database grow, so that each insert is checked against the
   * free space before it (design 6.8).
   */
 object LegacyBatches:
-  val MaxLines = 5000
+  /** With 1 MiB of text, at most [[SqliteBatch.Margin]] of pages (the raw lines' table and time index). */
+  val MaxLines = 2000
   val MaxBytes: Long = SpaceGuard.Chunk.toLong
   /** A line longer than this (UTF-8) is no NMEA or GNSS record: left out of an import. */
   val MaxLineBytes: Long = 64L * 1024

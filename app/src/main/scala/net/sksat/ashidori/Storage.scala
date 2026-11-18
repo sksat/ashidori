@@ -26,22 +26,49 @@ import ashidori.core.*
 object Storage:
   private def app = AshidoriApp.app
   lazy val reserveFile: File = File(app.getFilesDir, "logging-reserve")
+  /** Held locked by the main process while it lives ([[MainAlive]]). */
+  lazy val aliveFile: File = File(app.getFilesDir, "main-alive.lock")
 
-  /** The main process's reservations; each admission and release publishes the floor. */
-  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve(), () => publish())
+  /** The main process's reservations; each admission (refused if it cannot
+    * be published), truncation and release publishes the floor.
+    */
+  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve(), () => publisher.publish())
+
+  /** The floor file's writer (main process): every publication and mode change under one lock. */
+  lazy val publisher: FloorPublisher =
+    FloorPublisher(reserveFile, () => Settings.mode, lFor, () => budget.outstanding,
+      write = (f, x) =>
+        try ReserveFile.write(f, x)
+        catch case e: Exception =>
+          Log.w("logging reserve not published; removed (the other process uses the conservative L)", e)
+          throw e)
 
   /** The guard of this process's bulk writes that hold no reservation (SQLite batches). */
   def guard: SpaceGuard =
     if AshidoriApp.isMaintenanceProcess then maintenanceGuard else budget.guard
 
-  /** The maintenance process's guard: the larger of the floor the main
-    * process published (L and its reservations; the conservative L when the
-    * file is stale or unreadable) and its own L measured from the record.
-    */
+  /** The maintenance process's guard ([[maintenanceFloor]]). */
   lazy val maintenanceGuard: SpaceGuard = SpaceGuard(() => free(), () => maintenanceFloor())
 
+  @volatile private var aliveAt = 0L
+  @volatile private var aliveValue = true
+  /** In the main process itself: true, and the lock file is never opened
+    * there again (closing another descriptor of it would drop the lock).
+    */
+  private def mainAlive: Boolean =
+    if !AshidoriApp.isMaintenanceProcess then return true
+    val now = android.os.SystemClock.elapsedRealtime()
+    if now - aliveAt > 2_000 then
+      aliveValue = MainAlive.alive(aliveFile)
+      aliveAt = now
+    aliveValue
+
+  /** The floor of the maintenance process ([[ReserveFile.floor]]): the main
+    * process's published floor (its reservations only while it lives), or
+    * the conservative L if the file cannot be read, and at least its own L.
+    */
   def maintenanceFloor(): Long =
-    math.max(ReserveFile.read(reserveFile, System.currentTimeMillis()), ownL())
+    ReserveFile.floor(ReserveFile.read(reserveFile), System.currentTimeMillis(), mainAlive, ownL())
 
   @volatile private var ownAt = 0L
   @volatile private var ownValue = StorageBudget.MinReserve
@@ -69,8 +96,6 @@ object Storage:
   @volatile private var reserveAt = 0L
   @volatile private var reserveMode: Option[LoggingMode] = None
   @volatile private var reserveValue = ReserveFile.Conservative
-  @volatile private var published = (-1L, 0L)
-  private val publishLock = new Object
 
   /** L of the main process for its mode (measured at most once a minute,
     * at once for another mode). In the maintenance process, its floor.
@@ -88,26 +113,6 @@ object Storage:
     reserveValue
   }
 
-  /** Writes the floor (L of `mode` and what the reservations will still
-    * write) for the maintenance process. Never throws: a failure (of any
-    * step, the directory's sync included) is logged and the file removed,
-    * so that the other process falls back to the conservative L.
-    */
-  def publish(mode: LoggingMode = Settings.mode): Unit =
-    // Its own lock (taken before the budget's; never inside it).
-    if !AshidoriApp.isMaintenanceProcess then publishLock.synchronized {
-      val now = System.currentTimeMillis()
-      val floor = lFor(mode) + budget.outstanding
-      if floor != published._1 || now - published._2 >= ReserveFile.HeartbeatMs / 2 then
-        try
-          ReserveFile.write(reserveFile, floor, now)
-          published = (floor, now)
-        catch case e: Exception =>
-          published = (-1L, 0L)
-          Log.w("logging reserve not published; removed (the other process uses the conservative L)", e)
-          scala.util.Try(reserveFile.delete())
-    }
-
   /** One thread for the floor's writes and the mode changes (never the main thread). */
   private lazy val executor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r =>
     val t = Thread(r, "ashidori-storage")
@@ -115,22 +120,35 @@ object Storage:
     t
   }
 
-  /** The main process at start: the floor published, then every [[ReserveFile.HeartbeatMs]]. */
+  @volatile private var alive: java.nio.channels.FileChannel = null
+
+  /** The main process at start: its liveness lock taken (kept for its
+    * life), then the floor published, and again every
+    * [[ReserveFile.HeartbeatMs]] when the measured L changed (and at least
+    * that often).
+    */
   def start(): Unit =
     if !AshidoriApp.isMaintenanceProcess then
-      executor.scheduleWithFixedDelay(() => scala.util.Try(publish()), 0, ReserveFile.HeartbeatMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+      val t = Thread(() =>
+        try alive = MainAlive.hold(aliveFile)
+        catch case e: Exception => Log.w("main liveness lock not taken", e)
+      , "ashidori-alive")
+      t.setDaemon(true)
+      t.start()
+      executor.scheduleWithFixedDelay(() => scala.util.Try(publisher.refresh(ReserveFile.HeartbeatMs)), 0,
+        ReserveFile.HeartbeatMs / 2, java.util.concurrent.TimeUnit.MILLISECONDS)
       executor.execute { () =>
         // The shared reservation ledger of a development build before this one.
         for n <- Seq("storage-budget.json", "storage-budget.json.lock", "storage-budget.json.tmp") do File(app.getFilesDir, n).delete()
       }
 
-  /** A new logging mode: the floor for it is written first, then the mode is
-    * stored (it takes effect then), then `after` runs on the main thread.
+  /** A new logging mode, off the main thread: under the publisher's lock the
+    * floor of the new mode is written, then the mode is stored (it takes
+    * effect then); then `after` runs on the main thread.
     */
   def changeMode(m: LoggingMode, after: () => Unit = () => ()): Unit =
     executor.execute { () =>
-      publish(m)
-      Settings.storeMode(m)
+      scala.util.Try(publisher.changeMode(m)(Settings.storeMode(m)))
       app.getMainExecutor.execute(() => after())
     }
 

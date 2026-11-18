@@ -41,6 +41,7 @@ object BasemapUi:
   /** One line, shared with the 施設データ row: 未取得 / ダウンロード中 nn% / 取得済み vX / 取得できません（理由）・再試行. */
   def pinnedStatusLine(st: BasemapStatus): String = st match
     case BasemapStatus.Unavailable => "このビルドでは利用できません"
+    case BasemapStatus.Checking => "確認中"
     case BasemapStatus.Missing => "未取得"
     case BasemapStatus.Waiting(metered) => if metered then "ダウンロード待ち" else "未取得（Wi-Fi 接続時にダウンロード）"
     case BasemapStatus.Running(d, t, _) => s"ダウンロード中 ${percent(d, t)}%"
@@ -81,6 +82,7 @@ object BasemapUi:
   def cardTitle(st: BasemapStatus): String = st match
     case BasemapStatus.Unavailable => "このビルドではオフライン地図を利用できません"
     case BasemapStatus.Missing => "オフライン地図は未取得"
+    case BasemapStatus.Checking => "オフライン地図を確認中"
     case BasemapStatus.Installed(_, _) => "オフライン地図を読み込めません"
     case BasemapStatus.Waiting(false) => "オフライン地図は Wi-Fi 接続時に取得"
     case BasemapStatus.Waiting(true) => "オフライン地図のダウンロード待ち"
@@ -114,7 +116,7 @@ object BasemapUi:
     case _ => "オフライン地図なし"
 
   def chipAction(st: BasemapStatus): Option[ChipAction] = st match
-    case BasemapStatus.Unavailable => None
+    case BasemapStatus.Unavailable | BasemapStatus.Checking => None
     case BasemapStatus.Missing | BasemapStatus.Waiting(false) => Some(ChipAction.Download)
     case BasemapStatus.Waiting(true) => Some(ChipAction.Details("取得待ち", failed = false))
     case BasemapStatus.Running(d, t, _) => Some(ChipAction.Details(s"取得中 ${percent(d, t)}%", failed = false))
@@ -150,7 +152,7 @@ object BasemapUi:
     ) ++ failureLines(st) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote)
     val b = MaterialAlertDialogBuilder(act).setTitle("オフライン地図").setMessage(body.mkString("\n"))
     st match
-      case BasemapStatus.Unavailable => ()
+      case BasemapStatus.Unavailable | BasemapStatus.Checking => ()
       case BasemapStatus.Installed(_, _) =>
         b.setNegativeButton("削除", (_, _) => confirmDelete(act))
       case BasemapStatus.Running(_, _, _) | BasemapStatus.Waiting(_) =>

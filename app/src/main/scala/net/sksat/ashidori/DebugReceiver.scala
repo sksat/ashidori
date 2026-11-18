@@ -138,9 +138,34 @@ class DebugReceiver extends BroadcastReceiver:
           ro.close()
           Log.i(s"hold read: ended after ${System.currentTimeMillis() - t0} ms (${r.fold(_.getClass.getSimpleName, _ => "completed")})")
         Thread(run, "ashidori-hold-read").start()
+      case "ashidori.debug.SCATTER_DELETE" =>
+        // Deletes every `every`-th raw line (by rowid) of a day, through the
+        // bulk delete of archived rows (its guard and batch sizing), each batch logged.
+        val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 8))
+        val every = intent.getIntExtra("every", 7)
+        Thread(() =>
+          Db.debugBulk = true
+          try
+            val ids = Db.debugScattered(AshidoriApp.db, AshidoriApp.archive.startOfDay(d), AshidoriApp.archive.startOfDay(d.plusDays(1)), every)
+            Log.i(s"scatter delete: ${ids.size} rows of $d")
+            val r = scala.util.Try(AshidoriApp.db.deleteRawById(ids))
+            Log.i(s"scatter delete: ${r.fold(e => e.getClass.getSimpleName, n => s"$n deleted")}")
+          finally Db.debugBulk = false
+        , "ashidori-scatter").start()
+      case "ashidori.debug.RESERVE_LOOP" =>
+        // Four threads reserving and releasing for `seconds` (each publishes the floor).
+        val until = System.currentTimeMillis() + intent.getIntExtra("seconds", 5) * 1000L
+        for i <- 0 until 4 do
+          Thread(() =>
+            var n = 0
+            while System.currentTimeMillis() < until do
+              Storage.budget.reserve(1000).foreach(_.release())
+              n += 1
+            Log.i(s"reserve loop $i: $n")
+          , s"ashidori-reserve-$i").start()
       case "ashidori.debug.FLOOR" =>
         // The floor each process sees: the file's (or the conservative L), and this process's L.
-        AshidoriApp.io.execute(() => Log.i(s"floor: file ${Storage.reserveFile.length} bytes, read ${ashidori.core.ReserveFile.read(Storage.reserveFile, System.currentTimeMillis())}, maintenance floor ${Storage.maintenanceFloor()}, main L ${Storage.reserve()}, outstanding ${Storage.budget.outstanding}"))
+        AshidoriApp.io.execute(() => Log.i(s"floor: file ${Storage.reserveFile.length} bytes, read ${ashidori.core.ReserveFile.read(Storage.reserveFile)}, maintenance floor ${Storage.maintenanceFloor()}, main L ${Storage.reserve()}, outstanding ${Storage.budget.outstanding}"))
       case "ashidori.debug.RESCUE" =>
         val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("rescue.zip"))
         Thread(() =>

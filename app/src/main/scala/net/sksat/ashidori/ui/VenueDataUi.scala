@@ -53,7 +53,7 @@ object VenueDataUi:
       Seq("", PrivacyNote)
     val b = MaterialAlertDialogBuilder(act).setTitle("施設データ").setMessage(body.mkString("\n"))
     st match
-      case BasemapStatus.Unavailable => ()
+      case BasemapStatus.Unavailable | BasemapStatus.Checking => ()
       case BasemapStatus.Installed(_, _) =>
         if VenueData.broken then b.setPositiveButton("再取得", (_, _) => requestDownload(act, again = true))
         b.setNegativeButton("削除", (_, _) => confirmDelete(act))

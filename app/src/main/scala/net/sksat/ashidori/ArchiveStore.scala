@@ -925,14 +925,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
       // one transaction: an import cut short resumes after the last chunk.
       val key = s"${f.getName}|${f.length}|${f.lastModified}"
       var done = db.legacyImported(key)
-      // Batches sized by what the last one made the database and its WAL
-      // grow: about 1 MiB each (text bytes per byte of growth, measured).
-      var textBudget = 256L * 1024
+      // Batches of text sized by what each made the database and its WAL
+      // grow (design 6.8): from 64 KiB, doubled while a batch grows them by
+      // less than 2 MiB, smaller at once after one over 4 MiB; at most 1 MiB
+      // of text and 2,000 lines, which change at most 16 MiB of pages.
+      val sizer = BatchSizer(start = 64 * 1024, min = 4 * 1024, max = LegacyBatches.MaxBytes.toInt)
       var skipped = 0
       Using.resource(scala.io.Source.fromFile(f, "UTF-8")) { src =>
         var last = f.lastModified()
         var seen = 0L
-        LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty), () => textBudget).foreach { chunk0 =>
+        LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty), () => sizer.rows.toLong).foreach { chunk0 =>
           // A line longer than any batch: checked with its size and a margin
           // (indexes, the WAL); one beyond reason is left out, and the file kept.
           val chunk = chunk0.filter { l =>
@@ -949,19 +951,16 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           val fresh = timed.drop(math.max(0L, done - seen).toInt)
           seen += timed.size
           if fresh.nonEmpty then
-            // Checked against the free space now and L before it is inserted:
-            // the batch's text with a margin of 3 (one long line alone may be
-            // larger than the budget). Stopped here, the import resumes after
-            // the last batch.
+            // Checked against the free space now and the floor, with the
+            // margin of a bulk SQLite batch, before it is inserted. Stopped
+            // here, the import resumes after the last batch.
             val text = fresh.map((_, l) => LegacyBatches.utf8(l)).sum
-            guard.foreach(_.check(math.max(SpaceGuard.Chunk.toLong, text * 3)))
+            guard.foreach(_.check(SqliteBatch.Margin))
             done = seen
             val before = db.fileBytes
             db.insertLegacyChunk(fresh, key, done)
             val grown = db.fileBytes - before
-            textBudget =
-              if grown <= 0 then math.min(LegacyBatches.MaxBytes, textBudget * 2)
-              else math.max(16L * 1024, math.min(LegacyBatches.MaxBytes, text * SpaceGuard.Chunk / grown))
+            sizer.observe(text.toInt, grown)
             n += fresh.size
         }
       }

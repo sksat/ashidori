@@ -1008,14 +1008,16 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
   /** The guard of the logging reserve, of the process this runs in
     * ([[Storage.guard]]). Every batch of a bulk write that is not the record
-    * (deleting archived rows) is checked against it first, and sized by what
-    * the batches before made the database and its WAL grow ([[BatchSizer]]:
-    * at most about 1 MiB a batch). A delete also writes (the WAL; SQLite
-    * reuses freed pages, so the files may grow first). The logger's own
-    * writes never go through it.
+    * (deleting archived rows) is checked against it first with a margin of
+    * [[SqliteBatch.Margin]] (16 MiB), capped in rows so that it changes at
+    * most that much however scattered, and sized by what the batches before
+    * made the database and its WAL grow ([[BatchSizer]]). A delete also
+    * writes (the WAL; SQLite reuses freed pages, so the files may grow
+    * first). The logger's own writes never go through it.
     */
   private def bulkGuard: SpaceGuard = Storage.guard
-  private val sizer = BatchSizer(max = Db.DeleteChunk)
+  // Rows of the archived tables (at most two indexes each).
+  private val sizer = BatchSizer(max = SqliteBatch.maxRows(2))
 
   /** The database and its WAL, as they take room now. */
   def fileBytes: Long =
@@ -1026,10 +1028,12 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * wrote and the rows it was given; checked before, measured after.
     */
   private def bulk(f: Int => (Int, Int)): Int =
-    bulkGuard.check(SpaceGuard.Chunk)
+    bulkGuard.check(SqliteBatch.Margin)
     val before = fileBytes
     val (done, asked) = f(sizer.rows)
-    sizer.observe(asked, fileBytes - before)
+    val grown = fileBytes - before
+    sizer.observe(asked, grown)
+    if Db.debugBulk then Log.i(s"bulk batch: $asked rows, $done done, grew $grown bytes, next ${sizer.rows}")
     done
 
   /** The WAL written back into the database and truncated (after a
@@ -1332,19 +1336,28 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     // that is not the record, admitted only if the free space holds twice
     // the rows' estimated size above the floor, reserved while it runs
     // (design 6.8; published, so archive maintenance sees it).
-    val need = math.max(SpaceGuard.Chunk.toLong, 2 * rangeBytes(from, to))
+    val need = math.max(SqliteBatch.Margin, rangeBytes(from, to))
     val held = Storage.budget.reserve(need).getOrElse(throw StorageBudget.NoRoom())
     try deleteRange0(from, to) finally held.release()
 
-  /** The rows of [from, to) in the tables a deletion empties: their text
-    * and about 128 bytes a row (the row, its index entries).
+  /** What a deletion of [from, to) may change: every row it deletes or
+    * writes (in every table [[deleteRange0]] touches), each counted as its
+    * text and two pages (its table page and an index page, however
+    * scattered), and the rows it writes again (energy spans and raw-data
+    * sessions cut in two, the outbox and the sync marks).
     */
   def rangeBytes(from: Long, to: Long): Long =
-    val tables = Seq("fixes", "battery", "gnss_status", "pressure", "fix_msl")
-    val rows = tables.map(t => query(s"SELECT COUNT(*) FROM $t WHERE time>=? AND time<?", from, to)(_.getLong(0)).head).sum
+    def count(sql: String, args: Any*): Long = query(sql, args*)(_.getLong(0)).head
+    val byTime = Seq("fixes", "battery", "gnss_status", "pressure", "fix_msl")
+      .map(t => count(s"SELECT COUNT(*) FROM $t WHERE time>=? AND time<?", from, to)).sum
+    val motion = count("SELECT COUNT(*) FROM motion WHERE start>=? AND start<?", from, to)
+    val energy = count("SELECT COUNT(*) FROM energy_state WHERE start<? AND (end IS NULL OR end>?)", to, from) * 2
+    val sessions = count("SELECT COUNT(*) FROM gnss_sessions WHERE start<? AND end>?", to, from) * 3
+    val outbox = count("SELECT COUNT(*) FROM sync_outbox WHERE file IS NOT NULL")
+    val marks = count("SELECT COUNT(*) FROM sync_state")
     val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=? AND time<?", from, to)(c =>
-      c.getLong(0) * 128 + c.getLong(1)).head
-    rows * 128 + raw
+      (c.getLong(0), c.getLong(1))).head
+    (byTime + motion + energy + sessions + outbox + marks + raw._1 + 1) * 2 * SqliteBatch.PageBytes + raw._2
 
   private def deleteRange0(from: Long, to: Long): Unit =
     tx { db =>
@@ -1467,6 +1480,12 @@ object Db:
 
   /** Rows per DELETE when archiving: short write transactions. */
   val DeleteChunk = 5000
+  /** Debug builds: each bulk batch logged (DebugReceiver SCATTER_DELETE). */
+  @volatile var debugBulk = false
+
+  /** Debug builds: the raw lines of [from, to) whose rowid is a multiple of `every`. */
+  def debugScattered(db: Db, from: Long, to: Long, every: Int): Seq[Long] =
+    db.query("SELECT rowid FROM raw_lines WHERE time>=? AND time<? AND rowid % ? = 0", from, to, every.toLong)(_.getLong(0))
 
   /** A sealed batch waiting in the outbox. `cls` is the constraint class:
     * "small" (any allowed network) or "raw" (unmetered only).
