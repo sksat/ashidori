@@ -208,8 +208,10 @@ class PinnedDownload(val data: PinnedData, prefsName: String, val WorkName: Stri
     * cool-down ends. Leaves queued work (also a scheduled retry) as it is.
     */
   def autoStart(ctx: Context): Unit = AshidoriApp.io.execute { () =>
-    // The installed version looked up here, off the main thread, first.
+    // The installed version looked up here, off the main thread, first, and
+    // the preferences loaded (the list reads both on the main thread).
     data.dir
+    installedSource
     for p <- data.pin; permit <- Settings.gate.permit(Dest.Data, Mode.Auto) do
       if !data.installed && !prefs.getBoolean("declined", false) then
         val metered = prefs.getBoolean("queued", false) && prefs.getBoolean("metered", false)
