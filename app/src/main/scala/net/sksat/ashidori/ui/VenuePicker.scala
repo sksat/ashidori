@@ -18,10 +18,11 @@ import Ui.*
   * A venue tapped on the map (or activated with TalkBack), or a row of the
   * list, checks in to the stay at once ([[CheckIns.toStay]]): the stay's
   * check-in is replaced, and the stay's place named after the venue unless
-  * the user typed its name ([[VenueCheckIn.renames]]). The snackbar's
-  * 取り消し restores both. The venue of the stay's check-in is marked on
-  * the map. The one way to correct a past stay, from the day's 編集 and from
-  * the place sheet.
+  * the user named it ([[VenueCheckIn.renames]]). The snackbar's 取り消し
+  * restores both. The venue of the stay's check-in is marked on the map.
+  * Until a save is stored (and until the stay's check-in is first read),
+  * further picks are ignored. The one way to correct a past stay, from the
+  * day's 編集 and from the place sheet.
   */
 final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) extends Screen:
   private given Ctx = act
@@ -31,9 +32,12 @@ final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) 
 
   private val map = TrackMap(act, null, MapStyle.SurfacePicker)
   private var destroyed = false
-  /** The stay's check-in and place as stored now (read by [[reload]]). */
+  /** The stay's check-in as stored (read by [[reload]]): what the map marks. */
   private var existing: Option[CheckIn] = None
-  private var place: Option[Place] = None
+  /** A save on its way, or the first read: picks are ignored meanwhile. */
+  private var busy = true
+  /** The venue being saved, marked on the map meanwhile. */
+  private var inFlight: Option[VenueLayer.Picked] = None
   /** The candidates near the stay, and the matches of the typed name. */
   private var nearby = Vector.empty[(VenueLayer.Picked, Double)]
   @volatile private var generation = 0
@@ -63,6 +67,9 @@ final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) 
   // The stay on the map: its area and its point, the camera on it.
   map.markStay(Some((visit.latLng, math.max(visit.radius, 15.0))))
   map.setData(Nil, Seq(MapMarker(visit.latLng, visit.start.toString)), Nil, fit = false)
+  // The stay's marker lies among the venues: a tap there picks a venue.
+  map.venuesFirst = true
+  map.venueActionLabel = Some("チェックイン")
   // The area and a margin around it, so the venues there are in sight.
   locally {
     val r = math.max(visit.radius, 60.0) * 1.3
@@ -92,12 +99,12 @@ final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) 
   private def reload(first: Boolean = false): Unit =
     AshidoriApp.io.execute { () =>
       val ci = VenueCheckIn.ofStay(AshidoriApp.db.checkIns(visit.start - 60_000, visit.end + 60_001), visit)
-      val pl = visit.placeId.flatMap(id => AshidoriApp.db.places().find(_.id == id))
       val cands = if first then Some(candidates()) else None
       act.runOnUiThread { () =>
         if !destroyed then
           existing = ci
-          place = pl
+          busy = false
+          inFlight = None
           current.setText(ci.fold("")(c => s"✓ ${c.venueName}"))
           cands.foreach { cs =>
             nearby = cs.map((v, tag, d) => (map.venueAsDrawn(v, tag), d))
@@ -108,11 +115,13 @@ final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) 
     }
 
   /** The venue of the stay's check-in, marked on the map (as drawn when it is a candidate). */
-  private def markCurrent(): Unit =
-    map.pickVenue(existing.map { c =>
+  private def markCurrent(): Unit = map.pickVenue(inFlight.orElse(currentPick))
+
+  private def currentPick: Option[VenueLayer.Picked] =
+    existing.map { c =>
       nearby.map(_._1).find(p => c.venueExternalId.nonEmpty && p.venue.id == c.venueExternalId)
         .getOrElse(map.venueAsDrawn(Venue(c.venueExternalId, c.venueName, c.venueCategory, c.lat, c.lon), None))
-    })
+    }
 
   /** Venues near the stay from the index (with their tags), and past
     * check-ins there not among them, nearest first. I/O thread.
@@ -182,11 +191,15 @@ final class VenuePicker(act: MainActivity, visit: Visit, onChanged: () => Unit) 
   /** Checks in to the stay at `p`, replacing its check-in; the map marks it. */
   private def choose(p: VenueLayer.Picked): Unit =
     val v = p.venue
-    if existing.exists(c => c.venueName == v.name && c.venueExternalId == v.id) then markCurrent()
+    // Ignored while busy: the ring stays on the venue being saved (or the stay's).
+    if busy then markCurrent()
+    else if existing.exists(c => c.venueName == v.name && c.venueExternalId == v.id) then markCurrent()
     else
-      if !v.lat.isNaN then map.pickVenue(Some(p))
-      val rename = place.filter(pl => VenueCheckIn.renames(pl, existing))
-      CheckIns.toStay(act, v, visit, existing, rename, CheckIns.message(v.name, Some(visit)), () => {
+      busy = true
+      inFlight = Option.when(!v.lat.isNaN)(p)
+      map.pickVenue(inFlight)
+      // The stay's check-in is read again when it is saved: what is shown may be old.
+      CheckIns.toStay(act, v, visit, CheckIns.message(v.name, Some(visit)), () => {
         reload()
         onChanged()
       })

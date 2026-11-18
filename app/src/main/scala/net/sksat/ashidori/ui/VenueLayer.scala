@@ -57,6 +57,8 @@ final class VenueLayer(ctx: android.content.Context):
   private var picked: Option[Picked] = None
   /** A venue was picked (Some) or the pick ended by a tap elsewhere (None). */
   var onPick: Option[Picked] => Unit = _ => ()
+  /** The label of a venue's click action for TalkBack (None: the default). */
+  var actionLabel: Option[String] = None
   /** One background thread per map: queries never pile up on the main thread. */
   private val worker: ExecutorService = Executors.newSingleThreadExecutor { r =>
     val t = Thread(() => { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "ashidori-venue-map")
@@ -226,24 +228,28 @@ final class VenueLayer(ctx: android.content.Context):
     * it within a finger's reach is picked. Elsewhere, a pick ends. Returns
     * whether the tap was used.
     */
-  def tap(pt: android.graphics.PointF): Boolean = target match
+  def tap(pt: android.graphics.PointF): Boolean = hit(pt) match
+    case Some(p) =>
+      pickAndTell(Some(p))
+      true
+    case None if picked.nonEmpty =>
+      pickAndTell(None)
+      true
     case None => false
-    case Some((m, style)) =>
-      val r = TapSlopDp * ctx.getResources.getDisplayMetrics.density
-      val hits = Try(m.queryRenderedFeatures(RectF(pt.x - r, pt.y - r, pt.x + r, pt.y + r), LayerId).asScala.toVector)
-        .getOrElse(Vector.empty)
-      val near = hits.flatMap(f => pickedOf(f, style).map { p =>
-        val s = m.getProjection.toScreenLocation(MLatLng(p.venue.lat, p.venue.lon))
-        p -> math.hypot(s.x - pt.x, s.y - pt.y)
-      }).minByOption(_._2).map(_._1)
-      near match
-        case Some(p) =>
-          pickAndTell(Some(p))
-          true
-        case None if picked.nonEmpty =>
-          pickAndTell(None)
-          true
-        case None => false
+
+  /** The drawn venue closest to `pt` (screen pixels) within a finger's reach. */
+  def hit(pt: android.graphics.PointF): Option[Picked] = target.flatMap { (m, style) =>
+    val r = TapSlopDp * ctx.getResources.getDisplayMetrics.density
+    val hits = Try(m.queryRenderedFeatures(RectF(pt.x - r, pt.y - r, pt.x + r, pt.y + r), LayerId).asScala.toVector)
+      .getOrElse(Vector.empty)
+    hits.flatMap(f => pickedOf(f, style).map { p =>
+      val s = m.getProjection.toScreenLocation(MLatLng(p.venue.lat, p.venue.lon))
+      p -> math.hypot(s.x - pt.x, s.y - pt.y)
+    }).minByOption(_._2).map(_._1)
+  }
+
+  /** Picks `p` as a tap does (marks it, tells [[onPick]]). */
+  def pickNow(p: Picked): Unit = pickAndTell(Some(p))
 
   /** `v` (with its OpenStreetMap tag, if known) as the map would draw it,
     * for a venue picked elsewhere (a list): its colour and icon. Main thread.
@@ -421,7 +427,8 @@ final class VenueLayer(ctx: android.content.Context):
           node.setContentDescription(n.text)
           node.setBoundsInParent(n.at)
           node.setClickable(true)
-          node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_CLICK)
+          // What activating it does, where the host says (the venue picker: 「チェックイン」).
+          node.addAction(AccessibilityNodeInfoCompat.AccessibilityActionCompat(AccessibilityNodeInfoCompat.ACTION_CLICK, actionLabel.orNull))
         case None =>
           // Gone since it was listed: an empty node where the helper asks one.
           node.setContentDescription("")

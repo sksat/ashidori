@@ -112,6 +112,11 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     */
   var onVenue: Option[VenueLayer.Picked] => Unit = _ => ()
   venues.onPick = p => onVenue(p)
+  /** Venues take a tap before the stays and check-ins (the venue picker, whose stay marker lies among them). */
+  var venuesFirst = false
+  /** What activating a venue does, for TalkBack ([[VenueLayer.actionLabel]]). */
+  def venueActionLabel_=(l: Option[String]): Unit = venues.actionLabel = l
+  def venueActionLabel: Option[String] = venues.actionLabel
 
   /** Marks `p` as the picked venue (None: none), without [[onVenue]]. */
   def pickVenue(p: Option[VenueLayer.Picked]): Unit = venues.setPick(p)
@@ -520,7 +525,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
         m.addOnMapClickListener { p =>
           val pt = m.getProjection.toScreenLocation(p)
           val hits = m.queryRenderedFeatures(pt, "visit-circles", "checkin-circles").asScala
-          hits.headOption match
+          val venue = if venuesFirst then venues.hit(pt) else None
+          venue.foreach(venues.pickNow)
+          if venue.nonEmpty then true
+          else hits.headOption match
             case Some(f) =>
               if venues.pick.nonEmpty then
                 venues.setPick(None)
