@@ -4,7 +4,7 @@ import android.content.Context
 import org.maplibre.android.MapLibre
 import org.maplibre.android.maps.Style
 import net.sksat.ashidori.{AshidoriApp, Basemap, Log, Net, Settings}
-import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Permit, Precision, TileStyle, When}
+import ashidori.core.{BaseMapPolicy, Dest, Mode, OfflineBasemapStyle, Outbound, Permit, Precision, TileStyle, When}
 import ashidori.core.BaseMapPolicy.Outcome
 
 /** Selectable base maps. "オフライン地図" is drawn from data in the app and never
@@ -311,7 +311,35 @@ object OnlineStyles:
       scala.util.Try(TileStyle.vector(b("style").str, u => b("tilejson")(u).str, cap, token)).toOption
     }
 
-  private def fetch(name: String, p: Permit): Unit =
+  /** Failed fetches waiting for their retry: the permit and the attempts so far. */
+  private val waiting = scala.collection.mutable.Map.empty[String, (Permit, Int)]
+  private val timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-styles-retry"))
+  private var watching = false
+
+  /** A failed fetch is tried again after 5 s, doubling to 5 min, and at once
+    * when a network becomes available, while its permit holds (a map that
+    * gets a new permit asks again by itself).
+    */
+  private def retryLater(name: String, p: Permit, attempt: Int): Unit =
+    synchronized {
+      waiting(name) = (p, attempt)
+      if !watching then
+        watching = true
+        val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
+        cm.registerDefaultNetworkCallback(new android.net.ConnectivityManager.NetworkCallback:
+          override def onAvailable(n: android.net.Network): Unit = retryNow())
+    }
+    val delay = math.min(300_000L, 5_000L << math.min(attempt, 6))
+    timer.schedule((() => retry(name)): Runnable, delay, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+  private def retryNow(): Unit = synchronized(waiting.keys.toSeq).foreach(retry)
+
+  private def retry(name: String): Unit =
+    synchronized(waiting.remove(name)).foreach { (p, attempt) =>
+      if Settings.gate.valid(p) then fetch(name, p, attempt + 1)
+    }
+
+  private def fetch(name: String, p: Permit, attempt: Int = 0): Unit =
     if synchronized(fetching.add(name)) then
       net.execute { () =>
         try
@@ -323,7 +351,13 @@ object OnlineStyles:
           val tmp = java.io.File(dir, s"$name.json.tmp")
           java.nio.file.Files.writeString(tmp.toPath, ujson.write(ujson.Obj("style" -> style, "tilejson" -> ujson.Obj.from(tj))))
           tmp.renameTo(file(name))
+          synchronized(waiting -= name)
           AshidoriApp.app.getMainExecutor.execute(() => listeners.toSeq.foreach(_()))
-        catch case e: Exception => Log.w(s"online style $name: ${e.getMessage}")
+        catch
+          // Not allowed (any more): no retry under this permit.
+          case e: (Outbound.Blocked | Outbound.Refused) => Log.w(s"online style $name: ${e.getMessage}")
+          case e: Exception =>
+            Log.w(s"online style $name (attempt ${attempt + 1}): ${e.getMessage}")
+            retryLater(name, p, attempt)
         finally synchronized(fetching -= name)
       }

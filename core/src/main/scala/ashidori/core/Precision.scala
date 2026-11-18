@@ -54,8 +54,16 @@ object Precision:
     * (lat, lon) and its eight neighbours, as decimal strings: what the
     * venue search sends at [[Level.District]] (design 3.2). Holds no digit
     * of the position beyond the cell.
+    *
+    * At the 180° meridian and the poles the 3 × 3 cells are shifted inward
+    * to stay one box within ±180° and ±90° (Overpass takes no box across the
+    * meridian): still a fixed box of 3 × 3 cells per cell, holding it, but
+    * not centred on it. Japan is far from both.
     */
   def districtBox(lat: Double, lon: Double): (String, String, String, String) =
     val (i, j) = cell(lat, lon, 100)
-    def edge(k: Long, lo: Long, hi: Long) = java.math.BigDecimal.valueOf(math.max(lo, math.min(hi, k)), 2).toPlainString
-    (edge(i - 1, -9000, 9000), edge(j - 1, -18000, 18000), edge(i + 2, -9000, 9000), edge(j + 2, -18000, 18000))
+    /** The first of three cells around `k` within [lo, hi). */
+    def first(k: Long, lo: Long, hi: Long) = math.max(lo, math.min(hi - 3, k - 1))
+    val (si, wj) = (first(i, -9000, 9000), first(j, -18000, 18000))
+    def edge(k: Long) = java.math.BigDecimal.valueOf(k, 2).toPlainString
+    (edge(si), edge(wj), edge(si + 3), edge(wj + 3))

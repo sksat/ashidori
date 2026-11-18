@@ -187,7 +187,7 @@ final class DataHandlingScreen(act: MainActivity) extends Screen:
       e.setTextColor(color(attr.error))
       e.setPadding(e.getPaddingLeft, 0, e.getPaddingRight, dp(8))
       list.addView(e)
-    val pause = switchRow("地図・検索への送信を停止", g.paused, "同期、位置の取得、他のアプリは対象外") { on =>
+    val pause = switchRow("外部への送信を停止", g.paused, "同期、位置の取得、他のアプリは対象外") { on =>
       Settings.gate.setPaused(on)
     }
     val rows = Dest.values.toSeq.map { d =>
@@ -248,7 +248,7 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
   private def render(): Unit =
     list.removeAllViews()
     if Settings.gate.paused then
-      val p = supportingText("地図・検索への送信を停止中")
+      val p = supportingText("外部への送信を停止中")
       p.setPadding(p.getPaddingLeft, dp(12), p.getPaddingRight, 0)
       list.addView(p)
     list.addView(sectionHeader("送信"))
@@ -258,7 +258,7 @@ final class OutboundDestScreen(act: MainActivity, dest: Dest) extends Screen:
     }*))
     // The data's level waits for the region data (design 6): whole archives only now.
     if dest != Dest.Data then
-      list.addView(sectionHeader("精度"))
+      list.addView(sectionHeader("送信する粒度"))
       list.addView(listGroup(levels.map { l =>
         radioRow(OutboundUi.levelLabel(dest, l), "", chosen.level == l, Some(legend(l))) { chosen = chosen.copy(level = l); render() }
       }*))

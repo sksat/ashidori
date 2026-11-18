@@ -750,9 +750,10 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
       else if !thumbnail || (ms == MapStyle.Custom && MapStyle.custom._1.isEmpty) then img.setImageDrawable(null)
       else for
         cam <- camera
-        d <- ms.dest
-        p <- Settings.gate.permit(d, Mode.Auto)
-        json <- ms.styleJson(s"thumb:${d.key}", dialog, Some(p))
+        // The offline map sends nothing; an online one under a permit of its own destination.
+        json <- ms.dest match
+          case None => ms.styleJson("thumb:offline", dialog, None)
+          case Some(d) => Settings.gate.permit(d, Mode.Auto).flatMap(p => ms.styleJson(s"thumb:${d.key}", dialog, Some(p)))
       do
         val opts = org.maplibre.android.snapshotter.MapSnapshotter.Options(thumbW, thumbH)
           .withStyleBuilder(Style.Builder().fromJson(json))

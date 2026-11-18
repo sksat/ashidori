@@ -37,5 +37,8 @@ class PrecisionSuite extends munit.FunSuite:
     assertEquals(Overpass.queryBox(35.6899, 139.7601), q)
     assertEquals(Overpass.queryAt(Level.District, lat, lon, 200), (q, Overpass.BoxLimit))
     assertEquals(Overpass.queryAt(Level.Exact, lat, lon, 200), (Overpass.query(lat, lon, 200), Overpass.Limit))
-    assertEquals(Precision.districtBox(-0.001, 179.999), ("-0.02", "179.98", "0.01", "180.00"))
+    // At the meridian and the poles: three cells wide, shifted inward, holding the cell.
+    assertEquals(Precision.districtBox(-0.001, 179.999), ("-0.02", "179.97", "0.01", "180.00"))
+    assertEquals(Precision.districtBox(10.005, -179.995), ("9.99", "-180.00", "10.02", "-179.97"))
+    assertEquals(Precision.districtBox(89.999, 0.005), ("89.97", "-0.01", "90.00", "0.02"))
   }
