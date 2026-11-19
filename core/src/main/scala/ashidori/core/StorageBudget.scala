@@ -20,7 +20,10 @@ import java.nio.charset.StandardCharsets.UTF_8
   *    copy of a backup are checked before, watched and checked after;
   *    no bound on what one of them consumes is claimed.
   *
-  * Logging itself and its overflow files are never refused by L or H.
+  * Logging itself and its overflow files are never refused by L or H. When
+  * logging runs short of space, large work is stopped and the logger's
+  * emergency reserve released, and its batches go to overflow files
+  * ([[EmergencyReserve]]); large work runs only while that reserve is ready.
   */
 object Headroom:
   /** H: maintenance (archive rewrites, bulk SQLite writes, the visit index) stops below it. */
@@ -40,10 +43,14 @@ object Headroom:
   * device is not that model (allocation units, metadata, buffers below,
   * SQLite, other apps): what is promised is where the checks are and how
   * large each output is, not a bound on the free space.
+  *
+  * `open()`: large work may run at all (the logger's emergency reserve is
+  * ready and no emergency is in progress, [[EmergencyReserve]]); closed, every
+  * check fails, so work stops at its next output or batch.
   */
-final class SpaceGuard(free: () => Long, reserve: () => Long, held: () => Long = () => 0L):
+final class SpaceGuard(free: () => Long, reserve: () => Long, held: () => Long = () => 0L, open: () => Boolean = () => true):
   /** The chunk `n` (at most [[SpaceGuard.Chunk]]) may be written now. */
-  def allows(n: Long): Boolean = free() - reserve() - held() >= n
+  def allows(n: Long): Boolean = open() && free() - reserve() - held() >= n
   /** As [[allows]], or NoRoom. */
   def check(n: Long): Unit = if !allows(n) then throw StorageBudget.NoRoom()
 
@@ -132,7 +139,10 @@ object BulkLoop:
       guard.check(Headroom.M)
     total
 
-final class StorageBudget(free: () => Long, reserve: () => Long):
+/** The main process's reservations of large writes above L. `gate()` as
+  * [[SpaceGuard]]'s `open()`: closed, nothing is admitted and every reservation must stop.
+  */
+final class StorageBudget(free: () => Long, reserve: () => Long, gate: () => Boolean = () => true):
   final class Reservation private[StorageBudget] (private var bytes: Long, start: Long):
     private var written = start
     private var open = true
@@ -164,7 +174,7 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
       if size < written then
         written = size
         val others = active.filterNot(_ eq this).map(_.rest).sum
-        free() - others - reserve() >= rest && okLocked
+        gate() && free() - others - reserve() >= rest && okLocked
       else
         written = size
         okLocked
@@ -177,7 +187,7 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
       * reservations will still write (each chunk of its own is checked as
       * it comes, so its own rest is not counted twice).
       */
-    def guard: SpaceGuard = SpaceGuard(free, reserve, () => StorageBudget.this.synchronized(active.filterNot(_ eq this).map(_.rest).sum))
+    def guard: SpaceGuard = SpaceGuard(free, reserve, () => StorageBudget.this.synchronized(active.filterNot(_ eq this).map(_.rest).sum), gate)
 
     /** Gives the rest back. */
     def release(): Unit = StorageBudget.this.synchronized {
@@ -186,10 +196,10 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
     }
 
   private var active = List.empty[Reservation]
-  private def okLocked: Boolean = free() - active.map(_.rest).sum >= reserve()
+  private def okLocked: Boolean = gate() && free() - active.map(_.rest).sum >= reserve()
 
   private def admit(bytes: Long, start: Long): Option[Reservation] = synchronized {
-    if free() - active.map(_.rest).sum - reserve() < math.max(0L, bytes - start) then None
+    if !gate() || free() - active.map(_.rest).sum - reserve() < math.max(0L, bytes - start) then None
     else
       val x = Reservation(bytes, start)
       active = x :: active
@@ -212,11 +222,11 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
   /** The free space, less what reservations will still write, stays at or above the reserve. */
   def ok: Boolean = synchronized(okLocked)
   /** What a new reservation may take now. */
-  def available: Long = synchronized(math.max(0L, free() - active.map(_.rest).sum - reserve()))
+  def available: Long = synchronized(if !gate() then 0L else math.max(0L, free() - active.map(_.rest).sum - reserve()))
   def busy: Boolean = synchronized(active.nonEmpty)
 
   /** The guard of this process's writes: L and every reservation's rest. */
-  def guard: SpaceGuard = SpaceGuard(free, reserve, () => outstanding)
+  def guard: SpaceGuard = SpaceGuard(free, reserve, () => outstanding, gate)
 
 object StorageBudget:
   /** L's floor: 256 MB, the monitoring threshold. */

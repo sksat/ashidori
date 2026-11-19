@@ -37,6 +37,8 @@ enum LifeKind(val key: String, val label: String, val problem: Boolean = false):
   case WriteStall extends LifeKind("stall", "記録の保存が停止", problem = true)
   /** Repeated crashes: optional background work switched off. */
   case SafeMode extends LifeKind("safemode", "自動処理を停止", problem = true)
+  /** The logger's emergency path: space ran short, batches to overflow files (plan C stage 2). */
+  case Emergency extends LifeKind("emergency", "記録の緊急退避", problem = true)
 
 object LifeKind:
   def fromKey(k: String): Option[LifeKind] = values.find(_.key == k)

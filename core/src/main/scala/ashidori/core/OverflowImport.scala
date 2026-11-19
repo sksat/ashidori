@@ -68,6 +68,54 @@ object OverflowFiles:
     syncDir(dir)
     f
 
+  /** One batch's overflow file, written at most once whatever the retries
+    * (plan C stage 2): its name is fixed with the batch (unique to the
+    * process and batch), and once the rename completed it, a retry only
+    * syncs the directory again; it never writes a second file, so the batch
+    * cannot be imported twice. A `.tmp` of an earlier failed attempt of the
+    * same batch (never complete) is removed before it is written again, and
+    * the `.tmp` of an attempt that failed is removed (the batch is in
+    * memory: written again, or counted lost by the caller). `crash` marks
+    * the points after the write, the fsync and the rename (for tests).
+    */
+  final class Batch(val dir: Path, val name: String, bytes: () => Array[Byte], syncDir: Path => Unit,
+                    crash: String => Unit = _ => (), prepare: () => Unit = () => ()):
+    require(completed.exists(name.endsWith), name)
+    @volatile private var done = false
+    /** Completed (renamed) by an attempt of this batch. */
+    def completedNow: Boolean = done
+
+    def write(): Path =
+      val f = dir.resolve(name)
+      synchronized {
+        if !done then
+          prepare()
+          val tmp = dir.resolve(name + Partial)
+          Files.deleteIfExists(tmp)
+          try
+            val ch = java.nio.channels.FileChannel.open(tmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            try
+              val bb = java.nio.ByteBuffer.wrap(bytes())
+              while bb.hasRemaining do ch.write(bb)
+              crash("write")
+              ch.force(true)
+            finally ch.close()
+            crash("fsync")
+            // Without REPLACE_EXISTING: a completed file is never written over.
+            try Files.move(tmp, f)
+            catch case _: java.nio.file.FileAlreadyExistsException =>
+              // Only an attempt of this batch has its name: completed by it.
+              Files.deleteIfExists(tmp)
+            done = true
+            crash("rename")
+          catch case e: Exception =>
+            // (A process killed here runs nothing: its `.tmp` stays, never complete.)
+            if !done then scala.util.Try(Files.deleteIfExists(tmp))
+            throw e
+        syncDir(dir)
+      }
+      f
+
   /** How a backup takes a file of the overflow directory: Some(false) a
     * completed file (a consistent copy), Some(true) a `.tmp` (as it is,
     * marked partial: never presented as consistent), None not a spill file.
