@@ -101,6 +101,24 @@ class ImportChainSuite extends munit.FunSuite:
     assert(w.delayed.isEmpty)
   }
 
+  test("requests during the backoff do not lengthen it: a failure, six requests in the wait, a failure again: the next wait is 60 s") {
+    val w = World(Seq(names(1).head))
+    w.fails = Set(names(1).head)
+    w.chain.request()
+    w.drain()
+    assertEquals(w.delayed.map(_._1).toSeq, Seq(ImportChain.FirstBackoffMs))
+    // Six requests while the timer is pending (new commits, a recovery...).
+    for _ <- 1 to 6 do
+      w.chain.request()
+      w.drain()
+    assertEquals(w.delayed.map(_._1).toSeq, Seq(ImportChain.FirstBackoffMs))
+    // The timer: still failing.
+    val (_, r) = w.delayed.remove(0)
+    r.run()
+    w.drain()
+    assertEquals(w.delayed.map(_._1).toSeq, Seq(2 * ImportChain.FirstBackoffMs))
+  }
+
   test("a file held by a backup is tried again later; the emergency state ends the chain") {
     val w = World(names(3))
     w.busy = true

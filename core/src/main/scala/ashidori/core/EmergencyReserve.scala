@@ -75,6 +75,14 @@ object Emergency:
     def marked: Boolean
     /** Removes the emergency mark durably; throws. */
     def unmark(): Unit
+    /** Renames R itself to the mark and syncs the directory (when the mark
+      * cannot be written: the rename takes no room); throws.
+      */
+    def markByRename(): Unit
+    /** The mark's length (R renamed to it is long). */
+    def markLength: Long
+    /** Truncates the mark to 0 and syncs it; its length afterwards; throws. */
+    def releaseMark(): Long
 
   /** What happened, for the lifecycle log, the alert and the status. */
   enum Event:
@@ -136,6 +144,8 @@ final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarg
         emergency = true
         // Not released before (a release that failed, or the process died first).
         if disk == OnDisk.Full then releaseLocked()
+        // R renamed to the mark and not truncated yet: truncated now (the mark stays).
+        if scala.util.Try(files.markLength).getOrElse(0L) > 0 then releaseMarkLocked()
         // Released without the mark (it could not be written): written now.
         if !scala.util.Try(files.marked).getOrElse(true) then scala.util.Try(files.mark())
       else if disk == OnDisk.Full then ready = true
@@ -203,10 +213,14 @@ final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarg
       else scala.util.Try(files.mark()).failed.toOption.map(describe)
     if first then scala.util.Try(stopLarge())
     val disk = scala.util.Try(files.onDisk()).getOrElse(OnDisk.Full)
+    // No mark could be written: R itself becomes the mark by a rename (no
+    // room needed), so a mark exists before R shrinks; then it is truncated.
+    val renamed = markFailure.isDefined && disk != OnDisk.Absent && scala.util.Try(files.markByRename()).isSuccess
     val (released, releaseFailure) =
-      if disk == OnDisk.Full || ready then releaseLocked() else (None, None)
+      if renamed then releaseMarkLocked()
+      else if disk == OnDisk.Full || ready then releaseLocked() else (None, None)
     // A mark that failed for want of room: tried again with what R gave back.
-    val markFailure2 = markFailure.flatMap(m => scala.util.Try(files.mark()).failed.toOption.map(_ => m))
+    val markFailure2 = if renamed then None else markFailure.flatMap(m => scala.util.Try(files.mark()).failed.toOption.map(_ => m))
     ready = false
     val failure = (markFailure2.map(m => s"印を書けず: $m").toSeq ++ releaseFailure).reduceOption(_ + "・" + _)
     // Logged once per entry, and for a renewal that changed something.
@@ -214,21 +228,39 @@ final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarg
 
   private def describe(ex: Throwable): String = Option(ex.getMessage).getOrElse(ex.getClass.getSimpleName)
 
-  /** Releases R: truncated (its length checked), else removed. (bytes the free space grew by, failure). */
+  /** Releases R: truncated (its length checked), else removed, but only
+    * while the mark exists (without it, R is the last record of the state).
+    * (bytes the free space grew by, failure).
+    */
   private def releaseLocked(): (Option[Long], Option[String]) =
     val before = files.free()
     var failure: Option[String] = None
+    def removeIfMarked(): Boolean =
+      if !scala.util.Try(files.marked).getOrElse(false) then
+        failure = failure.map(_ + "、印がないため削除せず")
+        true
+      else scala.util.Try(files.remove()).getOrElse(false)
     val ok =
       try
         val left = files.release()
         if left != 0 then
           failure = Some(s"切り詰め後も $left バイト")
-          scala.util.Try(files.remove()).getOrElse(false)
+          removeIfMarked()
         else true
       catch case ex: Exception =>
         failure = Some(describe(ex))
-        scala.util.Try(files.remove()).getOrElse(false)
+        removeIfMarked()
     if !ok then failure = failure.map(_ + "、削除にも失敗")
+    (Some(files.free() - before), failure.map(f => s"解放に失敗: $f"))
+
+  /** Truncates R renamed to the mark; never removes it (the last mark). */
+  private def releaseMarkLocked(): (Option[Long], Option[String]) =
+    val before = files.free()
+    val failure =
+      try
+        val left = files.releaseMark()
+        Option.when(left != 0)(s"印にした予備の切り詰め後も $left バイト")
+      catch case ex: Exception => Some(s"印にした予備を切り詰められず: ${describe(ex)}")
     (Some(files.free() - before), failure.map(f => s"解放に失敗: $f"))
 
   /** Called every few seconds: the recovery clock, or the first creation of

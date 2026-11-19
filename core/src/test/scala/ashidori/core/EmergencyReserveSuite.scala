@@ -16,7 +16,11 @@ class EmergencyReserveSuite extends munit.FunSuite:
   private final class Disk(var free0: Long):
     var reserve: Option[Long] = None
     var tmp: Option[Long] = None
-    var marker = false
+    // The mark: None, or its length (R renamed to it is long).
+    var markLen: Option[Long] = None
+    def marker: Boolean = markLen.isDefined
+    var markTruncFails = false
+    var renameFails = false
     var releaseFails = false
     var removeFails = false
     var allocFails = false
@@ -67,13 +71,26 @@ class EmergencyReserveSuite extends munit.FunSuite:
       def mark(): Unit =
         kill("mark-before")
         if markFails then throw java.io.IOException("ENOSPC (No space left on device)")
-        marker = true
+        markLen = Some(markLen.getOrElse(0L))
         kill("mark-after")
       def marked: Boolean = marker
+      def markByRename(): Unit =
+        if renameFails then throw java.io.IOException("EXDEV")
+        markLen = Some(reserve.get)
+        reserve = None
+        kill("renamed-to-mark")
+      def markLength: Long = markLen.getOrElse(0L)
+      def releaseMark(): Long =
+        if markTruncFails then
+          kill("mark-truncate-failed")
+          throw java.io.IOException("EIO")
+        markLen.foreach(free0 += _)
+        markLen = Some(0L)
+        0L
       def unmark(): Unit =
         kill("unmark-before")
         if unmarkFails then throw java.io.IOException("EIO")
-        marker = false
+        markLen = None
 
   private final class World(disk: Disk):
     var now = 0L
@@ -188,19 +205,56 @@ class EmergencyReserveSuite extends munit.FunSuite:
     assert(!w3.res.largeWorkAllowed)
   }
 
-  test("a mark that cannot be written for want of room is written with what R gave back; a released R alone restores it too") {
+  test("a mark that cannot be written: R itself is renamed to the mark before it shrinks, then truncated") {
     val (d, w) = created()
     d.markFails = true
     d.free0 = E - 1
     w.res.route()
-    assert(!d.marker)
-    assertEquals(d.reserve, Some(0L))
-    assert(w.events.toSeq.collect { case e: Event.Entered => e.failure }.flatten.head.startsWith("印を書けず"))
-    // A restart: the truncated R restores it, and the mark is written then.
-    d.markFails = false
-    val w2 = World(d)
-    assert(w2.res.active)
     assert(d.marker)
+    assertEquals(d.markLen, Some(0L))
+    assertEquals(d.reserve, None)
+    assertEquals(d.free0, E - 1 + R)
+    assert(World(d).res.active)
+  }
+
+  test("the mark cannot be written, R renamed to it, its truncation fails, the process killed: still in the emergency after the restart, the mark never removed") {
+    val (d, w) = created()
+    d.markFails = true
+    d.markTruncFails = true
+    d.free0 = E - 1
+    d.killAt = Some("mark-truncate-failed")
+    killed(w.res.route())
+    d.killAt = None
+    assertEquals(d.markLen, Some(R))
+    // Without the kill: the mark kept (never removed), the failure shown.
+    val (d2, w2) = created()
+    d2.markFails = true
+    d2.markTruncFails = true
+    d2.free0 = E - 1
+    w2.res.route()
+    assertEquals(d2.markLen, Some(R))
+    assert(w2.events.toSeq.collect { case e: Event.Entered => e.failure }.flatten.head.contains("印にした予備を切り詰められず"))
+    // The restart: the mark (whatever its length) restores it; truncated now.
+    d.markFails = false
+    d.markTruncFails = false
+    d.free0 = Plenty
+    val w3 = World(d)
+    assert(w3.res.active)
+    assertEquals(w3.res.route(), Route.Overflow)
+    assertEquals(d.markLen, Some(0L))
+  }
+
+  test("neither a mark nor a rename: a failing truncation never removes R (it is the last record of the state)") {
+    val (d, w) = created()
+    d.markFails = true
+    d.renameFails = true
+    d.releaseFails = true
+    d.free0 = E - 1
+    w.res.route()
+    assert(!d.marker)
+    assertEquals(d.reserve, Some(R))
+    assert(w.events.toSeq.collect { case e: Event.Entered => e.failure }.flatten.head.contains("印がないため削除せず"))
+    assert(w.res.active)
   }
 
   test("without R (never created) a shortage still enters, and the mark restores it after a restart") {

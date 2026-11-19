@@ -189,6 +189,19 @@ object Storage:
       ArchiveStore.syncDir(dir)
       debugKill("emergency-marked")
     def marked: Boolean = markFile.exists
+    def markByRename(): Unit =
+      Os.rename(file.getPath, markFile.getPath)
+      ArchiveStore.syncDir(dir)
+    def markLength: Long = markFile.length
+    def releaseMark(): Long =
+      if debugFile("debug-mark-truncate-fails").exists then
+        debugKill("mark-truncate-failed")
+        throw java.io.IOException("debug: the mark cannot be truncated")
+      scala.util.Using.resource(java.io.RandomAccessFile(markFile, "rw")) { f =>
+        f.setLength(0)
+        f.getFD.sync()
+      }
+      markFile.length
     def unmark(): Unit =
       if !markFile.delete() && markFile.exists then throw java.io.IOException(s"cannot delete $markFile")
       ArchiveStore.syncDir(dir)

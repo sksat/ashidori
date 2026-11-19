@@ -219,17 +219,27 @@ final class ImportChain(post: Runnable => Unit, later: (Runnable, Long) => Unit,
                 synchronized { skip += f }
                 request()
 
-  /** The skipped files again, after the backoff. */
+  /** The skipped files again, after the backoff. The backoff doubles only
+    * when a timer is actually set: a request while one is pending (it finds
+    * the same failed files skipped) changes nothing.
+    */
   private def retryLater(): Unit =
     val ms = synchronized {
-      backoff = if backoff == 0 then FirstBackoffMs else math.min(MaxBackoffMs, backoff * 2)
-      backoff
+      if waiting then -1L
+      else
+        waiting = true
+        backoff = if backoff == 0 then FirstBackoffMs else math.min(MaxBackoffMs, backoff * 2)
+        backoff
     }
-    once(ms, clearSkip = true)
+    if ms >= 0 then schedule(ms, clearSkip = true)
 
-  private def once(ms: Long, clearSkip: Boolean = false): Unit =
+  private def once(ms: Long): Unit =
     val go = synchronized { if waiting then false else { waiting = true; true } }
-    if go then later(() => {
+    if go then schedule(ms, clearSkip = false)
+
+  /** Sets the timer (`waiting` already claimed). */
+  private def schedule(ms: Long, clearSkip: Boolean): Unit =
+    later(() => {
       synchronized {
         waiting = false
         if clearSkip then skip = Set.empty
