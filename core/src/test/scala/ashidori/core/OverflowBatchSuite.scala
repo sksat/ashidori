@@ -44,16 +44,60 @@ class OverflowBatchSuite extends munit.FunSuite:
     assertEquals(names(d), Seq("raw-1.txt"))
   }
 
-  test("an attempt that failed (ENOSPC while writing) leaves no .tmp; the retry completes it once") {
+  test("an attempt that failed while writing keeps its .tmp (never deleted); the retry writes a .tmp of its own and completes once") {
     val d = dir()
     var fail = true
     val b = OverflowFiles.Batch(d, "raw-2.txt", () => bytes(2), _ => (),
       crash = at => if at == "write" && fail then throw java.io.IOException("No space left on device"))
     intercept[java.io.IOException](b.write())
-    assertEquals(names(d), Nil)
+    assertEquals(names(d), Seq("raw-2.txt.tmp"))
     fail = false
     b.write()
-    assertEquals(names(d), Seq("raw-2.txt"))
+    // The first .tmp (partial) kept; the retry's own .tmp (raw-2.r1.txt.tmp) became the completed file.
+    assertEquals(names(d), Seq("raw-2.txt", "raw-2.txt.tmp"))
+    assertEquals(OverflowFiles.inBackup("raw-2.r1.txt.tmp"), Some(true))
+    // Imported: the completed file only, once.
+    val db = scala.collection.mutable.ArrayBuffer.empty[Int]
+    importAll(d, db, scala.collection.mutable.Set.empty)
+    importAll(d, db, scala.collection.mutable.Set.empty)
+    assertEquals(db.toSeq, Seq(2))
+  }
+
+  test("a rename that fails after the .tmp was written whole and synced: the retry renames that same file (the only copy is never deleted)") {
+    val d = dir()
+    var made = 0
+    var fail = true
+    var seen = Seq.empty[String]
+    val b = OverflowFiles.Batch(d, "raw-3.txt", () => { made += 1; bytes(3) }, _ => (),
+      crash = at => if at == "move" && fail then
+        seen = names(d)
+        throw java.io.IOException("rename: No space left on device"))
+    intercept[java.io.IOException](b.write())
+    // The synced copy is there and kept.
+    assertEquals(seen, Seq("raw-3.txt.tmp"))
+    assertEquals(names(d), Seq("raw-3.txt.tmp"))
+    assertEquals(String(Files.readAllBytes(d.resolve("raw-3.txt.tmp")), "UTF-8"), String(bytes(3), "UTF-8"))
+    fail = false
+    b.write()
+    b.write()
+    assertEquals(made, 1)
+    assertEquals(names(d), Seq("raw-3.txt"))
+  }
+
+  test("a backup listing a retry's .tmp that was completed meanwhile takes the completed file") {
+    val d = dir()
+    Files.write(d.resolve("raw-4.txt"), bytes(4))
+    val (taken, missing) = OverflowFiles.forBackup(d, p => if p.getFileName.toString.endsWith(".tmp") then throw java.io.IOException("gone") else p)
+    assertEquals(missing, Vector.empty)
+    // Listed only as the completed file here; a vanished r1 .tmp resolves to it.
+    Files.write(d.resolve("raw-5.r1.txt.tmp"), bytes(5))
+    val (t2, m2) = OverflowFiles.forBackup(d, p =>
+      if p.getFileName.toString == "raw-5.r1.txt.tmp" then
+        Files.move(p, d.resolve("raw-5.txt"))
+        throw java.nio.file.NoSuchFileException(p.toString)
+      else p)
+    assertEquals(m2, Vector.empty)
+    assert(t2.exists(_._1 == "raw-5.txt"))
   }
 
   test("killed after the write, the fsync or the rename: a .tmp is never imported, a completed file once; batch ids accounted") {

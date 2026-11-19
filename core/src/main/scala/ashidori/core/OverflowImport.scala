@@ -68,32 +68,45 @@ object OverflowFiles:
     syncDir(dir)
     f
 
-  /** One batch's overflow file, written at most once whatever the retries
-    * (plan C stage 2): its name is fixed with the batch (unique to the
-    * process and batch), and once the rename completed it, a retry only
-    * syncs the directory again; it never writes a second file, so the batch
-    * cannot be imported twice. A `.tmp` of an earlier failed attempt of the
-    * same batch (never complete) is removed before it is written again, and
-    * the `.tmp` of an attempt that failed is removed (the batch is in
-    * memory: written again, or counted lost by the caller). `crash` marks
-    * the points after the write, the fsync and the rename (for tests).
+  /** One batch's overflow file, completed at most once whatever the retries
+    * (plan C stage 2). Its name is fixed with the batch (unique to the
+    * process and batch); once a rename completed it, a retry only syncs the
+    * directory again and never writes a second file, so the batch cannot be
+    * imported twice.
+    *
+    * A `.tmp` is never deleted (it may be the only copy on disk) and never
+    * taken as complete. A retry after a `.tmp` was written whole and synced
+    * (the rename or something after the sync failed) renames that same file;
+    * a retry after a write or sync that failed writes a new `.tmp` of its
+    * own (`<name without suffix>.r<n><suffix>.tmp`), leaving the earlier one
+    * as it is. `crash` marks the points after the write, after the fsync,
+    * just before the rename (`move`) and after it (for tests).
     */
   final class Batch(val dir: Path, val name: String, bytes: () => Array[Byte], syncDir: Path => Unit,
                     crash: String => Unit = _ => (), prepare: () => Unit = () => ()):
     require(completed.exists(name.endsWith), name)
     @volatile private var done = false
+    // The `.tmp` written whole and synced, not yet renamed.
+    private var synced: Option[Path] = None
+    private var attempt = 0
     /** Completed (renamed) by an attempt of this batch. */
     def completedNow: Boolean = done
+
+    private def tmpName(n: Int): String =
+      if n == 0 then name + Partial
+      else
+        val ext = completed.find(name.endsWith).get
+        name.stripSuffix(ext) + s".r$n" + ext + Partial
 
     def write(): Path =
       val f = dir.resolve(name)
       synchronized {
         if !done then
           prepare()
-          val tmp = dir.resolve(name + Partial)
-          Files.deleteIfExists(tmp)
-          try
-            val ch = java.nio.channels.FileChannel.open(tmp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+          val tmp = synced.getOrElse {
+            val t = dir.resolve(tmpName(attempt))
+            attempt += 1
+            val ch = java.nio.channels.FileChannel.open(t, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
             try
               val bb = java.nio.ByteBuffer.wrap(bytes())
               while bb.hasRemaining do ch.write(bb)
@@ -101,17 +114,18 @@ object OverflowFiles:
               ch.force(true)
             finally ch.close()
             crash("fsync")
-            // Without REPLACE_EXISTING: a completed file is never written over.
-            try Files.move(tmp, f)
-            catch case _: java.nio.file.FileAlreadyExistsException =>
-              // Only an attempt of this batch has its name: completed by it.
-              Files.deleteIfExists(tmp)
-            done = true
-            crash("rename")
-          catch case e: Exception =>
-            // (A process killed here runs nothing: its `.tmp` stays, never complete.)
-            if !done then scala.util.Try(Files.deleteIfExists(tmp))
-            throw e
+            synced = Some(t)
+            t
+          }
+          crash("move")
+          // Without REPLACE_EXISTING: a completed file is never written over.
+          // Only an attempt of this batch has its name, so one there is this
+          // batch completed (its `.tmp` stays: never deleted).
+          try Files.move(tmp, f)
+          catch case _: java.nio.file.FileAlreadyExistsException => ()
+          done = true
+          synced = None
+          crash("rename")
         syncDir(dir)
       }
       f
@@ -142,7 +156,8 @@ object OverflowFiles:
       scala.util.Try(open(dir.resolve(name))).toOption.map(a => taken(name) = (a, partial)).isDefined
     for name <- listed; partial <- inBackup(name) if !taken.contains(name) do
       if !take(name, partial) then
-        val done = name.stripSuffix(Partial)
+        // (A retry's `.tmp`, `<name>.r<n><suffix>.tmp`, completes `<name><suffix>`.)
+        val done = name.stripSuffix(Partial).replaceAll("""\.r\d+(\.txt|\.rec)$""", "$1")
         // Completed meanwhile: its completed file (listed or not).
         val ok = partial && (taken.contains(done) || take(done, partial = false))
         if !ok then missing += name
@@ -157,3 +172,81 @@ object BackupManifest:
   def line(sha: String, bytes: Long, name: String, partial: Boolean = false): String =
     s"$sha  $bytes  $name" + (if partial then "  partial" else "") + "\n"
   def missing(name: String): String = s"-  -  $name  missing\n"
+
+/** The import of overflow files on the logger's writer queue (plan C stage
+  * 2): one file per step, each step posted behind whatever is queued, so a
+  * new batch waiting is always written first (a step that finds batches
+  * waiting posts itself again, behind them, and imports nothing). The
+  * chain goes on until no file is left, with no cap per run, logging or not.
+  * Raw and small batches are one chain, oldest first.
+  *
+  * A file that fails is skipped for the rest of the chain and tried again
+  * later, after a backoff that doubles from [[ImportChain.FirstBackoffMs]] up
+  * to [[ImportChain.MaxBackoffMs]] (no tight retry loop); a file held by a
+  * backup is tried again after [[ImportChain.BusyMs]]. `stopped()` (the
+  * emergency state) ends the chain; [[request]] starts it again.
+  */
+final class ImportChain(post: Runnable => Unit, later: (Runnable, Long) => Unit, pending: () => Long,
+                        stopped: () => Boolean, next: Set[String] => Option[String],
+                        importOne: String => ImportChain.Step):
+  import ImportChain.*
+  private var queued = false
+  private var skip = Set.empty[String]
+  private var backoff = 0L
+  private var waiting = false
+
+  /** Posts a step unless one is queued. */
+  def request(): Unit =
+    val go = synchronized { if queued then false else { queued = true; true } }
+    if go then post(() => step())
+
+  private def step(): Unit =
+    synchronized { queued = false }
+    if !stopped() then
+      if pending() > 0 then request()
+      else
+        val s = synchronized(skip)
+        next(s) match
+          case None =>
+            if s.nonEmpty then retryLater()
+          case Some(f) =>
+            importOne(f) match
+              case Step.Imported =>
+                synchronized { backoff = 0 }
+                request()
+              case Step.Busy => once(BusyMs)
+              case Step.Failed =>
+                synchronized { skip += f }
+                request()
+
+  /** The skipped files again, after the backoff. */
+  private def retryLater(): Unit =
+    val ms = synchronized {
+      backoff = if backoff == 0 then FirstBackoffMs else math.min(MaxBackoffMs, backoff * 2)
+      backoff
+    }
+    once(ms, clearSkip = true)
+
+  private def once(ms: Long, clearSkip: Boolean = false): Unit =
+    val go = synchronized { if waiting then false else { waiting = true; true } }
+    if go then later(() => {
+      synchronized {
+        waiting = false
+        if clearSkip then skip = Set.empty
+      }
+      request()
+    }, ms)
+
+object ImportChain:
+  enum Step:
+    case Imported, Busy, Failed
+  val BusyMs: Long = 5_000L
+  val FirstBackoffMs: Long = 30_000L
+  val MaxBackoffMs: Long = 30 * 60_000L
+
+  /** The overflow files to import, oldest first across raw (`.txt`) and
+    * small (`.rec`) batches (by the time in their names).
+    */
+  def order(names: Seq[String]): Seq[String] =
+    names.filter(n => n.endsWith(OverflowFiles.Completed) || n.endsWith(OverflowFiles.CompletedRecord))
+      .sortBy(n => (n.dropWhile(_ != '-'), n))

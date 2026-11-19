@@ -322,3 +322,38 @@ object CrashLoop:
     */
   def tripped(crashes: Seq[Long], now: Long, since: Long): Boolean =
     crashes.count(t => t > since && t > now - WindowMs && t <= now) >= Crashes
+
+/** The count of the logger's rows given up, on disk (plan C stage 2). Each
+  * loss sets a target total (what is on disk, or the target not yet
+  * written, plus the rows) and writes it; a write that failed keeps the
+  * target and the next loss or [[flush]] writes it again, the same total
+  * plus any new rows, never the rows added twice: a write that failed after
+  * its rename (the directory sync) left the new total on disk, and reading
+  * it back and adding the pending rows again would count them twice.
+  */
+final class LossCounter(read: () => Long, write: Long => Unit):
+  private var target: Option[Long] = None
+
+  /** `rows` given up: the new target written; the failure if it could not be. */
+  def add(rows: Long): Option[Throwable] = synchronized {
+    target = Some(target.getOrElse(read()) + rows)
+    flushLocked()
+  }
+
+  /** The target not yet written, written again; the failure if it still cannot be. */
+  def flush(): Option[Throwable] = synchronized(flushLocked())
+
+  private def flushLocked(): Option[Throwable] = target match
+    case None => None
+    case Some(t) =>
+      try
+        write(t)
+        target = None
+        None
+      catch case e: Exception => Some(e)
+
+  /** The rows given up in all (on disk or not). */
+  def total: Long = synchronized(math.max(read(), target.getOrElse(0L)))
+  /** Rows given up whose count is not on disk yet. */
+  def uncounted: Long = synchronized(target.fold(0L)(t => math.max(0L, t - read())))
+  def unwritten: Boolean = synchronized(target.isDefined)

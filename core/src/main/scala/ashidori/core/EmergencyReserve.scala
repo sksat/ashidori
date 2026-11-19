@@ -7,37 +7,43 @@ package ashidori.core
   * non-cache directory beside the records. It is "ready" only once it is
   * allocated, synced and published (renamed into place); large work other
   * than logging (downloads, backups, maintenance) starts and goes on only
-  * while it is ready. Only the main process creates and releases it; the
-  * maintenance process reads the file (present at full length) at its start
-  * and at each boundary.
+  * while it is ready and no emergency is marked. Only the main process
+  * creates and releases it; the maintenance process reads the files (R at
+  * full length, no emergency mark) at its start and at each boundary.
   *
   * The emergency state is entered when the free space F is below
   * [[Emergency.E]] before a logging or overflow write, when a logging
   * transaction fails with SQLITE_FULL, when an overflow write fails for lack
-  * of space, or on a report from other work ([[enter]]): large work is
-  * stopped (`stopLarge`), R is truncated to 0 and synced, and the logger
-  * writes its batches to overflow files instead of SQLite ([[route]]).
+  * of space, or on a report from other work ([[enter]]): its own durable
+  * mark is written first, large work is asked to stop (`stopLarge`), R is
+  * truncated to 0 and synced (removed if that fails), and the logger writes
+  * its batches to overflow files instead of SQLite ([[route]]).
   *
-  * The reserve file is also the state on disk: a file shorter than R
-  * (truncated) is "released", so a restart does not leave the emergency
-  * state; no file is "never created". Recovery ([[tick]], [[allocate]]): F
-  * at or above H + 2R for [[Emergency.SustainMs]] without a break, then (if
-  * logging) one new batch saved to SQLite, then R allocated again and synced;
-  * only then is it published as ready and the emergency state left. A
-  * generation number, bumped by every [[enter]], keeps a stale allocation
-  * from publishing; a new shortage during one cancels it.
+  * On disk the state is the mark, independent of R: a restart restores the
+  * emergency state when the mark exists, whatever became of R (a release
+  * that failed leaves R whole: it is released again); a released R (shorter
+  * than R) without the mark is restored as an emergency too (the mark could
+  * not be written). Recovery ([[tick]], [[allocate]]): F at or above
+  * H + 2R for [[Emergency.SustainMs]] without a break, then (if logging)
+  * one new batch saved to SQLite, then R allocated again and synced; only
+  * then is it published, the mark removed and the emergency state left. The
+  * decision and the start of the allocation are one step under the lock,
+  * which hands out a permit naming the generation; every [[enter]] bumps
+  * the generation, so an allocation decided before it never publishes.
   */
 object Emergency:
   /** R: the reserve. */
   val R: Long = 64L << 20
   /** E: below this free space the emergency state is entered. */
   val E: Long = 32L << 20
-  /** How long F must stay at or above [[resumeFree]] before recovery. */
+  /** How long F must stay at or above [[ResumeFree]] before recovery. */
   val SustainMs: Long = 60_000L
   /** Allocation step: a stale or cancelled allocation stops between steps. */
   val Step: Long = 4L << 20
-  /** F needed to recover (and to create R the first time): H + 2R. */
+  /** F needed to recover from an emergency: H + 2R. */
   val ResumeFree: Long = Headroom.H + 2 * R
+  /** F needed to create R the first time: R + E and a margin of 16 MiB (an operating value). */
+  val CreateFree: Long = R + E + (16L << 20)
 
   enum Reason(val label: String):
     case LowSpace extends Reason("空き容量が 32 MiB 未満")
@@ -64,12 +70,15 @@ object Emergency:
     def release(): Long
     /** Removes the reserve (when it cannot be truncated). */
     def remove(): Boolean
-    /** Leaves an empty reserve file as the mark of the released state (best effort). */
-    def markReleased(): Unit
+    /** Writes the emergency mark durably (the file and its directory synced); throws. */
+    def mark(): Unit
+    def marked: Boolean
+    /** Removes the emergency mark durably; throws. */
+    def unmark(): Unit
 
   /** What happened, for the lifecycle log, the alert and the status. */
   enum Event:
-    /** Entered (`first`) or renewed: `released` bytes the free space grew by, `failure` of the release. */
+    /** Entered (`first`) or renewed: `released` bytes the free space grew by, `failure` of the mark or the release. */
     case Entered(reason: Reason, detail: String, first: Boolean, released: Option[Long], failure: Option[String])
     case Created(gen: Long)
     case Recovered(gen: Long)
@@ -90,6 +99,9 @@ object Emergency:
     case Allocating extends Status("確保中")
     case Released extends Status("解放（記録を退避中）")
 
+  /** Leave to allocate R, given with the decision ([[EmergencyReserve.tick]]). */
+  final case class Permit(gen: Long)
+
 /** The reserve and the emergency state of the main process (see [[Emergency]]).
   * Thread-safe: the logger's write thread calls [[route]] and [[enter]], a
   * background thread [[tick]] and [[allocate]], other work [[enter]].
@@ -97,30 +109,36 @@ object Emergency:
 final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarge: () => Unit,
                              events: Emergency.Event => Unit = _ => (),
                              r: Long = Emergency.R, e: Long = Emergency.E, resumeFree: Long = Emergency.ResumeFree,
-                             sustainMs: Long = Emergency.SustainMs, step: Long = Emergency.Step):
+                             sustainMs: Long = Emergency.SustainMs, step: Long = Emergency.Step,
+                             createFree: Long = Emergency.CreateFree):
   import Emergency.*
 
   private var emergency = false
   private var ready = false
   private var gen = 0L
   private var sustainSince = -1L
-  // 0: none; 1: the next batch tries SQLite; 2: it was saved there.
+  // 0: none; 1: the next batch tries SQLite; 3: taken by a batch; 2: it was saved there.
   private var probe = 0
   private var allocating = false
   private var restored = false
 
-  /** Reads the state from the files: a full reserve is ready, a shorter one
-    * the released (emergency) state, none not created. An allocation file
-    * left by a process that died is removed (never published).
+  /** Reads the state from the files: the mark, or a released R, is the
+    * emergency state (an R left whole is released again); a full R without
+    * the mark is ready; nothing is "not created". An allocation file left by
+    * a process that died is removed (never published).
     */
   def restore(): Unit = synchronized {
     if !restored then
       restored = true
       scala.util.Try(files.discardTmp())
-      files.onDisk() match
-        case OnDisk.Full => ready = true
-        case OnDisk.Released => emergency = true
-        case OnDisk.Absent => ()
+      val disk = files.onDisk()
+      if scala.util.Try(files.marked).getOrElse(true) || disk == OnDisk.Released then
+        emergency = true
+        // Not released before (a release that failed, or the process died first).
+        if disk == OnDisk.Full then releaseLocked()
+        // Released without the mark (it could not be written): written now.
+        if !scala.util.Try(files.marked).getOrElse(true) then scala.util.Try(files.mark())
+      else if disk == OnDisk.Full then ready = true
   }
 
   private def restoredLocked(): Unit = if !restored then restore()
@@ -162,8 +180,9 @@ final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarg
   def probeFailed(): Unit = synchronized { if emergency && probe == 3 then probe = 1 }
 
   /** Enters the emergency state, or renews it (the recovery clock starts
-    * again, an allocation in progress is cancelled): stops large work,
-    * releases R (truncated to 0 and synced; removed if that fails).
+    * again, a permit or an allocation in progress is void): the mark first,
+    * then large work asked to stop, then R released (truncated to 0 and
+    * synced; removed if that fails).
     */
   def enter(reason: Reason, detail: String = ""): Unit = synchronized {
     restoredLocked()
@@ -177,115 +196,137 @@ final class EmergencyReserve(files: Emergency.Files, clock: () => Long, stopLarg
     sustainSince = -1
     probe = 0
     if allocating then scala.util.Try(files.discardTmp())
+    // The mark before anything else: a restart restores the state whatever
+    // happens to R below, or if the process dies in between.
+    val markFailure =
+      if !first && scala.util.Try(files.marked).getOrElse(false) then None
+      else scala.util.Try(files.mark()).failed.toOption.map(describe)
     if first then scala.util.Try(stopLarge())
-    var released: Option[Long] = None
-    var failure: Option[String] = None
     val disk = scala.util.Try(files.onDisk()).getOrElse(OnDisk.Full)
-    if disk == OnDisk.Full || ready then
-      val before = files.free()
-      val ok =
-        try
-          val left = files.release()
-          if left != 0 then
-            failure = Some(s"切り詰め後も $left バイト")
-            scala.util.Try(files.remove()).getOrElse(false)
-          else true
-        catch case ex: Exception =>
-          failure = Some(Option(ex.getMessage).getOrElse(ex.getClass.getSimpleName))
-          scala.util.Try(files.remove()).getOrElse(false)
-      if !ok then failure = failure.map(_ + "、削除にも失敗")
-      // Removed instead: an empty file marks the released state again (a
-      // restart must not take the missing file for "never created").
-      else if failure.isDefined then scala.util.Try(files.markReleased())
-      released = Some(files.free() - before)
-    else if disk == OnDisk.Absent then scala.util.Try(files.markReleased())
+    val (released, releaseFailure) =
+      if disk == OnDisk.Full || ready then releaseLocked() else (None, None)
+    // A mark that failed for want of room: tried again with what R gave back.
+    val markFailure2 = markFailure.flatMap(m => scala.util.Try(files.mark()).failed.toOption.map(_ => m))
     ready = false
+    val failure = (markFailure2.map(m => s"印を書けず: $m").toSeq ++ releaseFailure).reduceOption(_ + "・" + _)
     // Logged once per entry, and for a renewal that changed something.
     if first || released.isDefined then events(Event.Entered(reason, detail, first, released, failure))
 
-  /** Called every few seconds: the recovery clock, and whether to try a
-    * batch in SQLite (`logging`: the logger is on) or to [[allocate]] now.
-    * Without an emergency, R is created once F allows it.
+  private def describe(ex: Throwable): String = Option(ex.getMessage).getOrElse(ex.getClass.getSimpleName)
+
+  /** Releases R: truncated (its length checked), else removed. (bytes the free space grew by, failure). */
+  private def releaseLocked(): (Option[Long], Option[String]) =
+    val before = files.free()
+    var failure: Option[String] = None
+    val ok =
+      try
+        val left = files.release()
+        if left != 0 then
+          failure = Some(s"切り詰め後も $left バイト")
+          scala.util.Try(files.remove()).getOrElse(false)
+        else true
+      catch case ex: Exception =>
+        failure = Some(describe(ex))
+        scala.util.Try(files.remove()).getOrElse(false)
+    if !ok then failure = failure.map(_ + "、削除にも失敗")
+    (Some(files.free() - before), failure.map(f => s"解放に失敗: $f"))
+
+  /** Called every few seconds: the recovery clock, or the first creation of
+    * R. A permit is the decision to allocate now, registered under the same
+    * lock (the allocation has begun: [[allocate]] must follow); any [[enter]]
+    * after it voids it. With `logging` (batches are coming), recovery first
+    * tries one batch in SQLite.
     */
-  def tick(logging: Boolean): Boolean =
+  def tick(logging: Boolean): Option[Permit] =
     val f = files.free()
     synchronized {
       restoredLocked()
-      if allocating then false
-      else if !emergency then !ready && f >= resumeFree
+      if allocating then None
+      else if !emergency then
+        if !ready && f >= createFree then begin() else None
       else if f < resumeFree then
         sustainSince = -1
         if probe != 2 then probe = 0
-        false
+        None
       else
         val now = clock()
         if sustainSince < 0 then sustainSince = now
-        if now - sustainSince < sustainMs then false
+        if now - sustainSince < sustainMs then None
         else if logging && probe != 2 then
           if probe == 0 then probe = 1
-          false
-        else true
+          None
+        else begin()
     }
 
-  /** Allocates R and publishes it if nothing entered the emergency state
-    * meanwhile (generation unchanged); a new shortage (F below E) cancels
-    * it. True once published.
+  private def begin(): Option[Permit] =
+    allocating = true
+    Some(Permit(gen))
+
+  /** Allocates R under `permit` and publishes it if nothing entered the
+    * emergency state since the permit (generation unchanged). F falling
+    * below E plus a step while allocating cancels it (the logger sees the
+    * shortage itself before its next write). True once published.
     */
-  def allocate(): Boolean =
-    val g = synchronized {
+  def allocate(permit: Permit): Boolean =
+    val g = permit.gen
+    val valid = synchronized {
       restoredLocked()
-      if allocating || ready && !emergency then -1L
-      else
-        allocating = true
-        gen
+      allocating && gen == g
     }
-    if g < 0 then return false
     def stale = synchronized(gen != g)
+    def cancel(): Boolean =
+      scala.util.Try(files.discardTmp())
+      synchronized { sustainSince = -1; if probe == 2 then probe = 0 }
+      events(Event.AllocationCancelled(g))
+      false
     try
-      files.discardTmp()
-      var at = 0L
-      while at < r do
-        if stale then
-          files.discardTmp()
-          events(Event.AllocationCancelled(g))
-          return false
-        if files.free() < e + step then
-          // A new shortage: entered (renewed), which cancels this allocation.
-          enter(Reason.LowSpace, "予備の確保中")
-          files.discardTmp()
-          events(Event.AllocationCancelled(g))
-          return false
-        val n = math.min(step, r - at)
-        files.allocateTmp(at, n)
-        at += n
-      files.syncTmp()
-      synchronized {
-        if gen != g then
-          scala.util.Try(files.discardTmp())
-          events(Event.AllocationCancelled(g))
-          false
+      if !valid then cancel()
+      else
+        files.discardTmp()
+        var at = 0L
+        var cancelled = false
+        while at < r && !cancelled do
+          if stale || files.free() < e + step then cancelled = true
+          else
+            val n = math.min(step, r - at)
+            files.allocateTmp(at, n)
+            at += n
+        if cancelled then cancel()
         else
-          try files.publish()
-          catch case ex: Exception =>
-            // Possibly in place already: released again (never left ready
-            // on disk while this process says it is not).
-            scala.util.Try(files.discardTmp())
-            if scala.util.Try(files.onDisk()).toOption.contains(OnDisk.Full) then scala.util.Try(files.release())
-            throw ex
-          val was = emergency
-          ready = true
-          emergency = false
-          probe = 0
-          sustainSince = -1
-          events(if was then Event.Recovered(g) else Event.Created(g))
-          true
-      }
+          files.syncTmp()
+          synchronized {
+            if gen != g then cancel()
+            else
+              try files.publish()
+              catch case ex: Exception =>
+                // Possibly in place already: released again (never left ready
+                // on disk while this process says it is not).
+                scala.util.Try(files.discardTmp())
+                if emergency && scala.util.Try(files.onDisk()).toOption.contains(OnDisk.Full) then scala.util.Try(files.release())
+                throw ex
+              val was = emergency
+              ready = true
+              emergency = false
+              probe = 0
+              sustainSince = -1
+              // The mark last: a restart before this still restores the
+              // emergency (and releases R again: the safe side).
+              if was then
+                scala.util.Try(files.unmark()).failed.foreach(ex => events(Event.AllocationFailed(s"印を消せず: ${describe(ex)}")))
+              events(if was then Event.Recovered(g) else Event.Created(g))
+              true
+          }
     catch case ex: Exception =>
       scala.util.Try(files.discardTmp())
       synchronized { sustainSince = -1; if probe == 2 then probe = 0 }
-      events(Event.AllocationFailed(Option(ex.getMessage).getOrElse(ex.getClass.getSimpleName)))
+      events(Event.AllocationFailed(describe(ex)))
       false
     finally synchronized { allocating = false }
+
+  /** Out of the emergency state but its mark still on disk (its removal failed): removed again. */
+  def tidy(): Unit = synchronized {
+    if restored && !emergency && ready && scala.util.Try(files.marked).getOrElse(false) then scala.util.Try(files.unmark())
+  }
 
 /** One logging batch's way to disk (plan C stage 2): SQLite, or an overflow
   * file, or counted lost; see [[EmergencyReserve]].
