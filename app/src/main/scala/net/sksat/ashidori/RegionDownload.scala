@@ -165,6 +165,7 @@ class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, p
         ListenableWorker.Result.retry()
       case e: Exception =>
         Log.w(s"regions: download failed (attempt ${getRunAttemptCount + 1})", e)
+        Storage.noticeFailure(e, "地域データの取得")
         Regions.waiting = Some(DownloadCause.label(DownloadCause.of(e)))
         Regions.progress = Map.empty
         Regions.changed()

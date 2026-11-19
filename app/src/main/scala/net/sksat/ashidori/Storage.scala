@@ -15,19 +15,174 @@ import ashidori.core.*
   *  - Maintenance, in either process (archive rewrites, bulk SQLite writes,
   *    the visit index): the fixed stopping point H ([[guard]]); no process
   *    reads another's reservations.
-  *  - Logging and its overflow files: never refused by L or H.
+  *  - Logging and its overflow files: never refused by L or H. Short of
+  *    space, the emergency path ([[emergency]], plan C stage 2): large work
+  *    stopped, the reserve R released, batches to overflow files. Large
+  *    work of either process runs only while R is ready ([[largeWorkOpen]]).
   */
 object Storage:
   private def app = AshidoriApp.app
 
   /** The main process's reservations of downloads and backups (in memory). */
-  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve())
+  lazy val budget: StorageBudget = StorageBudget(() => free(), () => reserve(), () => largeWorkOpen())
 
   /** The guard of maintenance, in either process: archive rewrites, bulk
     * SQLite writes, the visit index (the fixed stopping point H; no other
     * process's reservations are read).
     */
-  lazy val guard: SpaceGuard = SpaceGuard(() => free(), () => Headroom.H)
+  lazy val guard: SpaceGuard = SpaceGuard(() => free(), () => Headroom.H, open = () => largeWorkOpen())
+
+  // --- the logger's emergency reserve (plan C stage 2) ----------------------------------
+
+  /** Large work other than logging may start or go on: the emergency
+    * reserve is ready and no emergency is in progress. The main process
+    * knows ([[emergency]]); the maintenance process reads the reserve file
+    * (present at its full length), at its start and at each boundary.
+    */
+  def largeWorkOpen(): Boolean =
+    if AshidoriApp.isMaintenanceProcess then ReserveFiles.onDisk() == Emergency.OnDisk.Full
+    else emergency.largeWorkAllowed
+
+  /** Why large work is deferred, when it is (shown). */
+  val DeferredText = "記録用の緊急予備がないため延期"
+
+  /** The reserve and the emergency state: the main process only (it alone
+    * creates and releases R). Read from the files on first use.
+    */
+  lazy val emergency: EmergencyReserve =
+    require(!AshidoriApp.isMaintenanceProcess, "the reserve belongs to the main process")
+    val e = debugLong("debug-emergency-e").getOrElse(Emergency.E)
+    val sustain = debugLong("debug-emergency-sustain-ms").getOrElse(Emergency.SustainMs)
+    val r = EmergencyReserve(ReserveFiles, () => android.os.SystemClock.elapsedRealtime(),
+      // Large work stops by the gate closing (its next output, batch or
+      // watcher check: largeWorkOpen) and, in the maintenance process, by the
+      // released file; nothing is waited for.
+      () => Log.w("emergency: large work asked to stop"),
+      ev => monitor.execute(() => onEvent(ev)), e = e, sustainMs = sustain)
+    r.restore()
+    r
+
+  private lazy val monitor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-reserve"))
+
+  /** Every 5 s: the recovery clock, or the first creation of R. */
+  private def watch(): Unit =
+    monitor.scheduleWithFixedDelay(() =>
+      try if emergency.tick(LoggerWrites.logging) then emergency.allocate()
+      catch case scala.util.control.NonFatal(e) => Log.w("emergency reserve check failed", e)
+    , 1, 5, java.util.concurrent.TimeUnit.SECONDS)
+
+  @volatile private var allocationFailures = 0
+  private def onEvent(e: Emergency.Event): Unit = e match
+    case Emergency.Event.Entered(reason, detail, first, released, failure) =>
+      val rel = released.fold("予備なし")(b => f"予備を解放（空き +${b / 1048576.0}%.1f MiB）")
+      LifeLog.add(LifeKind.Emergency,
+        (if first then "記録を退避ファイルへ切り替え" else "容量不足が継続") + s": ${reason.label}" +
+          (if detail.nonEmpty then s"（$detail）" else "") + s"・$rel" + failure.fold("")(f => s"・解放に失敗: $f"))
+      if first then Alerts.emergency(true)
+    case Emergency.Event.Created(_) =>
+      allocationFailures = 0
+      Log.i("emergency reserve created")
+      // Maintenance deferred for want of it may run now.
+      Maintenance.schedule(app)
+    case Emergency.Event.Recovered(_) =>
+      allocationFailures = 0
+      LifeLog.add(LifeKind.Emergency, "空き容量が回復: 予備を再確保し、通常の保存に復帰")
+      Alerts.emergency(false)
+      LoggerWrites.resumeImport()
+      LoggerWrites.Losses.flush()
+      Maintenance.schedule(app)
+    case Emergency.Event.AllocationFailed(why) =>
+      allocationFailures += 1
+      Log.w(s"emergency reserve allocation failed: $why")
+      if allocationFailures == 1 then LifeLog.add(LifeKind.Emergency, s"記録用の緊急予備を確保できず: $why")
+    case Emergency.Event.AllocationCancelled(g) => Log.i(s"emergency reserve allocation $g cancelled")
+
+  /** Another process's or worker's failure for lack of space (ENOSPC,
+    * SQLITE_FULL), reported by the main process's work: the emergency state.
+    */
+  def noticeFailure(e: Throwable, what: String): Unit =
+    if !AshidoriApp.isMaintenanceProcess && (NoSpace.full(e) || NoSpace.noSpace(e)) then
+      emergency.enter(Emergency.Reason.Reported, s"$what: ${LifeLog.describe(e)}")
+
+  /** The reserve file in the app's files (not a cache directory), on the
+    * same file system as the database. Allocated in an allocation file by
+    * `posix_fallocate` (or written whole where that is not supported),
+    * synced, then renamed into place: never sparse, never half published.
+    */
+  object ReserveFiles extends Emergency.Files:
+    import android.system.{ErrnoException, Os, OsConstants}
+    private def dir = app.getFilesDir
+    def file: File = File(dir, "emergency-reserve")
+    private def tmp = File(dir, "emergency-reserve.alloc")
+    private var out: java.io.RandomAccessFile = null
+
+    def free(): Long = Storage.free()
+    def onDisk(): Emergency.OnDisk =
+      if !file.exists then Emergency.OnDisk.Absent
+      else if file.length >= Emergency.R then Emergency.OnDisk.Full
+      else Emergency.OnDisk.Released
+    def discardTmp(): Unit = synchronized {
+      if out != null then
+        scala.util.Try(out.close())
+        out = null
+      if tmp.exists && !tmp.delete() then throw java.io.IOException(s"cannot delete $tmp")
+    }
+    def allocateTmp(from: Long, n: Long): Unit = synchronized {
+      if out == null then out = java.io.RandomAccessFile(tmp, "rw")
+      try Os.posix_fallocate(out.getFD, from, n)
+      catch case e: ErrnoException if e.errno == OsConstants.EOPNOTSUPP || e.errno == OsConstants.ENOSYS =>
+        // Written whole instead (zeros take blocks: not sparse).
+        val buf = new Array[Byte](1 << 20)
+        out.seek(from)
+        var left = n
+        while left > 0 do
+          val k = math.min(left, buf.length.toLong).toInt
+          out.write(buf, 0, k)
+          left -= k
+      debugKill("reserve-allocate")
+    }
+    def syncTmp(): Unit = synchronized {
+      if out == null then throw java.io.IOException("no allocation in progress")
+      out.getFD.sync()
+      out.close()
+      out = null
+      debugKill("reserve-sync")
+    }
+    def publish(): Unit =
+      debugKill("reserve-publish")
+      Os.rename(tmp.getPath, file.getPath)
+      ArchiveStore.syncDir(dir)
+    def release(): Long =
+      debugKill("reserve-release")
+      if debugFile("debug-reserve-release-fails").exists then throw java.io.IOException("debug: release fails")
+      scala.util.Using.resource(java.io.RandomAccessFile(file, "rw")) { f =>
+        f.setLength(0)
+        f.getFD.sync()
+      }
+      debugKill("reserve-released")
+      file.length
+    def remove(): Boolean =
+      val ok = file.delete() || !file.exists
+      scala.util.Try(ArchiveStore.syncDir(dir))
+      ok
+    def markReleased(): Unit =
+      if file.createNewFile() then scala.util.Try(ArchiveStore.syncDir(dir))
+
+  // --- debug builds: knobs of the emergency path's tests ---------------------------------
+
+  private def debugFile(name: String): File = File(Maintenance.dir, name)
+  private def debugLong(name: String): Option[Long] =
+    if !debuggable then None
+    else scala.util.Try(String(java.nio.file.Files.readAllBytes(debugFile(name).toPath), java.nio.charset.StandardCharsets.UTF_8).trim.toLong).toOption
+
+  /** Debug builds: the process is killed here once if `files/maintenance/debug-kill-<point>` exists (removed first). */
+  def debugKill(point: String): Unit =
+    if debuggable then
+      val f = debugFile(s"debug-kill-$point")
+      if f.exists && f.delete() then
+        Log.w(s"debug: killed at $point")
+        android.os.Process.killProcess(android.os.Process.myPid())
+
 
   /** Debug builds: free bytes to pretend (DebugReceiver STORAGE_FREE); None: the real ones. */
   @volatile var debugFree: Option[Long] = None
@@ -64,8 +219,12 @@ object Storage:
                      "storage-budget.json", "storage-budget.json.lock", "storage-budget.json.tmp") do
           scala.util.Try(File(dir, n).delete())
       }
+      // The emergency reserve: its state read from the files (a restart does
+      // not leave an emergency), then created or recovered in the background.
+      monitor.execute(() => scala.util.Try(emergency).failed.foreach(e => Log.w("emergency reserve state", e)))
+      watch()
 
-  private def debuggable: Boolean =
+  def debuggable: Boolean =
     (app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
   /** 「空き容量不足（記録用の予備を除いて N MB 必要）」 */
@@ -129,3 +288,15 @@ object LoggingRate:
     if now2 ne old then prefs.edit().putString("loggerSamples", now2.map((t, b) => s"$t,$b").mkString(";")).apply()
     StorageBudget.measuredRate(now2, now)
 
+
+/** Failures for lack of space: SQLITE_FULL, and ENOSPC of a file write. */
+object NoSpace:
+  private def chain(e: Throwable): Iterator[Throwable] =
+    Iterator.iterate(Option(e))(_.flatMap(x => Option(x.getCause))).takeWhile(_.isDefined).map(_.get)
+      .flatMap(x => Iterator(x) ++ x.getSuppressed.iterator)
+  def full(e: Throwable): Boolean = chain(e).exists(_.isInstanceOf[android.database.sqlite.SQLiteFullException])
+  def noSpace(e: Throwable): Boolean = chain(e).exists {
+    case x: android.system.ErrnoException => x.errno == android.system.OsConstants.ENOSPC
+    case x: java.io.IOException => Option(x.getMessage).exists(m => m.contains("ENOSPC") || m.contains("No space left"))
+    case _ => false
+  }

@@ -17,17 +17,19 @@ import ashidori.core.*
   */
 object SmallOverflow:
   private def dir: File = LoggerWrites.Overflow.dir
-  private var seq = 0L
+  private val seq = java.util.concurrent.atomic.AtomicLong()
   @volatile private var undecodable = Set.empty[String]
 
-  /** Writes `r` to its file; throws if that fails (nothing is kept then). */
-  def spill(r: SmallRecord): Unit = synchronized {
-    ArchiveStore.ensureDir(dir)
-    seq += 1
-    // Completed only by the rename (never written again): see OverflowFiles.
-    OverflowFiles.write(dir.toPath, f"small-${System.currentTimeMillis()}%013d-$seq%06d${OverflowFiles.CompletedRecord}",
-      (SmallRecord.encode(r) + "\n").getBytes(UTF_8), d => ArchiveStore.syncDir(d.toFile))
-  }
+  /** The overflow file of `r` (named now, written when needed, at most once:
+    * [[OverflowFiles.Batch]]).
+    */
+  def batch(r: SmallRecord): OverflowFiles.Batch =
+    val name = f"small-${System.currentTimeMillis()}%013d-${LoggerWrites.processTag}-${seq.incrementAndGet()}%06d${OverflowFiles.CompletedRecord}"
+    OverflowFiles.Batch(dir.toPath, name, () => (SmallRecord.encode(r) + "\n").getBytes(UTF_8),
+      d => ArchiveStore.syncDir(d.toFile), crash = LoggerWrites.debugCrash, prepare = () => ArchiveStore.ensureDir(dir))
+
+  /** Writes `r` to its file now; throws if that fails (nothing is kept then). */
+  def spill(r: SmallRecord): Unit = batch(r).write()
 
   /** Saves `r` in SQLite (the write thread's path and the import's). */
   def apply(db: Db, r: SmallRecord): Unit = r match
@@ -50,7 +52,9 @@ object SmallOverflow:
     val lock = LoggerWrites.Overflow.lock
     val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(OverflowFiles.CompletedRecord)).filterNot(f => undecodable(f.getName))
       .sortBy(_.getName)
-    for f <- files.take(50) if pending() < WriteBacklog.MaxOtherRows / 2 && lock.tryLock() do
+    var taken = 0
+    for f <- files.take(50) if LoggerWrites.importMayGo(taken, pending, WriteBacklog.MaxOtherRows) && lock.tryLock() do
+      taken += 1
       try
         val db = AshidoriApp.db
         val key = s"overflow|${f.getName}"
@@ -72,5 +76,7 @@ object SmallOverflow:
             case OverflowImport.Result.Kept => Log.w(s"overflow $f imported but not deleted; kept marked")
             case _ => ()
         }
-      catch case NonFatal(e) => Log.w(s"overflow import of $f failed", e)
+      catch case NonFatal(e) =>
+        Log.w(s"overflow import of $f failed", e)
+        Storage.noticeFailure(e, "退避ファイルの取り込み")
       finally lock.unlock()

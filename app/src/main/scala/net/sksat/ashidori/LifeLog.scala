@@ -47,7 +47,7 @@ object LifeLog:
             lineCount = kept.size
         finally l.release()
       }
-    catch case ex: Exception => Log.w("lifecycle log write failed", ex)
+    catch case ex: Exception => Log.w(s"lifecycle log write failed: ${describe(ex)}")
   }
 
   /** All entries, oldest first. */

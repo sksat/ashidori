@@ -196,14 +196,29 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   private def w = getWritableDatabase
   private def r = getReadableDatabase
 
+  /** One transaction, ended in every case. A failure in its statements
+    * (SQLITE_FULL in an INSERT included) rolls it back and is thrown as it
+    * was (a failure of the rollback is attached, never in its place); a
+    * failure at COMMIT is thrown by `endTransaction` after SQLite rolled the
+    * transaction back. Either way nothing of it is committed, and the
+    * connection is out of the transaction: the logger then keeps the batch
+    * in an overflow file ([[LoggerWrites]]).
+    */
   private def tx[A](f: SQLiteDatabase => A): A =
     val db = w
     db.beginTransaction()
-    try
-      val a = f(db)
-      db.setTransactionSuccessful()
-      a
-    finally db.endTransaction()
+    val a =
+      try
+        val a = f(db)
+        Db.debugInTx()
+        db.setTransactionSuccessful()
+        a
+      catch case e: Throwable =>
+        try db.endTransaction()
+        catch case e2: Throwable => e.addSuppressed(e2)
+        throw e
+    db.endTransaction()
+    a
 
   /** The first of `n` new rowids for `table`, in a write transaction.
     *
@@ -1414,6 +1429,17 @@ final class Db(ctx: Context, name: String = "ashidori.db")
 
 object Db:
   val Version = 9
+
+  /** Debug builds: a transaction of the logger's write thread fails with
+    * SQLITE_FULL after its statements ran (before COMMIT) while
+    * `files/maintenance/debug-full-insert` exists: the INSERT failure point
+    * of the emergency path's tests (the COMMIT one is tested with a full disk).
+    */
+  private[ashidori] def debugInTx(): Unit =
+    if debugTx && Thread.currentThread.getName == "ashidori-writes" &&
+        java.io.File(Maintenance.dir, "debug-full-insert").exists then
+      throw android.database.sqlite.SQLiteFullException("debug: database or disk is full (in the transaction)")
+  @volatile var debugTx = false
 
   /** The archive file of an upload mark (`<reg>|up:<file>`, `upgen:`,
     * `uppart:`, `upbytes:`), if `name` is one.

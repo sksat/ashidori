@@ -401,6 +401,7 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
               case f: PinnedFailure => (f.problem, f.sources)
               case other => (DownloadCause.of(other), Seq.empty)
             Log.w(s"$name ${pin.version} failed (attempt ${getRunAttemptCount + 1}): ${DownloadCause.label(cause)}", e)
+            Storage.noticeFailure(e, s"$name の取得")
             dl.failed(getApplicationContext, pin.version, cause, sources, getRunAttemptCount, p) match
               case DownloadRetry.Next.Backoff => ListenableWorker.Result.retry()
               // The next run is appended to this one: it must end as a success.

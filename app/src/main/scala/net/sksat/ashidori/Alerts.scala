@@ -16,6 +16,7 @@ object Alerts:
   val Channel = "alerts"
   private val CrashId = 2001
   private val StallId = 2002
+  private val EmergencyId = 2003
   val DayMs: Long = 24 * 3_600_000L
   /** Quarantined files (never deleted automatically) above this: a warning. */
   val QuarantineWarnBytes: Long = 512L << 20
@@ -109,13 +110,21 @@ object Alerts:
 
   def lastStall: Long = prefs.getLong("stallAt", 0L)
 
+  /** The logger's emergency path began (a notification) or ended (cancelled). */
+  def emergency(on: Boolean): Unit =
+    if on then notify(EmergencyId, EmergencyText)
+    else scala.util.Try(nm.cancel(EmergencyId))
+
+  val EmergencyText = "空き容量不足: 記録を退避中"
+
   /** The banner line for the status tab, if there was trouble in the last
     * day.
     */
   def issue(now: Long = System.currentTimeMillis()): Option[String] =
     val crashes = recentCrashes(now)
     val stalled = now - lastStall < DayMs || prefs.getBoolean("stallUp", false)
-    if CommitStatus.stuck().isDefined then Some("記録の整理が停止（要確認）")
+    if Try(Storage.emergency.active).getOrElse(false) then Some(EmergencyText)
+    else if CommitStatus.stuck().isDefined then Some("記録の整理が停止（要確認）")
     else if Attention.unseen then Some("記録の整理で隔離したファイルあり（要確認）")
     else if Attention.quarantineBytes() > QuarantineWarnBytes then Some("隔離したファイルが大きい（要確認）")
     else if ctx.getFilesDir.getUsableSpace < LowSpaceBytes then Some("端末の空き容量が少ない（要確認）")

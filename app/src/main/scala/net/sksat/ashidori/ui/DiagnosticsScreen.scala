@@ -50,7 +50,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
 
   private val savedRow = row("最後に保存された測位", "", "…")()
   private val crashRow = row("異常終了（直近24時間）", "", "…")()
-  private val pendingRow = row("保存待ち", "", "…")()
+  private val pendingRow = row("記録の保存", "", "…")()
+  private val reserveRow = row("記録用の緊急予備", "", "…")()
   private val kindRow = row("種類ごとの最後の保存", "", "")()
   /** The barometer: what was received is saved (value); what was not
     * received is missing (subtitle). Two facts, kept apart.
@@ -91,7 +92,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     scroll(
       vbox(
         sectionHeader("記録の保存"),
-        listGroup(savedRow, crashRow, pendingRow, kindRow, pressureRow, archiveRow, syncRow),
+        listGroup(savedRow, crashRow, pendingRow, reserveRow, kindRow, pressureRow, archiveRow, syncRow),
         repairCard,
         card(
           text("記録データ", 16f, bold = true),
@@ -184,6 +185,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val safe = Maintenance.SafeMode.maintenanceStopped
       val syncStopped = Maintenance.SafeMode.syncStopped
       val lost = LoggerWrites.Losses.total + LoggerWrites.Losses.uncounted
+      val counts = LoggerWrites.counts()
+      val reserve = Try(Storage.emergency.status).toOption
       val pendingCommit = AshidoriApp.archive.commitPending
       val stuck = CommitStatus.stuck()
       val attention = Attention.all()
@@ -207,13 +210,25 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         savedRow.value.setTextColor(color(if stale then attr.error else attr.onSurfaceVariant))
         crashRow.setValue(s"$crashes 回")
         crashRow.value.setTextColor(color(if crashes > 0 then attr.error else attr.onSurfaceVariant))
-        val pending = LoggerWrites.pending
-        pendingRow.setValue(s"$pending 行")
+        val pending = counts.pending
+        val emergency = reserve.contains(Emergency.Status.Released)
+        // Where the rows are: SQLite (this process), overflow files waiting
+        // for import, in memory, given up (in total).
+        pendingRow.setValue(if emergency then "退避中" else "通常")
+        pendingRow.value.setTextColor(color(if emergency then attr.error else attr.onSurfaceVariant))
         val commit = LoggerWrites.lastCommitAt
         pendingRow.setSubtitle(
-          (if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}") +
-            (if lost > 0 then s"・保存できなかった行 累計 $lost" else ""))
-        pendingRow.subtitle.setTextColor(color(if lost > 0 then attr.error else attr.onSurfaceVariant))
+          s"保存済み ${counts.saved} 行・退避済み ${counts.waitingFiles} 件・未保存 $pending 行・保存を断念 $lost 行" +
+            (if counts.uncounted > 0 then s"（うち未記録 ${counts.uncounted} 行）" else "") + "\n" +
+            (if commit == 0 then "このプロセスではまだ書き込みなし" else s"最後の書き込み ${full(commit).drop(5)}"))
+        pendingRow.subtitle.setTextColor(color(if lost > 0 || emergency then attr.error else attr.onSurfaceVariant))
+        reserveRow.setValue(reserve.fold("—")(_.label))
+        reserveRow.setSubtitle(reserve match
+          case Some(Emergency.Status.Ready) => s"${Emergency.R >> 20} MiB"
+          case Some(Emergency.Status.Released) => "空き容量の回復後に再確保"
+          case Some(Emergency.Status.None) => "空き容量の回復後に確保。地図の取得・バックアップ・整理は延期"
+          case _ => "")
+        reserveRow.value.setTextColor(color(if reserve.exists(r => r != Emergency.Status.Ready && r != Emergency.Status.Allocating) then attr.error else attr.onSurfaceVariant))
         val kinds = LoggerWrites.progress(Seq(WriteKind.Fixes, WriteKind.Motion, WriteKind.RawLines))
         kindRow.setSubtitle(kinds.map { (k, saved, unsaved) =>
           s"$k " + unsaved.map(u => s"${fmtDuration(u)}前から未保存").orElse(saved.map(a => s"${fmtDuration(a)}前")).getOrElse("—")
@@ -234,6 +249,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         archiveRow.value.setTextColor(color(if stuck.isDefined || safe || skipped.nonEmpty then attr.error else attr.onSurfaceVariant))
         showRepair(pendingCommit, stuck, attention, quarantined)
         savingText = s"saving=lastFix:${fix.map(full).getOrElse("none")} crashes24h=$crashes pending=$pending " +
+          s"saved=${counts.saved} spilledRows=${counts.spilled} overflowFiles=${counts.waitingFiles} uncounted=${counts.uncounted} reserve=${reserve.getOrElse("?")} " +
           s"safeMode=$safe syncStopped=$syncStopped lost=$lost skipped=${skipped.mkString(",")} " +
           s"commitPending=$pendingCommit stuck=${stuck.map(_.mkString("[", "; ", "]")).getOrElse("no")} " +
           s"quarantined=${attention.map(e => s"${e.path}->${e.quarantined}${if e.onlyCopy then "(only copy)" else ""}").mkString(",")}"

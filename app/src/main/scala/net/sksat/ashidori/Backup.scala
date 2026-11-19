@@ -77,7 +77,16 @@ object Backup:
   def writeQuarantine(c: Context, uri: Uri, progress: (Long, Long) => Unit): Written = writeZip(c, uri, progress, Mode.Quarantine)
 
   // One at a time: they share the copy of the database.
-  private def writeZip(c: Context, uri: Uri, progress: (Long, Long) => Unit, mode: Mode): Written = synchronized {
+  /** A backup failing for lack of space (ENOSPC, SQLITE_FULL) is reported to
+    * the logger's emergency path ([[Storage.noticeFailure]]).
+    */
+  private def writeZip(c: Context, uri: Uri, progress: (Long, Long) => Unit, mode: Mode): Written =
+    try writeZip0(c, uri, progress, mode)
+    catch case e: Exception =>
+      Storage.noticeFailure(e, "バックアップ")
+      throw e
+
+  private def writeZip0(c: Context, uri: Uri, progress: (Long, Long) => Unit, mode: Mode): Written = synchronized {
     val rescue = mode == Mode.Rescue
     val archive = AshidoriApp.archive
     val db = AshidoriApp.db
@@ -101,6 +110,10 @@ object Backup:
       if mode == Mode.Quarantine then 0L
       else db0 + db0 / 2 + size(archive.root) + size(LoggerWrites.Overflow.dir) + LoggingMargin +
         (if rescue then size(Maintenance.dir) else 0L)
+    // Large work waits for the logger's emergency reserve, and stops in an
+    // emergency (plan C stage 2): the quarantine export too, its destination
+    // may be on this storage.
+    if !Storage.largeWorkOpen() then throw java.io.IOException(Storage.DeferredText)
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量不足（${need >> 20} MB 必要）")
     // The main process's budget (design 6.8): an estimate reserved above L
@@ -129,6 +142,7 @@ object Backup:
     }
     // While it runs: stop before the logger has no room left.
     def checkSpace(written: Long): Unit =
+      if !Storage.largeWorkOpen() then throw java.io.IOException("記録の容量不足のため中断")
       if dir.getUsableSpace < floor then
         throw java.io.IOException(s"空き容量が ${floor >> 20} MB 未満のため中断（記録用の領域を確保）")
       if !space(written) then throw java.io.IOException("空き容量が記録用の予備を下回るため中断")

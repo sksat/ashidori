@@ -69,6 +69,10 @@ object Maintenance:
   val LowText = "空き容量が少ないため中断（続きは次回）"
   /** The last run stopped for the room (below H). */
   @volatile var stoppedLow = false
+  /** The progress line of a run deferred because the logger's emergency
+    * reserve is missing (not yet created, or released in an emergency).
+    */
+  val DeferText = "記録用の緊急予備がないため延期（空き容量の回復後に再開）"
 
   /** An unfinished commit cannot be finished (seen in the main process):
     * the maintenance process resolves it now where it can do so safely
@@ -104,6 +108,10 @@ object Maintenance:
     if AshidoriApp.newerDatabase.isDefined then return
     if !running.compareAndSet(false, true) then return
     try
+      // Large work waits for the logger's emergency reserve (plan C stage 2).
+      if !Storage.largeWorkOpen() then
+        Progress.set(DeferText, running = false)
+        return
       val db = AshidoriApp.db
       val archive = AshidoriApp.archive
       Progress.set(if manual then "修復を開始しました" else "未完了の整理を確認しています")
@@ -278,7 +286,23 @@ object Maintenance:
       if low.compareAndSet(false, true) then
         Progress.set(LowText)
         LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が ${Headroom.H / 1_000_000} MB に近い")
-    val stopOrLow = () => stop() || low.get
+    // The logger's emergency reserve, read from its file at the start and at
+    // every boundary (plan C stage 2): missing or released (an emergency in
+    // the main process), the run stops there and is deferred.
+    val deferred = AtomicBoolean(false)
+    def closed(): Boolean =
+      if Storage.largeWorkOpen() then false
+      else
+        if deferred.compareAndSet(false, true) then
+          stoppedLow = true
+          Progress.set(DeferText)
+          LifeLog.add(LifeKind.Note, "整理を延期: 記録用の緊急予備がない")
+        true
+    if closed() then
+      Progress.set(DeferText, running = false)
+      running.set(false)
+      return false
+    val stopOrLow = () => stop() || low.get || closed()
     val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false
     try
@@ -390,7 +414,7 @@ object Maintenance:
           case e: OutOfMemoryError => Log.w("monthly merge: out of memory", e)
           case NonFatal(e) => Log.w("monthly merge failed", e)
       if halt() then left = true
-      Progress.set(if low.get then LowText else if left then "中断（続きは次回）" else "完了", running = false)
+      Progress.set(if deferred.get then DeferText else if low.get then LowText else if left then "中断（続きは次回）" else "完了", running = false)
       // Then a bounded run of the 「訪れた日」 index (fewer days on battery).
       // Never a reason to run again: it is built while its list is open too.
       if !halt() then VisitDays.maintain(charging, halt)
