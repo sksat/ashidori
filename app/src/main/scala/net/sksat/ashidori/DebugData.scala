@@ -295,3 +295,59 @@ object DebugData:
           Log.i(f"visits bench: ${v.lat}%.4f,${v.lon}%.4f: ${got.size} days, query ${times.map(x => f"${x._1}%.1f").mkString("/")} ms, " +
             s"brute force ${want.size} days, ${if same then "same" else "DIFFERENT"}: ${show(got)}" +
             (if same then "" else s" | want ${show(want)}"))
+
+  /** Where the batches of a BATCHES run are: per batch id, its raw lines in
+    * SQLite and in completed overflow files (`.txt`), and its pressure sample
+    * in SQLite and in completed `.rec` files. A batch is complete in one
+    * place, or missing; never in two places, never partial, no row twice.
+    * `.tmp` files are counted apart (never complete).
+    */
+  def auditBatches(run: String, n: Int, lines: Int, base: Long): String =
+    import scala.util.Using
+    val db = AshidoriApp.db.getReadableDatabase
+    val rawDb = scala.collection.mutable.Map.empty[Int, Int].withDefaultValue(0)
+    Using.resource(db.rawQuery("SELECT line FROM raw_lines WHERE line LIKE ?", Array(s"Dbg,$run,%"))) { c =>
+      while c.moveToNext() do
+        val k = c.getString(0).split(',')(2).toInt
+        rawDb(k) += 1
+    }
+    val rawFile = scala.collection.mutable.Map.empty[Int, Int].withDefaultValue(0)
+    val tmpLines = scala.collection.mutable.Map.empty[Int, Int].withDefaultValue(0)
+    val dir = LoggerWrites.Overflow.dir
+    val files = Option(dir.listFiles()).toSeq.flatten
+    for f <- files do
+      val name = f.getName
+      val isTmp = name.endsWith(OverflowFiles.Partial)
+      if name.contains(".txt") then
+        for l <- String(java.nio.file.Files.readAllBytes(f.toPath), java.nio.charset.StandardCharsets.UTF_8).linesIterator do
+          val line = l.dropWhile(_ != '\t').drop(1)
+          if line.startsWith(s"Dbg,$run,") then
+            val k = line.split(',')(2).toInt
+            if isTmp then tmpLines(k) += 1 else rawFile(k) += 1
+    val pDb = scala.collection.mutable.Map.empty[Int, Int].withDefaultValue(0)
+    Using.resource(db.rawQuery("SELECT time FROM pressure WHERE hpa = 1234.5 AND time >= ? AND time < ?",
+        Array(base.toString, (base + n * 1000L).toString))) { c =>
+      while c.moveToNext() do
+        val t = c.getLong(0) - base
+        if t % 1000 == 0 then pDb((t / 1000).toInt) += 1
+    }
+    val pFile = scala.collection.mutable.Map.empty[Int, Int].withDefaultValue(0)
+    for f <- files if f.getName.endsWith(OverflowFiles.CompletedRecord) do
+      scala.util.Try(SmallRecord.decode(String(java.nio.file.Files.readAllBytes(f.toPath), java.nio.charset.StandardCharsets.UTF_8).trim)).toOption.foreach {
+        case SmallRecord.Pressure(ps) =>
+          for p <- ps if p.hPa == 1234.5f && p.time >= base && p.time < base + n * 1000L && (p.time - base) % 1000 == 0 do
+            pFile(((p.time - base) / 1000).toInt) += 1
+        case _ => ()
+      }
+    def place(db: Int, file: Int, whole: Int): String =
+      if db == whole && file == 0 then "db" else if file == whole && db == 0 then "file"
+      else if db == 0 && file == 0 then "missing" else s"bad(db=$db,file=$file)"
+    val raw = (0 until n).map(k => place(rawDb(k), rawFile(k), lines))
+    val pr = (0 until n).map(k => place(pDb(k), pFile(k), 1))
+    def tally(xs: Seq[String]) = xs.groupBy(identity).view.mapValues(_.size).toSeq.sortBy(_._1).map((k, v) => s"$k=$v").mkString(",")
+    def ids(xs: Seq[Int]) = if xs.size <= 30 then xs.mkString(" ") else xs.take(30).mkString(" ") + s" …(${xs.size})"
+    val missingRaw = (0 until n).filter(raw(_) == "missing")
+    s"raw[${tally(raw)}] pressure[${tally(pr)}] tmpLines=${tmpLines.values.sum}(batches ${tmpLines.keys.toSeq.sorted.mkString(" ")}) " +
+      s"missingRaw=${ids(missingRaw)} missingPressure=${ids((0 until n).filter(pr(_) == "missing"))} " +
+      s"bad=${ids((0 until n).filter(k => raw(k).startsWith("bad") || pr(k).startsWith("bad")))} " +
+      s"lost=${LoggerWrites.Losses.total}+${LoggerWrites.Losses.uncounted} overflowFiles=${files.size}"

@@ -201,6 +201,37 @@ class DebugReceiver extends BroadcastReceiver:
           Log.i("spilled a small-row batch")
         , "ashidori-spill-small").start()
       case "ashidori.debug.IMPORT" => LoggerWrites.markStart()
+      case "ashidori.debug.RESERVE" =>
+        // The emergency reserve and state (plan C stage 2).
+        AshidoriApp.io.execute(() =>
+          val e = Storage.emergency
+          Log.i(s"reserve: status ${e.status} gen ${e.generation} active ${e.active} largeWork ${e.largeWorkAllowed} " +
+            s"file ${Storage.ReserveFiles.file.length} free ${Storage.free()} counts ${LoggerWrites.counts()}"))
+      case "ashidori.debug.BATCHES" =>
+        // Batches of the logger with unique ids for the emergency path's tests:
+        // `n` raw batches of `lines` lines (`Dbg,<run>,<k>,<i>,<pad>`) and a
+        // pressure sample each (time base + k s, hPa 1234.5), every `ms` ms,
+        // through LoggerWrites like the logger's own. AUDIT_BATCHES accounts them.
+        val run = Option(intent.getStringExtra("run")).getOrElse("r")
+        val n = intent.getIntExtra("n", 100)
+        val lines = intent.getIntExtra("lines", 200)
+        val ms = intent.getIntExtra("ms", 200).toLong
+        val pad = "x" * intent.getIntExtra("pad", 40)
+        val base = intent.getLongExtra("base", System.currentTimeMillis())
+        Thread(() =>
+          Log.i(s"batches $run: base $base n $n lines $lines")
+          for k <- 0 until n do
+            LoggerWrites.rawLines((0 until lines).map(i => (base + k * 1000L + i, s"Dbg,$run,$k,$i,$pad")))
+            LoggerWrites.small(ashidori.core.SmallRecord.Pressure(Seq(ashidori.core.PressureSample(base + k * 1000L, 1234.5f))))
+            Thread.sleep(ms)
+          Log.i(s"batches $run: submitted $n")
+        , "ashidori-batches").start()
+      case "ashidori.debug.AUDIT_BATCHES" =>
+        val run = Option(intent.getStringExtra("run")).getOrElse("r")
+        val n = intent.getIntExtra("n", 100)
+        val lines = intent.getIntExtra("lines", 200)
+        val base = intent.getLongExtra("base", 0L)
+        AshidoriApp.io.execute(() => Log.i(s"audit batches $run: ${DebugData.auditBatches(run, n, lines, base)}"))
       case "ashidori.debug.AUDIT_SIGNALS" =>
         val d = LocalDate.now(AshidoriApp.zone).minusDays(intent.getIntExtra("daysAgo", 2))
         Thread(() => DebugData.auditSignals(d).foreach(l => Log.i(s"audit $l")), "ashidori-audit-signals").start()
