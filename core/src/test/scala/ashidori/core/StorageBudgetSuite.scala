@@ -220,3 +220,91 @@ class StorageBudgetSuite extends munit.FunSuite:
     other.release()
     assertEquals(b.outstanding, 0L)
   }
+
+  test("a backup's estimate decides its start only: used up, it goes on while the free space leaves L, the others and n") {
+    var free = 10_000L << 20
+    val L = 1_000L << 20
+    val b = StorageBudget(() => free, () => L)
+    val r = b.reserve(100L << 20).get
+    // It wrote more than it estimated (the copy, a WAL kept by a reader).
+    r.account(150L << 20)
+    assertEquals(r.outstanding, 0L)
+    free = L + (5L << 20)
+    assert(r.continues(SpaceGuard.Chunk), "stopped only because its own estimate is used up")
+    // Its own rest is not held against it either.
+    val s = b.reserve(1L << 20).get
+    s.release()
+    val t = b.reserve(0).get
+    r.account(10L << 20)
+    assert(r.continues(SpaceGuard.Chunk))
+    // Another reservation's rest is.
+    free = L + (60L << 20)
+    val other = b.reserve((59L << 20) + (1L << 19)).get
+    assert(!r.continues(SpaceGuard.Chunk), "the other reservation's rest must stay free")
+    other.release()
+    assert(r.continues(SpaceGuard.Chunk))
+    // Below L + n: it stops.
+    free = L + 1000
+    assert(!r.continues(SpaceGuard.Chunk))
+    t.release()
+    r.release()
+  }
+
+  test("bulk SQLite writes: a shortfall after the last batch is reported too, and its rows stay done") {
+    val H = 1_000L << 20
+    var free = H + (20L << 20)
+    var left = 100
+    val seen = scala.collection.mutable.ArrayBuffer.empty[BulkLoop.Batch]
+    val r = scala.util.Try(BulkLoop.run(BatchSizer(), SpaceGuard(() => free, () => H), () => free, () => 0L, seen += _) { n =>
+      val k = math.min(n, left)
+      left -= k
+      // The last batch takes 10 MiB: H + M is not left after it.
+      if left == 0 then free -= 10L << 20
+      (k, n, left > 0)
+    })
+    assertEquals(left, 0, "every row done")
+    assertEquals(seen.size, 2)
+    assert(seen.last.freeAfter - H < Headroom.M)
+    assert(r.failed.toOption.exists(_.isInstanceOf[StorageBudget.NoRoom]), s"not reported: $r")
+    // With room after the last batch: done, nothing reported.
+    free = H + (100L << 20)
+    left = 10
+    assertEquals(BulkLoop.run(BatchSizer(), SpaceGuard(() => free, () => H), () => free, () => 0L) { n =>
+      val k = math.min(n, left); left -= k; (k, n, left > 0)
+    }, 10L)
+  }
+
+  test("old logs imported through the bulk loop: each batch's growth and the free space after it recorded; stopped before and after") {
+    val H = 1_000L << 20
+    var free = H + (40L << 20)
+    var files = 0L
+    val lines = (0 until 200_000).map(i => s"Raw,$i," + "x" * 100)
+    val sizer = BatchSizer(start = 64 * 1024, min = 4 * 1024, max = LegacyBatches.MaxBytes.toInt)
+    var budget = sizer.rows.toLong
+    val batches = LegacyBatches(lines.iterator, () => budget)
+    val imported = scala.collection.mutable.ArrayBuffer.empty[String]
+    val seen = scala.collection.mutable.ArrayBuffer.empty[BulkLoop.Batch]
+    val r = scala.util.Try(BulkLoop.run(sizer, SpaceGuard(() => free, () => H), () => free, () => files, seen += _) { size =>
+      budget = size.toLong
+      val chunk = batches.next()
+      val text = chunk.map(LegacyBatches.utf8).sum
+      imported ++= chunk
+      // The database grows by twice the text.
+      files += text * 2
+      free -= text * 2
+      (chunk.size, text.toInt, batches.hasNext)
+    })
+    // Every batch recorded with its growth and the free space after it.
+    assert(seen.nonEmpty)
+    for (b, k) <- seen.zipWithIndex do
+      assert(b.grown > 0, b.toString)
+      assert(b.freeAfter <= H + (40L << 20), b.toString)
+    assertEquals(seen.map(_.grown).sum, files)
+    // The text budget grew from 64 KiB while batches grew the files by little.
+    assert(seen.map(_.rows).max > 64 * 1024, seen.map(_.rows).toString)
+    // It stopped on a shortfall (after a batch); what was imported is a prefix, nothing skipped.
+    assert(r.failed.toOption.exists(_.isInstanceOf[StorageBudget.NoRoom]))
+    assertEquals(imported.toSeq, lines.take(imported.size))
+    assert(seen.last.freeAfter - H < Headroom.M)
+  }
+

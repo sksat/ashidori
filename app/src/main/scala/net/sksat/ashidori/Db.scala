@@ -1019,11 +1019,13 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   /** The last bulk batch: its rows, what it made the files grow, the free space after it. */
   @volatile var lastBatch: Option[BulkLoop.Batch] = None
 
+  /** Records a bulk batch (also the legacy import's, in bytes of text). */
+  def recordBatch(b: BulkLoop.Batch): Unit =
+    lastBatch = Some(b)
+    if Db.debugBulk then Log.i(s"bulk batch: ${b.rows} asked, grew ${b.grown} bytes, free after ${b.freeAfter}")
+
   private def bulk(f: Int => (Int, Int, Boolean)): Long =
-    BulkLoop.run(sizer, Storage.guard, () => Storage.free(), () => fileBytes, b => {
-      lastBatch = Some(b)
-      if Db.debugBulk then Log.i(s"bulk batch: ${b.rows} rows, grew ${b.grown} bytes, free after ${b.freeAfter}, next ${sizer.rows}")
-    })(f)
+    BulkLoop.run(sizer, Storage.guard, () => Storage.free(), () => fileBytes, recordBatch)(f)
 
   /** The WAL written back into the database and truncated (after a
     * maintenance run), if the free space holds the WAL's size above the

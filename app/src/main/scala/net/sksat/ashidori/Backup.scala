@@ -114,15 +114,17 @@ object Backup:
     var accounted = 0L
     val floor = if mode == Mode.Quarantine then QuarantineFloor else LoggingMargin
     // What has been written on this storage (the copy, then the ZIP's
-    // output bytes) goes to the reservation; false once the free space
-    // would cut into the reserve.
+    // output bytes) goes to the reservation (its rest shrinks, for the other
+    // writes); then whether it goes on: the free space must leave L, the
+    // other reservations and 1 MiB. Its own estimate decided only its start:
+    // used up, it is not a reason to stop.
     // Its own lock: the copy's watcher calls it while this object's lock is held.
     val spaceLock = new Object
     def space(written: Long): Boolean = spaceLock.synchronized {
       reserved.forall { r =>
-        val more = math.max(0L, written - accounted)
         accounted = math.max(accounted, written)
-        r.wrote(more)
+        r.account(accounted)
+        r.continues(ashidori.core.SpaceGuard.Chunk)
       }
     }
     // While it runs: stop before the logger has no room left.
@@ -174,7 +176,7 @@ object Backup:
                 // Others (the logger, maintenance, other apps) may take room
                 // too: cancelled once less than 1 MiB is left above L and the
                 // other reservations, measured on the real free space.
-                if !space(snapshot.length) || reserved.exists(r => !r.guard.allows(ashidori.core.SpaceGuard.Chunk)) then
+                if !space(snapshot.length) then
                   breached = true
                   sig.cancel()
             catch case _: InterruptedException => ()

@@ -104,10 +104,11 @@ object BatchSizer:
   val Grow: Long = 4L << 20
 
 /** One bulk SQLite write in batches (design 6.8): before each batch the
-  * free space must leave H and M (`guard.allows(M)`), and after it again;
-  * a shortfall after a batch keeps what it committed and starts no next
-  * batch ([[StorageBudget.NoRoom]]: deferred to a later run). No row is
-  * ever dropped to go on. `batch(n)` does one transaction of up to `n`
+  * free space must leave H and M (`guard.allows(M)`), and after it again,
+  * the last batch included; a shortfall after a batch keeps what it
+  * committed, starts no next batch and is reported to the caller
+  * ([[StorageBudget.NoRoom]]: deferred to a later run). No row is ever
+  * dropped to go on. `batch(n)` does one transaction of up to `n`
   * rows and gives (rows done, rows asked, more left); `files()` is the
   * database and its WAL's size; each batch's growth and the free space
   * after it go to `seen`.
@@ -128,7 +129,7 @@ object BulkLoop:
       seen(Batch(asked, grown, free()))
       total += done
       more = left
-      if more then guard.check(Headroom.M)
+      guard.check(Headroom.M)
     total
 
 final class StorageBudget(free: () => Long, reserve: () => Long):
@@ -141,6 +142,17 @@ final class StorageBudget(free: () => Long, reserve: () => Long):
       written += n
       okLocked
     }
+
+    /** `total` bytes written in all so far (its rest shrinks; nothing decided). */
+    def account(total: Long): Unit = StorageBudget.this.synchronized {
+      written = math.max(written, total)
+    }
+
+    /** Whether a write whose estimate decided only its start goes on with an
+      * output of `n`: the free space must leave L, the other reservations'
+      * rest and `n`; its own estimate, used up or not, is not a reason to stop.
+      */
+    def continues(n: Long): Boolean = guard.allows(n)
 
     /** For a file being brought to `bytes`: it is `size` bytes long now. A
       * file that became shorter (a restart from the start, a discarded
