@@ -54,6 +54,16 @@ object Maintenance:
       val wait = math.max(0L, MinUptimeMs - (SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime))
       js.schedule(job(JobDelayed).setMinimumLatency(wait).setOverrideDeadline(wait + 6 * 3_600_000L).build())
 
+  /** The logger ran short of space (plan C stage 2): the running and queued
+    * jobs are cancelled (a running one stops at its next boundary through
+    * onStopJob; nothing waits). [[schedule]] queues them again after recovery.
+    */
+  def cancelJobs(): Unit =
+    Try {
+      val js = ctx.getSystemService(classOf[JobScheduler])
+      Seq(JobIdle, JobDelayed, JobManual, JobRepair).foreach(js.cancel)
+    }.failed.foreach(e => Log.w("cancelling the maintenance jobs failed", e))
+
   /** Runs now, also for days skipped after failures; clears the crash-loop
     * switch (the user asked for it).
     */

@@ -45,12 +45,14 @@ object LoggerWrites:
   private lazy val stall = WriteStall.Alert(WriteStall.Monitor(Alerts.restoredStall()), Alerts.StallEffects)
 
   @volatile private var lastSubmitUptime = Long.MinValue / 2
-  /** Batches are coming (the logger is on and running, or one was handed
-    * over in the last minute): recovery from the emergency state waits for
-    * one saved in SQLite ([[EmergencyReserve.tick]]).
+  /** Batches are coming: the logger is on and running, one was handed over
+    * in the last minute, or some are waiting or being written. Recovery from
+    * the emergency state then waits for one saved in SQLite
+    * ([[EmergencyReserve.tick]]).
     */
   def logging: Boolean =
-    Settings.loggingEnabled && LoggerState.running || SystemClock.uptimeMillis() - lastSubmitUptime < 60_000L
+    Settings.loggingEnabled && LoggerState.running || SystemClock.uptimeMillis() - lastSubmitUptime < 60_000L ||
+      pending > 0
 
   /** Rows of this process: committed to SQLite, kept in overflow files. */
   private val savedRows = java.util.concurrent.atomic.AtomicLong()
@@ -72,7 +74,10 @@ object LoggerWrites:
           Log.w(s"saving $rows $what failed", e)
           throw e
       def spill(): Unit =
-        file.write()
+        try file.write()
+        catch case e: Exception =>
+          Log.w(s"keeping $rows $what in ${file.name} failed: ${LifeLog.describe(e)}")
+          throw e
         spilledRows.addAndGet(rows)
         backlog.synchronized(backlog.spill(rows))
       def lost(why: String): Unit = lostNow(rows, s"$what（$why）")
@@ -105,12 +110,12 @@ object LoggerWrites:
               case EmergencyPath.Outcome.Saved =>
                 savedRows.addAndGet(rows)
                 // Rows lost while their count could not be written: written now.
-                if Losses.uncounted > 0 then Losses.flush()
+                if Losses.unwritten then Losses.flush()
               case _ => ()
             backlog.synchronized(backlog.done(id, rows, raw, SystemClock.uptimeMillis(),
               lost = outcome == EmergencyPath.Outcome.Lost, failed = outcome != EmergencyPath.Outcome.Saved))
             note()
-          if outcome == EmergencyPath.Outcome.Saved then importOverflow()
+          if outcome == EmergencyPath.Outcome.Saved then imports.request()
         }
 
   /** A batch of small rows, kept in a file if it cannot be saved now.
@@ -129,17 +134,24 @@ object LoggerWrites:
   def deleteRange(from: Long, to: Long)(done: scala.util.Try[Unit] => Unit): Unit =
     exec.execute(() => done(Try(commit(_.deleteRange(from, to)))))
 
-  /** Imports overflow files (on the write thread), never in the emergency
-    * state; new batches first: after each file it yields to any batch
-    * waiting ([[Overflow.importSome]]).
+  /** The import of overflow files: one file per step on this queue, behind
+    * any batch waiting, until none is left; never in the emergency state
+    * ([[ImportChain]]).
     */
-  private def importOverflow(): Unit =
-    if !Storage.emergency.active then
-      Overflow.importSome(() => backlog.synchronized(backlog.pending))
-      SmallOverflow.importSome(() => backlog.synchronized(backlog.pending))
+  private lazy val imports: ImportChain =
+    val retry = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => Thread(r, "ashidori-import-retry"))
+    ImportChain(r => exec.execute(r), (r, ms) => retry.schedule(r, ms, java.util.concurrent.TimeUnit.MILLISECONDS),
+      () => backlog.synchronized(backlog.pending), () => Storage.emergency.active,
+      skip => ImportChain.order(Option(Overflow.dir.list()).toSeq.flatten).find(n => !skip(n) && !SmallOverflow.undecodable(n)),
+      name =>
+        val f = File(Overflow.dir, name)
+        val before = backlog.synchronized(backlog.pending)
+        val step = if name.endsWith(OverflowFiles.CompletedRecord) then SmallOverflow.importOne(f) else Overflow.importOne(f)
+        Log.i(s"overflow import $name: $step (waiting at start $before, after ${backlog.synchronized(backlog.pending)})")
+        step)
 
   /** The emergency state ended: the overflow files are imported (behind any batch queued). */
-  def resumeImport(): Unit = exec.execute(() => importOverflow())
+  def resumeImport(): Unit = imports.request()
 
   def fixes(fs: Seq[Fix]): Unit =
     if fs.nonEmpty then small(SmallRecord.Fixes(fs))
@@ -163,6 +175,14 @@ object LoggerWrites:
     * at once, its transaction ended by [[Db]], for the emergency path.
     */
   private def commit(write: Db => Unit): Unit =
+    // SQLITE_FULL in a statement: the emergency path begins (stop requests,
+    // R released) before the transaction is rolled back (Db.tx).
+    Db.beforeRollback.set(e =>
+      if NoSpace.full(e) then Storage.emergency.enter(Emergency.Reason.SqliteFull, LifeLog.describe(e)))
+    try commit0(write)
+    finally Db.beforeRollback.remove()
+
+  private def commit0(write: Db => Unit): Unit =
     val start = SystemClock.uptimeMillis()
     var pause = 200L
     var failures = 0
@@ -210,7 +230,7 @@ object LoggerWrites:
     */
   def markStart(): Unit =
     lastCommitUptime = math.max(lastCommitUptime, SystemClock.uptimeMillis())
-    exec.execute(() => importOverflow())
+    imports.request()
 
   /** Called now and then while logging: reports (once) when nothing was
     * committed for longer than the plan explains, or when a batch has been
@@ -235,30 +255,32 @@ object LoggerWrites:
       else LifeLog.add(LifeKind.Note, "記録の保存が再開しました")
     }
 
-  /** Count of rows given up, kept on disk (shown in 端末診断). */
+  /** Count of rows given up, kept on disk (shown in 端末診断): a failed
+    * write keeps its target total and writes that again ([[LossCounter]]).
+    */
   object Losses:
     private def file = File(Maintenance.dir, "write-losses")
-    /** Rows lost that could not be counted on disk (shown as well). */
-    @volatile var uncounted = 0L
-    def total: Long = Try(String(java.nio.file.Files.readAllBytes(file.toPath), UTF_8).trim.toLong).getOrElse(0L)
-    def add(rows: Int): Unit = synchronized {
-      try
-        Maintenance.write(file, (total + uncounted + rows).toString)
-        uncounted = 0
-      catch case NonFatal(e) =>
-        uncounted += rows
+    private def read(): Long = Try(String(java.nio.file.Files.readAllBytes(file.toPath), UTF_8).trim.toLong).getOrElse(0L)
+    private val counter = LossCounter(() => read(), t =>
+      Maintenance.write(file, t.toString)
+      // Debug builds: the directory sync after the rename fails once.
+      if Storage.debugOnce("debug-losses-sync-fails") then throw java.io.IOException("debug: directory sync after the rename failed"))
+    /** Rows given up in all (on disk, or not written yet). */
+    def total: Long = counter.total
+    /** Rows given up whose count is not on disk yet (shown as well; lost if the process ends). */
+    def uncounted: Long = counter.uncounted
+    def unwritten: Boolean = counter.unwritten
+    def add(rows: Int): Unit =
+      counter.add(rows).foreach { e =>
         Log.w(s"counting lost rows on disk failed: ${LifeLog.describe(e)}")
         LifeLog.add(LifeKind.Note, s"失われた行数をファイルに記録できず（$rows 行）: ${LifeLog.describe(e)}")
-    }
-    /** Writes the rows not counted on disk yet (when there is room again). */
-    def flush(): Unit = synchronized {
-      if uncounted > 0 then
-        try
-          Maintenance.write(file, (total + uncounted).toString)
-          LifeLog.add(LifeKind.Note, s"失われた行数を記録（$uncounted 行、累計 $total 行）")
-          uncounted = 0
-        catch case NonFatal(e) => Log.w(s"counting lost rows on disk failed again: ${LifeLog.describe(e)}")
-    }
+      }
+    /** Writes the total not on disk yet (when there is room again). */
+    def flush(): Unit =
+      if counter.unwritten then
+        counter.flush() match
+          case None => LifeLog.add(LifeKind.Note, s"失われた行数を記録（累計 $total 行）")
+          case Some(e) => Log.w(s"counting lost rows on disk failed again: ${LifeLog.describe(e)}")
 
 
   /** Names the overflow files of this process apart from any other's
@@ -266,13 +288,6 @@ object LoggerWrites:
     */
   private[ashidori] lazy val processTag: String =
     java.lang.Long.toString(System.currentTimeMillis(), 36) + "p" + android.os.Process.myPid()
-
-  /** Whether the import may take another file: the first while the queue
-    * is short, the next only while no batch waits (new records first), and
-    * none in the emergency state.
-    */
-  private[ashidori] def importMayGo(taken: Int, pending: () => Long, cap: Long): Boolean =
-    !Storage.emergency.active && (if taken == 0 then pending() < cap / 2 else pending() == 0)
 
   /** Raw-line batches kept in files (one per batch, fsynced) until imported.
     * An import inserts a file's lines and records it in one transaction
@@ -296,14 +311,12 @@ object LoggerWrites:
     /** Writes `lines` to an overflow file now (debug builds' SPILL). */
     def spill(lines: Seq[(Long, String)]): Unit = batch(lines).write()
 
-    /** Imports overflow files (on the write thread): see [[importMayGo]]. */
-    def importSome(pending: () => Long): Unit =
-      val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(OverflowFiles.Completed)).sortBy(_.getName)
-      var taken = 0
-      // A backup holds the lock while it copies the database: the import waits
-      // for the next commit then, the logger's writes never wait for it.
-      for f <- files.take(20) if importMayGo(taken, pending, WriteBacklog.MaxRawRows) && lock.tryLock() do
-        taken += 1
+    /** Imports one file (on the write thread). Busy while a backup holds
+      * the lock (the logger's writes never wait for it).
+      */
+    def importOne(f: File): ImportChain.Step =
+      if !lock.tryLock() then ImportChain.Step.Busy
+      else
         try
           val db = AshidoriApp.db
           val key = s"overflow|${f.getName}"
@@ -319,15 +332,22 @@ object LoggerWrites:
             def syncDir(): Unit = ArchiveStore.syncDir(dir)
             def unmark(): Unit = db.legacyDone(key)
           ) match
-            case OverflowImport.Result.Kept => Log.w(s"overflow $f imported but not deleted; kept marked")
-            case _ => ()
+            case OverflowImport.Result.Kept =>
+              Log.w(s"overflow $f imported but not deleted; kept marked")
+              ImportChain.Step.Failed
+            case _ => ImportChain.Step.Imported
         catch case NonFatal(e) =>
           Log.w(s"overflow import of $f failed", e)
           Storage.noticeFailure(e, "退避ファイルの取り込み")
+          ImportChain.Step.Failed
         finally lock.unlock()
 
   /** Debug builds: the process killed after an overflow file's write, fsync or rename ([[Storage.debugKill]]). */
-  private[ashidori] val debugCrash: String => Unit = p => Storage.debugKill(s"overflow-$p")
+  private[ashidori] val debugCrash: String => Unit = p =>
+    // Debug builds: the rename of a synced `.tmp` fails once (as for want of room).
+    if p == "move" && Storage.debugOnce("debug-overflow-rename-fails") then
+      throw java.io.IOException("debug: rename failed: No space left on device")
+    Storage.debugKill(s"overflow-$p")
 
   /** Counts for 端末診断: rows saved to SQLite and kept in overflow files by
     * this process, overflow files waiting to be imported, rows waiting (not

@@ -196,13 +196,20 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   private def w = getWritableDatabase
   private def r = getReadableDatabase
 
-  /** One transaction, ended in every case. A failure in its statements
-    * (SQLITE_FULL in an INSERT included) rolls it back and is thrown as it
-    * was (a failure of the rollback is attached, never in its place); a
-    * failure at COMMIT is thrown by `endTransaction` after SQLite rolled the
-    * transaction back. Either way nothing of it is committed, and the
-    * connection is out of the transaction: the logger then keeps the batch
-    * in an overflow file ([[LoggerWrites]]).
+  /** One transaction, ended in every case, the connection out of it after.
+    *
+    *  - A failure in its statements (SQLITE_FULL in an INSERT included) is
+    *    first given to [[Db.beforeRollback]] (the logger's write thread:
+    *    the emergency path begins, R released, while the transaction is
+    *    still open), then the transaction is rolled back and the failure
+    *    thrown as it was (a failure of the rollback attached, never in its
+    *    place). Nothing of it is committed.
+    *  - A failure at COMMIT is found only by `endTransaction`, which throws
+    *    it: the emergency path begins after. For SQLITE_FULL SQLite rolls
+    *    the transaction back. The outcome of a failed COMMIT is not certain
+    *    in general (an I/O error after the commit record was written may
+    *    leave it committed): such a batch may then be kept in overflow too
+    *    and imported twice. This is outside plan C stage 2 (design 11.2).
     */
   private def tx[A](f: SQLiteDatabase => A): A =
     val db = w
@@ -214,6 +221,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         db.setTransactionSuccessful()
         a
       catch case e: Throwable =>
+        try Option(Db.beforeRollback.get).foreach(_(e))
+        catch case e2: Throwable => e.addSuppressed(e2)
         try db.endTransaction()
         catch case e2: Throwable => e.addSuppressed(e2)
         throw e
@@ -1440,6 +1449,11 @@ object Db:
         java.io.File(Maintenance.dir, "debug-full-insert").exists then
       throw android.database.sqlite.SQLiteFullException("debug: database or disk is full (in the transaction)")
   @volatile var debugTx = false
+
+  /** Told of a failure in a transaction's statements before it is rolled
+    * back (this thread only; the logger's write thread sets it).
+    */
+  val beforeRollback: ThreadLocal[Throwable => Unit] = ThreadLocal()
 
   /** The archive file of an upload mark (`<reg>|up:<file>`, `upgen:`,
     * `uppart:`, `upbytes:`), if `name` is one.

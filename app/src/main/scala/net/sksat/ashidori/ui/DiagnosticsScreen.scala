@@ -184,7 +184,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
       val skipped = Try(Maintenance.Guard.skipped()).getOrElse(Nil)
       val safe = Maintenance.SafeMode.maintenanceStopped
       val syncStopped = Maintenance.SafeMode.syncStopped
-      val lost = LoggerWrites.Losses.total + LoggerWrites.Losses.uncounted
+      val lost = LoggerWrites.Losses.total
       val counts = LoggerWrites.counts()
       val reserve = Try(Storage.emergency.status).toOption
       val pendingCommit = AshidoriApp.archive.commitPending

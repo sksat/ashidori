@@ -36,11 +36,12 @@ object Storage:
 
   /** Large work other than logging may start or go on: the emergency
     * reserve is ready and no emergency is in progress. The main process
-    * knows ([[emergency]]); the maintenance process reads the reserve file
-    * (present at its full length), at its start and at each boundary.
+    * knows ([[emergency]]); the maintenance process reads the files (R at
+    * its full length, no emergency mark), at its start and at each boundary.
+    * Its jobs are also cancelled when the emergency state is entered.
     */
   def largeWorkOpen(): Boolean =
-    if AshidoriApp.isMaintenanceProcess then ReserveFiles.onDisk() == Emergency.OnDisk.Full
+    if AshidoriApp.isMaintenanceProcess then ReserveFiles.onDisk() == Emergency.OnDisk.Full && !ReserveFiles.marked
     else emergency.largeWorkAllowed
 
   /** Why large work is deferred, when it is (shown). */
@@ -55,9 +56,13 @@ object Storage:
     val sustain = debugLong("debug-emergency-sustain-ms").getOrElse(Emergency.SustainMs)
     val r = EmergencyReserve(ReserveFiles, () => android.os.SystemClock.elapsedRealtime(),
       // Large work stops by the gate closing (its next output, batch or
-      // watcher check: largeWorkOpen) and, in the maintenance process, by the
-      // released file; nothing is waited for.
-      () => Log.w("emergency: large work asked to stop"),
+      // watcher check: largeWorkOpen); the maintenance process by its jobs
+      // cancelled (onStopJob) and by the mark it reads at each boundary.
+      // Nothing is waited for.
+      () =>
+        Log.w("emergency: large work asked to stop")
+        Maintenance.cancelJobs()
+      ,
       ev => monitor.execute(() => onEvent(ev)), e = e, sustainMs = sustain)
     r.restore()
     r
@@ -67,7 +72,13 @@ object Storage:
   /** Every 5 s: the recovery clock, or the first creation of R. */
   private def watch(): Unit =
     monitor.scheduleWithFixedDelay(() =>
-      try if emergency.tick(LoggerWrites.logging) then emergency.allocate()
+      try
+        emergency.tick(LoggerWrites.logging).foreach { p =>
+          // Debug builds: a shortage right after the decision (the permit must be void).
+          if debugOnce("debug-enter-after-permit") then emergency.enter(Emergency.Reason.Reported, "debug: after the decision")
+          emergency.allocate(p)
+        }
+        emergency.tidy()
       catch case scala.util.control.NonFatal(e) => Log.w("emergency reserve check failed", e)
     , 1, 5, java.util.concurrent.TimeUnit.SECONDS)
 
@@ -162,11 +173,25 @@ object Storage:
       debugKill("reserve-released")
       file.length
     def remove(): Boolean =
-      val ok = file.delete() || !file.exists
-      scala.util.Try(ArchiveStore.syncDir(dir))
-      ok
-    def markReleased(): Unit =
-      if file.createNewFile() then scala.util.Try(ArchiveStore.syncDir(dir))
+      if debugFile("debug-reserve-remove-fails").exists then
+        debugKill("reserve-remove-failed")
+        false
+      else
+        val ok = file.delete() || !file.exists
+        scala.util.Try(ArchiveStore.syncDir(dir))
+        ok
+    /** The emergency mark: its own file, independent of R. */
+    def markFile: File = File(dir, "emergency-state")
+    def mark(): Unit =
+      if debugFile("debug-mark-fails").exists then throw java.io.IOException("debug: mark: No space left on device")
+      if !markFile.exists then
+        scala.util.Using.resource(java.io.FileOutputStream(markFile))(_.getFD.sync())
+      ArchiveStore.syncDir(dir)
+      debugKill("emergency-marked")
+    def marked: Boolean = markFile.exists
+    def unmark(): Unit =
+      if !markFile.delete() && markFile.exists then throw java.io.IOException(s"cannot delete $markFile")
+      ArchiveStore.syncDir(dir)
 
   // --- debug builds: knobs of the emergency path's tests ---------------------------------
 
@@ -174,6 +199,9 @@ object Storage:
   private def debugLong(name: String): Option[Long] =
     if !debuggable then None
     else scala.util.Try(String(java.nio.file.Files.readAllBytes(debugFile(name).toPath), java.nio.charset.StandardCharsets.UTF_8).trim.toLong).toOption
+
+  /** Debug builds: true once if `files/maintenance/<name>` exists (removed). */
+  def debugOnce(name: String): Boolean = debuggable && { val f = debugFile(name); f.exists && f.delete() }
 
   /** Debug builds: the process is killed here once if `files/maintenance/debug-kill-<point>` exists (removed first). */
   def debugKill(point: String): Unit =

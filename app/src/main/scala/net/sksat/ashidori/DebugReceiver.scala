@@ -195,11 +195,24 @@ class DebugReceiver extends BroadcastReceiver:
         val to = from + intent.getIntExtra("minutes", 60) * 60_000L
         LoggerWrites.deleteRange(from, to)(r => Log.i(s"deleted [$from, $to): $r"))
       case "ashidori.debug.SPILL_SMALL" =>
+        // `files` small-row batches (10 pressure samples each) in overflow files.
+        val n = intent.getIntExtra("files", 1)
         Thread(() =>
           val t = System.currentTimeMillis()
-          SmallOverflow.spill(ashidori.core.SmallRecord.Pressure((0 until 10).map(i => ashidori.core.PressureSample(t + i * 5000L, 1000f))))
-          Log.i("spilled a small-row batch")
+          for k <- 0 until n do
+            SmallOverflow.spill(ashidori.core.SmallRecord.Pressure((0 until 10).map(i => ashidori.core.PressureSample(t + k * 50_000L + i * 5000L, 1000f))))
+          Log.i(s"spilled $n small-row batches")
         , "ashidori-spill-small").start()
+      case "ashidori.debug.LOSE" =>
+        // Counts `rows` lost rows (the loss counter's tests).
+        val n = intent.getIntExtra("rows", 10)
+        AshidoriApp.io.execute(() =>
+          LoggerWrites.Losses.add(n)
+          Log.i(s"lose $n: total ${LoggerWrites.Losses.total} uncounted ${LoggerWrites.Losses.uncounted} unwritten ${LoggerWrites.Losses.unwritten}"))
+      case "ashidori.debug.LOSSES_FLUSH" =>
+        AshidoriApp.io.execute(() =>
+          LoggerWrites.Losses.flush()
+          Log.i(s"losses flushed: total ${LoggerWrites.Losses.total} uncounted ${LoggerWrites.Losses.uncounted} unwritten ${LoggerWrites.Losses.unwritten}"))
       case "ashidori.debug.IMPORT" => LoggerWrites.markStart()
       case "ashidori.debug.RESERVE" =>
         // The emergency reserve and state (plan C stage 2).

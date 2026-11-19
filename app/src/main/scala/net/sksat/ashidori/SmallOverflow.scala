@@ -18,7 +18,7 @@ import ashidori.core.*
 object SmallOverflow:
   private def dir: File = LoggerWrites.Overflow.dir
   private val seq = java.util.concurrent.atomic.AtomicLong()
-  @volatile private var undecodable = Set.empty[String]
+  @volatile private var undecodableSet = Set.empty[String]
 
   /** The overflow file of `r` (named now, written when needed, at most once:
     * [[OverflowFiles.Batch]]).
@@ -45,38 +45,41 @@ object SmallOverflow:
   /** Files waiting to be imported. */
   def waiting: Int = Option(dir.listFiles()).toSeq.flatten.count(_.getName.endsWith(OverflowFiles.CompletedRecord))
 
-  /** Imports spilled batches, oldest first, while the queue is short (on
-    * the write thread, as the raw-line overflow).
+  /** Files that could not be read (kept, never deleted unread; reported once). */
+  def undecodable(name: String): Boolean = undecodableSet(name)
+
+  /** Imports one spilled batch (on the write thread). Busy while a backup
+    * holds the lock.
     */
-  def importSome(pending: () => Long): Unit =
+  def importOne(f: File): ImportChain.Step =
     val lock = LoggerWrites.Overflow.lock
-    val files = Option(dir.listFiles()).toSeq.flatten.filter(_.getName.endsWith(OverflowFiles.CompletedRecord)).filterNot(f => undecodable(f.getName))
-      .sortBy(_.getName)
-    var taken = 0
-    for f <- files.take(50) if LoggerWrites.importMayGo(taken, pending, WriteBacklog.MaxOtherRows) && lock.tryLock() do
-      taken += 1
+    if !lock.tryLock() then ImportChain.Step.Busy
+    else
       try
         val db = AshidoriApp.db
         val key = s"overflow|${f.getName}"
         val rec =
           try Some(SmallRecord.decode(String(java.nio.file.Files.readAllBytes(f.toPath), UTF_8).trim))
           catch case NonFatal(e) =>
-            // Kept as it is (never deleted unread); reported once.
-            undecodable += f.getName
+            undecodableSet += f.getName
             LifeLog.add(LifeKind.Note, s"退避した記録を読めず: ${f.getName}（${LifeLog.describe(e)}）")
             None
-        rec.foreach { r =>
-          OverflowImport.run(new OverflowImport.Ops:
-            def marked = db.legacyImported(key) != 0
-            def insertMarked(): Unit = db.importMarked(key)(apply(db, r))
-            def deleteFile(): Boolean = f.delete() || !f.exists
-            def syncDir(): Unit = ArchiveStore.syncDir(dir)
-            def unmark(): Unit = db.legacyDone(key)
-          ) match
-            case OverflowImport.Result.Kept => Log.w(s"overflow $f imported but not deleted; kept marked")
-            case _ => ()
-        }
+        rec match
+          case None => ImportChain.Step.Failed
+          case Some(r) =>
+            OverflowImport.run(new OverflowImport.Ops:
+              def marked = db.legacyImported(key) != 0
+              def insertMarked(): Unit = db.importMarked(key)(apply(db, r))
+              def deleteFile(): Boolean = f.delete() || !f.exists
+              def syncDir(): Unit = ArchiveStore.syncDir(dir)
+              def unmark(): Unit = db.legacyDone(key)
+            ) match
+              case OverflowImport.Result.Kept =>
+                Log.w(s"overflow $f imported but not deleted; kept marked")
+                ImportChain.Step.Failed
+              case _ => ImportChain.Step.Imported
       catch case NonFatal(e) =>
         Log.w(s"overflow import of $f failed", e)
         Storage.noticeFailure(e, "退避ファイルの取り込み")
+        ImportChain.Step.Failed
       finally lock.unlock()
