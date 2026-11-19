@@ -65,7 +65,9 @@ object Maintenance:
     Progress.set("開始待ち")
 
   @volatile private var repairAsked = 0L
-  /** The last run stopped for the room above the logging reserve. */
+  /** The progress line of a run stopped for the room. */
+  val LowText = "空き容量が少ないため中断（続きは次回）"
+  /** The last run stopped for the room (below H). */
   @volatile var stoppedLow = false
 
   /** An unfinished commit cannot be finished (seen in the main process):
@@ -126,7 +128,7 @@ object Maintenance:
         catch
           case _: ArchiveStore.CommitStuck => "自動では解決できません（「整理を修復」で解決）"
           // Its record stays; finished when there is room.
-          case _: StorageBudget.NoRoom => "空き容量が記録用の予備に近いため中断（続きは次回）"
+          case _: StorageBudget.NoRoom => LowText
           case NonFatal(e) =>
             Log.w("archive repair failed", e)
             LifeLog.add(LifeKind.ArchiveRepair, s"整理の修復に失敗（記録は端末内に保持）: ${LifeLog.describe(e)}")
@@ -262,20 +264,20 @@ object Maintenance:
       return false
     if !running.compareAndSet(false, true) then return false
     val deadline = System.currentTimeMillis() + BudgetMs
-    // The logging reserve (design 6.8): every file this process writes goes
-    // through the guard, each chunk of at most 1 MiB checked against the
-    // free space and L (as the main process last wrote it) before it is
-    // written; one that does not fit stops the run. The file being written
-    // is dropped (portions committed before stay committed), no data is
-    // lost, it is not counted as a failure, and the rest is done next time.
+    // The stopping point H (design 6.8): every file this process writes
+    // goes through the guard, each output of at most 1 MiB checked against
+    // the free space and H before it is written, and each bulk SQLite batch
+    // before and after it against H and M; a shortfall stops the run. The
+    // file being written is dropped (portions committed before stay
+    // committed), no data is lost, it is not counted as a failure, and the
+    // rest is deferred to the next run.
     val low = AtomicBoolean(false)
     stoppedLow = false
     def noRoom(what: String): Unit =
       stoppedLow = true
       if low.compareAndSet(false, true) then
-        Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）")
-        LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が記録用の予備（${Try(Storage.reserve() / 1_000_000).getOrElse(0L)} MB）に近い")
-    Log.i(s"maintenance: floor ${Try(Storage.reserve()).getOrElse(-1L)} (file ${ReserveFile.read(Storage.reserveFile)})")
+        Progress.set(LowText)
+        LifeLog.add(LifeKind.Note, s"整理を中断（$what）: 空き容量が ${Headroom.H / 1_000_000} MB に近い")
     val stopOrLow = () => stop() || low.get
     val halt = () => stopOrLow() || System.currentTimeMillis() > deadline
     var left = false
@@ -293,7 +295,7 @@ object Maintenance:
         // record stays, and the next run finishes it.
         case _: StorageBudget.NoRoom =>
           noRoom("中断された整理の続き")
-          Progress.set("空き容量が記録用の予備に近いため中断（続きは次回）", running = false)
+          Progress.set(LowText, running = false)
           return true
         case _: ArchiveStore.CommitStuck =>
           // Not a failure of this run: nothing to archive until it is resolved.
@@ -388,7 +390,7 @@ object Maintenance:
           case e: OutOfMemoryError => Log.w("monthly merge: out of memory", e)
           case NonFatal(e) => Log.w("monthly merge failed", e)
       if halt() then left = true
-      Progress.set(if low.get then "空き容量が記録用の予備に近いため中断（続きは次回）" else if left then "中断（続きは次回）" else "完了", running = false)
+      Progress.set(if low.get then LowText else if left then "中断（続きは次回）" else "完了", running = false)
       // Then a bounded run of the 「訪れた日」 index (fewer days on battery).
       // Never a reason to run again: it is built while its list is open too.
       if !halt() then VisitDays.maintain(charging, halt)

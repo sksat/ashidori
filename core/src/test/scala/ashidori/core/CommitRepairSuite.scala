@@ -38,6 +38,7 @@ class CommitRepairSuite extends munit.FunSuite:
     val log = mutable.ArrayBuffer.empty[String]
     var crashAt = -1
     private var ops = 0
+    def opsDone: Int = ops
     for t <- tables if old(t).nonEmpty do dest(path(t)) = fileOf(old(t))
 
     private def newRows(t: String) = (old(t) ++ chunk(t)).sortBy(ArchiveMerge.key)
@@ -58,9 +59,11 @@ class CommitRepairSuite extends munit.FunSuite:
     /** The commit renamed these tables' files, then stopped. */
     def renamed(ts: String*): Unit = for t <- ts do dest(path(t)) = tmp.remove(path(t)).get
 
+    /** What a step at [[crashAt]] throws: a crash, or a shortfall of room (deferred work). */
+    var failWith: () => Exception = () => Crash()
     private def step(): Unit =
       ops += 1
-      if ops == crashAt then throw Crash()
+      if ops == crashAt then throw failWith()
 
     private def iter(f: FakeFile) =
       if f.decodeFails then f.rows.iterator.take(1) ++ Iterator(throw java.io.IOException("bad page")) else f.rows.iterator
@@ -350,6 +353,42 @@ class CommitRepairSuite extends munit.FunSuite:
         assertNoDuplicates(w)
       k += 1
     assert(k > 8, s"only ${k - 1} steps")
+  }
+
+  test("compaction stopped for room at any step and resumed, again and again: every input row (by its unique id) is kept once") {
+    // Each row's value is a unique id ("g100", "i101", ...). Stops come from
+    // the guard (StorageBudget.NoRoom: the work is deferred, not failed),
+    // at every step of finishing a commit, in successive runs.
+    for renamedTables <- Seq(Seq("gnss_raw", "imu", "nmea"), Seq("gnss_raw"), Seq.empty[String]) do
+      def scenario(): World =
+        val w = World(tables, old, chunk)
+        w.renamed(renamedTables*)
+        w.failWith = () => StorageBudget.NoRoom()
+        w
+      val clean = scenario()
+      val files = clean.files
+      clean.repair(manual = false)
+      var k = 1
+      var stopped = true
+      while stopped do
+        val w = scenario()
+        // Stopped at step k; the next run stopped at its own step k; the third has room.
+        var runs = 0
+        var done = false
+        while !done do
+          w.crashAt = if runs < 2 then w.opsDone + k else -1
+          done =
+            try { w.repair(manual = false); true }
+            catch case _: StorageBudget.NoRoom => false
+          runs += 1
+          assertComplete(w)
+          assertNothingDeleted(w, files)
+        stopped = runs > 1
+        assertNoDuplicates(w)
+        assertEquals(w.record, None, s"$renamedTables: stopped at step $k")
+        for t <- tables do assertEquals(w.rows(t).map(_(1)).distinct.size, w.rows(t).size, s"$t: an id twice")
+        k += 1
+      assert(k > 3, s"$renamedTables: only ${k - 1} steps")
   }
 
   test("once a repair began, recovery continues it: a quarantined file is not a commit to drop") {

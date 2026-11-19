@@ -954,18 +954,15 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val (where, args) = ArchiveSql.rawPortion(from, to, maxRowid, after, upTo)
     deleteChunked("raw_lines", ArchiveSql.except(where, except), args)
 
-  /** Deletes raw lines by rowid (late lines archived in a sorted pass), in batches sized as [[bulk]]. */
+  /** Deletes raw lines by rowid (late lines archived in a sorted pass), in batches ([[bulk]]). */
   def deleteRawById(rowids: Seq[Long]): Long =
     var rest = rowids
-    var total = 0L
-    while rest.nonEmpty do
-      total += bulk { n =>
-        val (ids, more) = rest.splitAt(n)
-        rest = more
-        val d = tx(_.delete("raw_lines", s"rowid IN (${ids.mkString(",")})", null))
-        (d, ids.size)
-      }
-    total
+    bulk { n =>
+      val (ids, more) = rest.splitAt(n)
+      rest = more
+      val d = tx(_.delete("raw_lines", s"rowid IN (${ids.mkString(",")})", null))
+      (d, ids.size, more.nonEmpty)
+    }
 
   /** Whether any archived table still holds rows of [from, to) in SQLite. */
   def hasHotRows(from: Long, to: Long): Boolean =
@@ -990,51 +987,43 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     n
 
   private def deleteChunked(table: String, where: String, args: Seq[Long]): Long =
-    var total = 0L
-    var full = true
-    while full do
-      total += bulk { n =>
-        val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, n))
-        try
-          args.zipWithIndex.foreach((v, i) => st.bindLong(i + 1, v))
-          val d = st.executeUpdateDelete()
-          full = d == n
-          (d, n)
-        finally st.close()
-      }
-    total
+    bulk { n =>
+      val st = w.compileStatement(ArchiveSql.deleteChunk(table, where, n))
+      try
+        args.zipWithIndex.foreach((v, i) => st.bindLong(i + 1, v))
+        val d = st.executeUpdateDelete()
+        (d, n, d == n)
+      finally st.close()
+    }
 
   // --- bulk writes that are not the record (design 6.8) -----------------------
 
-  /** The guard of the logging reserve, of the process this runs in
-    * ([[Storage.guard]]). Every batch of a bulk write that is not the record
-    * (deleting archived rows) is checked against it first with a margin of
-    * [[SqliteBatch.Margin]] (16 MiB), capped in rows so that it changes at
-    * most that much however scattered, and sized by what the batches before
-    * made the database and its WAL grow ([[BatchSizer]]). A delete also
-    * writes (the WAL; SQLite reuses freed pages, so the files may grow
-    * first). The logger's own writes never go through it.
+  /** Bulk writes that are not the record (deleting archived rows), in
+    * either process (design 6.8): each batch is one transaction; before it
+    * and after it the free space must leave H and M ([[Storage.guard]]);
+    * a shortfall after a batch keeps it and starts no next one
+    * ([[StorageBudget.NoRoom]]: deferred). Batches are sized by what they
+    * made the database and its WAL grow ([[BatchSizer]], at most 512
+    * rows): an operating control, not a bound (a delete also writes, SQLite
+    * rewrites freed pages and reuses them later, so the files may grow
+    * first; long rows and sparse deletes change more). The logger's own
+    * writes never go through it.
     */
-  private def bulkGuard: SpaceGuard = Storage.guard
-  // Rows of the archived tables (at most two indexes each).
-  private val sizer = BatchSizer(max = SqliteBatch.maxRows(2))
+  private val sizer = BatchSizer()
 
   /** The database and its WAL, as they take room now. */
   def fileBytes: Long =
     val p = java.io.File(w.getPath)
     p.length + java.io.File(p.getPath + "-wal").length
 
-  /** One batch of a bulk write: `f(rows)` does it and gives the rows it
-    * wrote and the rows it was given; checked before, measured after.
-    */
-  private def bulk(f: Int => (Int, Int)): Int =
-    bulkGuard.check(SqliteBatch.Margin)
-    val before = fileBytes
-    val (done, asked) = f(sizer.rows)
-    val grown = fileBytes - before
-    sizer.observe(asked, grown)
-    if Db.debugBulk then Log.i(s"bulk batch: $asked rows, $done done, grew $grown bytes, next ${sizer.rows}")
-    done
+  /** The last bulk batch: its rows, what it made the files grow, the free space after it. */
+  @volatile var lastBatch: Option[BulkLoop.Batch] = None
+
+  private def bulk(f: Int => (Int, Int, Boolean)): Long =
+    BulkLoop.run(sizer, Storage.guard, () => Storage.free(), () => fileBytes, b => {
+      lastBatch = Some(b)
+      if Db.debugBulk then Log.i(s"bulk batch: ${b.rows} rows, grew ${b.grown} bytes, free after ${b.freeAfter}, next ${sizer.rows}")
+    })(f)
 
   /** The WAL written back into the database and truncated (after a
     * maintenance run), if the free space holds the WAL's size above the
@@ -1044,18 +1033,9 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     */
   def checkpoint(): Unit =
     val wal = java.io.File(w.getPath + "-wal").length
-    if wal > 0 && bulkGuard.allows(wal) then
+    if wal > 0 && Storage.guard.allows(wal) then
       for mode <- Seq("PASSIVE", "TRUNCATE") do
         scala.util.Try { val c = w.rawQuery(s"PRAGMA wal_checkpoint($mode)", null); try c.moveToFirst() finally c.close() }
-
-  /** Bytes per hour the logger wrote in the last hour, from the raw lines
-    * and positions stored (their text and about 64 bytes a row beside it).
-    */
-  def recentLoggingBytesPerHour(now: Long): Long =
-    val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=?", now - 3_600_000L)(c =>
-      c.getLong(0) * 64 + c.getLong(1)).headOption.getOrElse(0L)
-    val fixes = query("SELECT COUNT(*) FROM fixes WHERE time>=?", now - 3_600_000L)(_.getLong(0) * 128).headOption.getOrElse(0L)
-    raw + fixes
 
   /** Earliest time still held in SQLite for an archived table (None if empty). */
   def oldestHot(): Option[Long] =
@@ -1332,19 +1312,19 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * rows in the range are not shown ([[ArchiveStore.read]]).
     */
   def deleteRange(from: Long, to: Long): Unit =
-    // One transaction (the range and its mark go together): a bulk write
-    // that is not the record, admitted only if the free space holds twice
-    // the rows' estimated size above the floor, reserved while it runs
-    // (design 6.8; published, so archive maintenance sees it).
-    val need = math.max(SqliteBatch.Margin, rangeBytes(from, to))
-    val held = Storage.budget.reserve(need).getOrElse(throw StorageBudget.NoRoom())
-    try deleteRange0(from, to) finally held.release()
+    // One transaction (the range and its mark go together; it is not split).
+    // Its estimate decides only whether it starts (design 6.8): the free
+    // space must hold it, M and H, before; it is checked again after. No
+    // bound on what it consumes is claimed.
+    val need = rangeBytes(from, to)
+    Storage.guard.check(Headroom.M + need)
+    deleteRange0(from, to)
+    if !Storage.guard.allows(Headroom.M) then Log.w(s"range deletion: free space below H + M after it")
 
-  /** What a deletion of [from, to) may change: every row it deletes or
-    * writes (in every table [[deleteRange0]] touches), each counted as its
-    * text and two pages (its table page and an index page, however
-    * scattered), and the rows it writes again (energy spans and raw-data
-    * sessions cut in two, the outbox and the sync marks).
+  /** An estimate of what a deletion of [from, to) writes, for its start
+    * only: every row it deletes or writes (in every table [[deleteRange0]]
+    * touches), each counted as its text and two 4 KiB pages, the raw
+    * lines' text and the outbox's BLOBs (a whole sealed batch may go).
     */
   def rangeBytes(from: Long, to: Long): Long =
     def count(sql: String, args: Any*): Long = query(sql, args*)(_.getLong(0)).head
@@ -1353,11 +1333,11 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val motion = count("SELECT COUNT(*) FROM motion WHERE start>=? AND start<?", from, to)
     val energy = count("SELECT COUNT(*) FROM energy_state WHERE start<? AND (end IS NULL OR end>?)", to, from) * 2
     val sessions = count("SELECT COUNT(*) FROM gnss_sessions WHERE start<? AND end>?", to, from) * 3
-    val outbox = count("SELECT COUNT(*) FROM sync_outbox WHERE file IS NOT NULL")
+    val (outbox, blobs) = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(blob)), 0) FROM sync_outbox")(c => (c.getLong(0), c.getLong(1))).head
     val marks = count("SELECT COUNT(*) FROM sync_state")
     val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=? AND time<?", from, to)(c =>
       (c.getLong(0), c.getLong(1))).head
-    (byTime + motion + energy + sessions + outbox + marks + raw._1 + 1) * 2 * SqliteBatch.PageBytes + raw._2
+    (byTime + motion + energy + sessions + outbox + marks + raw._1 + 1) * 2 * 4096L + raw._2 + blobs
 
   private def deleteRange0(from: Long, to: Long): Unit =
     tx { db =>

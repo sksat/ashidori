@@ -63,7 +63,7 @@ class AshidoriApp extends Application:
     // The region packs: the state and the files reconciled before any use,
     // then (with the data rule automatic) updates and packs left planned.
     RegionDownload.autoStart(this)
-    // The floor of the logging reserve, for the large writes of every process.
+    // Files of earlier development builds' storage budget.
     Storage.start()
     // Area names cached from the platform geocoder: recompute on the device.
     AshidoriApp.io.execute(() => Geocoding.migrateCachedNames())
@@ -103,10 +103,8 @@ object Settings:
   private def prefs: SharedPreferences = AshidoriApp.app.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
   def mode: LoggingMode = LoggingMode.fromKey(prefs.getString("mode", LoggingMode.Balanced.key))
-  /** Sets the mode: the storage floor for it is written first (design 6.8), off the main thread. */
-  def mode_=(m: LoggingMode): Unit = Storage.changeMode(m)
-  /** Stores the mode (after the floor for it is written: [[Storage.changeMode]]). */
-  private[ashidori] def storeMode(m: LoggingMode): Unit = prefs.edit().putString("mode", m.key).commit()
+  /** Sets the mode; the main process's L follows at its next check (Storage.reserve). */
+  def mode_=(m: LoggingMode): Unit = prefs.edit().putString("mode", m.key).apply()
 
   /** First-run onboarding finished. */
   def onboarded: Boolean = prefs.getBoolean("onboarded", false)

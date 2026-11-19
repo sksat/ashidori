@@ -103,9 +103,11 @@ object Backup:
         (if rescue then size(Maintenance.dir) else 0L)
     if dir.getUsableSpace < need then
       throw java.io.IOException(s"空き容量不足（${need >> 20} MB 必要）")
-    // The shared budget (design 6.8): what it writes here, above the
-    // logging reserve and what the other large writes will still take
-    // (the quarantine export asks for none, as above).
+    // The main process's budget (design 6.8): an estimate reserved above L
+    // and what the other downloads will still write, to decide whether it
+    // starts. It is not a bound on what the backup consumes (the database
+    // copy cannot be split; a long read may keep the WAL from being reused).
+    // The quarantine export asks for none, as above.
     val reserved = if mode == Mode.Quarantine then None else
       val r = need - LoggingMargin
       Some(Storage.budget.reserve(r).getOrElse(throw java.io.IOException(Storage.shortage(r))))
@@ -158,17 +160,20 @@ object Backup:
         val overflow = LoggerWrites.Overflow
         overflow.lock.lock()
         try
-          // The copy is watched: every 200 ms its size goes to the budget,
-          // and a copy that would cut into the logging reserve is interrupted.
+          // The copy is watched: every 200 ms its size goes to the budget, and
+          // a cancellation is requested once the room is short (the period at
+          // which it asks, not a bound on when it stops or on what it wrote;
+          // the read connection is closed either way, and a cancelled copy is
+          // never taken as complete).
           val sig = android.os.CancellationSignal()
           @volatile var breached = false
           val watcher = Thread(() =>
             try
               while !Thread.currentThread().isInterrupted do
                 Thread.sleep(200)
-                // Its reservation covers the copy; others (the other process,
-                // the logger) may still take room: cancelled once less than
-                // 1 MiB is left above L and the other reservations.
+                // Others (the logger, maintenance, other apps) may take room
+                // too: cancelled once less than 1 MiB is left above L and the
+                // other reservations, measured on the real free space.
                 if !space(snapshot.length) || reserved.exists(r => !r.guard.allows(ashidori.core.SpaceGuard.Chunk)) then
                   breached = true
                   sig.cancel()

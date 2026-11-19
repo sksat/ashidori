@@ -153,19 +153,9 @@ object VisitDays:
   }
 
   /** `f`, or None after logging its failure: a corrupt index is deleted. */
-  /** A write of the index that would change more than the margin of a
-    * bulk SQLite write (design 6.8): the index is deleted instead (it is
-    * derived; deleting frees its room) and built again.
-    */
-  final class TooLarge(what: String) extends RuntimeException(what)
-
   private def guarded[A](what: String)(f: => A): Option[A] =
     try Some(f)
     catch
-      case e: TooLarge =>
-        Log.w(s"visits: $what: ${e.getMessage}: the index is deleted and built again")
-        reset()
-        None
       case e: SQLiteDatabaseCorruptException =>
         Log.w(s"visits: $what: index corrupt; deleted", e)
         reset()
@@ -316,20 +306,24 @@ object VisitDays:
       }
     private def exec(sql: String, args: Any*): Unit = w.execSQL(sql, args.map(_.asInstanceOf[AnyRef]).toArray)
 
-    /** Every transaction of the index is checked first against the guard of
-      * the logging reserve (design 6.8) with the margin of a bulk SQLite
-      * write, 16 MiB; one that may change more checks more ([[putStays]])
-      * or is not done ([[removeStays]], [[clear]]). The rest are single rows.
+    /** Every transaction of the index is a bulk SQLite write (design 6.8):
+      * before it and after it the free space must leave H and M; a shortfall
+      * after one keeps it and stops the work there (NoRoom, caught by
+      * [[guarded]]: done later). The rest are single rows.
       */
     def transaction[A](f: => A): A =
-      Storage.guard.check(SqliteBatch.Margin)
+      Storage.guard.check(Headroom.M)
       val db = w
       db.beginTransaction()
-      try
-        val a = f
-        db.setTransactionSuccessful()
-        a
-      finally db.endTransaction()
+      val a =
+        try
+          val a = f
+          db.setTransactionSuccessful()
+          a
+        finally db.endTransaction()
+      // Committed (the outermost): kept; no next one if the room is short now.
+      if !db.inTransaction then Storage.guard.check(Headroom.M)
+      a
 
     def meta(key: String): Option[String] = q("SELECT v FROM meta WHERE k=?", key)(_.getString(0)).headOption
     def setMeta(key: String, value: String): Unit = exec("INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)", key, value)
@@ -356,19 +350,7 @@ object VisitDays:
     def days(from: Long, to: Long): Map[Long, DayState] =
       q("SELECT day, want, built FROM days WHERE day>=? AND day<=?", from, to)(c => c.getLong(0) -> stateOf(c, 1)).toMap
 
-    /** What deleting and writing `rows` rows may change, however scattered:
-      * two pages each (the row's page and an index page).
-      */
-    private def pages(rows: Long): Long = rows * 2 * SqliteBatch.PageBytes
-
-    /** A day's stays: checked first with the larger of the margin and what its rows may change. */
-    def putStays(d: Long, stays: Seq[(Visit, Seq[Long])]): Unit =
-      val old = q("SELECT COUNT(*) FROM cells WHERE day=?", d)(_.getLong(0)).head +
-        q("SELECT COUNT(*) FROM stays WHERE day=?", d)(_.getLong(0)).head
-      Storage.guard.check(math.max(SqliteBatch.Margin, pages(old + stays.size + stays.map(_._2.size).sum)))
-      putStays0(d, stays)
-
-    private def putStays0(d: Long, stays: Seq[(Visit, Seq[Long])]): Unit = transaction {
+    def putStays(d: Long, stays: Seq[(Visit, Seq[Long])]): Unit = transaction {
       exec("DELETE FROM cells WHERE stay IN (SELECT id FROM stays WHERE day=?)", d)
       exec("DELETE FROM stays WHERE day=?", d)
       val cv = ContentValues()
@@ -391,14 +373,7 @@ object VisitDays:
         finally st.close()
     }
 
-    /** Stays of a deleted range, in the marking's transaction (it cannot be
-      * split). One that may change more than [[SqliteBatch.Margin]] is not
-      * done: the index is deleted instead ([[TooLarge]]).
-      */
     def removeStays(from: Long, to: Long): Unit = transaction {
-      val rows = q("SELECT COUNT(*) FROM cells WHERE stay IN (SELECT id FROM stays WHERE start<? AND end>?)", to, from)(_.getLong(0)).head +
-        q("SELECT COUNT(*) FROM stays WHERE start<? AND end>?", to, from)(_.getLong(0)).head
-      if pages(rows) > SqliteBatch.Margin then throw TooLarge(s"removing $rows rows")
       exec("DELETE FROM cells WHERE stay IN (SELECT id FROM stays WHERE start<? AND end>?)", to, from)
       exec("DELETE FROM stays WHERE start<? AND end>?", to, from)
     }
@@ -419,14 +394,7 @@ object VisitDays:
           c.getLong(0) -> Visit(c.getLong(1), c.getLong(2), c.getDouble(3), c.getDouble(4), c.getDouble(5), 0)
         }
 
-    /** Empties it (in the caller's transaction). An index larger than
-      * [[SqliteBatch.Margin]] (SQLite rewrites every freed page) is deleted
-      * instead ([[TooLarge]]), which frees its room.
-      */
     def clear(): Unit = transaction {
-      val p = java.io.File(w.getPath)
-      val size = p.length + java.io.File(p.getPath + "-wal").length
-      if size > SqliteBatch.Margin then throw TooLarge(s"clearing $size bytes")
       for t <- Seq("cells", "stays", "days") do exec(s"DELETE FROM $t")
       exec("DELETE FROM meta WHERE k NOT LIKE 'stale%'")
     }

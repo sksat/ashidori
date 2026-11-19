@@ -83,11 +83,10 @@ class DebugReceiver extends BroadcastReceiver:
         Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()
       case "ashidori.debug.LOG" =>
         Settings.onboarded = true
+        Settings.mode = ashidori.core.LoggingMode.fromKey(Option(intent.getStringExtra("mode")).getOrElse("max"))
         Settings.loggingEnabled = true
-        Storage.changeMode(ashidori.core.LoggingMode.fromKey(Option(intent.getStringExtra("mode")).getOrElse("max")), () => {
-          LoggerService.send(c, LoggerService.ActionStart)
-          LoggerService.send(c, LoggerService.ActionRefresh)
-        })
+        LoggerService.send(c, LoggerService.ActionStart)
+        LoggerService.send(c, LoggerService.ActionRefresh)
       case "ashidori.debug.STOP" =>
         Settings.loggingEnabled = false
         LoggerService.send(c, LoggerService.ActionStop)
@@ -106,7 +105,10 @@ class DebugReceiver extends BroadcastReceiver:
           try
             val n = Backup.write(c, android.net.Uri.fromFile(f), (d, t) => Log.i(s"backup $d / $t"))
             Log.i(s"backup done: ${n.bytes} bytes to $f, missing ${n.missing.size}")
-          catch case e: Throwable => Log.e("backup failed", e)
+          catch case e: Throwable =>
+            // As the screen does: an output that did not complete is not kept.
+            f.delete()
+            Log.e("backup failed", e)
         , "ashidori-backup").start()
       case "ashidori.debug.VACUUM_CANCEL" =>
         // The backup's database copy, cancelled after `ms` (as its watcher does
@@ -152,20 +154,9 @@ class DebugReceiver extends BroadcastReceiver:
             Log.i(s"scatter delete: ${r.fold(e => e.getClass.getSimpleName, n => s"$n deleted")}")
           finally Db.debugBulk = false
         , "ashidori-scatter").start()
-      case "ashidori.debug.RESERVE_LOOP" =>
-        // Four threads reserving and releasing for `seconds` (each publishes the floor).
-        val until = System.currentTimeMillis() + intent.getIntExtra("seconds", 5) * 1000L
-        for i <- 0 until 4 do
-          Thread(() =>
-            var n = 0
-            while System.currentTimeMillis() < until do
-              Storage.budget.reserve(1000).foreach(_.release())
-              n += 1
-            Log.i(s"reserve loop $i: $n")
-          , s"ashidori-reserve-$i").start()
-      case "ashidori.debug.FLOOR" =>
-        // The floor each process sees: the file's (or the conservative L), and this process's L.
-        AshidoriApp.io.execute(() => Log.i(s"floor: file ${Storage.reserveFile.length} bytes, read ${ashidori.core.ReserveFile.read(Storage.reserveFile)}, maintenance floor ${Storage.maintenanceFloor()}, main L ${Storage.reserve()}, outstanding ${Storage.budget.outstanding}"))
+      case "ashidori.debug.STORAGE" =>
+        // The free space, L (main process) and H, and what the reservations will still write.
+        AshidoriApp.io.execute(() => Log.i(s"storage: free ${Storage.free()}, L ${Storage.reserve()}, H ${ashidori.core.Headroom.H}, outstanding ${Storage.budget.outstanding}"))
       case "ashidori.debug.RESCUE" =>
         val f = java.io.File(c.getExternalFilesDir(null), Option(intent.getStringExtra("file")).getOrElse("rescue.zip"))
         Thread(() =>

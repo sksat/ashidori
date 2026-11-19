@@ -226,13 +226,12 @@ final class ArchiveStore(val root: File, zone: ZoneId):
 
   // --- writing --------------------------------------------------------------------
 
-  /** The guard of the logging reserve (design 6.8), set by the maintenance
-    * process: every file written here goes through it, in chunks of at
-    * most 1 MiB, each checked against the free space and L before it is
-    * written. A chunk that does not fit throws [[StorageBudget.NoRoom]]:
-    * the file being written is dropped (its rows stay where they were: in
-    * SQLite, or in the files it would have replaced), and the work is done
-    * by a later run.
+  /** The guard of maintenance (design 6.8; H, set by AshidoriApp): every
+    * file written here goes through it, in outputs of at most 1 MiB, each
+    * checked against the free space and H before it is written. One that
+    * does not fit throws [[StorageBudget.NoRoom]]: the file being written
+    * is dropped (its rows stay where they were: in SQLite, or in the files
+    * it would have replaced), and the work is deferred to a later run.
     */
   @volatile var guard: Option[SpaceGuard] = None
 
@@ -935,8 +934,8 @@ final class ArchiveStore(val root: File, zone: ZoneId):
         var last = f.lastModified()
         var seen = 0L
         LegacyBatches(src.getLines().filterNot(_.startsWith("#")).filter(_.nonEmpty), () => sizer.rows.toLong).foreach { chunk0 =>
-          // A line longer than any batch: checked with its size and a margin
-          // (indexes, the WAL); one beyond reason is left out, and the file kept.
+          // A line over 64 KiB is not imported: the file is kept (renamed
+          // `.skipped`) and the lines are shown as not imported.
           val chunk = chunk0.filter { l =>
             val b = LegacyBatches.utf8(l)
             if b > LegacyBatches.MaxLineBytes then
@@ -951,23 +950,23 @@ final class ArchiveStore(val root: File, zone: ZoneId):
           val fresh = timed.drop(math.max(0L, done - seen).toInt)
           seen += timed.size
           if fresh.nonEmpty then
-            // Checked against the free space now and the floor, with the
-            // margin of a bulk SQLite batch, before it is inserted. Stopped
-            // here, the import resumes after the last batch.
+            // A bulk SQLite batch (design 6.8): H and M checked before it and
+            // after it. Stopped, the import resumes after the last batch.
             val text = fresh.map((_, l) => LegacyBatches.utf8(l)).sum
-            guard.foreach(_.check(SqliteBatch.Margin))
+            guard.foreach(_.check(Headroom.M))
             done = seen
             val before = db.fileBytes
             db.insertLegacyChunk(fresh, key, done)
             val grown = db.fileBytes - before
             sizer.observe(text.toInt, grown)
             n += fresh.size
+            guard.foreach(_.check(Headroom.M))
         }
       }
       // The input is never deleted with lines left out: kept beside, not imported again.
       if skipped > 0 then
         f.renameTo(File(f.getPath + ".skipped"))
-        LifeLog.add(LifeKind.Note, s"旧形式のログ ${f.getName}: 長すぎる行 $skipped 行を取り込まず（ファイルは残す）")
+        LifeLog.add(LifeKind.Note, s"旧形式のログ ${f.getName}: 64 KiB を超える $skipped 行は未取り込み（元のファイルを ${f.getName}.skipped として保持）")
       else f.delete()
       db.legacyDone(key)
     n

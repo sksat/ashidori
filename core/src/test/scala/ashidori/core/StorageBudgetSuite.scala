@@ -23,125 +23,62 @@ class StorageBudgetSuite extends munit.FunSuite:
     intercept[StorageBudget.NoRoom](stop.write(new Array[Byte](MiB)))
   }
 
-  test("the floor file: L, the reservations and the time, written atomically and read back; missing or corrupt is None") {
-    val dir = Files.createTempDirectory("reserve").toFile
-    val f = File(dir, "logging-reserve")
-    assertEquals(ReserveFile.read(f), None)
-    ReserveFile.write(f, Published(300_000_000L, 40_000_000L, 1_800_000_000_000L))
-    assertEquals(ReserveFile.read(f), Some(Published(300_000_000L, 40_000_000L, 1_800_000_000_000L)))
-    assert(!File(dir, "logging-reserve.tmp").exists)
-    // The format of earlier builds (one or two numbers) is not trusted either.
-    for bad <- Seq("", "garbage", "300000000", "300000000 1800000000000", "-5 0 1", "0 0 1", "1 -1 1", "12x 0 1", "1 2 3 4") do
-      Files.write(f.toPath, bad.getBytes)
-      assertEquals(ReserveFile.read(f), None, bad)
+  test("the output wrapper: every output at most C, each checked just before it is written; a compressor's trailer at close too") {
+    val events = scala.collection.mutable.ArrayBuffer.empty[String]
+    val guard = SpaceGuard(() => { events += "check"; Long.MaxValue / 2 }, () => 0L)
+    val sink = new OutputStream:
+      def write(b: Int): Unit = events += "out 1"
+      override def write(b: Array[Byte], off: Int, len: Int): Unit = events += s"out $len"
+      override def flush(): Unit = events += "flush"
+      override def close(): Unit = events += "close"
+    val g = GuardedOutputStream(sink, guard)
+    // A compressor with a buffer above the wrapper, as the backup's ZIP.
+    val zip = java.util.zip.ZipOutputStream(java.io.BufferedOutputStream(g, 64 * 1024))
+    zip.putNextEntry(java.util.zip.ZipEntry("a"))
+    val rnd = scala.util.Random(7)
+    val data = new Array[Byte](5 * MiB)
+    rnd.nextBytes(data)
+    zip.write(data)
+    zip.closeEntry()
+    zip.flush()
+    val beforeClose = events.size
+    zip.close()
+    // Every output is preceded by its own check, and none is over C.
+    val outs = events.toSeq.zipWithIndex.filter(_._1.startsWith("out "))
+    assert(outs.nonEmpty)
+    for (e, k) <- outs do
+      assert(e.stripPrefix("out ").toInt <= SpaceGuard.Chunk, e)
+      assertEquals(events(k - 1), "check", s"output $k not checked just before it")
+    // The central directory and the end record are written at close: checked too.
+    assert(events.drop(beforeClose).exists(_.startsWith("out ")))
+    assertEquals(events.last, "close")
   }
 
-  test("the other process's floor: the published one (reservations only while the main process lives), at least its own L") {
-    val now = 1_800_000_000_000L
-    val C = ReserveFile.Conservative
-    assertEquals(C, 210L * 1000 * 1000 * 24)
-    assert(C > StorageBudget.MinReserve)
-    // Missing, unreadable or corrupt: the conservative L (never the 256 MB floor).
-    assertEquals(ReserveFile.floor(None, now, true, 256_000_000L), C)
-    assertEquals(ReserveFile.floor(None, now, false, 9_000_000_000L), 9_000_000_000L)
-    val p = Published(300_000_000L, 1_500_000_000L, now)
-    // Fresh or stale alike: the last floor while the main process lives;
-    // only its L once it is gone (its reservations can write nothing more).
-    for at <- Seq(now, now - 3_600_000L, now - 7L * 86_400_000) do
-      assertEquals(ReserveFile.floor(Some(p.copy(at = at)), now, true, 100_000_000L), 1_800_000_000L)
-      assertEquals(ReserveFile.floor(Some(p.copy(at = at)), now, false, 100_000_000L), 300_000_000L)
-      // Its own L, measured from the record, when larger.
-      assertEquals(ReserveFile.floor(Some(p.copy(at = at)), now, false, 700_000_000L), 700_000_000L)
-    // A last floor above the conservative L is kept as it is (not lowered to it).
-    val big = Published(C, 2_000_000_000L, now - 3_600_000L)
-    assertEquals(ReserveFile.floor(Some(big), now, true, 0L), C + 2_000_000_000L)
-    // From the future (a clock set back): as unreadable.
-    assertEquals(ReserveFile.floor(Some(p.copy(at = now + 120_000)), now, true, 0L), C)
-  }
-
-  test("the main process's liveness: a lock held while it lives") {
-    val f = File(Files.createTempDirectory("alive").toFile, "main-alive.lock")
-    assert(!MainAlive.alive(f), "nobody holds it")
-    val held = MainAlive.hold(f)
-    assert(MainAlive.alive(f), "held")
-    held.close()
-    assert(!MainAlive.alive(f), "released when its holder ends")
-  }
-
-  test("a floor that cannot be published refuses the reservation, and the file is removed") {
-    val dir = Files.createTempDirectory("reserve").toFile
-    val f = File(dir, "logging-reserve")
-    var mode = LoggingMode.Balanced
-    lazy val pub: FloorPublisher = FloorPublisher(f, () => mode, m => StorageBudget.loggingReserve(m, None), () => budget.outstanding)
-    lazy val budget: StorageBudget = StorageBudget(() => 100_000_000_000L, () => StorageBudget.loggingReserve(mode, None), () => pub.publish())
-    val r = budget.reserve(1_000_000_000L).get
-    assertEquals(ReserveFile.read(f).map(p => (p.l, p.held)), Some((StorageBudget.loggingReserve(mode, None), 1_000_000_000L)))
-    r.release()
-    assertEquals(ReserveFile.read(f).map(_.held), Some(0L))
-    dir.setWritable(false)
-    try
-      if !dir.canWrite then
-        // The large write (a backup's database copy) never starts.
-        assertEquals(budget.reserve(1_000_000_000L), None)
-        assertEquals(budget.outstanding, 0L)
-        // A mode change still takes effect; the floor file is gone (the other
-        // process then uses the conservative L), and the failure is thrown.
-        dir.setWritable(true)
-        Files.createDirectory(File(dir, "logging-reserve.tmp").toPath)
-        intercept[java.io.IOException](pub.changeMode(LoggingMode.Max) { mode = LoggingMode.Max })
-        assertEquals(mode, LoggingMode.Max)
-        assert(!f.exists)
-        assertEquals(ReserveFile.floor(ReserveFile.read(f), System.currentTimeMillis(), true, 0L), ReserveFile.Conservative)
-    finally dir.setWritable(true)
-  }
-
-  test("a mode change and the reservations' publications never leave an older mode's floor last") {
-    val dir = Files.createTempDirectory("reserve").toFile
-    val f = File(dir, "logging-reserve")
-    @volatile var mode = LoggingMode.Eco
-    val writes = java.util.concurrent.ConcurrentLinkedQueue[Long]()
-    lazy val pub: FloorPublisher = FloorPublisher(f, () => mode, m => StorageBudget.loggingReserve(m, None), () => budget.outstanding,
-      write = (file, p) => { writes.add(p.l); Thread.sleep(1); ReserveFile.write(file, p) })
-    lazy val budget: StorageBudget = StorageBudget(() => Long.MaxValue / 4, () => StorageBudget.loggingReserve(mode, None), () => pub.publish())
-    val lMax = StorageBudget.loggingReserve(LoggingMode.Max, None)
-    val stop = java.util.concurrent.atomic.AtomicBoolean(false)
-    val reservers = (0 until 4).map(_ => Thread(() => while !stop.get do budget.reserve(1000).foreach(_.release())))
-    reservers.foreach(_.start())
-    Thread.sleep(50)
-    // The mode is stored only after its floor is written; a reservation's
-    // publication in between would read the old mode without the lock.
-    pub.changeMode(LoggingMode.Max) { Thread.sleep(30); mode = LoggingMode.Max }
-    Thread.sleep(50)
-    stop.set(true)
-    reservers.foreach(_.join(5000))
-    val seq = writes.toArray.toSeq.map(_.asInstanceOf[Long])
-    val first = seq.indexOf(lMax)
-    assert(first >= 0)
-    assert(seq.drop(first).forall(_ == lMax), "an older mode's floor was written after the new one")
-    assertEquals(ReserveFile.read(f).map(_.l), Some(lMax))
-  }
-
-  test("two writers racing each other on one free space: below L by at most 2 MiB") {
-    val L = 100L * MiB
-    val free = java.util.concurrent.atomic.AtomicLong(L + 9L * MiB + 123)
-    val lowest = java.util.concurrent.atomic.AtomicLong(Long.MaxValue)
-    // Both check, then both write (the worst order), every round.
-    val barrier = java.util.concurrent.CyclicBarrier(2)
-    def writer(): Runnable = () =>
-      val sink = new OutputStream:
-        def write(b: Int): Unit = write(Array(b.toByte), 0, 1)
-        override def write(b: Array[Byte], off: Int, len: Int): Unit =
-          try barrier.await(2, java.util.concurrent.TimeUnit.SECONDS) catch case _: Exception => ()
-          val now = free.addAndGet(-len)
-          lowest.accumulateAndGet(now, math.min)
-      val g = GuardedOutputStream(sink, SpaceGuard(() => free.get, () => L))
-      try while true do g.write(new Array[Byte](MiB))
-      catch case _: StorageBudget.NoRoom => barrier.reset()
-    val ts = Seq(Thread(writer()), Thread(writer()))
-    ts.foreach(_.start())
-    ts.foreach(_.join(10_000))
-    assert(lowest.get < L + MiB, s"both wrote down to the reserve: ${lowest.get - L}")
-    assert(lowest.get >= L - 2L * MiB, s"${(L - lowest.get) / MiB.toDouble} MiB below L")
+  test("the model: N writers on one free space, each with one output in progress, take at most N × C below the reserve") {
+    // The model of the guarantee for files (not the device: no allocation
+    // units, buffers, SQLite or other apps): the free space reflects each
+    // completed output exactly, each output takes its bytes, L is fixed.
+    for n <- Seq(1, 2, 4) do
+      val L = 100L * MiB
+      val free = java.util.concurrent.atomic.AtomicLong(L + 9L * MiB + 123)
+      val lowest = java.util.concurrent.atomic.AtomicLong(Long.MaxValue)
+      // All check, then all write (the worst order), every round.
+      val barrier = java.util.concurrent.CyclicBarrier(n)
+      def writer(): Runnable = () =>
+        val sink = new OutputStream:
+          def write(b: Int): Unit = write(Array(b.toByte), 0, 1)
+          override def write(b: Array[Byte], off: Int, len: Int): Unit =
+            try barrier.await(2, java.util.concurrent.TimeUnit.SECONDS) catch case _: Exception => ()
+            val now = free.addAndGet(-len)
+            lowest.accumulateAndGet(now, math.min)
+        val g = GuardedOutputStream(sink, SpaceGuard(() => free.get, () => L))
+        try while true do g.write(new Array[Byte](MiB))
+        catch case _: StorageBudget.NoRoom => barrier.reset()
+      val ts = (0 until n).map(_ => Thread(writer()))
+      ts.foreach(_.start())
+      ts.foreach(_.join(10_000))
+      assert(lowest.get < L + MiB, s"$n writers: stopped early, ${lowest.get - L}")
+      assert(lowest.get >= L - n.toLong * MiB, s"$n writers: ${(L - lowest.get) / MiB.toDouble} MiB below L")
   }
 
   test("old logs are imported in batches of at most the asked bytes of text and 2,000 lines") {
@@ -165,16 +102,9 @@ class StorageBudgetSuite extends munit.FunSuite:
     assert(("あ" * 30_000).length < LegacyBatches.MaxLineBytes)
   }
 
-  test("bulk SQLite batches: capped so that scattered rows change at most 16 MiB; sized by the measured growth") {
-    assertEquals(SqliteBatch.maxRows(1), 1024)
-    assertEquals(SqliteBatch.maxRows(2), 682)
-    // Scattered deletes measured on SQLite (4 KiB pages, secure delete): 512
-    // rows changed 3.54 MiB, 1,024 rows 6.28 MiB; the cap holds at 2 pages a row and more.
-    assert(SqliteBatch.maxRows(1) * 2L * 2 * SqliteBatch.PageBytes <= SqliteBatch.Margin)
+  test("bulk SQLite batches: 64 rows first, at most 512, doubled under 2 MiB of growth, smaller at once over 4 MiB") {
     val s = BatchSizer()
-    // Small first.
     assertEquals(s.rows, 64)
-    // Doubled while a batch grows the files by less than 2 MiB.
     s.observe(64, 200L * 1024)
     assertEquals(s.rows, 128)
     s.observe(128, 1L << 20)
@@ -182,32 +112,68 @@ class StorageBudgetSuite extends munit.FunSuite:
     // Kept between 2 and 4 MiB.
     s.observe(256, 3L << 20)
     assertEquals(s.rows, 256)
-    // Smaller at once after a batch over 4 MiB: half the limit's worth.
+    // Smaller at once after a batch over 4 MiB.
     s.observe(256, 8L << 20)
     assertEquals(s.rows, 64)
-    // No growth (the WAL reused): it grows, but never past the cap.
+    // No growth (the WAL reused): it grows, never past the explicit cap.
     for _ <- 0 until 10 do s.observe(s.rows, 0)
-    assertEquals(s.rows, SqliteBatch.maxRows(1))
-    // A huge row: one at a time.
-    s.observe(s.rows, 100L << 20)
-    assertEquals(s.rows, 20)
-    s.observe(20, 100L << 20)
+    assertEquals(s.rows, 512)
+    // A huge row: one at a time, never none.
+    s.observe(512, 100L << 20)
+    assertEquals(s.rows, 10)
+    s.observe(10, 100L << 20)
     assertEquals(s.rows, 1)
-    // A simulated scattered delete (6.3 KiB of pages a row): no batch over the 16 MiB margin.
-    val t = BatchSizer()
-    var left = 300_000
-    var worst = 0L
-    while left > 0 do
-      val n = math.min(left, t.rows)
-      val grown = n * 6_300L
-      worst = math.max(worst, grown)
-      t.observe(n, grown)
-      left -= n
-    assert(worst <= SqliteBatch.Margin, worst.toString)
+    s.observe(1, 100L << 20)
+    assertEquals(s.rows, 1)
     // The text of an import, in bytes.
     val u = BatchSizer(start = 64 * 1024, min = 4 * 1024, max = 1 << 20)
     u.observe(64 * 1024, 150L * 1024)
     assertEquals(u.rows, 128 * 1024)
+  }
+
+  test("bulk SQLite writes: long rows, BLOBs and sparse deletes with a long reader may exceed 16 MiB; after a shortfall no batch starts, nothing is dropped") {
+    // A simulated table: each row's growth (a long reader keeps the WAL from
+    // being reused: every batch grows the files by what it changed).
+    val rows = (0 until 3000).map(i => if i == 700 then 40L << 20 else if i % 500 == 0 then 6L << 20 else 6_300L)
+    val H = 1_000L << 20
+    var free = H + (60L << 20)
+    var files = 0L
+    var deleted = 0
+    val batches = scala.collection.mutable.ArrayBuffer.empty[BulkLoop.Batch]
+    val guard = SpaceGuard(() => free, () => H)
+    val sizer = BatchSizer()
+    val r = scala.util.Try(BulkLoop.run(sizer, guard, () => free, () => files, b => batches += b) { n =>
+      val take = rows.slice(deleted, deleted + n)
+      val grown = take.sum
+      files += grown
+      free -= grown
+      deleted += take.size
+      (take.size, n, deleted < rows.size)
+    })
+    // A batch with the 40 MiB row consumed more than M: allowed (no bound claimed).
+    assert(batches.exists(_.grown > Headroom.M), batches.map(_.grown).max.toString)
+    // It stopped on a shortfall, after the batch that caused it, and started none after it.
+    assert(r.failed.toOption.exists(_.isInstanceOf[StorageBudget.NoRoom]), r.toString)
+    val last = batches.last
+    assert(last.freeAfter - H < Headroom.M, last.toString)
+    assert(batches.init.forall(_.freeAfter - H >= Headroom.M))
+    // Every row is either deleted or still there (none skipped to go on).
+    assertEquals(deleted, batches.map(_.rows).sum min rows.size)
+    // Each next batch after a large one was smaller.
+    for (a, b) <- batches.zip(batches.drop(1)) if a.grown > BatchSizer.Grow do assert(b.rows < a.rows || b.rows == 1, s"$a then $b")
+    // With room, a later run resumes where it stopped and finishes.
+    free = 10_000L << 20
+    BulkLoop.run(sizer, guard, () => free, () => files) { n =>
+      val take = rows.slice(deleted, deleted + n)
+      free -= take.sum
+      deleted += take.size
+      (take.size, n, deleted < rows.size)
+    }
+    assertEquals(deleted, rows.size)
+    // Below H + M before the first batch: none starts.
+    var ran = false
+    intercept[StorageBudget.NoRoom](BulkLoop.run(BatchSizer(), SpaceGuard(() => H + Headroom.M - 1, () => H), () => 0L, () => 0L) { _ => ran = true; (1, 1, false) })
+    assert(!ran)
   }
 
   test("a copied row group larger than 1 MiB is written in checked chunks of at most 1 MiB") {
@@ -253,26 +219,4 @@ class StorageBudgetSuite extends munit.FunSuite:
     r.release()
     other.release()
     assertEquals(b.outstanding, 0L)
-  }
-
-  test("each admitted reservation is published before it is given out, each release after; a failed publication refuses it") {
-    val events = scala.collection.mutable.ArrayBuffer.empty[String]
-    var fail = false
-    lazy val b: StorageBudget = StorageBudget(() => 100_000L, () => 10_000L, () => {
-      events += s"publish ${b.outstanding}"
-      if fail then throw java.io.IOException("not written")
-    })
-    val r = b.reserve(5_000).get
-    assertEquals(events.toSeq, Seq("publish 5000"))
-    r.release()
-    r.release()
-    assertEquals(events.toSeq, Seq("publish 5000", "publish 0"))
-    fail = true
-    assertEquals(b.reserve(5_000), None)
-    assertEquals(b.outstanding, 0L)
-    // A truncated file has more to write again: published, or it stops.
-    fail = false
-    val d = b.reserveFile(5_000, 3_000).get
-    fail = true
-    assert(!d.at(1_000))
   }
