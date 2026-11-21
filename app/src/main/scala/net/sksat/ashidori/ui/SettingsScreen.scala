@@ -51,6 +51,64 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
       .setTitle("データの出典")
       .setView(padded(body, 24, 8))
+      .setNeutralButton("ライセンス", (_, _) => showLicenses())
+      .setPositiveButton("閉じる", null)
+      .show()
+
+  /** The full license texts of what the offline maps draw with (the assets from tools/licenses/). */
+  private val Licenses = Seq(
+    ("Noto Sans（フォント）", "SIL Open Font License 1.1", "LICENSE-fonts.txt"),
+    ("アイコン（tangrams/icons）", "MIT License", "LICENSE-icons.txt"),
+    ("地図の配色とレイヤー定義（@protomaps/basemaps）", "BSD-3-Clause", "LICENSE-basemaps.txt"))
+
+  private def showLicenses(): Unit =
+    import android.text.{SpannableStringBuilder, Spanned}
+    import android.text.style.{ForegroundColorSpan, RelativeSizeSpan}
+    val items: Array[CharSequence] = Licenses.map { (what, license, _) =>
+      val sb = SpannableStringBuilder(what + "\n")
+      val start = sb.length
+      sb.append(license)
+      sb.setSpan(RelativeSizeSpan(0.85f), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+      sb.setSpan(ForegroundColorSpan(color(attr.onSurfaceVariant)), start, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+      sb: CharSequence
+    }.toArray
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle("ライセンス")
+      .setItems(items, (_, i) => showLicense(Licenses(i)._2, Licenses(i)._3))
+      .setPositiveButton("閉じる", null)
+      .show()
+
+  /** Joins the hard-wrapped lines of the texts' paragraphs (a line of 60 characters
+    * or more, not a rule of dashes, and the next one, unless it starts a numbered
+    * item or is a URL), so that they wrap to the screen.
+    */
+  private def reflow(s: String): String =
+    val out = StringBuilder()
+    var prev = ""
+    for line <- s.linesIterator do
+      val t = line.trim
+      val join = prev.length >= 60 && !prev.forall(_ == '-') && t.nonEmpty && !t.head.isDigit && !t.startsWith("http")
+      if join then
+        while out.nonEmpty && out.last == ' ' do out.setLength(out.length - 1)
+        out.append(' ').append(t)
+      else
+        if out.nonEmpty then out.append('\n')
+        out.append(line)
+      prev = line
+    out.toString
+
+  private def showLicense(title: String, asset: String): Unit =
+    val content = scala.util.Try {
+      val in = act.getAssets.open(asset)
+      try String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8) finally in.close()
+    }.map(reflow).getOrElse("読み込めませんでした")
+    val body = text(content, 13f)
+    body.setTextIsSelectable(true)
+    android.text.util.Linkify.addLinks(body, android.text.util.Linkify.WEB_URLS)
+    com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
+      .setTitle(title)
+      .setView(scroll(padded(body, 24, 8)))
+      .setNeutralButton("戻る", (_, _) => showLicenses())
       .setPositiveButton("閉じる", null)
       .show()
 

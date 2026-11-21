@@ -83,8 +83,11 @@ android {
 }
 
 // The App Links filter needs a host: merged only when ashidori.defaultServer is set.
+// The license texts of the map's fonts, icons and layers (tools/licenses/, the
+// same texts the tools put into the downloaded maps) are assets, for データの出典.
 androidComponents {
     onVariants { variant ->
+        variant.sources.assets?.addStaticSourceDirectory(rootProject.file("tools/licenses").path)
         if (defaultServerHost != null) variant.sources.manifests.addStaticManifestFile("src/applinks/AndroidManifest.xml")
     }
 }
