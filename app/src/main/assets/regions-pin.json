@@ -1,0 +1,10 @@
+{
+  "format": "ashidori regions pin v1",
+  "version": "20261117",
+  "file": "ashidori-regions-20261117.json",
+  "bytes": 36218,
+  "sha256": "d9c734df7cd433a8b7755542b775be269f7e315f049fc760264674b0f6b4e1b2",
+  "build": "20261117",
+  "cells": 136,
+  "cellBytes": 1213869317
+}
