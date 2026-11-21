@@ -114,7 +114,7 @@
 - [Natural Earth](https://www.naturalearthdata.com/)（パブリックドメイン）。低ズームの海岸線と境界に含まれる
 - Noto Sans の字形（SIL Open Font License 1.1）、protomaps/basemaps-assets のアイコン（MIT License）、@protomaps/basemaps の配色（BSD-3-Clause）。漢字とかなは端末のフォントで描画する
 
-出典の一覧は `tools/ATTRIBUTION` と、生成物と同じディレクトリの `ATTRIBUTION` にも記す。アプリの「データの出典」は、ダウンロードしたオフライン地図の `manifest.json` の出典を表示し、未取得の間は同じ内容の固定の文を表示する。
+出典の一覧は `tools/ATTRIBUTION` と、生成物と同じディレクトリの `ATTRIBUTION` にも記す。フォント、アイコン、配色とレイヤー定義のライセンスの全文は `tools/licenses/` に出典のコミットとともに置き、生成物（`OFL.txt`、`LICENSE-icons.txt`、`LICENSE-basemaps.txt`）とアプリ（「データの出典」の「ライセンス」）に含める。アプリの「データの出典」は、ダウンロードしたオフライン地図の `manifest.json` の出典を表示し、未取得の間は同じ内容の固定の文を表示する。
 
 施設データ（チェックインの候補）は次のデータから作成する。生成には `tools/venues/build.sh <作業ディレクトリ>` を用い、`tools/venues/out/` に出力する（約 18 MB、リポジトリにも APK にも含めない）。入力の抽出の版と sha256、pyosmium の版は `build.sh` に固定し、件数と出力の sha256 を `manifest.json` に記録する。
 

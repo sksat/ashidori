@@ -73,7 +73,8 @@ ashidori のオフラインの地域データ（ズーム 8 の区画ごとの�
 
 地図データは © OpenStreetMap contributors であり、Open Database License 1.0
 （https://opendatacommons.org/licenses/odbl/1-0/）の下で提供される。
-スタイルの束（ashidori-regions-style-*.zip）の出典は束の中の ATTRIBUTION、フォントのライセンスは OFL.txt を参照。
+スタイルの束（ashidori-regions-style-*.zip）の出典は束の中の ATTRIBUTION、ライセンスの全文は
+OFL.txt（フォント）、LICENSE-icons.txt（アイコン）、LICENSE-basemaps.txt（地図の配色とレイヤー定義）を参照。
 EOF
 
 echo "# GitHub Releases: the catalog and the style bundle first, then the packs in batches."

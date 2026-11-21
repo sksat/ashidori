@@ -18,7 +18,8 @@ import sys
 import zipfile
 
 FORMAT = "ashidori basemap archive v1"
-REQUIRED = ["style.json", "manifest.json", "ATTRIBUTION", "OFL.txt", "japan.pmtiles", "world.pmtiles"]
+REQUIRED = ["style.json", "manifest.json", "ATTRIBUTION", "OFL.txt", "LICENSE-icons.txt", "LICENSE-basemaps.txt",
+            "japan.pmtiles", "world.pmtiles"]
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 

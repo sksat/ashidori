@@ -13,7 +13,11 @@ writes <out>/ashidori-regions-style-<version>.zip holding
                               MapLibre draws with the system font (CJK, kana,
                               Hangul) and ranges without glyphs are empty files
   sprites/light{,@2x}.{json,png}
-  manifest.json  ATTRIBUTION  OFL.txt
+  manifest.json  ATTRIBUTION
+  OFL.txt                     the fonts' license, from protomaps/basemaps-assets
+  LICENSE-icons.txt           the sprites' license (tangrams/icons, MIT)
+  LICENSE-basemaps.txt        the layers' license (@protomaps/basemaps, BSD-3-Clause);
+                              both from tools/licenses/, which names their sources
 
 The fonts are a superset of the offline basemap's (tools/basemap/assemble.py
 fetches only the ranges its tiles use), so a style with packs can take the
@@ -113,13 +117,15 @@ def main():
         put(f"sprites/{s}", data)
     put("OFL.txt", assemble.download(assemble.ASSETS.format(commit=a.assets_commit, path="fonts/OFL.txt"),
                                      os.path.join(cache, "fonts/OFL.txt")))
+    for name in assemble.LICENSE_FILES:
+        put(name, assemble.license_text(name))
     attribution = [
         "Noto Sans（SIL Open Font License 1.1）。字形データは protomaps/basemaps-assets による",
         "アイコン: protomaps/basemaps-assets（tangrams/icons に由来、MIT License）",
         "地図の配色: @protomaps/basemaps（BSD-3-Clause）",
     ]
     put("ATTRIBUTION", ("地域データのスタイル（フォント、アイコン、配色）の出典\n\n"
-                        + "".join(f"- {l}\n" for l in attribution) + "\nフォントのライセンスは OFL.txt を参照。\n").encode())
+                        + "".join(f"- {l}\n" for l in attribution) + f"\nライセンスの全文: {assemble.LICENSE_NOTE}\n").encode())
     manifest = {
         "format": FORMAT,
         "style": a.style,

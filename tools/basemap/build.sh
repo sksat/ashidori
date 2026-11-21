@@ -16,6 +16,7 @@
 # Output (default tools/basemap/out/, untracked):
 #   japan.pmtiles  world.pmtiles  style.json  fonts/<stack>/<range>.pbf
 #   sprites/light{,@2x}.{json,png}  manifest.json  ATTRIBUTION  OFL.txt
+#   LICENSE-icons.txt  LICENSE-basemaps.txt (from tools/licenses/)
 # The app does not bundle it: tools/basemap/package.sh packs it into the
 # archive that the app downloads on first run and pins in the app.
 set -eu

@@ -38,7 +38,8 @@ ashidori のオフライン地図のデータ。アプリが初回にダウン�
 
 地図データは © OpenStreetMap contributors であり、Open Database License 1.0
 （https://opendatacommons.org/licenses/odbl/1-0/）の下で提供される。出典の一覧は
-アーカイブ内の ATTRIBUTION、フォントのライセンスは OFL.txt を参照。
+アーカイブ内の ATTRIBUTION、ライセンスの全文は OFL.txt（フォント）、LICENSE-icons.txt（アイコン）、
+LICENSE-basemaps.txt（地図の配色とレイヤー定義）を参照。
 EOF
 
 cat <<EOF

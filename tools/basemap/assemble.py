@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Assembles the offline basemap: style.json, glyphs, sprites, manifest and
-ATTRIBUTION, next to japan.pmtiles and world.pmtiles (see build.sh).
+"""Assembles the offline basemap: style.json, glyphs, sprites, manifest,
+ATTRIBUTION and the license texts, next to japan.pmtiles and world.pmtiles
+(see build.sh).
 
 Glyphs: MapLibre Native draws CJK ideographs, kana and fullwidth forms with the
 system font (localIdeographFontFamily, on by default on Android), so only the
@@ -26,6 +27,12 @@ import urllib.request
 
 ASSETS = "https://raw.githubusercontent.com/protomaps/basemaps-assets/{commit}/{path}"
 SPRITES = ["light.json", "light.png", "light@2x.json", "light@2x.png"]
+# Full license texts of the sprites (tangrams/icons, MIT) and of the layer
+# definitions (@protomaps/basemaps, BSD-3-Clause), vendored in tools/licenses/
+# with their source at a fixed commit; OFL.txt comes with the fonts.
+LICENSES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "licenses")
+LICENSE_FILES = ["LICENSE-icons.txt", "LICENSE-basemaps.txt"]
+LICENSE_NOTE = "フォントは OFL.txt、アイコンは LICENSE-icons.txt、地図の配色とレイヤー定義は LICENSE-basemaps.txt。"
 # BMP ranges drawn locally by MapLibre Native (i18n.cpp, allowsFixedWidthGlyphGeneration).
 LOCAL = [
     (0x02EA, 0x02EB), (0x1100, 0x11FF), (0x2E80, 0x2EFF), (0x2F00, 0x2FDF), (0x3000, 0x303F),
@@ -200,6 +207,11 @@ def download(url, dest):
         return f.read()
 
 
+def license_text(name):
+    with open(os.path.join(LICENSES, name), "rb") as f:
+        return f.read()
+
+
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -301,9 +313,12 @@ def main():
     ofl = download(ASSETS.format(commit=a.assets_commit, path="fonts/OFL.txt"), os.path.join(cache, "fonts/OFL.txt"))
     with open(os.path.join(a.out, "OFL.txt"), "wb") as f:
         f.write(ofl)
+    for name in LICENSE_FILES:
+        with open(os.path.join(a.out, name), "wb") as f:
+            f.write(license_text(name))
 
     sizes = {}
-    for name in ("japan.pmtiles", "world.pmtiles", "style.json", "OFL.txt"):
+    for name in ("japan.pmtiles", "world.pmtiles", "style.json", "OFL.txt", *LICENSE_FILES):
         with open(os.path.join(a.out, name), "rb") as f:
             files[name] = f.read()
     for rel, data in files.items():
@@ -348,7 +363,7 @@ def main():
         "japan.pmtiles と world.pmtiles は OpenStreetMap のデータベースから作成された",
         "Produced Work であり、OpenStreetMap のデータは Open Database License 1.0",
         "（https://opendatacommons.org/licenses/odbl/1-0/）の下で提供される。",
-        "フォントのライセンスは OFL.txt を参照。",
+        f"ライセンスの全文: {LICENSE_NOTE}",
         "",
     ]
     with open(os.path.join(a.out, "ATTRIBUTION"), "w", encoding="utf-8") as f:
