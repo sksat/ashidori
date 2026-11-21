@@ -43,7 +43,10 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。作り方: https://github.com/sksat/ashidori/tree/main/tools/venues",
       "",
       "■ 施設のオンライン検索",
-      "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）"
+      "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）",
+      "",
+      "■ ペアリングの確認",
+      "・BIP-39 の日本語の単語表（MIT License）: https://github.com/bitcoin/bips/blob/master/bip-0039/japanese.txt"
     )
     val body = text(lines.mkString("\n"), 14f)
     body.setTextIsSelectable(true)
@@ -55,11 +58,14 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       .setPositiveButton("閉じる", null)
       .show()
 
-  /** The full license texts of what the offline maps draw with (the assets from tools/licenses/). */
+  /** The full license texts of what the app bundles or draws the offline maps with (the assets
+    * from tools/licenses/).
+    */
   private val Licenses = Seq(
     ("Noto Sans（フォント）", "SIL Open Font License 1.1", "LICENSE-fonts.txt"),
     ("アイコン（tangrams/icons）", "MIT License", "LICENSE-icons.txt"),
-    ("地図の配色とレイヤー定義（@protomaps/basemaps）", "BSD-3-Clause", "LICENSE-basemaps.txt"))
+    ("地図の配色とレイヤー定義（@protomaps/basemaps）", "BSD-3-Clause", "LICENSE-basemaps.txt"),
+    ("BIP-39 の日本語の単語表（ペアリングの確認）", "MIT License", "LICENSE-bip39.txt"))
 
   private def showLicenses(): Unit =
     import android.text.{SpannableStringBuilder, Spanned}
