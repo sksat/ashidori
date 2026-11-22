@@ -1,69 +1,58 @@
 # データフロー（README）
-# 端末は記録を暗号化してから送る。復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号化した記録だけが届く。
+# 端末は記録を暗号化したバッチにして送り、同期サーバは暗号化したバッチと
+# その一覧だけを持つ。復号できるのは利用者の端末とペアリングしたブラウザだけ。
 direction: down
-grid-rows: 3
-grid-gap: 150
+
+*.style.font-size: 26
+*.*.style.font-size: 26
+*.*.*.style.font-size: 26
+(** -> **)[*].style.font-size: 22
+(** <-> **)[*].style.font-size: 22
+
+# Every arrow points the way the data moves: written on the device, or sent
+# encrypted over the network.
+classes: {
+  local: {style: {stroke: "#5b5a56"; stroke-width: 3}}
+  encrypted: {style: {stroke: "#2a78d6"; stroke-width: 3}}
+}
 
 phone: 端末 {
-  grid-columns: 3
-  horizontal-gap: 90
-  sensors: "センサー" {
-    d: "GNSS・IMU・気圧・電池" {shape: text}
-  }
-  db: "SQLite" {
-    shape: cylinder
-    d: "当日のセンサーの記録\n場所・チェックイン\n移動手段の修正" {shape: text}
-  }
-  archive: "Parquet" {
-    shape: cylinder
-    d: "前日までのセンサーの記録\n日・月ごとのファイル" {shape: text}
+  sensors: "センサー\nGNSS・IMU・気圧・電池"
+
+  sqlite: SQLite {
+    today: 当日のセンサーの記録 {shape: cylinder}
+    edits: "場所・チェックイン\n移動手段の修正" {shape: cylinder}
   }
 
-  sensors -> db: 記録
-  db -> archive: 移す
+  parquet: Parquet {
+    files: 日・月のファイル {shape: cylinder}
+  }
+
+  sensors -> sqlite.today: 記録 {class: local}
+  sqlite.today -> parquet.files: 翌日以降に移す {class: local}
 }
 
-server: 同期サーバ {
+cf: 同期サーバ（Cloudflare） {
   label.near: top-left
-  grid-columns: 2
-  horizontal-gap: 110
-  # The Worker on the left (under the device's encryption and above the readers),
-  # the stores on the right, so no arrow crosses a store.
-  api: "Worker（Cloudflare Workers）" {
-    d: "認証・記録の受け渡し\nWeb 版と管理ページの配信" {shape: text}
+  worker: Worker
+
+  r2: Cloudflare R2 {
+    batches: 暗号化したバッチ {shape: cylinder}
   }
-  stores: "" {
-    style.fill: transparent
-    style.stroke: transparent
-    grid-rows: 2
-    vertical-gap: 24
-    blobs: "Cloudflare R2" {
-      shape: cylinder
-      d: "暗号化した記録そのもの\n日・月のファイル、場所、チェックイン\n移動手段の修正、端末の状態" {shape: text}
-    }
-    meta: "Cloudflare D1" {
-      shape: cylinder
-      d: "利用者・端末・招待\n記録の一覧（端末・種類・大きさ・時刻）\n共有したチェックイン" {shape: text}
-    }
+
+  d1: Cloudflare D1 {
+    index: "バッチの一覧\n端末・種類・大きさ・時刻" {shape: cylinder}
+    accounts: "利用者・端末" {shape: cylinder}
   }
-  api -> stores.blobs: 保存・取り出し
-  api -> stores.meta: 更新・参照
+
+  worker <-> r2.batches: 保存・取り出し {class: encrypted}
+  worker -> d1.index: 一覧に追加 {class: local}
 }
 
-readers: "" {
-  style.fill: transparent
-  style.stroke: transparent
-  grid-columns: 2
-  horizontal-gap: 80
-  web: "Web 版（ブラウザ）" {
-    d: "ブラウザの中で復号して表示" {shape: text}
-  }
-  other: "別の端末" {
-    d: "端末の中で復号して表示" {shape: text}
-  }
-}
+web: "Web 版（ブラウザ）\nブラウザの中で復号"
+other: "別の端末\n端末の中で復号"
 
-phone.db -> server.api: "暗号化して送る\n場所・チェックイン・修正\n端末の状態"
-phone.archive -> server.api: "暗号化して送る\n日・月のファイル"
-server.api -> readers.web: 暗号化した記録を取得
-server.api -> readers.other: 暗号化した記録を取得
+phone.sqlite.edits -> cf.worker: 暗号化して送る {class: encrypted}
+phone.parquet.files -> cf.worker: 暗号化して送る {class: encrypted}
+web <- cf.worker: 暗号化したバッチ {class: encrypted}
+other <- cf.worker: 暗号化したバッチ {class: encrypted}
