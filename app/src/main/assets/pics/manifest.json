@@ -1,0 +1,25 @@
+{
+  "format": "pics-sites v1",
+  "attribution": [
+    "出典：警察庁ウェブサイト「全国高度化PICS整備交差点（CSV版）」（令和8年4月1日現在） https://www.npa.go.jp/bureau/traffic/seibi2/annzen-shisetu/utms/pics.html を加工して作成（文字コードと列の変換。ashidori）"
+  ],
+  "source": {
+    "title": "全国高度化PICS整備交差点（CSV版）",
+    "publisher": "警察庁",
+    "url": "https://www.npa.go.jp/bureau/traffic/seibi2/annzen-shisetu/utms/pics.html",
+    "asOf": "2026-04-01",
+    "terms": "公共データ利用規約（第1.0版）（PDL1.0）に準拠（警察庁ウェブサイトの利用規約）",
+    "file": "00-260401-zenkoku-kousaten.csv",
+    "bytes": 77452,
+    "sha256": "8386b14608b05bfa1f22fcbd151cedc0a8defda611a7153876a1ec2bc1e9d73a",
+    "encoding": "Shift_JIS",
+    "rows": 638
+  },
+  "output": {
+    "file": "sites.csv",
+    "bytes": 43719,
+    "sha256": "a165832d7a0a315f4f2ba5124862c3fb4a0f7e95711f476470ea0c93b8448c65",
+    "rows": 638
+  },
+  "processing": "文字コードを UTF-8 に変換し、都道府県・市町村・交差点名称・緯度・経度の列を抜き出した"
+}

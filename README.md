@@ -155,6 +155,7 @@ Gradle のプロパティ（リポジトリの外の `~/.gradle/gradle.propertie
 - オフライン地図・地域データ: © OpenStreetMap contributors（[ODbL 1.0](https://www.openstreetmap.org/copyright)、Produced Work）、[Protomaps Basemap](https://protomaps.com/)、[Natural Earth](https://www.naturalearthdata.com/)
 - 施設データ: © OpenStreetMap contributors（[ODbL 1.0](https://www.openstreetmap.org/copyright)、Derivative Database として ODbL 1.0 の下で提供）、[Geofabrik](https://download.geofabrik.de/asia/japan.html) の日本の抽出
 - 地図のフォント・アイコン・配色: Noto Sans（SIL Open Font License 1.1）、tangrams/icons（MIT）、@protomaps/basemaps（BSD-3-Clause）
+- 信号機の電波の交差点の一覧: 警察庁ウェブサイト「全国高度化PICS整備交差点（CSV版）」（令和8年4月1日現在、<https://www.npa.go.jp/bureau/traffic/seibi2/annzen-shisetu/utms/pics.html>、[公共データ利用規約（第1.0版）](https://www.digital.go.jp/resources/open_data/public_data_license_v1.0)）を加工して作成（文字コードと列の変換）
 - ペアリングの確認の語: BIP-39 の日本語の単語表（[bitcoin/bips](https://github.com/bitcoin/bips/blob/master/bip-0039/japanese.txt)、MIT）
 
 版と加工の内容は [`tools/ATTRIBUTION`](tools/ATTRIBUTION)、ライセンスの全文は [`tools/licenses/`](tools/licenses/) にあり、アプリの「設定 > データの出典」にも表示する。
