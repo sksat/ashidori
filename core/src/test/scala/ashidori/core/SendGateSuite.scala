@@ -177,6 +177,22 @@ class SendGateSuite extends munit.FunSuite:
     assertEquals(started.map(_._1).toSeq, Seq("a", "c", "d", "e"))
   }
 
+  test("a job is running until it finishes or the queue drops it (a timed-out snapshot acts only then)") {
+    val g = gate(Policy.fromBlock(false))
+    val q = SnapshotQueue[String](g)
+    q.enqueue(() => Some("a"))
+    q.enqueue(() => Some("b"))
+    assert(q.isRunning("a") && !q.isRunning("b"))
+    q.finished("a")
+    assert(!q.isRunning("a") && q.isRunning("b"))
+    // Dropped by a change of the rules (or a hold): no longer its job, though not finished.
+    assertEquals(q.invalidate(), Some("b"))
+    assert(!q.isRunning("b"))
+    q.enqueue(() => Some("c"))
+    q.hold()
+    assert(!q.isRunning("c"))
+  }
+
   test("a queued job of an old generation is skipped even without invalidate, and the next one runs") {
     val g = gate()
     val q = SnapshotQueue[String](g)

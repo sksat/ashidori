@@ -41,6 +41,41 @@ class BaseMapPolicySuite extends munit.FunSuite:
     assert(BaseMapPolicy.thumbnail(mixed, Offline, Offline, true) && !BaseMapPolicy.thumbnail(mixed, Offline, Offline, false))
   }
 
+  test("snapshot without a validated network: the offline map instead of an automatic online one, never another online map") {
+    val mixed = rules(When.Auto, When.OnAction)
+    // Reachable: the rules alone, as snapshot.
+    for w <- Seq(auto, onAction, mixed); c <- Seq(Osm, Gsi, Offline); a <- Seq(true, false) do
+      assertEquals(BaseMapPolicy.snapshotNow(w, c, Offline, a, reachable = true), BaseMapPolicy.snapshot(w, c, Offline, a))
+    // Not reachable: the online map becomes the offline one, or none without it.
+    assertEquals(BaseMapPolicy.snapshotNow(auto, Osm, Offline, true, reachable = false), Draw(Offline))
+    assertEquals(BaseMapPolicy.snapshotNow(auto, Osm, Offline, false, reachable = false), NoBasemap)
+    assertEquals(BaseMapPolicy.snapshotNow(mixed, Osm, Offline, true, reachable = false), Draw(Offline))
+    // What did not send before sends nothing now either; the offline map is unchanged.
+    assertEquals(BaseMapPolicy.snapshotNow(onAction, Gsi, Offline, true, reachable = false), Draw(Offline))
+    assertEquals(BaseMapPolicy.snapshotNow(auto, Offline, Offline, true, reachable = false), Draw(Offline))
+    assertEquals(BaseMapPolicy.snapshotNow(auto, Offline, Offline, false, reachable = false), NoBasemap)
+    // No case gives an online map that snapshot would not.
+    for w <- Seq(auto, onAction, mixed, rules(When.Never, When.Auto)); c <- Seq(Osm, Gsi, Offline); a <- Seq(true, false); r <- Seq(true, false) do
+      BaseMapPolicy.snapshotNow(w, c, Offline, a, r) match
+        case Draw(s) if s != Offline => assertEquals(BaseMapPolicy.snapshot(w, c, Offline, a), Draw(s))
+        case _ => ()
+  }
+
+  test("the fallback of a snapshot is the offline map, or no base map without it") {
+    assertEquals(BaseMapPolicy.snapshotFallback(Offline, true), Draw(Offline))
+    assertEquals(BaseMapPolicy.snapshotFallback(Offline, false), NoBasemap)
+  }
+
+  test("a snapshot that fell back is drawn online again only while the rules still choose an online map") {
+    assert(BaseMapPolicy.redrawOnline(auto, Osm, Offline, true, fellBack = true))
+    assert(BaseMapPolicy.redrawOnline(auto, Osm, Offline, false, fellBack = true))
+    assert(!BaseMapPolicy.redrawOnline(auto, Osm, Offline, true, fellBack = false))
+    // The rule changed to on action or never, or the offline map chosen since: not again.
+    assert(!BaseMapPolicy.redrawOnline(onAction, Osm, Offline, true, fellBack = true))
+    assert(!BaseMapPolicy.redrawOnline(rules(When.Never, When.Never), Osm, Offline, true, fellBack = true))
+    assert(!BaseMapPolicy.redrawOnline(auto, Offline, Offline, true, fellBack = true))
+  }
+
   test("custom tile URLs: http(s) with {z} {x} {y}, one line only") {
     assert(BaseMapPolicy.validTileUrl("https://t.example.net/{z}/{x}/{y}.png?key=abc"))
     assert(!BaseMapPolicy.validTileUrl("https://t.example.net/{z}/{x}.png"))

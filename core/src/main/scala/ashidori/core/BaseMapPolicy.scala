@@ -74,6 +74,35 @@ object BaseMapPolicy:
   def snapshot[S](when: S => When, chosen: S, offline: S, offlineAvailable: Boolean): Outcome[S] =
     resolve(if auto(when, chosen, offline) then chosen else offline, offline, offlineAvailable)
 
+  /** What a snapshot draws when the online map [[snapshot]] chose cannot be
+    * drawn now: no validated network, its style not on the device, or its
+    * rendering failed or ran out of time. The on-device basemap (with the
+    * region packs), which sends nothing; without it, no base map. Never
+    * another online map: the rules are not asked, as nothing is sent.
+    */
+  def snapshotFallback[S](offline: S, offlineAvailable: Boolean): Outcome[S] =
+    resolve(offline, offline, offlineAvailable)
+
+  /** [[snapshot]] right before it starts, `reachable` telling whether a
+    * validated network is there. Without one, an online map is not tried
+    * (its style and tiles cannot arrive, and the card would wait for them):
+    * the snapshot is the [[snapshotFallback]].
+    */
+  def snapshotNow[S](when: S => When, chosen: S, offline: S, offlineAvailable: Boolean, reachable: Boolean): Outcome[S] =
+    snapshot(when, chosen, offline, offlineAvailable) match
+      case Draw(s) if s != offline && !reachable => snapshotFallback(offline, offlineAvailable)
+      case o => o
+
+  /** Whether a snapshot that fell back from an online map (`fellBack`) is
+    * drawn again when a network returns: only while [[snapshot]] still
+    * chooses an online map by the rules then. Its new job takes its permit
+    * as any other.
+    */
+  def redrawOnline[S](when: S => When, chosen: S, offline: S, offlineAvailable: Boolean, fellBack: Boolean): Boolean =
+    fellBack && (snapshot(when, chosen, offline, offlineAvailable) match
+      case Draw(s) => s != offline
+      case NoBasemap => false)
+
   /** Whether the picker may render a thumbnail of `style` at the current
     * view: each candidate by its own destination's rule (automatic only).
     */

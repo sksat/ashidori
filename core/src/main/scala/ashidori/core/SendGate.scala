@@ -271,6 +271,9 @@ final class SnapshotQueue[H](gate: SendGate, dests: Set[Dest] = Dest.Tiles):
     busy = false
     r
 
+  /** `h` is the running job's handle (not finished, cancelled or dropped). */
+  def isRunning(h: H): Boolean = running.contains(h)
+
   /** Drops queued jobs (e.g. the screen reloaded); a running one finishes. */
   def clearQueued(): Unit = queue.clear()
 
