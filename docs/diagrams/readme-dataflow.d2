@@ -1,0 +1,26 @@
+# 記録と同期（README）
+# 鍵 K を持つのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号文だけが届く。
+direction: right
+
+phone: 端末 {
+  sensors: "センサー\nGNSS・IMU\n気圧・電池"
+  db: "SQLite\n当日の記録" {shape: cylinder}
+  archive: "Parquet\n日・月の\nアーカイブ" {shape: cylinder}
+  enc: "暗号化\n鍵 K"
+
+  sensors -> db
+  db -> archive: 翌日以降
+  archive -> enc
+  db -> enc: 場所・チェックイン\n修正・状態
+}
+
+server: "同期サーバ\nWorkers・D1・R2" {shape: cylinder}
+
+readers: "鍵 K を持つ側" {
+  web: "Web ブラウザ\n（ブラウザ内で復号）"
+  other: "別の端末"
+}
+
+phone.enc -> server: 暗号文
+server -> readers.web: 暗号文
+server -> readers.other: 暗号文

@@ -1,0 +1,30 @@
+# 端末の外とのやり取り（README）
+# 破線は「データの扱い」で送信先ごとに許可したときだけの経路を表す。
+direction: right
+
+classes: {
+  gated: {style.stroke-dash: 4}
+}
+
+releases: "GitHub Releases\nオフライン地図・施設データ・地域データ"
+
+phone: 端末 {
+  direction: down
+  pin: "固定した sha256 で照合"
+  local: "端末内の地図・地名・施設\n通信せずに表示・検索"
+  pin -> local
+}
+
+ext: 外部サービス {
+  tiles: "オンライン地図の配信元\n表示範囲"
+  geocoder: "Android の Geocoder\n位置"
+  overpass: "OpenStreetMap の施設検索\n位置"
+}
+
+sync: "同期サーバ"
+
+releases -> phone.pin: "取得（地域データは選んだ区画）"
+phone -> ext.tiles: 許可した粒度 {class: gated}
+phone -> ext.geocoder: 許可した粒度 {class: gated}
+phone -> ext.overpass: 「オンラインで検索」 {class: gated}
+phone <-> sync: 暗号文
