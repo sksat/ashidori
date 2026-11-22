@@ -451,6 +451,47 @@ object RegionStatus:
   /** When its packs were last placed. */
   def date(r: Region, s: RegionState): Option[Long] = r.cells.flatMap(s.packs.get).flatMap(_.installed.map(_.at)).maxOption
 
+/** What the run does with a region now (design 6.12), for its bar. */
+enum RegionProgress:
+  /** The run does not work on it (it waits, was stopped, or is done). */
+  case Idle
+  /** The run works on it, without a size yet (its style bundle, or the catalog). */
+  case Busy
+  /** `done` of `total` bytes: of all its packs (those already on the
+    * device count as done), or, for an update (`update`), of the newer versions.
+    */
+  case Bytes(done: Long, total: Long, update: Boolean)
+  /** A pack is complete: it is checked and placed. */
+  case Checking
+
+object RegionProgress:
+  /** `progress`: bytes of the pack being downloaded ([[RegionRun.Env.progress]]);
+    * `running`: a run is under way (it works on the first pending pack).
+    */
+  def of(r: Region, s: RegionState, progress: Map[Cell, Long], running: Boolean): RegionProgress =
+    val cells = r.cells.distinct
+    val active = progress.keys.find(cells.contains)
+      .orElse(if running then RegionRun.pending(s).map(_._1).filter(cells.contains) else None)
+    active.flatMap(c => s.packs.get(c).flatMap(_.target).map(c -> _)) match
+      case None => Idle
+      case Some((c, t)) =>
+        progress.get(c) match
+          case None => Busy
+          case Some(n) if n >= t.file.bytes => Checking
+          case Some(_) =>
+            val ps = cells.flatMap(x => s.packs.get(x).map(x -> _))
+            def got(x: Cell, t: Target) = progress.getOrElse(x, 0L).min(t.file.bytes)
+            if s.packs(c).installed.nonEmpty then
+              val up = ps.collect { case (x, PackState(Some(_), Some(t), _)) => x -> t }
+              Bytes(up.map(got.tupled).sum, up.map(_._2.file.bytes).sum, update = true)
+            else
+              val sizes = ps.map { (x, p) =>
+                p.installed match
+                  case Some(i) => (i.bytes, i.bytes)
+                  case None => p.target.fold((0L, 0L))(t => (got(x, t), t.file.bytes))
+              }
+              Bytes(sizes.map(_._1).sum, sizes.map(_._2).sum, update = false)
+
 /** The size a selection of cells would download (design 6.11): the
   * catalog's packs not on the device or planned yet, and the style bundles
   * they need that are not there; cells outside the catalog apart.

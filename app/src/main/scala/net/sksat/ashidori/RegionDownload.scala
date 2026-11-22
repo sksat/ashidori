@@ -100,6 +100,10 @@ class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, p
       case _ => None
 
   override def doWork(): ListenableWorker.Result =
+    Regions.runStep(1)
+    try work() finally Regions.runStep(-1)
+
+  private def work(): ListenableWorker.Result =
     // The start's reconciliation first: nothing else touches the files before it.
     Regions.ensureLoaded()
     val p = permit()
@@ -119,16 +123,22 @@ class RegionWorker(ctx: Context, params: WorkerParameters) extends Worker(ctx, p
         def budget: StorageBudget = RegionDownload.budget
         def cancelled(): Boolean = isStopped
         def now(): Long = System.currentTimeMillis()
-        private var shown = 0L
+        /** The pack reported on, its size and its throttle. */
+        private var shown: Option[(Cell, Long, ProgressThrottle)] = None
         override def progress(cell: Option[Cell], done: Long): Unit = cell match
           case None =>
+            shown = None
             Regions.progress = Map.empty
             Regions.changed()
           case Some(c) =>
             Regions.waiting = None
-            // About every 1 MB.
-            if done < shown || done - shown >= 1_000_000 then
-              shown = done
+            // At most every 250 ms, and 1 MiB on (the first and the last bytes always).
+            val (_, total, t) = shown.filter(_._1 == c).getOrElse {
+              val s = (c, Regions.state.packs.get(c).flatMap(_.target).fold(0L)(_.file.bytes), ProgressThrottle())
+              shown = Some(s)
+              s
+            }
+            if t.due(done, total, System.currentTimeMillis()) then
               Regions.progress = Map(c -> done)
               Regions.changed()
         // A change that cannot be written stops the run (it is retried).

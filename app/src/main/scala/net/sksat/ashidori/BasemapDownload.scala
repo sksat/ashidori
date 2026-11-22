@@ -442,15 +442,14 @@ abstract class PinnedWorker(ctx: Context, params: WorkerParameters, dl: PinnedDo
     val errors = scala.collection.mutable.ArrayBuffer.empty[(BasemapSource, DownloadCause)]
     val found = sources.iterator.map { (source, url) =>
       try
-        var shown = -1L
+        val shown = ProgressThrottle()
         ResumableDownload.run(http, url, part, pin.bytes, () => isStopped, n => {
           // Every write reports the file's size, also after a restart from
           // the start (another source, HTTP 200 to a Range request): it stops
           // (the partial file stays) once it would cut into the logging reserve.
           if !room.at(n) then throw PinnedFailure(DownloadCause.Storage)
-          // About every 1 %.
-          if n == pin.bytes || n - shown >= pin.bytes / 100 then
-            shown = n
+          // At most every 250 ms, and 1 MiB on (the first and the last bytes always).
+          if shown.due(n, pin.bytes, System.currentTimeMillis()) then
             dl.reportProgress(Some((n, pin.bytes, source)))
         }, o => GuardedOutputStream(o, room.guard))
         if Sha256.matches(part, pin) then Some(part -> source)

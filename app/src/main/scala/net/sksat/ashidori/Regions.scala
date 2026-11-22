@@ -188,6 +188,16 @@ object Regions:
   /** Why downloads wait now (空き容量が不足, 通信できません), until the next run gets on. */
   @volatile var waiting: Option[String] = None
 
+  private val runs = java.util.concurrent.atomic.AtomicInteger()
+  /** A run of the downloads is under way in this process (it may be on a bundle, with no bytes to tell). */
+  def running: Boolean = runs.get > 0
+  /** Around each run ([[RegionWorker]]): tells the UI when it starts and ends. */
+  private[ashidori] def runStep(delta: Int): Unit =
+    runs.addAndGet(delta)
+    changed()
+  /** What the list's bar shows of `r` now. */
+  def activity(r: Region): RegionProgress = RegionProgress.of(r, state, progress, running)
+
   private val listeners = scala.collection.mutable.LinkedHashSet.empty[() => Unit]
   def listen(f: () => Unit): () => Unit =
     listeners += f

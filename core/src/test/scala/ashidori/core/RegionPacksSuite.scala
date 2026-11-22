@@ -770,3 +770,47 @@ class RegionPacksSuite extends munit.FunSuite:
     first.get()
     assert(!b2.loading)
   }
+
+  test("progress: bytes of the whole region while packs download, the bundle and the check without a size") {
+    val c = publish("20261117", Seq(tokyo, osaka)).catalog
+    val r = Region("r1", "a", Seq(tokyo, osaka), 0)
+    val s = RegionState.empty.add(r, c)
+    val (ob, tb) = (c.cells(osaka).map.bytes, c.cells(tokyo).map.bytes)
+    assertEquals(s.queue.map(_._1), Seq(osaka, tokyo))
+    // Nothing runs: no bar.
+    assertEquals(RegionProgress.of(r, s, Map.empty, running = false), RegionProgress.Idle)
+    // The run is on its first pack, before any bytes of it (its bundle first).
+    assertEquals(RegionProgress.of(r, s, Map.empty, running = true), RegionProgress.Busy)
+    assertEquals(RegionProgress.of(r, s, Map(osaka -> 10L), running = true), RegionProgress.Bytes(10, ob + tb, update = false))
+    assertEquals(RegionProgress.of(r, s, Map(osaka -> ob), running = true), RegionProgress.Checking)
+    // The first pack placed: it counts as done, the bar does not start over.
+    val one = s.copy(packs = s.packs.updated(osaka, PackState(Some(Installed("20261117", "s1", ob, 1)), None)))
+    assertEquals(RegionProgress.of(r, one, Map(tokyo -> 5L), running = true), RegionProgress.Bytes(ob + 5, ob + tb, update = false))
+    // Another region's pack: not this one's bar.
+    val other = Region("r2", "b", Seq(ishigaki), 0)
+    assertEquals(RegionProgress.of(other, one, Map(tokyo -> 5L), running = true), RegionProgress.Idle)
+    // An update: of the newer versions only.
+    val placed = RegionState(Seq(r), Map(
+      tokyo -> PackState(Some(Installed("20261010", "s1", 1, 1)), None),
+      osaka -> PackState(Some(Installed("20261117", "s1", ob, 1)), None)))
+    val up = placed.update(Set(tokyo, osaka), c)
+    assertEquals(RegionProgress.of(r, up, Map(tokyo -> 7L), running = true), RegionProgress.Bytes(7, tb, update = true))
+  }
+
+  test("progress reports: thinned by time and bytes; the first, the last and a restart always") {
+    val t = ProgressThrottle(intervalMs = 250, step = 1000)
+    assert(t.due(10, 100_000, 0))
+    // Too soon, and too little.
+    assert(!t.due(2_000, 100_000, 100))
+    assert(!t.due(500, 100_000, 400))
+    assert(t.due(2_000, 100_000, 400))
+    // The end at once; the same size again not.
+    assert(t.due(100_000, 100_000, 410))
+    assert(!t.due(100_000, 100_000, 900))
+    // From the start again (another source).
+    assert(t.due(5, 100_000, 920))
+    // A small file: 1/200 of it is enough.
+    val s = ProgressThrottle(intervalMs = 250, step = 1000)
+    assert(s.due(1, 2_000, 0))
+    assert(s.due(11, 2_000, 300))
+  }
