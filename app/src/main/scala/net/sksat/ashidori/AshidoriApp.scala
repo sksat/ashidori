@@ -123,6 +123,13 @@ object Settings:
   def showEstimates: Boolean = prefs.getBoolean("showEstimates", false)
   def showEstimates_=(b: Boolean): Unit = prefs.edit().putBoolean("showEstimates", b).apply()
 
+  /** 「信号機の電波を記録」: receive 高度化PICS advertisements while
+    * recording (docs/design/pics.md). Off unless the user turns it on (and
+    * grants 付近のデバイス).
+    */
+  def picsEnabled: Boolean = prefs.getBoolean("picsEnabled", false)
+  def picsEnabled_=(b: Boolean): Unit = prefs.edit().putBoolean("picsEnabled", b).apply()
+
   /** When recording was last switched on (0 if unknown). */
   def loggingSince: Long = prefs.getLong("enabledSince", 0L)
 

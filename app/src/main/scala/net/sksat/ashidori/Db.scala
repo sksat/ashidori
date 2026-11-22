@@ -50,6 +50,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     addEnergy(db)
     addElevation(db)
     addTombstones(db)
+    addPics(db)
 
   private def columns(db: SQLiteDatabase, table: String): Set[String] =
     Using.resource(db.rawQuery(s"PRAGMA table_info($table)", null)) { c =>
@@ -69,6 +70,12 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     */
   private def addElevation(db: SQLiteDatabase): Unit =
     DbSchema.toV8(columns(db, "fixes"), columns(db, "sync_outbox")).foreach(db.execSQL)
+
+  /** Version 10: received PICS advertisements (`pics_adv`) and the PICS
+    * scan of the state spans (`energy_state.ble`). Only adds what is missing.
+    */
+  private def addPics(db: SQLiteDatabase): Unit =
+    DbSchema.toV10(columns(db, "energy_state")).foreach(db.execSQL)
 
   /** Version 9: check-ins and places are deleted by a tombstone (`deleted`). */
   private def addTombstones(db: SQLiteDatabase): Unit =
@@ -184,6 +191,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     if oldV < 7 then addEnergy(db)
     if oldV < 8 then addElevation(db)
     if oldV < 9 then addTombstones(db)
+    if oldV < 10 then addPics(db)
 
   /** A database of a newer app version: not opened (Android's default
     * would fail the same way). The data stays as it is; the way back is a
@@ -323,6 +331,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     cv.put("eff_mode", e.effMode)
     cv.put("motion", e.motion)
     cv.put("env", e.env)
+    // NULL where not known (never "off").
+    e.ble.foreach(cv.put("ble", _))
     cv
 
   /** Applies a record of the logger's state changes ([[EnergyLog]]): in
@@ -343,7 +353,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       else
         query(s"""SELECT rowid,$energyCols,(SELECT confirmed_at FROM energy_checkpoint k WHERE k.boot=energy_state.boot)
           |FROM energy_state WHERE end IS NULL AND boot<?""".stripMargin, b) { c =>
-          (rowOf(c, 1).copy(id = c.getLong(0)), Option.when(!c.isNull(17))(c.getLong(17)))
+          (rowOf(c, 1).copy(id = c.getLong(0)), Option.when(!c.isNull(18))(c.getLong(18)))
         }
     val ch = EnergyLog.apply(EnergyLog.Before(tail, cp, newest, olderOpen), r, AshidoriApp.zone, deletedIn(db))
     for id <- ch.remove do db.delete("energy_state", "rowid=?", Array(id.toString))
@@ -436,13 +446,14 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       b.result()
     }
 
-  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown,boot,seq"
+  private val energyCols = "start,end,gnss,gnss_interval_ms,provider,detail,still,screen_on,charging,mode,eff_mode,motion,env,end_unknown,boot,seq,ble"
   private def energyOf(c: Cursor, at: Int, end: Long): EnergySpan = rowOf(c, at).span.copy(end = end)
   private def rowOf(c: Cursor, at: Int): EnergyRow =
     def s(i: Int) = Option(c.getString(at + i)).getOrElse("")
     EnergyRow(c.getLong(at), Option.when(!c.isNull(at + 1))(c.getLong(at + 1)),
       EnergyState(c.getInt(at + 2) != 0, c.getLong(at + 3), s(4), c.getInt(at + 5) != 0,
-        c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12)),
+        c.getInt(at + 6) != 0, c.getInt(at + 7) != 0, c.getInt(at + 8) != 0, s(9), s(10), s(11), s(12),
+        Option(c.getString(at + 16))),
       !c.isNull(at + 13) && c.getInt(at + 13) != 0, c.getLong(at + 14), c.getLong(at + 15))
 
   /** When recorder `boot` last confirmed its state, if it did. */
@@ -576,6 +587,63 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     finally st.close()
   }
 
+  /** Closed runs of received PICS advertisements ([[PicsAdv]]): rowids
+    * from the floor, and a run that touches a deleted range is not written
+    * ([[Deletion.keptRun]]).
+    */
+  def insertPicsAdv(rs0: Iterable[PicsAdv]): Unit = tx { db =>
+    val del = deletedIn(db)
+    val rs = rs0.filter(a => Deletion.keptRun(del, a.start, a.end))
+    val st = db.compileStatement(
+      "INSERT INTO pics_adv(rowid, start, end, addr, iid, kind, msg, msg_last, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan) " +
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    try
+      var id = claimRowids(db, "pics_adv", rs.size)
+      for a <- rs do
+        st.clearBindings()
+        st.bindLong(1, id)
+        id += 1
+        st.bindLong(2, a.start)
+        st.bindLong(3, a.end)
+        st.bindString(4, a.addr)
+        a.iid.fold(st.bindNull(5))(st.bindString(5, _))
+        Seq(6 -> a.kind, 7 -> a.msg, 8 -> a.msgLast).foreach((i, v) => v.fold(st.bindNull(i))(x => st.bindLong(i, x.toLong)))
+        st.bindLong(9, a.msgChanges.toLong)
+        st.bindLong(10, a.n.toLong)
+        st.bindLong(11, a.rssiMax.toLong)
+        st.bindLong(12, a.rssiMaxAt)
+        st.bindLong(13, a.rssiMin.toLong)
+        st.bindString(14, a.data)
+        st.bindString(15, a.scan)
+        st.executeInsert()
+    finally st.close()
+  }
+
+  /** Runs of received PICS advertisements starting in [from, to),
+    * archived and recent, in time order (rule C: under the lock, each once).
+    */
+  def picsAdv(from: Long, to: Long): Vector[PicsAdv] = AshidoriApp.archive.reading(Archive.PicsAdvs) {
+    once("pics_adv", AshidoriApp.archive.read(Archive.PicsAdvs, from, to).map(Archive.picsOf) ++ hotPics(from, to))(a =>
+      Archive.picsRow(a).toIndexedSeq).sortBy(_.start)
+  }
+
+  /** The last `n` runs in SQLite (today's), newest first: 端末診断's list. */
+  def recentPicsAdv(n: Int): Vector[PicsAdv] = AshidoriApp.archive.reading(Archive.PicsAdvs) {
+    val (x, xa) = notPending("pics_adv")
+    query(s"SELECT $picsCols FROM pics_adv WHERE 1$x ORDER BY start DESC, rowid DESC LIMIT $n", xa*)(picsOf)
+  }
+
+  private val picsCols = "start,end,addr,iid,kind,msg,msg_last,msg_changes,n,rssi_max,rssi_max_at,rssi_min,data,scan"
+  private def picsOf(c: Cursor): PicsAdv =
+    def oi(i: Int) = Option.when(!c.isNull(i))(c.getInt(i))
+    PicsAdv(c.getLong(0), c.getLong(1), c.getString(2), Option(c.getString(3)), oi(4), oi(5), oi(6), c.getInt(7), c.getInt(8),
+      c.getInt(9), c.getLong(10), c.getInt(11), c.getString(12), c.getString(13))
+
+  private def hotPics(from: Long, to: Long, maxRowid: Long = Long.MaxValue): Vector[PicsAdv] =
+    val (x, xa) = notPending("pics_adv")
+    query(s"SELECT $picsCols FROM pics_adv WHERE start>=? AND start<? AND rowid<=?$x ORDER BY start, rowid",
+      (Seq[Any](from, to, maxRowid) ++ xa)*)(picsOf)
+
   /** Barometric pressure in [from, to), archived and recent, for [[Elevation.estimate]]. */
   def pressure(from: Long, to: Long): Vector[PressureSample] = AshidoriApp.archive.reading(Archive.Pressure) {
     once("pressure", AshidoriApp.archive.read(Archive.Pressure, from, to).map(Archive.pressureOf) ++ hotPressure(from, to))(p =>
@@ -620,7 +688,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     }
 
   def counts(): Map[String, Long] =
-    Seq("fixes", "motion", "battery", "energy_state", "pressure", "places", "checkins", "gnss_sessions").map { t =>
+    Seq("fixes", "motion", "battery", "energy_state", "pressure", "pics_adv", "places", "checkins", "gnss_sessions").map { t =>
       t -> query(s"SELECT COUNT(*) FROM $t")(_.getLong(0)).head
     }.toMap
 
@@ -1109,6 +1177,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
           Seq(c.getLong(0), c.getInt(1), c.getInt(2), c.getDouble(3), c.getInt(4), c.getString(5), flt(c, 6))
         }
       case Archive.Pressure => hotPressure(from, to, maxRowid).map(Archive.pressureRow)
+      case Archive.PicsAdvs => hotPics(from, to, maxRowid).map(Archive.picsRow)
       case _ => Vector.empty
 
   /** When the newest fix in SQLite was taken (the logger's last persisted
@@ -1329,7 +1398,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * so nothing is written into it again: positions, motion, battery, GNSS
     * status, pressure and raw lines by their time; state spans and raw-data
     * sessions cut at the range's edges (a span crossing it keeps its parts
-    * outside). Batches still queued, in the logger's buffers or in overflow
+    * outside); PICS runs touching it whole. Batches still queued, in the logger's buffers or in overflow
     * files are dropped when they are written ([[kept]]). Run it on the
     * write thread ([[LoggerWrites.deleteRange]]), after what was queued.
     *
@@ -1358,12 +1427,13 @@ final class Db(ctx: Context, name: String = "ashidori.db")
       .map(t => count(s"SELECT COUNT(*) FROM $t WHERE time>=? AND time<?", from, to)).sum
     val motion = count("SELECT COUNT(*) FROM motion WHERE start>=? AND start<?", from, to)
     val energy = count("SELECT COUNT(*) FROM energy_state WHERE start<? AND (end IS NULL OR end>?)", to, from) * 2
+    val pics = count("SELECT COUNT(*) FROM pics_adv WHERE start<? AND end>=?", to, from)
     val sessions = count("SELECT COUNT(*) FROM gnss_sessions WHERE start<? AND end>?", to, from) * 3
     val (outbox, blobs) = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(blob)), 0) FROM sync_outbox")(c => (c.getLong(0), c.getLong(1))).head
     val marks = count("SELECT COUNT(*) FROM sync_state")
     val raw = query("SELECT COUNT(*), COALESCE(SUM(LENGTH(line)), 0) FROM raw_lines WHERE time>=? AND time<?", from, to)(c =>
       (c.getLong(0), c.getLong(1))).head
-    (byTime + motion + energy + sessions + outbox + marks + raw._1 + 1) * 2 * 4096L + raw._2 + blobs
+    (byTime + motion + energy + pics + sessions + outbox + marks + raw._1 + 1) * 2 * 4096L + raw._2 + blobs
 
   private def deleteRange0(from: Long, to: Long): Unit =
     tx { db =>
@@ -1372,6 +1442,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         Array[AnyRef](java.lang.Long.valueOf(from), java.lang.Long.valueOf(to), java.lang.Long.valueOf(System.currentTimeMillis())))
       for t <- Seq("fixes", "battery", "gnss_status", "pressure", "raw_lines") do db.delete(t, "time>=? AND time<?", a)
       db.delete("motion", "start>=? AND start<?", a)
+      // A PICS run touching the range goes whole (its summary cannot be cut: Deletion.keptRun).
+      db.delete("pics_adv", "start<? AND end>=?", Array(to.toString, from.toString))
       // Spans: crossing ones replaced by their parts outside (new rowids, as
       // every change of energy_state).
       val crossing = query(s"SELECT rowid,$energyCols FROM energy_state WHERE start<? AND (end IS NULL OR end>?)", to, from) { c =>
@@ -1437,7 +1509,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
   }
 
 object Db:
-  val Version = 9
+  val Version = 10
 
   /** Debug builds: a transaction of the logger's write thread fails with
     * SQLITE_FULL after its statements ran (before COMMIT) while
@@ -1498,7 +1570,7 @@ object Db:
   /** Tables archived to Parquet, and their time column. */
   val ArchivedTables: Map[String, String] = scala.collection.immutable.ListMap(
     "fixes" -> "time", "motion" -> "start", "battery" -> "time", "gnss_status" -> "time", "energy_state" -> "start",
-    "pressure" -> "time", "raw_lines" -> "time")
+    "pressure" -> "time", "pics_adv" -> "start", "raw_lines" -> "time")
 
   /** Rows per DELETE when archiving: short write transactions. */
   val DeleteChunk = 5000

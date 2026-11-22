@@ -87,6 +87,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   repairCard.setVisibility(View.GONE)
   private val ticker = Handler(Looper.getMainLooper)
   private val tick: Runnable = () => { showDataStatus(); ticker.postDelayed(tick, 1000) }
+  /** 信号機の電波 (also in the copied report). */
+  private val picsPanel = PicsPanel(act, r => { sections("pics") = r; render() })
 
   val view: View =
     scroll(
@@ -94,6 +96,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         sectionHeader("記録の保存"),
         listGroup(savedRow, crashRow, pendingRow, reserveRow, kindRow, pressureRow, archiveRow, syncRow),
         repairCard,
+        picsPanel.view,
         card(
           text("記録データ", 16f, bold = true),
           caption("地図と施設データは含みません。"),
@@ -133,6 +136,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     ticker.removeCallbacks(tick)
     tick.run()
     showRecording()
+    picsPanel.onShow()
     sections.clear()
     sections("device") = device()
     sections("gnss") = gnss()
@@ -174,7 +178,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
           render()
       }
 
-  override def onHide(): Unit = ticker.removeCallbacks(tick)
+  override def onHide(): Unit =
+    ticker.removeCallbacks(tick)
+    picsPanel.onHide()
 
   private def showSaving(): Unit =
     AshidoriApp.io.execute { () =>

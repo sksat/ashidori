@@ -53,7 +53,7 @@ class LoggerService extends Service:
   private var lastBatterySample = 0L
   private var drain = Double.NaN
   /** Battery readings and state spans for the energy analysis. */
-  private lazy val energy = EnergyRecorder(this, bm, handler, () => plan.foreach(energyUpdate))
+  private lazy val energy = EnergyRecorder(this, bm, handler, () => { plan.foreach(energyUpdate); planPics() })
   /** Barometer and MSL altitude for the elevation estimate. */
   private lazy val pressure = PressureRecorder(sm, handler)
   private lazy val mslAltitude = MslAltitude(this, handler, vs => handler.post { () =>
@@ -64,6 +64,18 @@ class LoggerService extends Service:
   })
 
   private var plan: Option[SamplingPlan] = None
+
+  /** The PICS reception (docs/design/pics.md): its scan, the plan it was
+    * last brought to, and the plan's inputs from the fixes (the nearest
+    * listed intersection, whether the leg is rail or air).
+    */
+  private lazy val pics = PicsScanner(this, handler, () => plan.foreach(energyUpdate))
+  private var picsPlan = PicsScanPolicy.Initial
+  private var picsNear: Option[PicsScanPolicy.Near] = None
+  private var picsRail = false
+  private var picsRailAt = 0L
+  private val picsWindows = scala.collection.mutable.Queue.empty[MotionWindow]
+  private val picsReplan: Runnable = () => planPics()
   /** (provider, interval, batch, minDistance) currently registered */
   private var locReg: Option[(String, Long, Long, Float)] = None
   private var accelReg: Int = 0
@@ -184,6 +196,8 @@ class LoggerService extends Service:
       LoggerState.flushSensors = () => handler.post(() => sm.flush(sensorListener))
       LoggerState.onMain { LoggerState.running = true }
       energy.start(pm.isInteractive)
+      PicsLive.replan = () => handler.post(picsReplan)
+      pics.start()
       tick()
     evaluate(force = true)
 
@@ -196,6 +210,9 @@ class LoggerService extends Service:
     handler.post { () =>
       handler.removeCallbacksAndMessages(null)
       stopRecorder()
+      PicsLive.replan = () => ()
+      if started then pics.stop()
+      PicsLive.plan = PicsScanPolicy.Initial
       // Never started with a database of a newer version: nothing to close.
       if AshidoriApp.newerDatabase.isEmpty then energy.stop(System.currentTimeMillis())
       lm.removeUpdates(locationListener)
@@ -369,6 +386,7 @@ class LoggerService extends Service:
         LifeLog.add(LifeKind.StillExit, (if wakeReason.nonEmpty then wakeReason else "設定・状態の変化") + s"・${p.describe}")
     wakeReason = ""
     energyUpdate(p)
+    planPics()
     LoggerState.sensors = SensorState(accelReg, if accelReg > 0 then p.accelBatchMs else 0L, sigMotionArmed, pdrSensors,
       recorder.map(_.imuHz).getOrElse(0), accelSince)
 
@@ -385,8 +403,65 @@ class LoggerService extends Service:
       mode = Settings.mode.key,
       effMode = p.effectiveMode.key,
       motion = estimator.current.toString,
-      env = indoor.current.toString
+      env = indoor.current.toString,
+      ble = Some(if started then pics.key else PicsScan.Off.key)
     ), p.describe)
+
+  /** The PICS scan brought to the plan of now (design 3.1): at every
+    * evaluation, fix and qualifying reception, and every 5 s while
+    * receiving (its exits are timed). Never wakes the device.
+    */
+  private def planPics(): Unit =
+    if started then
+      handler.removeCallbacks(picsReplan)
+      val now = SystemClock.elapsedRealtime()
+      val wall = System.currentTimeMillis()
+      val still = estimator.current == MotionState.Stationary
+      PicsIngest.still = still
+      def known(t: Long) = Option.when(t > 0)(t)
+      val in = PicsScanPolicy.Input(
+        now = now,
+        enabled = Settings.picsEnabled && PicsLive.broken.isEmpty,
+        permission = pics.permission,
+        bluetooth = pics.bluetoothOn,
+        logging = true,
+        speed = Option.when(wall - lastSpeedAt < 60_000 && !lastSpeed.isNaN)(lastSpeed),
+        railOrAir = picsRail && estimator.current == MotionState.Vehicle,
+        stillSince = Option.when(still)(now - math.max(0L, wall - motionSince)),
+        near = picsNear,
+        lastQualifying = known(PicsIngest.lastQualifying),
+        lastSignals = known(PicsIngest.lastSignals),
+        testUntil = known(PicsLive.testUntil),
+        screenOn = energy.screenOn,
+        batching = pics.offloadedBatching.contains(true))
+      val p = PicsScanPolicy.plan(in, picsPlan)
+      if p.state != picsPlan.state then LifeLog.add(LifeKind.Pics, s"${p.state.label}（${p.why}）")
+      if (p.state == PicsScanPolicy.State.Test) != (picsPlan.state == PicsScanPolicy.State.Test) then
+        PicsIngest.setTest(p.state == PicsScanPolicy.State.Test)
+      if p.state != PicsScanPolicy.State.Test && PicsLive.testUntil != 0L && now >= PicsLive.testUntil then PicsLive.testUntil = 0L
+      picsPlan = p
+      PicsLive.plan = p
+      PicsLive.input = Some(in)
+      pics.apply(p)
+      if p.state == PicsScanPolicy.State.Receiving || p.state == PicsScanPolicy.State.Test then
+        handler.postDelayed(picsReplan, 5_000L)
+      PicsLive.changed()
+
+  /** A fix: the nearest listed intersection (distance − accuracy), and
+    * whether the leg is rail or air (at most every 30 s, only in a vehicle).
+    */
+  private def picsFix(f: Fix): Unit =
+    if Settings.picsEnabled then
+      val now = SystemClock.elapsedRealtime()
+      val wall = System.currentTimeMillis()
+      val acc = if f.hasAccuracy then f.accuracy.toDouble else 0.0
+      val clearance = PicsSitesData.index.nearest(f.lat, f.lon, PicsScanPolicy.StandbyExitM + acc)
+        .fold(Double.PositiveInfinity)(_._2 - acc)
+      picsNear = Some(PicsScanPolicy.Near(clearance, now - math.max(0L, wall - f.time)))
+      if estimator.current != MotionState.Vehicle then picsRail = false
+      else if wall - picsRailAt >= 30_000L then
+        picsRailAt = wall
+        picsRail = PicsScanPolicy.railOrAir(LoggerState.recentFixes, picsWindows.toSeq, wall)
 
   /** Step detector + rotation vector only while walking indoors: the gyro
     * on some phones cannot batch, so this keeps the CPU awake.
@@ -494,6 +569,7 @@ class LoggerService extends Service:
         lastSpeedAt = f.time
     ls.lastOption.foreach { l =>
       val f = pendingFixes.last
+      picsFix(f)
       LoggerState.onMain {
         LoggerState.lastFix = Some(f)
         LoggerState.fixesToday += ls.size
@@ -604,6 +680,8 @@ class LoggerService extends Service:
 
   private def onWindow(w: MotionWindow): Unit =
     pendingMotion += w
+    picsWindows += w
+    while picsWindows.nonEmpty && picsWindows.head.end < w.end - 10 * 60_000L do picsWindows.dequeue()
     // Written on the same schedule as fixes, not only when a fix arrives:
     // without fixes (indoors, network off) windows would wait for onDestroy
     // and be lost if the process is killed.

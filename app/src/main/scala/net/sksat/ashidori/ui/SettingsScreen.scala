@@ -21,6 +21,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     }.getOrElse(Seq.empty)
     val basemap = Basemap.attribution
     val venues = VenueData.attribution
+    val pics = PicsSitesData.attribution
     def bullets(ls: Seq[String]) = ls.map("・" + _).mkString("\n")
     val lines = Seq(
       "■ 地名の検索（端末内で処理）",
@@ -41,6 +42,10 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       if venues.nonEmpty then bullets(venues) else VenueStaticCredits,
       "OpenStreetMap: https://www.openstreetmap.org/copyright",
       "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。生成の手順: https://github.com/sksat/ashidori/tree/main/tools/venues",
+      "",
+      "■ 信号機の電波（高度化PICS の整備交差点）",
+      if pics.nonEmpty then bullets(pics) else PicsStaticCredit,
+      "公共データ利用規約（第1.0版）: https://www.digital.go.jp/resources/open_data/public_data_license_v1.0",
       "",
       "■ 施設のオンライン検索",
       "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）",
@@ -128,6 +133,39 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     "地図の配色: @protomaps/basemaps（BSD-3-Clause）"
   ).map("・" + _).mkString("\n")
 
+  /** The credit of the bundled PICS list if its manifest does not read (tools/pics/build.py writes the same). */
+  private val PicsStaticCredit =
+    "・出典：警察庁ウェブサイト「全国高度化PICS整備交差点（CSV版）」（令和8年4月1日現在） " +
+      "https://www.npa.go.jp/bureau/traffic/seibi2/annzen-shisetu/utms/pics.html を加工して作成（文字コードと列の変換。ashidori）"
+
+  /** 「信号機の電波を記録」: turning it on asks for 付近のデバイス; refused, it stays off. */
+  private def picsSwitch(): SwitchRow =
+    lazy val row: SwitchRow = switchRow("信号機の電波を記録", Settings.picsEnabled) { on =>
+      if !on then setPics(row, false)
+      else if PicsScanner.hasPermission(act) then setPics(row, true)
+      else act.requestPermissions(Seq(android.Manifest.permission.BLUETOOTH_SCAN)) { () =>
+        val ok = PicsScanner.hasPermission(act)
+        setPics(row, ok)
+        if !ok then row.switch.setChecked(false)
+      }
+    }
+    showPics(row)
+    row
+
+  private def setPics(row: SwitchRow, on: Boolean): Unit =
+    if Settings.picsEnabled != on then
+      Settings.picsEnabled = on
+      if LoggerState.running then LoggerService.send(act, LoggerService.ActionRefresh)
+    showPics(row)
+
+  /** A subtitle only when it cannot work as asked. */
+  private def showPics(row: SwitchRow): Unit =
+    row.setSubtitle(
+      if !Settings.picsEnabled && !PicsScanner.hasPermission(act) then ""
+      else if Settings.picsEnabled && !PicsScanner.hasPermission(act) then "付近のデバイス: 未許可"
+      else if Settings.picsEnabled && PicsScanner.bluetoothOn(act).contains(false) then "Bluetooth: オフ"
+      else "")
+
   /** Credits of the venue data before it is downloaded (tools/venues/build_index.py writes the same). */
   private val VenueStaticCredits = Seq(
     "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
@@ -208,7 +246,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
 
     lazy val mode: ListRow = choiceRow("記録モード", "")(chooseMode(mode))
     showMode(mode)
-    add(sectionHeader("記録"), listGroup(mode))
+    add(sectionHeader("記録"), listGroup(mode, picsSwitch()))
 
     // Where the records are kept and what is sent where, per destination.
     add(sectionHeader("プライバシー"), listGroup(

@@ -107,7 +107,27 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val (motionRow, motionValue) = row("動き")
   private val (envRow, envValue) = row("屋内外")
   private val (batteryRow, batteryValue) = row("電池")
-  private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow)
+  /** 信号機の電波: shown while it is on and something came in the last 10 minutes. */
+  private val (picsRow, picsValue) = row("信号機")
+  picsRow.setVisibility(View.GONE)
+  private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow, picsRow)
+  /** The signals' colours are fresh for 2 s: the row is redrawn twice a second while shown. */
+  private val picsTicker = android.os.Handler(android.os.Looper.getMainLooper)
+  private val picsTick: Runnable = () =>
+    showPics()
+    if picsRow.getVisibility == View.VISIBLE then picsTicker.postDelayed(picsTick, 500)
+  private def showPics(): Unit =
+    PicsUi.statusLine match
+      case Some((line, spoken)) =>
+        picsValue.setText(line)
+        picsValue.setContentDescription(spoken)
+        if picsRow.getVisibility != View.VISIBLE then
+          picsRow.setVisibility(View.VISIBLE)
+          picsTicker.removeCallbacks(picsTick)
+          picsTicker.postDelayed(picsTick, 500)
+      case None =>
+        picsRow.setVisibility(View.GONE)
+        picsTicker.removeCallbacks(picsTick)
   /** Why it is like this: supplementary, so quieter and marked with ⓘ.
     * The mode note keeps its line even when empty: switching modes adds or
     * removes it ("「高精度」で動作中: 充電中のため精度を1段階向上").
@@ -323,6 +343,8 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     loadFiles()
   override def onHide(): Unit =
     unobserve()
+    picsTicker.removeCallbacks(picsTick)
+    picsRow.setVisibility(View.GONE)
     peers.onHide()
     panel.onHide()
     sensorPanel.onHide()
@@ -398,6 +420,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       else
         val d = LoggerState.drainPctPerHour
         s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
+    showPics()
     modeNote.setText(plan.flatMap(PositioningPanel.modeNote(_, Settings.mode)).fold("")("ⓘ " + _))
     // Indoors the note keeps its room in every mode (最高精度 has none);
     // elsewhere it does not appear.

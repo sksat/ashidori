@@ -41,6 +41,7 @@ object SmallOverflow:
     case SmallRecord.Pressure(ps)                  => db.insertPressure(ps)
     case e: SmallRecord.Energy                     => db.applyEnergy(e)
     case SmallRecord.FixMsl(vs)                    => db.updateFixMsl(vs)
+    case SmallRecord.PicsAdvs(rs)                  => db.insertPicsAdv(rs)
 
   /** Files waiting to be imported. */
   def waiting: Int = Option(dir.listFiles()).toSeq.flatten.count(_.getName.endsWith(OverflowFiles.CompletedRecord))

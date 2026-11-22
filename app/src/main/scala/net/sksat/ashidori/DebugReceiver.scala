@@ -10,6 +10,16 @@ import java.time.LocalDate
   *   am broadcast -n <pkg>/net.sksat.ashidori.DebugReceiver -a ashidori.debug.SYNTH --ei hours 5 [--ei startMinute 600] [--ei daysAgo 1] (or --ei minutes N)
   *   ... -a ashidori.debug.ODD [--ei daysAgo 1]       raw lines that do not convert, and late ones
   *   ... -a ashidori.debug.CORRUPT_TEST                a corrupt test database is kept (not deleted)
+  *   ... -a ashidori.debug.PICS --es hex 580102FF000000CD08494351FFFFFFFF0000000000000000 [--ei rssi -62]
+  *          [--es addr 02:00:00:00:00:01] [--ei company 462] [--el at <ms>]   one PICS advertisement (company ID
+  *                                                    left out), into the scan callback's path (scan `debug`)
+  *   ... -a ashidori.debug.PICS --ei flood 20000      that many of changing content from 300 senders, at once (the caps)
+  *   ... -a ashidori.debug.PICS --ez spill true --es hex ... [--el at <ms>]   one run kept in an overflow file (.rec)
+  *   ... -a ashidori.debug.PICS_WALK [--es site <name in the list>] [--ei wait 40] [--ez fast true] [--ei daysAgo 1]
+  *                                                    a synthetic crossing (approach, red, green, walking away)
+  *                                                    with fixes and motion, in real time (fast: back-dated at once)
+  *   ... -a ashidori.debug.PICS_STATE [--ez enable true]   the PICS plan's inputs and result to the lifecycle log
+  *                                                    (enable: 「信号機の電波を記録」 set first)
   *   ... -a ashidori.debug.SPILL --ei files 100        overflow files, as if the write queue had been full
   *   ... -a ashidori.debug.LOG --es mode max        start recording in a mode
   *   ... -a ashidori.debug.STOP                       stop recording
@@ -79,6 +89,23 @@ class DebugReceiver extends BroadcastReceiver:
             LoggerWrites.Overflow.spill((0 until 2000).map(i => (t0 + k * 2000L + i, s"Accel,${t0 + k * 2000L + i},$i,0.1,0.2,9.8")))
           Log.i(s"spilled $n overflow files")
         , "ashidori-spill").start()
+      case "ashidori.debug.PICS" =>
+        val at = intent.getLongExtra("at", 0L)
+        val hex = Option(intent.getStringExtra("hex")).getOrElse("")
+        if intent.hasExtra("flood") then
+          Thread(() => Log.i(DebugPics.flood(intent.getIntExtra("flood", 10_000))), "ashidori-pics-flood").start()
+        else if intent.getBooleanExtra("spill", false) then Log.i(DebugPics.spill(hex, at))
+        else
+          Log.i(DebugPics.inject(hex, intent.getIntExtra("rssi", -62),
+            Option(intent.getStringExtra("addr")).getOrElse(DebugPics.DefaultAddr), intent.getIntExtra("company", 0x01ce), at))
+      case "ashidori.debug.PICS_WALK" =>
+        Log.i(DebugPics.walk(Option(intent.getStringExtra("site")), intent.getIntExtra("wait", 40), intent.getBooleanExtra("fast", false),
+          intent.getIntExtra("daysAgo", 0)))
+      case "ashidori.debug.PICS_STATE" =>
+        if intent.hasExtra("enable") then
+          Settings.picsEnabled = intent.getBooleanExtra("enable", false)
+          if LoggerState.running then LoggerService.send(c, LoggerService.ActionRefresh)
+        Log.i(s"PICS_STATE ${DebugPics.state()}")
       case "ashidori.debug.CORRUPT_TEST" =>
         Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()
       case "ashidori.debug.LOG" =>
