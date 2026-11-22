@@ -1,5 +1,5 @@
 # 記録と同期（README）
-# 復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号文だけが届く。
+# 復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号化した記録だけが届く。
 direction: down
 grid-rows: 3
 grid-gap: 64
@@ -35,5 +35,5 @@ readers: "自分の端末とブラウザ" {
   other: "別の端末\n端末内で復号"
 }
 
-phone.enc -> server.workers: 暗号文
-server.workers -> readers: 暗号文
+phone.enc -> server.workers: 暗号化した記録
+server.workers -> readers: 暗号化した記録
