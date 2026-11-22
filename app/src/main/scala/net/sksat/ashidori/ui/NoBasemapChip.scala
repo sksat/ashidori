@@ -8,7 +8,7 @@ import Ui.*
 
 /** The small chip on a map drawn without a base map (the offline map is
   * needed and missing): 「簡易地図がありません」 and what can be done, in one
-  * line — 「取得」 (starts the download), 「取得中 nn%」, or 「取得できません」
+  * line — 「取得」 (starts the download), 「取得中 nn%」 (with a bar under it), or 「取得できません」
   * in the error colour after a failed download (opens the 簡易地図 dialog
   * with the reason). Nothing happens until it is tapped, and the download
   * sends no location ([[BasemapUi.PrivacyNote]]).
@@ -20,14 +20,21 @@ final class NoBasemapChip(act: MainActivity) extends LinearLayout(act):
   private given Ctx = act
   private val title = text("", 12f, colorAttr = attr.onSurfaceVariant)
   private val action = text("", 12f, bold = true)
-  setOrientation(LinearLayout.HORIZONTAL)
-  setGravity(Gravity.CENTER_VERTICAL)
+  /** Under the line while the download runs. */
+  private val bar = DownloadBar()
+  setOrientation(LinearLayout.VERTICAL)
   title.setSingleLine(true)
   action.setSingleLine(true)
-  addView(title)
+  private val line = hbox(title)
   private val alp = Ui.wrap
   alp.setMarginStart(dp(8))
-  addView(action, alp)
+  line.addView(action, alp)
+  addView(line)
+  bar.setTrackThickness(dp(3))
+  bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+  private val blp = Ui.matchWrap
+  blp.topMargin = dp(4)
+  addView(bar, blp)
   setPadding(dp(10), dp(6), dp(10), dp(6))
   private val bg = GradientDrawable()
   bg.setCornerRadius(dp(8).toFloat)
@@ -44,6 +51,7 @@ final class NoBasemapChip(act: MainActivity) extends LinearLayout(act):
   def refresh(): Unit =
     val st = BasemapDownload.status
     title.setText(BasemapUi.chipTitle(st))
+    DownloadBar.show(bar, DownloadBar.of(st))
     BasemapUi.chipAction(st) match
       case None =>
         action.setVisibility(View.GONE)

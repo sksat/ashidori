@@ -94,120 +94,175 @@ final class OfflineDataScreen(act: MainActivity) extends Screen:
     try show()
     catch case e: Exception =>
       Log.w("regions: list", e)
+      built = None
       list.removeAllViews()
       list.addView(supportingText("読み込めません"))
 
+  /** One row as shown: `line` and `bar` follow a download; the rest is
+    * the row's shape (a change of it builds the list again). `menu`: a
+    * region's ︙; `pinned`: which pinned row (its tap opens its dialog).
+    */
+  private final case class Line(mark: String, markColor: Int, name: String, chipText: Option[String],
+                                line: String, error: Boolean, bar: Progress,
+                                menu: Option[Region] = None, pinned: Option[String] = None):
+    def shape: Line = copy(line = "", error = false, bar = Progress.Hidden)
+
+  /** A row on screen and its views that follow the download. */
+  private final class Built(val view: LinearLayout, val sub: TextView,
+                            val bar: com.google.android.material.progressindicator.LinearProgressIndicator)
+
+  /** The shape of the list on screen and its rows; progress only updates those in place. */
+  private var built: Option[(Any, Seq[Built])] = None
+
   private def show(): Unit =
     checkWork()
-    list.removeAllViews()
     val s = Regions.state
     val add = Settings.gate.rule(Dest.Data).level == Level.Cell && Regions.offered
-    if add then
-      val b = button("＋ 範囲を選んで取得", tonal = true)(selectArea())
-      val lp = matchWrap
-      lp.setMargins(dp(16), dp(12), dp(16), 0)
-      b.setLayoutParams(lp)
-      list.addView(b)
-    list.addView(sectionHeader("地域"))
-    Regions.book.broken.map(_ => "地域データを読み込めません").orElse(Regions.book.writeError.map(_ => "地域データを保存できません")).foreach { p =>
-      val t = supportingText(p)
-      t.setTextColor(color(attr.error))
-      list.addView(t)
-    }
-    if Regions.loading then list.addView(supportingText("読み込み中"))
-    else if s.regions.isEmpty then list.addView(supportingText("なし"))
-    else list.addView(listGroup(s.regions.map(row)*))
+    val problem = Regions.book.broken.map(_ => "地域データを読み込めません").orElse(Regions.book.writeError.map(_ => "地域データを保存できません"))
+    val regions = if Regions.loading then Seq.empty else s.regions.map(row)
+    val pinned = Seq(
+      pinnedRow("basemap", "オフライン地図 · 全域", BasemapDownload.status, Basemap.sizeLabel),
+      pinnedRow("venues", "施設データ · 日本", VenueDownload.status, VenueData.sizeLabel))
     // Opening this screen may fetch the catalog (RegionsUi.ensureCatalog): where it goes.
-    if Regions.offered then
-      val host = scala.util.Try(java.net.URI(Regions.url("v", "f")).getHost).toOption.getOrElse("github.com")
-      list.addView(supportingText(s"更新の確認 · $host"))
-    list.addView(sectionHeader("全域"))
-    list.addView(listGroup(pinnedRow("オフライン地図 · 全域", BasemapDownload.status, Basemap.sizeLabel)(BasemapUi.showDialog(act)),
-      pinnedRow("施設データ · 日本", VenueDownload.status, VenueData.sizeLabel)(VenueDataUi.showDialog(act))))
-    if Regions.offered then
-      val line = if !Regions.autoUpdate then "オフ" else if Regions.metered then "モバイルデータ通信でも" else "Wi-Fi 接続時"
-      list.addView(spacer(12))
-      list.addView(listGroup(navRow("自動更新", line)(autoUpdateDialog())))
-    list.addView(spacer(24))
+    val host = Option.when(Regions.offered)(scala.util.Try(java.net.URI(Regions.url("v", "f")).getHost).toOption.getOrElse("github.com"))
+    val auto = Option.when(Regions.offered)(if !Regions.autoUpdate then "オフ" else if Regions.metered then "モバイルデータ通信でも" else "Wi-Fi 接続時")
+    val rows = regions ++ pinned
+    val shape = (add, problem, Regions.loading, host, auto, rows.map(_.shape))
+    built match
+      case Some((was, views)) if was == shape => views.zip(rows).foreach(patch)
+      case _ =>
+        list.removeAllViews()
+        if add then
+          val b = button("＋ 範囲を選んで取得", tonal = true)(selectArea())
+          val lp = matchWrap
+          lp.setMargins(dp(16), dp(12), dp(16), 0)
+          b.setLayoutParams(lp)
+          list.addView(b)
+        list.addView(sectionHeader("地域"))
+        problem.foreach { p =>
+          val t = supportingText(p)
+          t.setTextColor(color(attr.error))
+          list.addView(t)
+        }
+        val views = rows.map(build)
+        if Regions.loading then list.addView(supportingText("読み込み中"))
+        else if regions.isEmpty then list.addView(supportingText("なし"))
+        else list.addView(listGroup(views.take(regions.size).map(_.view)*))
+        host.foreach(h => list.addView(supportingText(s"更新の確認 · $h")))
+        list.addView(sectionHeader("全域"))
+        list.addView(listGroup(views.drop(regions.size).map(_.view)*))
+        auto.foreach { line =>
+          list.addView(spacer(12))
+          list.addView(listGroup(navRow("自動更新", line)(autoUpdateDialog())))
+        }
+        list.addView(spacer(24))
+        built = Some(shape -> views)
 
   private def selectArea(): Unit =
     if !Regions.allowed then act.push(OutboundDestScreen(act, Dest.Data))
     else act.push(RegionSelectScreen(act))
 
   /** A row of the basemap or the venue data, in the same form as a region. */
-  private def pinnedRow(name: String, st: BasemapStatus, sizeLabel: String)(onTap: => Unit): View =
+  private def pinnedRow(key: String, name: String, st: BasemapStatus, sizeLabel: String): Line =
     val (mark, markColor, line, error) = st match
       case BasemapStatus.Installed(_, _) => ("✓", attr.primary, sizeLabel, false)
-      case BasemapStatus.Running(d, t, _) => ("↓", attr.onSurfaceVariant, s"取得中 · ${BasemapUi.percent(d, t)}%", false)
+      case BasemapStatus.Running(_, _, _) => ("↓", attr.onSurfaceVariant, DownloadBar.line(st).getOrElse(""), false)
       case BasemapStatus.Waiting(_) => ("↓", attr.onSurfaceVariant, "待機中", false)
       case f: BasemapStatus.Failed => ("!", attr.error, BasemapUi.failedText(f.failure), true)
       case _ => ("", attr.onSurfaceVariant, "未取得", false)
-    val r = regionLine(mark, markColor, name, None, line, error, None)
-    r.setOnClickListener(_ => onTap)
-    ripple(r)
-    r
+    Line(mark, markColor, name, None, line, error, DownloadBar.of(st), pinned = Some(key))
 
-  /** One row: a status mark, the name with an optional mark, one line, an optional ︙. */
-  private def regionLine(mark: String, markColor: Int, name: String, chipText: Option[String], line: String,
-                         error: Boolean, menu: Option[View => Unit]): LinearLayout =
-    val m = text(mark, 18f, bold = true)
-    m.setTextColor(color(markColor))
+  /** One row: a status mark, the name with an optional mark, one line and
+    * the bar of a download under it, an optional ︙.
+    */
+  private def build(l: Line): Built =
+    val m = text(l.mark, 18f, bold = true)
+    m.setTextColor(color(l.markColor))
     m.setGravity(Gravity.CENTER)
     m.setLayoutParams(LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT))
     m.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
-    val title = oneLine(text(name, 16f))
+    val title = oneLine(text(l.name, 16f))
     title.setLayoutParams(LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
     val head = hbox(title)
     head.setGravity(Gravity.CENTER_VERTICAL)
-    chipText.foreach { c =>
+    l.chipText.foreach { c =>
       val ch = chip(c, color(attr.tertiaryContainer), color(attr.onTertiaryContainer))
       val lp = wrap
       lp.setMarginStart(dp(8))
       ch.setLayoutParams(lp)
       head.addView(ch)
     }
-    val sub = tabular(oneLine(text(line, 14f, colorAttr = if error then attr.error else attr.onSurfaceVariant)))
-    val texts = vbox(head, sub)
+    val sub = tabular(oneLine(text("", 14f)))
+    val bar = DownloadBar()
+    bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    val blp = matchWrap
+    blp.topMargin = dp(6)
+    blp.bottomMargin = dp(2)
+    bar.setLayoutParams(blp)
+    val texts = vbox(head, sub, bar)
     texts.setLayoutParams(LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
     val r = hbox(m, texts)
     r.setGravity(Gravity.CENTER_VERTICAL)
     r.setPadding(dp(12), dp(8), dp(4), dp(8))
     r.setMinimumHeight(dp(72))
-    menu match
-      case Some(f) =>
-        lazy val b: View = iconButton(R.drawable.ic_more_vert, s"$name のメニュー")(f(b))
+    l.menu match
+      case Some(region) =>
+        lazy val b: View = iconButton(R.drawable.ic_more_vert, s"${l.name} のメニュー")(menu(b, region))
         r.addView(b)
       case None => r.setPadding(dp(12), dp(8), dp(16), dp(8))
-    val state = if mark == "✓" then "取得済み" else if mark == "↓" then "取得中" else if mark == "!" then "失敗" else ""
-    r.setContentDescription(Seq(name, chipText.getOrElse(""), state, line).filter(_.nonEmpty).mkString("、"))
-    r
+    l.pinned.foreach { key =>
+      r.setOnClickListener(_ => if key == "venues" then VenueDataUi.showDialog(act) else BasemapUi.showDialog(act))
+      ripple(r)
+    }
+    val b = Built(r, sub, bar)
+    patch(b, l)
+    b
 
-  private def row(r: Region): View =
+  /** What follows the download: the line, its colour, the bar, the row's description. */
+  private def patch(b: Built, l: Line): Unit =
+    b.sub.setText(l.line)
+    b.sub.setTextColor(color(if l.error then attr.error else attr.onSurfaceVariant))
+    DownloadBar.show(b.bar, l.bar)
+    val state = if l.mark == "✓" then "取得済み" else if l.mark == "↓" then "取得中" else if l.mark == "!" then "失敗" else ""
+    b.view.setContentDescription(Seq(l.name, l.chipText.getOrElse(""), state, l.line).filter(_.nonEmpty).mkString("、"))
+
+  private def row(r: Region): Line =
     val s = Regions.state
     val st = Regions.status(r)
     val bytes = RegionsUi.size(RegionStatus.bytes(r, s))
     val dated = RegionStatus.date(r, s).map(RegionsUi.date)
-    val (mark, markColor, line, error, chipText) = st match
+    // The run works on it now: the bar (before why it waited last).
+    val going: String => Option[(String, Progress)] = verb => Regions.activity(r) match
+      case RegionProgress.Idle => None
+      case RegionProgress.Checking => Some("照合中" -> Progress.Busy)
+      case a @ RegionProgress.Bytes(d, t, _) => Some(s"$verb · ${DownloadBar.bytes(d, t)}" -> DownloadBar.of(a))
+      case a => Some(verb -> DownloadBar.of(a))
+    def line(mark: String, markColor: Int, l: String, error: Boolean, bar: Progress = Progress.Hidden, chipText: Option[String] = None) =
+      Line(mark, markColor, r.name, chipText, l, error, bar, menu = Some(r))
+    st match
       case RegionStatus.Ready(newer) =>
-        ("✓", attr.primary, (Seq(bytes) ++ dated).mkString(" · "), false, Option.when(newer)("新しい版"))
-      case RegionStatus.Downloading(done, total) =>
-        val l =
-          if Regions.progress.keySet.exists(r.cells.contains) then s"取得中 · ${if total > 0 then done * 100 / total else 0}%"
-          else Regions.waiting.getOrElse(if !workActive then "中断" else if Regions.metered then "待機中" else "Wi-Fi 接続待ち")
-        ("↓", attr.onSurfaceVariant, l, Regions.waiting.nonEmpty, None)
-      case RegionStatus.Failed(reason) => ("!", attr.error, reason, true, None)
-      case RegionStatus.Unusable => ("!", attr.error, "使用不可（スタイル未取得）", true, None)
+        line("✓", attr.primary, (Seq(bytes) ++ dated).mkString(" · "), false, chipText = Option.when(newer)("新しい版"))
+      case RegionStatus.Downloading(_, _) =>
+        going("取得中") match
+          case Some((l, bar)) => line("↓", attr.onSurfaceVariant, l, false, bar)
+          case None =>
+            val l = Regions.waiting.getOrElse(if !workActive then "中断" else if Regions.metered then "待機中" else "Wi-Fi 接続待ち")
+            line("↓", attr.onSurfaceVariant, l, Regions.waiting.nonEmpty)
+      case RegionStatus.Failed(reason) => line("!", attr.error, reason, true)
+      case RegionStatus.Unusable => line("!", attr.error, "使用不可（スタイル未取得）", true)
       // The old version stays drawn: ✓, and the update's state.
-      case RegionStatus.Updating(done, total) =>
-        val l =
-          if Regions.progress.keySet.exists(r.cells.contains) then s"更新中 · ${if total > 0 then done * 100 / total else 0}%"
-          else Regions.waiting.map("更新待ち · " + _).getOrElse(
-            if !workActive then "更新を中断" else if Regions.metered then "更新待ち" else "更新待ち · Wi-Fi 接続待ち")
-        ("✓", attr.primary, l, Regions.waiting.nonEmpty, None)
-      case RegionStatus.UpdateFailed(reason) => ("✓", attr.primary, s"更新に失敗（$reason）", true, None)
-    regionLine(mark, markColor, r.name, chipText, line, error, Some(anchor => menu(anchor, r, st)))
+      case RegionStatus.Updating(_, _) =>
+        going("更新中") match
+          case Some((l, bar)) => line("✓", attr.primary, l, false, bar)
+          case None =>
+            val l = Regions.waiting.map("更新待ち · " + _).getOrElse(
+              if !workActive then "更新を中断" else if Regions.metered then "更新待ち" else "更新待ち · Wi-Fi 接続待ち")
+            line("✓", attr.primary, l, Regions.waiting.nonEmpty)
+      case RegionStatus.UpdateFailed(reason) => line("✓", attr.primary, s"更新に失敗（$reason）", true)
 
-  private def menu(anchor: View, r: Region, st: RegionStatus): Unit =
+  /** The ︙ of a region, for its state when it is opened. */
+  private def menu(anchor: View, r: Region): Unit =
+    val st = Regions.status(r)
     val p = PopupMenu(act, anchor)
     val m = p.getMenu
     val newer = st == RegionStatus.Ready(true)

@@ -176,6 +176,15 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
 
   // ---- without a base map (setting on): why, and the two ways to a map ----
   private val noMapTitle = Ui.text("", 13f, bold = true)(using act)
+  /** The download's bar under that title, while it runs. */
+  private val noMapBar =
+    given Ui.Ctx = act
+    val b = DownloadBar()
+    b.setImportantForAccessibility(android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    val lp = Ui.matchWrap
+    lp.topMargin = Ui.dp(6)
+    b.setLayoutParams(lp)
+    b
   private val downloadButton =
     compact(Ui.button(BasemapUi.downloadLabel(BasemapDownload.status))(BasemapUi.requestDownload(act))(using act))
   private val grantButton =
@@ -192,7 +201,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     downloadButton.setLayoutParams(wrapLp())
     grantButton.setLayoutParams(wrapLp())
     Ui.tint(grantButton, Ui.color(Ui.attr.surfaceContainerHigh), Ui.color(Ui.attr.onSurface))
-    val card = Ui.vbox(noMapTitle, downloadButton, grantButton)
+    val card = Ui.vbox(noMapTitle, noMapBar, downloadButton, grantButton)
     card.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10))
     val bg = android.graphics.drawable.GradientDrawable()
     bg.setCornerRadius(Ui.dp(16).toFloat)
@@ -228,6 +237,7 @@ final class TrackMap(act: MainActivity, saved: Bundle, surface: String, controls
     if offer then
       val st = BasemapDownload.status
       noMapTitle.setText(BasemapUi.cardTitle(st))
+      DownloadBar.show(noMapBar, DownloadBar.of(st))
       // A failure is the exception: its reason in the error colour.
       noMapTitle.setTextColor(Ui.color(st match
         case _: BasemapStatus.Failed => Ui.attr.error

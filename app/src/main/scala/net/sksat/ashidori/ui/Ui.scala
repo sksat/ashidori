@@ -277,6 +277,9 @@ object Ui:
       value.setText(s)
       value.setVisibility(if s.length == 0 then View.GONE else View.VISIBLE)
 
+    /** Adds a view under the subtitle (e.g. the bar of a download). */
+    def below(v: View): Unit = texts.addView(v)
+
     /** Adds a view at the trailing edge, after the value. */
     def trailing(v: View): Unit =
       val lp = wrap

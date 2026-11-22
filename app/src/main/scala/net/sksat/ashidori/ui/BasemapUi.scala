@@ -38,13 +38,15 @@ object BasemapUi:
       case Some(t) => s"${timeLabel(t)} に再試行"
       case None => if st.metered || unmeteredNow then "まもなく再試行" else "Wi-Fi 接続時に再試行"
 
-  /** One line, shared with the 施設データ row: 未取得 / ダウンロード中 nn% / 取得済み vX / 取得できません（理由）・再試行. */
+  /** One line, shared with the 施設データ row: 未取得 / ダウンロード中 / 照合・展開中 / 取得済み vX / 取得できません（理由）・再試行
+    * (the bytes so far are beside the bar, [[DownloadBar]]).
+    */
   def pinnedStatusLine(st: BasemapStatus): String = st match
     case BasemapStatus.Unavailable => "このビルドでは利用できません"
     case BasemapStatus.Checking => "確認中"
     case BasemapStatus.Missing => "未取得"
     case BasemapStatus.Waiting(metered) => if metered then "ダウンロード待ち" else "未取得（Wi-Fi 接続時にダウンロード）"
-    case BasemapStatus.Running(d, t, _) => s"ダウンロード中 ${percent(d, t)}%"
+    case BasemapStatus.Running(d, t, _) => if t > 0 && d < t then "ダウンロード中" else "照合・展開中"
     case BasemapStatus.Installed(v, _) => s"取得済み v$v"
     case f: BasemapStatus.Failed => s"${failedText(f.failure)}・${retryText(f)}"
 
@@ -144,13 +146,73 @@ object BasemapUi:
 
   /** Status, download / retry and delete. */
   def showDialog(act: MainActivity): Unit =
-    val st = BasemapDownload.status
-    val body = Seq(
-      "日本はズーム 10、全世界はズーム 5 まで",
-      "",
-      "状態: " + statusLine(st)
-    ) ++ failureLines(st) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote)
-    val b = MaterialAlertDialogBuilder(act).setTitle("オフライン地図").setMessage(body.mkString("\n"))
+    pinnedDialog(act, "オフライン地図", BasemapDownload, "日本はズーム 10、全世界はズーム 5 まで", statusLine,
+      st => failureLines(st) ++ sourceLine(st) ++ Option(Basemap.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote),
+      buttons(act), () => showDialog(act))
+
+  /** The dialog of a pinned download (オフライン地図, 施設データ): what it
+    * is, 状態 with the bar of a download under it, `rest` of the lines and
+    * the buttons for the state. While it is open and the app in view it
+    * follows the download: the progress in place; for another state it
+    * opens again (`reopen`), with that state's buttons.
+    */
+  private[ui] def pinnedDialog(act: MainActivity, title: String, dl: PinnedDownload, about: String,
+                               status: BasemapStatus => String, rest: BasemapStatus => Seq[String],
+                               buttons: (MaterialAlertDialogBuilder, BasemapStatus) => Unit, reopen: () => Unit): Unit =
+    import Ui.*
+    given Ctx = act
+    val st = dl.status
+    def body(s: String) = text(s, 14f, colorAttr = attr.onSurfaceVariant)
+    val state = body("")
+    val bar = DownloadBar()
+    val blp = matchWrap
+    blp.topMargin = dp(8)
+    bar.setLayoutParams(blp)
+    val barLine = tabular(body(""))
+    val tail = body("")
+    def fill(s: BasemapStatus): Unit =
+      state.setText("状態: " + status(s))
+      DownloadBar.show(bar, DownloadBar.of(s))
+      val line = DownloadBar.amount(s)
+      barLine.setText(line.getOrElse(""))
+      barLine.setVisibility(if line.isEmpty then android.view.View.GONE else android.view.View.VISIBLE)
+      tail.setText(rest(s).mkString("\n"))
+    fill(st)
+    val content = vbox(body(about + "\n"), state, bar, barLine, tail)
+    content.setPadding(dp(24), dp(16), dp(24), 0)
+    val b = MaterialAlertDialogBuilder(act).setTitle(title).setView(scroll(content))
+    buttons(b, st)
+    val d = b.setNeutralButton("閉じる", null).create()
+    // Another state: other buttons (a download that ended, failed or was queued).
+    def same(s: BasemapStatus) = (s, st) match
+      case (BasemapStatus.Running(_, _, a), BasemapStatus.Running(_, _, b)) => a == b
+      case _ => s == st
+    def update(): Unit =
+      if d.isShowing then
+        val now = dl.status
+        if same(now) then fill(now)
+        else
+          d.dismiss()
+          reopen()
+    var stop: Option[() => Unit] = None
+    def follow(): Unit =
+      if stop.isEmpty then stop = Some(dl.listen(() => update()))
+      update()
+    def unfollow(): Unit =
+      stop.foreach(_())
+      stop = None
+    val lifecycle = new androidx.lifecycle.DefaultLifecycleObserver:
+      override def onStart(o: androidx.lifecycle.LifecycleOwner): Unit = follow()
+      override def onStop(o: androidx.lifecycle.LifecycleOwner): Unit = unfollow()
+    d.setOnDismissListener { _ =>
+      unfollow()
+      act.getLifecycle.removeObserver(lifecycle)
+    }
+    d.show()
+    // Calls onStart at once (the activity is started): it follows from now.
+    act.getLifecycle.addObserver(lifecycle)
+
+  private def buttons(act: MainActivity)(b: MaterialAlertDialogBuilder, st: BasemapStatus): Unit =
     st match
       case BasemapStatus.Unavailable | BasemapStatus.Checking => ()
       case BasemapStatus.Installed(_, _) =>
@@ -164,7 +226,6 @@ object BasemapUi:
         b.setNegativeButton("削除", (_, _) => BasemapDownload.delete(act))
       case BasemapStatus.Missing =>
         b.setPositiveButton("ダウンロード", (_, _) => requestDownload(act))
-    b.setNeutralButton("閉じる", null).show()
 
   private def confirmDelete(act: MainActivity): Unit =
     MaterialAlertDialogBuilder(act)

@@ -172,23 +172,35 @@ final class SettingsScreen(act: MainActivity) extends Screen:
   val view: View = scroll(list)
 
   /** The オフラインのデータ row, kept current while downloads run. */
-  private var offlineRow: Option[ListRow] = None
-  private val stopBasemap = BasemapDownload.listen(() => offlineRow.foreach(showOffline))
-  private val stopVenues = VenueDownload.listen(() => offlineRow.foreach(showOffline))
-  private val stopRegions = Regions.listen(() => offlineRow.foreach(showOffline))
-  override def onDestroy(): Unit =
-    stopBasemap()
-    stopVenues()
-    stopRegions()
+  private var offlineRow: Option[(ListRow, com.google.android.material.progressindicator.LinearProgressIndicator)] = None
+  /** Followed while the screen is shown. */
+  private var stops = Seq.empty[() => Unit]
+  override def onHide(): Unit =
+    stops.foreach(_())
+    stops = Seq.empty
 
-  /** One line: a failed download first (in the error colour), else what is on the device. */
-  private def showOffline(row: ListRow): Unit =
+  /** One line: a failed download first (in the error colour), then one
+    * that runs (with its bar), else what is on the device.
+    */
+  private def showOffline(row: ListRow, bar: com.google.android.material.progressindicator.LinearProgressIndicator): Unit =
     val failed = Seq(BasemapDownload.status -> "オフライン地図", VenueDownload.status -> "施設データ").collectFirst {
       case (f: BasemapStatus.Failed, name) => s"$name: ${BasemapUi.failedText(f.failure)}"
     }
+    def going(name: String, p: Progress, busy: String) = p match
+      case Progress.Part(d, t) => Some(s"$name · ${DownloadBar.bytes(d, t)}" -> p)
+      case Progress.Busy => Some(s"$name · $busy" -> p)
+      case Progress.Hidden => None
+    val running = Seq(BasemapDownload.status -> "オフライン地図", VenueDownload.status -> "施設データ").iterator
+      .flatMap((st, name) => going(name, DownloadBar.of(st), "照合・展開中"))
+      .nextOption()
+      .orElse(if !Regions.offered then None else Regions.state.regions.iterator.flatMap { r =>
+        val a = Regions.activity(r)
+        going(r.name, DownloadBar.of(a), if a == ashidori.core.RegionProgress.Checking then "照合中" else "取得中")
+      }.nextOption())
     val regions = if Regions.offered then Seq(s"地域 ${Regions.state.regions.size}") else Seq.empty
-    row.setSubtitle(failed.getOrElse((regions ++ Seq("全域の地図", "施設データ")).mkString("・")))
+    row.setSubtitle(failed.orElse(running.map(_._1)).getOrElse((regions ++ Seq("全域の地図", "施設データ")).mkString("・")))
     row.subtitle.setTextColor(color(if failed.nonEmpty then attr.error else attr.onSurfaceVariant))
+    DownloadBar.show(bar, if failed.nonEmpty then Progress.Hidden else running.fold(Progress.Hidden)(_._2))
 
   override def onShow(): Unit =
     list.removeAllViews()
@@ -203,8 +215,18 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       navRow("データの扱い", OutboundUi.summary)(act.push(DataHandlingScreen(act)))))
 
     val offline = navRow("オフラインのデータ", " ")(act.push(OfflineDataScreen(act)))
-    showOffline(offline)
-    offlineRow = Some(offline)
+    val bar = DownloadBar()
+    bar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO)
+    val blp = matchWrap
+    blp.topMargin = dp(6)
+    blp.bottomMargin = dp(2)
+    bar.setLayoutParams(blp)
+    offline.below(bar)
+    showOffline(offline, bar)
+    offlineRow = Some(offline -> bar)
+    stops.foreach(_())
+    val follow = () => offlineRow.foreach(showOffline.tupled)
+    stops = Seq(BasemapDownload.listen(follow), VenueDownload.listen(follow), Regions.listen(follow))
     // Open (check) the installed index, so an unreadable one shows here.
     AshidoriApp.io.execute { () =>
       VenueData.index()

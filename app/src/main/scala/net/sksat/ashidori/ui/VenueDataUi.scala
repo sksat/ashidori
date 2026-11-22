@@ -41,17 +41,15 @@ object VenueDataUi:
 
   /** Status, download / retry and delete. */
   def showDialog(act: MainActivity): Unit =
-    val st = VenueDownload.status
-    val date = st match
+    def date(st: BasemapStatus) = st match
       case BasemapStatus.Installed(_, _) => VenueData.dateLabel.map("データ: OpenStreetMap " + _)
       case _ => None
-    val body = Seq(
-      "チェックインの候補となる施設（日本・OpenStreetMap）",
-      "",
-      "状態: " + statusLine(st)
-    ) ++ BasemapUi.failureLines(st) ++ date ++ BasemapUi.sourceLine(st) ++ Option(VenueData.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++
-      Seq("", PrivacyNote)
-    val b = MaterialAlertDialogBuilder(act).setTitle("施設データ").setMessage(body.mkString("\n"))
+    BasemapUi.pinnedDialog(act, "施設データ", VenueDownload, "チェックインの候補となる施設（日本・OpenStreetMap）", statusLine,
+      st => BasemapUi.failureLines(st) ++ date(st) ++ BasemapUi.sourceLine(st) ++
+        Option(VenueData.sizeLabel).filter(_.nonEmpty).map("サイズ: " + _) ++ Seq("", PrivacyNote),
+      buttons(act), () => showDialog(act))
+
+  private def buttons(act: MainActivity)(b: MaterialAlertDialogBuilder, st: BasemapStatus): Unit =
     st match
       case BasemapStatus.Unavailable | BasemapStatus.Checking => ()
       case BasemapStatus.Installed(_, _) =>
@@ -66,7 +64,6 @@ object VenueDataUi:
         b.setNegativeButton("削除", (_, _) => VenueDownload.delete(act))
       case BasemapStatus.Missing =>
         b.setPositiveButton("ダウンロード", (_, _) => requestDownload(act))
-    b.setNeutralButton("閉じる", null).show()
 
   private def confirmDelete(act: MainActivity): Unit =
     MaterialAlertDialogBuilder(act)
