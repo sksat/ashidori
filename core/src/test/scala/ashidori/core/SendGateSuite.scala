@@ -193,6 +193,36 @@ class SendGateSuite extends munit.FunSuite:
     assert(!q.isRunning("c"))
   }
 
+  test("a late snapshot result is used only by the card's current job, and not cached when its data changed") {
+    import SnapshotArrival.*
+    def of(ended: Boolean = false, startGen: Int = 3, cardGen: Int = 3, cardJob: Boolean = true,
+           queueJob: Boolean = true, keyAtStart: String = "offline@1+a", keyNow: String = "offline@1+a") =
+      SnapshotArrival.of(ended, startGen, cardGen, cardJob, queueJob, keyAtStart, keyNow)
+    assertEquals(of(), Current)
+    // Already ended (e.g. the timeout won, then the snapshot called back).
+    assertEquals(of(ended = true), Stale)
+    // The card left the screen and came back: a new generation.
+    assertEquals(of(cardGen = 4), Stale)
+    // The card runs another job now (it was drawn again).
+    assertEquals(of(cardJob = false), Stale)
+    // The queue dropped it: a change of the rules, or the screen held.
+    assertEquals(of(queueJob = false), Stale)
+    // Stale wins over a changed key: nothing of an old job is used.
+    assertEquals(of(queueJob = false, keyNow = "offline@2+a"), Stale)
+    // The basemap or the region packs changed while it was drawing.
+    assertEquals(of(keyNow = "offline@2+a"), Outdated)
+    assertEquals(of(keyNow = "offline@1+a+b"), Outdated)
+
+    // With the queue: a job cancelled by a change of the rules is stale when it calls back late.
+    val g = gate(Policy.fromBlock(false))
+    val q = SnapshotQueue[String](g)
+    q.enqueue(() => Some("old"))
+    q.invalidate()
+    q.enqueue(() => Some("new"))
+    assertEquals(SnapshotArrival.of(false, 0, 0, cardJob = true, q.isRunning("old"), "k", "k"), Stale)
+    assertEquals(SnapshotArrival.of(false, 0, 0, cardJob = true, q.isRunning("new"), "k", "k"), Current)
+  }
+
   test("a queued job of an old generation is skipped even without invalidate, and the next one runs") {
     val g = gate()
     val q = SnapshotQueue[String](g)

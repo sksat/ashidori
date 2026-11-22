@@ -291,6 +291,38 @@ final class SnapshotQueue[H](gate: SendGate, dests: Set[Dest] = Dest.Tiles):
             running = None
             busy = false
 
+/** What a snapshot job does with a result that arrives (drawn, failed, or
+  * out of time), so that a late result never changes a card it no longer
+  * belongs to.
+  */
+enum SnapshotArrival:
+  /** Not the card's current job any more: it ended already (drawn, failed or
+    * timed out), the card left the screen since it started (its generation
+    * moved), the card started another job, or the queue dropped it (a change
+    * of the rules, the screen held). Ignored: no picture, no cache, no
+    * fallback, and nothing of the card's current job is released.
+    */
+  case Stale
+  /** The card's current job, but drawn from data that changed meanwhile
+    * (its cache key, read at the start, moved: the basemap or the region
+    * packs): not shown and not cached; the card is drawn again.
+    */
+  case Outdated
+  /** The card's current job, as started: used. */
+  case Current
+
+object SnapshotArrival:
+  /** `ended`: this job already ended. `startGen`, `cardGen`: the card's
+    * generation when the job started and now. `cardJob`: it is still the
+    * card's running job. `queueJob`: it is still the queue's running job.
+    * `keyAtStart`, `keyNow`: the picture's cache key then and now.
+    */
+  def of(ended: Boolean, startGen: Int, cardGen: Int, cardJob: Boolean, queueJob: Boolean,
+         keyAtStart: String, keyNow: String): SnapshotArrival =
+    if ended || startGen != cardGen || !cardJob || !queueJob then Stale
+    else if keyAtStart != keyNow then Outdated
+    else Current
+
 /** The map consents of versions before per-destination settings
   * (`mapConsents`): read once to migrate them, and written for those
   * versions ([[ExternalSettings]]).
