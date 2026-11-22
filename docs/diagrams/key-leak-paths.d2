@@ -11,7 +11,7 @@ attacker: "侵入者、悪意ある管理者\nCloudflare アカウントの乗�
 
 server: 同期サーバ（Cloudflare） {
   d1: "D1\n包んだ鍵、公開鍵\nメタデータ" {shape: cylinder}
-  r2: "R2\n暗号文\n正確な送信時刻" {shape: cylinder}
+  r2: "R2\n暗号化した記録\n正確な送信時刻" {shape: cylinder}
   backup: "D1 の Time Travel\n30 日" {shape: cylinder}
   logs: "ログ\nエラーだけ" {shape: page}
   page: "Web 閲覧のページ" {class: maybe}
@@ -23,7 +23,7 @@ browser: "ブラウザ\n付与した範囲の EK" {class: maybe}
 tiles: "地図タイル、地名\n外部サービス" {class: maybe}
 
 attacker -> server.d1: "時刻、大きさ、件数"
-attacker -> server.r2: "暗号文だけ"
+attacker -> server.r2: "暗号化した記録だけ"
 attacker -> server.logs: "位置は出さない"
 attacker -> server.page: 書き換える
 server.page -> browser: 改ざんしたコード {class: maybe}

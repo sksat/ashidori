@@ -11,7 +11,7 @@ record: "record v2" {
   name: "object ID または head ID（16 B）"
   version: "head の版（8 B）"
   refs: "参照する object ID（head だけ）"
-  body: "AEAD: nonce と暗号文 / HPKE: 鍵 ID、enc、暗号文"
+  body: "AEAD: nonce と暗号化した本文 / HPKE: 鍵 ID、enc、暗号化した本文"
   sig: "Ed25519 署名（64 B）"
 }
 

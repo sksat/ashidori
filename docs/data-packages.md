@@ -27,7 +27,7 @@ tools/geocoder/fetch.sh <作業ディレクトリ>   # app/src/main/assets/geoco
 ## オフライン地図（全域）
 
 Protomaps Basemap の日次ビルドから、日本（ズーム 6〜10）と全世界（ズーム 0〜5）を切り出す（約 64 MB）。
-Protomaps の日次ビルドは 1 週間ほどで消え、直接の参照も推奨されないため、切り出したデータを自前で配布する。
+Protomaps の日次ビルドは 1 週間ほどで消え、直接の参照も推奨されないため、切り出したデータを GitHub Releases と同期サーバで配布する。
 
 ```sh
 tools/basemap/build.sh <作業ディレクトリ>   # tools/basemap/out/ に生成する（BUILD=YYYYMMDD で日次ビルドを指定）
@@ -45,7 +45,7 @@ tools/basemap/release.sh                    # 公開のコマンドを表示す�
 
 ## 施設データ
 
-Geofabrik の日本の抽出（OpenStreetMap）から、名前と種別を持つ施設を抜き出して索引にする（約 18 MB）。
+Geofabrik の日本の抽出（OpenStreetMap）から、名前と種別を持つ施設を抜き出す（約 18 MB）。
 
 ```sh
 tools/venues/build.sh <作業ディレクトリ>   # tools/venues/out/ に生成する（約 3 GB の作業領域、5 分ほど）

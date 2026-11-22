@@ -70,13 +70,13 @@
 
 ### 気圧（`pressure`）
 
-気圧計は wakeup でないセンサーとして 1 Hz で登録し、報告の遅延（移動中は加速度のバッチに合わせて 10〜60 秒、静止中は 60 秒）を長くとる。
+気圧計は wakeup でないセンサーとして 1 Hz で登録し、報告の遅延（移動中は加速度の一括受信に合わせて 10〜60 秒、静止中は 60 秒）を長くとる。
 気圧計のために端末を起こさない。
 権限は要らない。
 
 保存の保証は、受信した値と受信していない値で分かれる。
 
-- **受信した値は残る。** センサーが一度に渡したバッチを処理した直後に書き込みへ回し、保存できなければファイルに退避する（[書き込みの経路](#書き込みの経路)）。メモリに残るのは、閉じていない 5 秒（静止中は 1 分）の区切りだけである。
+- **受信した値は残る。** センサーが一括で渡した値を処理した直後に書き込みへ回し、保存できなければファイルに退避する（[書き込みの経路](#書き込みの経路)）。メモリに残るのは、閉じていない 5 秒（静止中は 1 分）の区切りだけである。
 - **受信していない値は欠ける。** 端末が眠っている間、センサーハブは読みを FIFO に溜めるが、満杯になると古い読みから上書きする。wakeup でないセンサーの報告の遅延は端末を起こさないので、眠っている時間が FIFO の容量を超えると、その分は欠ける。FIFO の大きさは端末診断のレポート（`sensors`）にある。実機での欠け方は測っていない。
 - 遅延を変えるとき（再登録）と停止するときは、先に FIFO を flush し、完了の通知（`onFlushCompleted`、最大 5 秒）を待ってから登録を外す。停止では、その後でロガーのスレッドを終える。
 
@@ -119,9 +119,9 @@ Android 14 以上では `AltitudeConverter` が端末内のジオイドモデル
 UI の読み込み、書き出し、推定の計算（共有の I/O executor）を待たない。
 
 - 種類ごとに `WriteKind` を持つ。キー（`energy_state`、`pressure`、`fix_msl` など）で数え、ラベルは表示だけに使う。ある種類が 3 分を超えて保存されなければ、ほかの種類が保存されていても通知する。
-- 小さい行（測位、動き、電池、GNSS の状態、生データの区間、気圧、状態の変化、海抜高度）は `SmallRecord` として渡す。保存できない場合、つまり書き込み待ちが上限（20 万行）に達した場合と、SQLite が再試行の後も拒んだ場合は、バッチを 1 ファイルとして退避ディレクトリに書く（fsync、rename、ディレクトリの fsync）。SQLite に書けるようになってから、行と取り込み済みの印を一つのトランザクションで書き、ファイルを消し、印を消す（`OverflowImport`、生データと同じ）。途中で落ちても、失わず、二重にもしない。
+- 小さい行（測位、動き、電池、GNSS の状態、生データの区間、気圧、状態の変化、海抜高度）は `SmallRecord` として渡す。保存できない場合、つまり書き込み待ちが上限（20 万行）に達した場合と、SQLite が再試行の後も拒んだ場合は、まとめて渡された行を 1 ファイルとして退避ディレクトリに書く（fsync、rename、ディレクトリの fsync）。SQLite に書けるようになってから、行と取り込み済みの印を一つのトランザクションで書き、ファイルを消し、印を消す（`OverflowImport`、生データと同じ）。途中で落ちても、失わず、二重にもしない。
 - 生データの行も、SQLite が拒んだ場合に退避するようにした（以前は失った行として数えた）。
-- 退避したバッチの種類は、その種類が次に保存されるまで未保存として数える。保存の遅れの通知はそのまま出る。
+- 退避した行の種類は、その種類が次に保存されるまで未保存として数える。保存の遅れの通知はそのまま出る。
 - 退避ファイルはバックアップに含まれる（生データの退避と同じディレクトリ）。
 - 退避にも失敗した行だけを、失った行として数えて記録する。
 
@@ -133,8 +133,8 @@ UI の読み込み、書き出し、推定の計算（共有の I/O executor）�
 
 | 版 | 内容 |
 | --- | --- |
-| 7 | `battery` に `charge_uah INTEGER`、`current_avg_ua INTEGER`、`current_now_ua INTEGER`、`voltage_mv INTEGER`、`temp_c REAL`、`plug TEXT` を追加。`energy_state(start, end, gnss, gnss_interval_ms, provider, detail, still, screen_on, charging, mode, eff_mode, motion, env, end_unknown, boot, seq)` と `start` の索引、`energy_checkpoint(boot, seq, confirmed_at)` を作成 |
-| 8 | `fixes` に `alt_acc REAL`、`msl REAL`、`msl_acc REAL` を追加。`pressure(time, hpa)` と `time` の索引、`deleted_range(start, end, deleted_at, archived_at)`、`fix_msl(time, msl, msl_acc)` と `time` の索引を作成。`sync_outbox` に `file TEXT`（batch がどのアーカイブのファイルの一部か）と `del_seq INTEGER`（そのファイルを開く前の削除の通し番号）を追加 |
+| 7 | `battery` に `charge_uah INTEGER`、`current_avg_ua INTEGER`、`current_now_ua INTEGER`、`voltage_mv INTEGER`、`temp_c REAL`、`plug TEXT` を追加。`energy_state(start, end, gnss, gnss_interval_ms, provider, detail, still, screen_on, charging, mode, eff_mode, motion, env, end_unknown, boot, seq)` と `start` のインデックス、`energy_checkpoint(boot, seq, confirmed_at)` を作成 |
+| 8 | `fixes` に `alt_acc REAL`、`msl REAL`、`msl_acc REAL` を追加。`pressure(time, hpa)` と `time` のインデックス、`deleted_range(start, end, deleted_at, archived_at)`、`fix_msl(time, msl, msl_acc)` と `time` のインデックスを作成。`sync_outbox` に `file TEXT`（送る行がどのアーカイブのファイルの一部か）と `del_seq INTEGER`（そのファイルを開く前の削除の通し番号）を追加 |
 
 - 追加だけである。追加した列は NULL を許し（`end_unknown` は既定値 0）、既存の行は変えない。
 - 各段は無い列と表だけを足す（`PRAGMA table_info` と `IF NOT EXISTS`）。同じ段を再度実行しても変わらない。
@@ -145,7 +145,7 @@ UI の読み込み、書き出し、推定の計算（共有の I/O executor）�
 `SQLiteOpenHelper` は、`onUpgrade` と `setVersion`（`user_version`）を一つのトランザクションで行う。
 試験はこれを同じ形で再現する（WAL の接続で `BEGIN IMMEDIATE`、版 7 と 8 の段、`PRAGMA user_version=8`、`COMMIT`）。
 
-- 0.21.0 と同じ文で作って行を入れたデータベースが 8 になり、行が変わらず、新規に作った表と列・索引が一致する。再実行で変わらない。移行後の行の rowid は既存より大きい。
+- 0.21.0 と同じ文で作って行を入れたデータベースが 8 になり、行が変わらず、新規に作った表と列・インデックスが一致する。再実行で変わらない。移行後の行の rowid は既存より大きい。
 - 段の間でプロセスを殺す（トランザクションの中で SIGKILL）と、版 6 のまま何も変わらない。次に開くと移行する。
 - 段の途中で SQL が失敗した場合も、版 6 のまま何も変わらない。次に開くと移行する。
 
@@ -227,9 +227,9 @@ UPDATE で閉じると、変換中に閉じた行（rowid はその最大以下�
 
 - 時刻で消す表：`fixes`、`battery`、`gnss_status`、`pressure`、`raw_lines`。`motion` は開始時刻で消す。
 - 期間をまたぐ行は端で切る：`energy_state`（期間の外の部分を新しい rowid で入れ直す）と `gnss_sessions`。
-- 期間を `deleted_range` に残し、以後の挿入はすべてその期間の行を落とす（`Deletion.kept`）。待ち行列のバッチ、ロガーのバッファ、生データと小さい行の退避ファイル、旧形式のログの取り込み、状態の変化の再送、海抜高度の後からの書き込みが、消したデータを戻さない。
+- 期間を `deleted_range` に残し、以後の挿入はすべてその期間の行を落とす（`Deletion.kept`）。書き込みを待つ行、ロガーのバッファ、生データと小さい行の退避ファイル、旧形式のログの取り込み、状態の変化の再送、海抜高度の後からの書き込みが、消したデータを戻さない。
 - 挿入の判断は、その挿入の書き込みトランザクションの中で `deleted_range` を読み直して行う（キャッシュを使わない）。トランザクションは排他なので、別のプロセスの削除と挿入は順に並ぶ。読み出しの判断だけは数秒のキャッシュを使う。
-- 削除は記録の書き込みスレッドで、それより前に渡したバッチの後に行う（`LoggerWrites.deleteRange`）。
+- 削除は記録の書き込みスレッドで、それより前に渡した行を書いた後に行う（`LoggerWrites.deleteRange`）。
 - 場所、チェックイン、移動手段の修正は利用者が作るデータであり、消さない（個別に消す）。動作の記録（LifeLog）も消さない。
 - この版では削除を取り消せない。`deleted_range` の期間には以後も書かないので、取り消しを作る場合は、期間を外すことと、その間に落とした行が戻らないことを利用者に示す必要がある。
 

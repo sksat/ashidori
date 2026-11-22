@@ -7,7 +7,7 @@ classes: {
   maybe: {style.stroke-dash: 4}
 }
 
-user: 利用者（鍵 K を持つ） {
+user: 利用者（鍵を持つ） {
   grid-rows: 1
   p1: 端末 1
   p2: 端末 2
@@ -29,7 +29,7 @@ ext: "外部サービス\n地図タイル、地名、施設検索"
 operator: 運用者 {shape: person}
 follower: フォロワー {shape: person}
 
-user <-> server.workers: 暗号文
+user <-> server.workers: 暗号化した記録
 user -> server.workers: 共有チェックイン（平文） {class: plain}
 server.workers -> follower: 平文 {class: plain}
 server.admin <- operator

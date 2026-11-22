@@ -8,14 +8,14 @@ tools/venues/ が生成するデータの出典 / Sources of the data generated 
   https://www.openstreetmap.org/copyright  https://opendatacommons.org/licenses/odbl/1-0/
   施設データは OpenStreetMap から作成した Derivative Database である（ODbL 4.4。名前・種別・位置を
   抜き出して形式を変えたもので、他のデータとは組み合わせていない）。ODbL 4.6 により、配布するときは
-  索引そのものを同じ ODbL で提供し、作り方（extract.py、build_index.py、build.sh）を示す。
+  施設データそのものを同じ ODbL で提供し、生成の手順（extract.py、build_index.py、build.sh）を示す。
 - 入力: Geofabrik の日本の抽出（japan-261014.osm.pbf、OpenStreetMap 2026-10-14T20:21:12Z 時点、
   sha256 47897333ff734752efeb12ca1fad46a327e72d305bf6ecc249b8fd068634a8e4、
   https://download.geofabrik.de/asia/japan.html）。Geofabrik の抽出も ODbL 1.0 である。
   加工: name と種別のキー（amenity, shop, tourism, leisure, railway, public_transport, office,
   historic, aeroway）を持つノード・ウェイ・リレーションから、チェックインの対象とならないもの
   （線路、ホーム、駐車場、案内板など）を除いて抜き出し、ウェイとリレーションは外接矩形の中心に
-  置き、索引形式に変換（ashidori）
+  置き、施設データの形式に変換（ashidori）
 
 ■ 生成に用いるツール
 

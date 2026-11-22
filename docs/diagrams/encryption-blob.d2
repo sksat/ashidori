@@ -11,7 +11,7 @@ blob: blob（先頭から順に） {
   shape: sql_table
   識別子 ASH1: 4 byte
   nonce: 12 byte
-  暗号文: 可変長
+  暗号化した本文: 可変長
   認証タグ: 16 byte
 }
 
@@ -20,5 +20,5 @@ nonce -> gcm
 key -> gcm
 aad -> gcm
 nonce -> blob.nonce
-gcm -> blob.暗号文
+gcm -> blob.暗号化した本文
 gcm -> blob.認証タグ
