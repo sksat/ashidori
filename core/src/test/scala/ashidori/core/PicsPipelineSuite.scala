@@ -46,19 +46,32 @@ class PicsPipelineSuite extends munit.FunSuite:
     assertEquals(p.runs.refusedTotal.get(PicsRuns.Refused.Test), None)
   }
 
-  test("the scan's stop: a batched scan is flushed, its results waited for, then stopped; the others stopped at once") {
+  test("the scan's stop: a batched scan is flushed and stopped after the whole window; the others stopped at once") {
     val order = scala.collection.mutable.ArrayBuffer.empty[String]
-    val came = PicsScanStop.run(batched = true, () => order += "flush", ms => { order += s"wait $ms"; order += "results"; true },
-      () => order += "stop")
-    assert(came)
-    assertEquals(order.toSeq, Seq("flush", s"wait ${PicsScanStop.TimeoutMs}", "results", "stop"))
+    PicsScanStop.run(batched = true, () => order += "flush", ms => order += s"window $ms", () => order += "stop")
+    assertEquals(order.toSeq, Seq("flush", s"window ${PicsScanStop.TimeoutMs}", "stop"))
     order.clear()
-    // The results did not come in time: stopped anyway (the callback still takes them later).
-    assert(!PicsScanStop.run(batched = true, () => order += "flush", _ => false, () => order += "stop"))
-    assertEquals(order.toSeq, Seq("flush", "stop"))
-    order.clear()
-    assert(PicsScanStop.run(batched = false, () => order += "flush", _ => false, () => order += "stop"))
+    PicsScanStop.run(batched = false, () => order += "flush", ms => order += s"window $ms", () => order += "stop")
     assertEquals(order.toSeq, Seq("stop"))
+  }
+
+  test("the flush window: a batch delivered first does not end it; the flushed results arriving late are in it") {
+    // As the scanner runs it: deliveries on the callback's thread, the stop when the window is over.
+    val flushAt = 10_000L
+    val w = PicsScanStop.FlushWindow(flushAt)
+    val taken = scala.collection.mutable.ArrayBuffer.empty[String]
+    val deliveries = Seq(flushAt + 10 -> "batch of before the flush", flushAt + 1_500 -> "the flushed results")
+    var stoppedAt = -1L
+    var t = flushAt
+    while stoppedAt < 0 do
+      deliveries.filter(_._1 == t).foreach { (at, what) => w.delivered(at); taken += what }
+      if w.over(t) then stoppedAt = t
+      t += 10
+    assertEquals(taken.toSeq, deliveries.map(_._2))
+    assertEquals(w.deliveries, 2)
+    assertEquals(stoppedAt, flushAt + PicsScanStop.TimeoutMs)
+    // Never earlier, whatever came.
+    assert(!w.over(flushAt + PicsScanStop.TimeoutMs - 1))
   }
 
   test("the start gate is the process's: a logger stopped and started again starts no sooner than 10 s") {

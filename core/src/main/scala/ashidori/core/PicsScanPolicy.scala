@@ -248,25 +248,32 @@ object PicsScanGate:
 
 /** How a scan is stopped (design 3.2): a batched scan's controller may
   * still hold results, and `flushPendingScanResults` hands them over
-  * later (asynchronously): flush, wait until they came (or `timeoutMs`),
-  * then stop. Results that come after the stop anyway (a timeout) are
-  * still taken by the callback. Every stop goes this way: a change of
-  * scan, the reopening, the end of the logger.
+  * later (asynchronously), to the same callback as the batches it delivers
+  * anyway: a delivery cannot tell the flushed results from a batch that was
+  * on its way before. So the scan is stopped only when the whole window
+  * after the flush is over ([[FlushWindow]]), every delivery in it taken;
+  * one after the stop is still taken by the callback. Every stop goes this
+  * way: a change of scan, the reopening, the end of the logger.
   */
 object PicsScanStop:
   val TimeoutMs: Long = 2_000L
 
-  /** `flushed(ms)`: waits up to `ms` for the flushed results to be handed
-    * over; whether they came. Returns that (true when nothing was batched).
-    */
-  def run(batched: Boolean, flush: () => Unit, flushed: Long => Boolean, stop: () => Unit, timeoutMs: Long = TimeoutMs): Boolean =
-    val came =
-      if !batched then true
-      else
-        flush()
-        flushed(timeoutMs)
+  /** `waitFor(ms)`: waits that long, the callback taking what comes. */
+  def run(batched: Boolean, flush: () => Unit, waitFor: Long => Unit, stop: () => Unit, timeoutMs: Long = TimeoutMs): Unit =
+    if batched then
+      flush()
+      waitFor(timeoutMs)
     stop()
-    came
+
+  /** The window after a flush (ms): no delivery ends it early, the first
+    * one may be a batch of before the flush.
+    */
+  final class FlushWindow(flushAt: Long, timeoutMs: Long = TimeoutMs):
+    private var n = 0
+    def delivered(at: Long): Unit = if at >= flushAt then n += 1
+    def deliveries: Int = n
+    def endsAt: Long = flushAt + timeoutMs
+    def over(now: Long): Boolean = now >= endsAt
 
 /** What the status row shows of an intersection (design 6, 7.5), on the
   * monotonic clock: the signals' colours only for [[FreshMs]] after their
