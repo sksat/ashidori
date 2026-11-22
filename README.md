@@ -101,7 +101,7 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 取得したデータは、アプリに固定した sha256 で照合してから使う。OS の測位サービスと、地図アプリで開く・共有するなどの操作は、この設定の対象外である。詳しくは [`docs/privacy.md`](docs/privacy.md) にある。
 
-## 記録の流れ
+## データフロー
 
 ![記録は端末の SQLite から日・月の Parquet にまとめられ、端末で暗号化してから同期サーバに送る。復号できるのは自分の端末とブラウザだけ](docs/diagrams/readme-dataflow.svg)
 
