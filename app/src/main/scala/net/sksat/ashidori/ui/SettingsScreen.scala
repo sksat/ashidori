@@ -25,7 +25,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
     val lines = Seq(
       "■ 地名の検索（端末内で処理）",
       if geocoder.nonEmpty then bullets(geocoder)
-      else "・大字・町丁目レベル位置参照情報　国土交通省。加工: 索引形式に変換（ashidori）\n・GeoNames、CC BY 4.0。改変: 索引形式に変換（ashidori）",
+      else "・大字・町丁目レベル位置参照情報　国土交通省。加工: 地名データベースの形式に変換（ashidori）\n・GeoNames、CC BY 4.0。改変: 地名データベースの形式に変換（ashidori）",
       "位置参照情報: https://nlftp.mlit.go.jp/isj/",
       "GeoNames: https://www.geonames.org/（CC BY 4.0: https://creativecommons.org/licenses/by/4.0/）",
       "",
@@ -40,7 +40,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
       "■ 施設データ",
       if venues.nonEmpty then bullets(venues) else VenueStaticCredits,
       "OpenStreetMap: https://www.openstreetmap.org/copyright",
-      "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。作り方: https://github.com/sksat/ashidori/tree/main/tools/venues",
+      "施設データは OpenStreetMap から作成した Derivative Database であり、ODbL 1.0 の下で提供する。生成の手順: https://github.com/sksat/ashidori/tree/main/tools/venues",
       "",
       "■ 施設のオンライン検索",
       "・OpenStreetMap（Overpass API）: © OpenStreetMap contributors（ODbL）",
@@ -131,7 +131,7 @@ final class SettingsScreen(act: MainActivity) extends Screen:
   /** Credits of the venue data before it is downloaded (tools/venues/build_index.py writes the same). */
   private val VenueStaticCredits = Seq(
     "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
-    "Geofabrik の日本の抽出（https://download.geofabrik.de/asia/japan.html）。加工: チェックインの対象となる施設を抜き出し、索引形式に変換（ashidori）"
+    "Geofabrik の日本の抽出（https://download.geofabrik.de/asia/japan.html）。加工: チェックインの対象となる施設を抜き出し、施設データの形式に変換（ashidori）"
   ).map("・" + _).mkString("\n")
 
   private def modeValue(m: LoggingMode) = s"${ModeInfo.symbol(m)} ${m.label}"

@@ -238,18 +238,18 @@ def attribution(isj_files, isj_members, gn_files):
         files = names[0] if len(names) == 1 else f"{names[0]}〜{names[-1]}（{len(names)} ファイル）"
         detail = "、".join(filter(None, ["・".join(f"{y}年" for y in years),
                                          "・".join(f"第{v}版" for v in versions), f"ファイル: {files}"]))
-        lines.append(f"{ISJ_TITLE}（{detail}）。加工: 索引形式に変換（ashidori）")
+        lines.append(f"{ISJ_TITLE}（{detail}）。加工: 地名データベースの形式に変換（ashidori）")
     for f in gn_files:
         when = f"、{f['date']} 版" if f.get("date") else ""
         lines.append(f"GeoNames（{f['file']}{when}）、CC BY 4.0（{CC_BY}）。"
-                     "改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）")
+                     "改変: 地名データベースの形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）")
     return lines
 
 
 def write_attribution_file(path, lines):
     """Plain-text notice placed next to the generated index."""
     body = [
-        "地名の索引（index.bin）の出典 / Sources of the offline geocoder index",
+        "地名データベース（index.bin）の出典 / Sources of the offline geocoder index",
         "",
         "index.bin は tools/geocoder/build_index.py により次のデータを加工して作成した。",
         "",

@@ -1,8 +1,8 @@
 {
   "format": "AGEO v1",
   "attribution": [
-    "大字・町丁目レベル位置参照情報　国土交通省（2025年、第19.0b版、ファイル: 01000-19.0b.zip〜47000-19.0b.zip（47 ファイル））。加工: 索引形式に変換（ashidori）",
-    "GeoNames（cities1000.zip、2026-10-13 版）、CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）。改変: 索引形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）"
+    "大字・町丁目レベル位置参照情報　国土交通省（2025年、第19.0b版、ファイル: 01000-19.0b.zip〜47000-19.0b.zip（47 ファイル））。加工: 地名データベースの形式に変換（ashidori）",
+    "GeoNames（cities1000.zip、2026-10-13 版）、CC BY 4.0（https://creativecommons.org/licenses/by/4.0/）。改変: 地名データベースの形式に変換し、日本国内の地点と廃止・歴史上の地点などを除外（ashidori）"
   ],
   "output": {
     "file": "index.bin",

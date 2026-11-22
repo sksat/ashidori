@@ -4,6 +4,6 @@
   位置参照情報利用約款 第2条第3項に従い出典を表示する。
 - cities-sample.txt: GeoNames（cities1000.txt、https://www.geonames.org/）から数行を抜き出した。
   Creative Commons Attribution 4.0（https://creativecommons.org/licenses/by/4.0/）。
-- fixture.bin: 上の 2 つから tools/geocoder/build_index.py で作った索引。
+- fixture.bin: 上の 2 つから tools/geocoder/build_index.py で作った地名データベース。
 
-本体の索引の出典と版は README の「データの出典」と tools/ATTRIBUTION を参照。
+本体の地名データベースの出典と版は README の「データの出典」と tools/ATTRIBUTION を参照。

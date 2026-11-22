@@ -238,8 +238,8 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
         syncRow.setValue(if syncStopped then "停止中" else "動作中")
         syncRow.value.setTextColor(color(if syncStopped then attr.error else attr.onSurfaceVariant))
         archiveRow.setSubtitle(
-          if stuck.isDefined then "途中で中断した整理を自動では完了できません（記録は端末内に保持）"
-          else if pendingCommit then "途中で中断した整理があります（自動で完了します）"
+          if stuck.isDefined then "中断した整理を自動では完了できません（記録は端末内に保持）"
+          else if pendingCommit then "中断した整理があります（自動で完了します）"
           else if safe then "異常終了が続いたため停止中（「記録を再整理」で再開）"
           else if skipped.nonEmpty then s"保留中: ${skipped.map(_.toString.drop(5)).mkString("、")}（データは端末内に保持）"
           else "充電中、または起動の30分後に自動で行います")
@@ -267,7 +267,7 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
     val (listed, quiet) = attention.partition(e => e.onlyCopy || !e.seen)
     val lines =
       stuck.map(ls => "記録は端末内に保持し、記録を続けています。" +: ls)
-        .orElse(Option.when(pendingCommit)(Seq("途中で中断した整理があります。自動で完了します。"))).toSeq.flatten ++
+        .orElse(Option.when(pendingCommit)(Seq("中断した整理があります。自動で完了します。"))).toSeq.flatten ++
       Option.when(!pendingCommit && attention.nonEmpty)(
         "記録の整理は再開しました。隔離したファイルの行は復元しません。タイムライン・書き出し・同期には含みません。").toSeq ++
       Option.when(listed.nonEmpty)("隔離したファイル（削除しません）:").toSeq ++
@@ -306,9 +306,9 @@ final class DiagnosticsScreen(act: MainActivity) extends Screen:
   private def confirmRepair(): Unit =
     com.google.android.material.dialog.MaterialAlertDialogBuilder(act)
       .setTitle("整理を修復")
-      .setMessage("途中で中断した整理を表ごとに解決します。置き換え済みの表は、端末内に重複して残る行がすべてファイルにあることを確かめてから、その行を削除します。" +
-        "以前から保存されていた行は、元のファイルが残っていないため行数だけを確かめます（残る中で最もよい確認）。" +
-        "検証できないファイルは隔離し、削除しません。先に救出用バックアップを書き出すことを勧めます。")
+      .setMessage("中断した整理を表ごとに解決します。置き換え済みの表は、端末内に重複して残る行がすべてファイルにあることを確かめてから、その行を削除します。" +
+        "以前から保存されていた行は、元のファイルが残っていないため行数のみを確かめます。" +
+        "検証できないファイルは隔離し、削除しません。先に救出用バックアップを書き出すことを推奨します。")
       .setPositiveButton("修復する", (_, _) => {
         backupLine = None
         Maintenance.repairNow(act)

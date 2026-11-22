@@ -242,18 +242,18 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-ATTRIBUTION = """施設の索引（venues.aven）の出典 / Sources of the venue index
+ATTRIBUTION = """施設データ（venues.aven）の出典 / Sources of the venue data
 
 - © OpenStreetMap contributors。Open Database License 1.0
   https://www.openstreetmap.org/copyright  https://opendatacommons.org/licenses/odbl/1-0/
   venues.aven は OpenStreetMap のデータから作成した Derivative Database であり、ODbL 1.0 の下で
-  提供する。作り方は https://github.com/sksat/ashidori の tools/venues/ に記す。
+  提供する。生成の手順は https://github.com/sksat/ashidori の tools/venues/ に記す。
 - 入力: Geofabrik の抽出 {source_file}（OpenStreetMap {source_date} 時点、sha256 {source_sha256}、
   https://download.geofabrik.de/asia/japan.html）
   加工: name と種別のキー（amenity, shop, tourism, leisure, railway, public_transport, office,
   historic, aeroway）を持つノード・ウェイ・リレーションから、チェックインの対象とならないもの
   （線路、ホーム、駐車場、案内板など）を除いて抜き出し、ウェイとリレーションは外接矩形の中心に
-  置き、索引形式に変換（ashidori）
+  置き、施設データの形式に変換（ashidori）
 """
 
 
@@ -301,7 +301,7 @@ def main():
         "tools": a.tool,
         "attribution": [
             "© OpenStreetMap contributors（ODbL 1.0、https://www.openstreetmap.org/copyright）",
-            f"Geofabrik の抽出 {a.source_file}（OpenStreetMap {date} 時点）。加工: チェックインの対象となる施設を抜き出し、索引形式に変換（ashidori）",
+            f"Geofabrik の抽出 {a.source_file}（OpenStreetMap {date} 時点）。加工: チェックインの対象となる施設を抜き出し、施設データの形式に変換（ashidori）",
         ],
     }
     with open(os.path.join(a.out, "manifest.json"), "w", encoding="utf-8") as f:

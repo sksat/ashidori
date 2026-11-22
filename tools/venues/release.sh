@@ -32,7 +32,7 @@ venues=$(field "$desc" venues)
 
 notes="$dist/ashidori-venues-$version.notes.md"
 cat > "$notes" <<EOF
-ashidori の施設データ（チェックインの候補を端末内で探す索引）。アプリがダウンロードし、sha256 を照合する。
+ashidori の施設データ（チェックインの候補となる施設）。アプリがダウンロードし、sha256 を照合する。
 
 - 版: $version（OpenStreetMap $osm 時点、Geofabrik の抽出 $source から作成。$venues 件）
 - ファイル: ashidori-venues-$version.zip（$bytes バイト）
@@ -40,7 +40,7 @@ ashidori の施設データ（チェックインの候補を端末内で探す�
 
 施設データは © OpenStreetMap contributors であり、OpenStreetMap から作成した Derivative Database
 として Open Database License 1.0（https://opendatacommons.org/licenses/odbl/1-0/）の下で提供する。
-作り方はリポジトリの tools/venues/、出典はアーカイブ内の ATTRIBUTION を参照。
+生成の手順はリポジトリの tools/venues/、出典はアーカイブ内の ATTRIBUTION を参照。
 EOF
 
 cat <<EOF
