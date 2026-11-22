@@ -1,0 +1,53 @@
+# データフロー（README）
+# 復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号化した記録だけが届く。
+direction: down
+grid-rows: 3
+grid-gap: 80
+
+phone: 端末 {
+  grid-columns: 2
+  horizontal-gap: 110
+  vertical-gap: 80
+  # The grid fills column by column: sensors over enc, db over archive,
+  # so the encrypted records leave from the bottom left, straight down to the server.
+  sensors: "センサー\nGNSS・IMU・気圧・電池"
+  enc: 暗号化
+  db: "SQLite\n当日のセンサーの記録\n場所・チェックイン\n移動手段の修正" {shape: cylinder}
+  archive: "Parquet\n前日までのセンサーの記録\n日・月ごとのファイル" {shape: cylinder}
+
+  sensors -> db: 記録
+  db -> archive: 前日までの分を移す
+  db -> enc: 場所・チェックイン・修正
+  archive -> enc
+}
+
+server: 同期サーバ {
+  grid-columns: 2
+  horizontal-gap: 150
+  # The front on the left (under the device's encryption and above the readers),
+  # the stores on the right, so no arrow crosses a store.
+  api: "受け付け（Cloudflare Workers）\n端末とブラウザの認証\n記録の受け渡し"
+  stores: "" {
+    style.fill: transparent
+    style.stroke: transparent
+    grid-rows: 2
+    vertical-gap: 24
+    blobs: "記録の置き場（Cloudflare R2）\n暗号化した記録" {shape: cylinder}
+    meta: "台帳（Cloudflare D1）\n利用者・端末・記録の一覧" {shape: cylinder}
+  }
+  api -> stores.blobs: 保存・取り出し
+  api -> stores.meta: 一覧の更新・参照
+}
+
+readers: "" {
+  style.fill: transparent
+  style.stroke: transparent
+  grid-columns: 2
+  horizontal-gap: 80
+  web: "Web 版（ブラウザ）\nブラウザの中で復号して表示"
+  other: "同じ利用者の別の端末\n端末の中で復号して表示"
+}
+
+phone.enc -> server.api: 暗号化した記録を送る
+server.api -> readers.web: 暗号化した記録を取得
+server.api -> readers.other: 暗号化した記録を取得
