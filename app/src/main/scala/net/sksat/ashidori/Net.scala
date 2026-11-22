@@ -26,6 +26,15 @@ object Net:
   /** One line per request, refusal and cut: debug builds only (a tile path holds the area). */
   def log(msg: String): Unit = if debug then android.util.Log.i(Tag, msg)
 
+  /** A validated network is there now (the system reached the internet
+    * through it). Without one, nothing online can arrive: snapshots draw the
+    * offline map instead of waiting ([[BaseMapPolicy.snapshotNow]]).
+    */
+  def reachable: Boolean =
+    val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
+    Option(cm.getNetworkCapabilities(cm.getActiveNetwork))
+      .exists(_.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+
   /** The allowed hosts of a destination now. */
   def hosts(d: Dest): Set[String] = d match
     case Dest.Ofm => Outbound.OfmHosts

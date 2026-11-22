@@ -20,7 +20,17 @@ import Ui.*
 
 /** A still map of one day for the timeline: the route in transport mode
   * colors and the stays, on the chosen base map. Rendered off-screen one at
-  * a time and cached; without tiles (offline) the plain sketch stays.
+  * a time and cached.
+  *
+  * An online map that cannot be drawn (no validated network, its style not
+  * on the device yet, the snapshot failed or ran out of time) gives way to
+  * the offline map with the region packs around the day
+  * ([[BaseMapPolicy.snapshotFallback]]), which sends nothing; without it the
+  * plain sketch stays. That picture is cached under the offline map's key,
+  * so the online one replaces it when it is drawn: when the style arrives,
+  * when the card is shown again, or when a validated network returns (only
+  * while the rules still choose the online map, [[BaseMapPolicy.redrawOnline]];
+  * its job takes its permit as any other).
   *
   * Without a base map to draw ([[Outcome.NoBasemap]]: the offline map is
   * needed and not downloaded) MapLibre is not run: the card, at the same
@@ -52,10 +62,32 @@ object DayMap:
   // OpenFreeMap's style arrived: cards waiting for it are drawn.
   OnlineStyles.listen(() => cards.asScala.toSeq.foreach(_.invalidateMap()))
 
+  /** How long an online snapshot may take before the card falls back to the offline map. */
+  private val OnlineTimeoutMs = 30_000L
+  private val main = android.os.Handler(android.os.Looper.getMainLooper)
+
+  // A validated network returned: the cards that fell back from the online
+  // map are drawn again, if the rules still choose it.
+  private var validated = Net.reachable
+  private def networkChanged(v: Boolean): Unit =
+    if v && !validated then
+      val again = cards.asScala.toSeq.filter(c => c.fellBack && MapStyle.redrawOnline)
+      Net.log(s"day maps: network validated, ${again.size} drawn again")
+      again.foreach(_.invalidateMap())
+    validated = v
+  AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager]).registerDefaultNetworkCallback(
+    new android.net.ConnectivityManager.NetworkCallback:
+      override def onCapabilitiesChanged(n: android.net.Network, caps: android.net.NetworkCapabilities): Unit =
+        networkChanged(caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+      override def onLost(n: android.net.Network): Unit = networkChanged(false)
+    , main)
+
   /** A card's frame; `redraw` picks its base map again. */
   private final class MapCard(c: Context) extends FrameLayout(c):
     var redraw: () => Unit = () => ()
     private var stale = false
+    /** Its picture is the fallback of an online map (the offline map, or the plain sketch). */
+    var fellBack = false
     /** A job of it is queued or rendering. */
     var waiting = false
     /** Moves on each time it leaves the window: a job queued before does not start. */
@@ -200,11 +232,15 @@ object DayMap:
       sketch.grid = false
       chip.show(false)
 
+    def cached(style: MapStyle): Option[Bitmap] = Option(cache.get(key(style)))
+    val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
+    val (lon0, lon1) = (pts.map(_.lon).min, pts.map(_.lon).max)
+    // The region packs around the day, if more are placed than one style draws.
+    def viewRegions(): Unit = Regions.view(frame, Bounds(lon0, lat0, lon1, lat1))
+
     def start(style: MapStyle, json: String): Option[MapSnapshotter] =
       val density = dm.density
       // Fit everything with a margin; at least ~400 m across.
-      val (lat0, lat1) = (pts.map(_.lat).min, pts.map(_.lat).max)
-      val (lon0, lon1) = (pts.map(_.lon).min, pts.map(_.lon).max)
       val padLat = math.max((lat1 - lat0) * 0.15, 0.002)
       val padLon = math.max((lon1 - lon0) * 0.15, 0.0025)
       val bounds = LatLngBounds.Builder()
@@ -243,36 +279,87 @@ object DayMap:
       val snap = MapSnapshotter(act, opts)
       frame.running = Some(snap)
       frame.waiting = true
+      // Ends once: drawn, failed, or out of time (online only).
+      var ended = false
+      def end(): Unit =
+        ended = true
+        main.removeCallbacksAndMessages(snap)
+        if frame.running.contains(snap) then
+          frame.running = None
+          frame.waiting = false
+        Regions.release(frame)
+      def failed(why: String): Unit =
+        end()
+        // The basemap removed meanwhile: say so. An online map that could
+        // not be drawn: the offline map instead. Else (the offline map
+        // failed) the sketch stays.
+        if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()
+        else if style.online then
+          Net.log(s"snapshot online failed ($why): the offline map instead")
+          fallBack()
+        queue.finished(snap)
+      // An online snapshot whose tiles never come (the network gone
+      // meanwhile) gives way. One the queue dropped (a change of the rules,
+      // the screen held) or the card cancelled is not this one's to end.
+      if style.online then
+        val timeout: Runnable = () =>
+          if !ended && frame.running.contains(snap) && queue.isRunning(snap) then
+            snap.cancel()
+            failed("timeout")
+        main.postAtTime(timeout, snap, android.os.SystemClock.uptimeMillis() + OnlineTimeoutMs)
       snap.start(
-        s => {
-          if frame.running.contains(snap) then
-            frame.running = None
-            frame.waiting = false
-          Regions.release(frame)
+        s => if !ended then {
+          end()
           cache.put(key(style), s.getBitmap)
           show(s.getBitmap)
+          if style.online then frame.fellBack = false
           queue.finished(snap)
         },
-        (_: String) => {
-          if frame.running.contains(snap) then
-            frame.running = None
-            frame.waiting = false
-          Regions.release(frame)
-          // Offline or no tiles: keep the sketch. The basemap removed
-          // meanwhile: say so.
-          if MapStyle.forSnapshot == Outcome.NoBasemap then sketchOnly()
-          queue.finished(snap)
-        }
+        (msg: String) => if !ended then failed(msg)
       )
       Some(snap)
+
+    // The offline map instead of the online one: from the cache, else a job
+    // (queued: the one running ends first). The plain sketch meanwhile, and
+    // without an offline map.
+    def fallBack(): Unit =
+      frame.fellBack = true
+      cached(MapStyle.Offline) match
+        case Some(b) => show(b)
+        case None =>
+          pending()
+          if MapStyle.offlineAvailable then
+            val gen = frame.generation
+            frame.waiting = true
+            queue.enqueue { () =>
+              frame.waiting = false
+              if frame.generation != gen || !frame.onScreen then
+                frame.deferred()
+                None
+              else cached(MapStyle.Offline) match
+                case Some(b) =>
+                  show(b)
+                  None
+                case None =>
+                  viewRegions()
+                  MapStyle.snapshotFallback(frame) match
+                    case (Outcome.Draw(s), Some(json)) => start(s, json)
+                    case _ => None
+            }
 
     def render(): Unit = MapStyle.forSnapshot match
       case Outcome.NoBasemap => sketchOnly()
       case Outcome.Draw(style) =>
-        Option(cache.get(key(style))) match
+        frame.fellBack = false
+        cached(style) match
           case Some(b) => show(b)
+          // No validated network: the offline map now, not a job waiting for the online one.
+          case None if style.online && !Net.reachable => fallBack()
           case None =>
-            pending()
+            // An offline picture drawn before stays until the online one replaces it.
+            cached(MapStyle.Offline).filter(_ => style.online) match
+              case Some(b) => show(b)
+              case None => pending()
             val gen = frame.generation
             frame.waiting = true
             queue.enqueue { () =>
@@ -286,14 +373,29 @@ object DayMap:
               // area: an online map only if its destination is automatic, by
               // the rules now, not when the card was laid out.
               else
-                // The region packs around the day, if more are placed than one style draws.
-                Regions.view(frame, Bounds(pts.map(_.lon).min, pts.map(_.lat).min, pts.map(_.lon).max, pts.map(_.lat).max))
+                viewRegions()
                 MapStyle.snapshot(frame) match
+                  // The offline map given for an online one (no permit or
+                  // network, its style not here yet): a fallback.
+                  case Some((Outcome.Draw(s), Some(json))) if style.online && !s.online =>
+                    frame.fellBack = true
+                    cached(s) match
+                      case Some(b) =>
+                        show(b)
+                        None
+                      case None => start(s, json)
                   case Some((Outcome.Draw(s), Some(json))) => start(s, json)
+                  // No base map for an online map: the plain sketch, drawn
+                  // again when a network returns.
+                  case Some((_, _)) if style.online =>
+                    frame.fellBack = true
+                    pending()
+                    None
                   case Some((_, _)) =>
                     sketchOnly()
                     None
-                  // OpenFreeMap's style is being fetched: drawn when it arrives.
+                  // OpenFreeMap's style is being fetched and there is no
+                  // offline map: drawn when it arrives.
                   case None => None
             }
 

@@ -68,10 +68,7 @@ object VenueSearch:
     hit.foreach(h => Try(AshidoriApp.db.touchVenueCache(store.touch(h.keys, now).put)))
     hit
 
-  private def online: Boolean =
-    val cm = AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager])
-    Option(cm.getNetworkCapabilities(cm.getActiveNetwork))
-      .exists(_.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+  private def online: Boolean = Net.reachable
 
   private object OutOfTime extends Exception("time budget spent")
 

@@ -152,22 +152,45 @@ object MapStyle:
     */
   def forSnapshot: Outcome[MapStyle] = BaseMapPolicy.snapshot(when, current, Offline, offlineAvailable)
 
+  /** [[forSnapshot]] with the network now: without a validated one, the
+    * offline map instead of an online one ([[BaseMapPolicy.snapshotNow]]).
+    */
+  def forSnapshotNow: Outcome[MapStyle] =
+    BaseMapPolicy.snapshotNow(when, current, Offline, offlineAvailable, Net.reachable)
+
+  /** A snapshot that fell back from the online map is drawn again when a
+    * network returns ([[BaseMapPolicy.redrawOnline]]).
+    */
+  def redrawOnline: Boolean = BaseMapPolicy.redrawOnline(when, current, Offline, offlineAvailable, fellBack = true)
+
   /** The offline map has something to draw: the basemap, or region packs. */
   def offlineAvailable: Boolean = Basemap.available || Regions.drawable
 
+  /** What a snapshot draws when its online map cannot be drawn
+    * ([[BaseMapPolicy.snapshotFallback]]): the offline map with the region
+    * packs around `owner`'s view ([[Regions.view]]), which sends nothing.
+    */
+  def snapshotFallback(owner: AnyRef): (Outcome[MapStyle], Option[String]) =
+    BaseMapPolicy.snapshotFallback(Offline, offlineAvailable) match
+      case o @ Outcome.Draw(s) => o -> s.styleJson("snapshot", owner, None)
+      case o => o -> None
+
   /** What a snapshot about to start draws: the base map with its style (an
-    * online one under a permit taken now; the offline map when there is no
-    * permit), or None while OpenFreeMap's style is fetched.
+    * online one under a permit taken now). The offline map instead
+    * ([[snapshotFallback]]) without a permit, without a validated network,
+    * or while OpenFreeMap's style is fetched (drawn online when it arrives).
+    * None only while that style is fetched and there is no offline map.
     */
   def snapshot(owner: AnyRef): Option[(Outcome[MapStyle], Option[String])] =
-    forSnapshot match
+    forSnapshotNow match
       case Outcome.NoBasemap => Some(Outcome.NoBasemap -> None)
       case o @ Outcome.Draw(s) if s.online =>
         s.dest.flatMap(Settings.gate.permit(_, Mode.Auto)) match
-          case Some(p) => s.styleJson("snapshot", owner, Some(p)).map(j => o -> Some(j))
-          case None =>
-            if offlineAvailable then Some(Outcome.Draw(Offline) -> Offline.styleJson("snapshot", owner, None))
-            else Some(Outcome.NoBasemap -> None)
+          case Some(p) =>
+            s.styleJson("snapshot", owner, Some(p)) match
+              case Some(j) => Some(o -> Some(j))
+              case None => Option.when(offlineAvailable)(snapshotFallback(owner))
+          case None => Some(snapshotFallback(owner))
       case o @ Outcome.Draw(s) => Some(o -> s.styleJson("snapshot", owner, None))
 
   /** Whether the picker may render this map's thumbnail at the current view. */
