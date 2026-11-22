@@ -68,19 +68,11 @@ object DayMap:
 
   // A validated network returned: the cards that fell back from the online
   // map are drawn again, if the rules still choose it.
-  private var validated = Net.reachable
-  private def networkChanged(v: Boolean): Unit =
-    if v && !validated then
-      val again = cards.asScala.toSeq.filter(c => c.fellBack && MapStyle.redrawOnline)
-      Net.log(s"day maps: network validated, ${again.size} drawn again")
-      again.foreach(_.invalidateMap())
-    validated = v
-  AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager]).registerDefaultNetworkCallback(
-    new android.net.ConnectivityManager.NetworkCallback:
-      override def onCapabilitiesChanged(n: android.net.Network, caps: android.net.NetworkCapabilities): Unit =
-        networkChanged(caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
-      override def onLost(n: android.net.Network): Unit = networkChanged(false)
-    , main)
+  MapStyle.onNetworkReturn { () =>
+    val again = cards.asScala.toSeq.filter(c => c.fellBack && MapStyle.redrawOnline)
+    Net.log(s"day maps: network validated, ${again.size} drawn again")
+    again.foreach(_.invalidateMap())
+  }
 
   /** A card's frame; `redraw` picks its base map again. */
   private final class MapCard(c: Context) extends FrameLayout(c):
@@ -279,8 +271,25 @@ object DayMap:
       val snap = MapSnapshotter(act, opts)
       frame.running = Some(snap)
       frame.waiting = true
-      // Ends once: drawn, failed, or out of time (online only).
+      // What this job belongs to, read now: the card's generation, and the
+      // cache key (the basemap's and the region packs' versions the style
+      // was just built from, in this same turn of the main thread).
+      val startGen = frame.generation
+      val keyAtStart = key(style)
+      // Ends once: drawn, failed, or out of time (online only). A result
+      // that is no longer the card's current job is dropped whole
+      // (SnapshotArrival.Stale): it shows, caches, queues and releases
+      // nothing, so a cancelled job can never touch the card's new one.
       var ended = false
+      def arrival = SnapshotArrival.of(ended, startGen, frame.generation, frame.running.contains(snap),
+        queue.isRunning(snap), keyAtStart, key(style))
+      def drop(why: String): Unit =
+        ended = true
+        main.removeCallbacksAndMessages(snap)
+        Net.log(s"snapshot result dropped ($why): not the card's current job")
+        // The queue moved on from it already (finished, invalidated or held);
+        // ignored there unless it is somehow still its job, which must not stall.
+        queue.finished(snap)
       def end(): Unit =
         ended = true
         main.removeCallbacksAndMessages(snap)
@@ -303,19 +312,30 @@ object DayMap:
       // the screen held) or the card cancelled is not this one's to end.
       if style.online then
         val timeout: Runnable = () =>
-          if !ended && frame.running.contains(snap) && queue.isRunning(snap) then
+          if arrival != SnapshotArrival.Stale then
             snap.cancel()
             failed("timeout")
         main.postAtTime(timeout, snap, android.os.SystemClock.uptimeMillis() + OnlineTimeoutMs)
       snap.start(
-        s => if !ended then {
-          end()
-          cache.put(key(style), s.getBitmap)
-          show(s.getBitmap)
-          if style.online then frame.fellBack = false
-          queue.finished(snap)
-        },
-        (msg: String) => if !ended then failed(msg)
+        s => arrival match
+          case SnapshotArrival.Stale => if !ended then drop("drawn")
+          // The basemap or the packs changed while drawing: the picture is
+          // of the old data; not kept under the new key, drawn again.
+          case SnapshotArrival.Outdated =>
+            end()
+            Net.log("snapshot result discarded: its offline data changed while drawing")
+            queue.finished(snap)
+            frame.invalidateMap()
+          case SnapshotArrival.Current =>
+            end()
+            cache.put(keyAtStart, s.getBitmap)
+            show(s.getBitmap)
+            if style.online then frame.fellBack = false
+            queue.finished(snap),
+        (msg: String) => arrival match
+          case SnapshotArrival.Stale => if !ended then drop(s"failed: $msg")
+          // A failure of the card's current job: the fallback reads the data anew.
+          case _ => failed(msg)
       )
       Some(snap)
 

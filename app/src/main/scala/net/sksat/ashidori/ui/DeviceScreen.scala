@@ -29,6 +29,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
   val view: View = scroll(body)
   /** A running snapshotter must stay referenced until it calls back. */
   private var snapshotter: Option[MapSnapshotter] = None
+  /** The map is a fallback of the online map the rules choose ([[MapStyle.snapshot]]). */
+  private var fellBack = false
 
   private var unobserve: () => Unit = () => ()
   private var unwatch: () => Unit = () => ()
@@ -41,7 +43,10 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     // and renders it again under the new rules; so does OpenFreeMap's style arriving.
     val stopRules = Settings.gate.onChange(ds => if ds.exists(Dest.Tiles) then act.runOnUiThread(() => { stopMap(); render() }))
     val stopStyles = OnlineStyles.listen(() => { stopMap(); render() })
-    unwatch = () => { stopRules(); stopStyles() }
+    // A validated network returned: a fallback is drawn again, if the rules
+    // still choose the online map (its job takes its permit as before).
+    val stopNetwork = MapStyle.onNetworkReturn(() => if fellBack && MapStyle.redrawOnline then { stopMap(); render() })
+    unwatch = () => { stopRules(); stopStyles(); stopNetwork() }
     unwatchBasemap()
     // Installed or removed: draw the map with or without it.
     var version = Basemap.installedVersion
@@ -183,13 +188,23 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     Regions.view(this, ashidori.core.Bounds(f.lon - 0.05, f.lat - 0.05, f.lon + 0.05, f.lat + 0.05))
     // Another device's position: an online map only if its destination is
     // automatic, under a permit taken now (holder `snapshot`).
+    // The rules choose an online map: a picture without it is a fallback
+    // (no validated network, its style not here yet), drawn again when a
+    // network returns.
+    val wantsOnline = MapStyle.forSnapshot match
+      case Outcome.Draw(s) => s.online
+      case Outcome.NoBasemap => false
     val (style, json) = MapStyle.snapshot(this) match
-      case Some((Outcome.Draw(s), Some(j))) => (s, j)
+      case Some((Outcome.Draw(s), Some(j))) =>
+        fellBack = wantsOnline && !s.online
+        (s, j)
       // OpenFreeMap's style is being fetched: blank until it arrives.
       case None =>
+        fellBack = false
         stopMap()
         return frame
       case Some(_) =>
+        fellBack = wantsOnline
         stopMap()
         frame.addView(PositionSketchView(act, acc / (2 * half), dotColor),
           FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))

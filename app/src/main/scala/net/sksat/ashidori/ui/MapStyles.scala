@@ -163,6 +163,30 @@ object MapStyle:
     */
   def redrawOnline: Boolean = BaseMapPolicy.redrawOnline(when, current, Offline, offlineAvailable, fellBack = true)
 
+  private val networkReturns = scala.collection.mutable.LinkedHashSet.empty[() => Unit]
+  private var validated = false
+  private var watching = false
+  /** `f` runs (main thread) each time a validated network returns: the
+    * still images that fell back to the offline map ask again
+    * ([[redrawOnline]]). Returns the function that stops it. Main thread only.
+    */
+  def onNetworkReturn(f: () => Unit): () => Unit =
+    if !watching then
+      watching = true
+      validated = Net.reachable
+      def changed(v: Boolean): Unit =
+        val returned = v && !validated
+        validated = v
+        if returned then networkReturns.toSeq.foreach(_())
+      AshidoriApp.app.getSystemService(classOf[android.net.ConnectivityManager]).registerDefaultNetworkCallback(
+        new android.net.ConnectivityManager.NetworkCallback:
+          override def onCapabilitiesChanged(n: android.net.Network, caps: android.net.NetworkCapabilities): Unit =
+            changed(caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+          override def onLost(n: android.net.Network): Unit = changed(false)
+        , android.os.Handler(android.os.Looper.getMainLooper))
+    networkReturns += f
+    () => networkReturns -= f
+
   /** The offline map has something to draw: the basemap, or region packs. */
   def offlineAvailable: Boolean = Basemap.available || Regions.drawable
 
