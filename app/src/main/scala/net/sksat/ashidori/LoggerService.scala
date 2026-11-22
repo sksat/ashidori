@@ -212,6 +212,8 @@ class LoggerService extends Service:
       stopRecorder()
       PicsLive.replan = () => ()
       if started then pics.stop()
+      // A test running now ends with the logger (the rows follow the plan: PicsIngest).
+      PicsLive.testUntil = 0L
       PicsLive.plan = PicsScanPolicy.Initial
       // Never started with a database of a newer version: nothing to close.
       if AshidoriApp.newerDatabase.isEmpty then energy.stop(System.currentTimeMillis())
@@ -436,8 +438,6 @@ class LoggerService extends Service:
         batching = pics.offloadedBatching.contains(true))
       val p = PicsScanPolicy.plan(in, picsPlan)
       if p.state != picsPlan.state then LifeLog.add(LifeKind.Pics, s"${p.state.label}（${p.why}）")
-      if (p.state == PicsScanPolicy.State.Test) != (picsPlan.state == PicsScanPolicy.State.Test) then
-        PicsIngest.setTest(p.state == PicsScanPolicy.State.Test)
       if p.state != PicsScanPolicy.State.Test && PicsLive.testUntil != 0L && now >= PicsLive.testUntil then PicsLive.testUntil = 0L
       picsPlan = p
       PicsLive.plan = p

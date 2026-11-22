@@ -214,19 +214,23 @@ class ArchiveSchemaSuite extends munit.FunSuite:
     val full = PicsAdv(t0, t0 + 4800, "02:00:00:00:00:01", Some("00CD0849"), Some(2), Some(255), Some(3), 2, 25, -61, t0 + 200,
       -88, "580102FF000000CD08494351FFFFFFFF0000000000000000", "bal")
     val short = PicsAdv(t0 + 10, t0 + 10, "02:00:00:00:00:02", None, Some(2), None, None, 0, 1, -70, t0 + 10, -70, "580102", "debug")
+    val folded = PicsAdv.fold(Seq(full, full.copy(start = t0 + 5000, end = t0 + 9000, rssiMaxAt = t0 + 5000,
+      data = "580102FF000000CD08493351FFFFFFFF0000000000000000")))
+    assertEquals(folded.parts, 2)
     val f = File.createTempFile("pics", ".parquet")
     f.deleteOnExit()
     Using.resource(BufferedOutputStream(FileOutputStream(f))) { o =>
       val w = Archive.writer(Archive.PicsAdvs, o, 100)
-      Seq(full, short).foreach(a => w.write(Archive.picsRow(a)))
+      Seq(full, short, folded).foreach(a => w.write(Archive.picsRow(a)))
       w.close()
     }
     assertEquals(ParquetReader.meta(f.getPath).keyValues.get(Archive.SchemaKey), Some("4"))
     Using.resource(Archive.open(Archive.PicsAdvs, f.getPath)) { r =>
       val rows = r.rowIterator.toVector
-      assertEquals(rows.map(Archive.picsOf), Vector(full, short))
+      assertEquals(rows.map(Archive.picsOf), Vector(full, short, folded))
+      assertEquals(Archive.picsOf(rows(2)).expand.map(_.data.slice(20, 24)), Seq("4351", "3351"))
       // The values a file gives are the values a row from SQLite has (the repair's hash compares them).
-      assertEquals(rows.map(ArchiveMerge.hash), Vector(full, short).map(a => ArchiveMerge.hash(Archive.picsRow(a).toIndexedSeq)))
+      assertEquals(rows.map(ArchiveMerge.hash), Vector(full, short, folded).map(a => ArchiveMerge.hash(Archive.picsRow(a).toIndexedSeq)))
     }
     assertEquals(Archive.layouts(Archive.PicsAdvs), Seq(4 -> Archive.PicsAdvs.columns))
   }

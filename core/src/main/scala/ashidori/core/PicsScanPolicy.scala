@@ -245,3 +245,48 @@ object PicsScanGate:
   val TooFrequently = 6
   /** The scans that are reopened (filtered scans Android may lower). */
   val Reopened: Set[PicsScan] = Set(PicsScan.Balanced, PicsScan.BalancedBatch, PicsScan.LowLatency)
+
+/** How a scan is stopped (design 3.2): a batched scan's controller may
+  * still hold results, and `flushPendingScanResults` hands them over
+  * later (asynchronously): flush, wait until they came (or `timeoutMs`),
+  * then stop. Results that come after the stop anyway (a timeout) are
+  * still taken by the callback. Every stop goes this way: a change of
+  * scan, the reopening, the end of the logger.
+  */
+object PicsScanStop:
+  val TimeoutMs: Long = 2_000L
+
+  /** `flushed(ms)`: waits up to `ms` for the flushed results to be handed
+    * over; whether they came. Returns that (true when nothing was batched).
+    */
+  def run(batched: Boolean, flush: () => Unit, flushed: Long => Boolean, stop: () => Unit, timeoutMs: Long = TimeoutMs): Boolean =
+    val came =
+      if !batched then true
+      else
+        flush()
+        flushed(timeoutMs)
+    stop()
+    came
+
+/** What the status row shows of an intersection (design 6, 7.5), on the
+  * monotonic clock: the signals' colours only for [[FreshMs]] after their
+  * reception (grey at exactly that time, not at the next redraw), the
+  * signals only while receiving, the row for [[ShownMs]] after the last
+  * reception. `nextAt`: when it changes next without a new reception.
+  */
+object PicsDisplay:
+  val FreshMs: Long = 2_000L
+  val ShownMs: Long = 10 * 60_000L
+
+  final case class View(signals: Boolean, fresh: Boolean, nextAt: Long)
+
+  def at(now: Long, receiving: Boolean, signalsAt: Long, lastAt: Long): Option[View] =
+    if !receiving && now - lastAt > ShownMs then None
+    else
+      val signals = receiving && signalsAt > 0 && now - signalsAt <= PicsScanPolicy.QuietMs
+      val fresh = signals && now - signalsAt < FreshMs
+      val next =
+        if fresh then signalsAt + FreshMs
+        else if signals then signalsAt + PicsScanPolicy.QuietMs + 1
+        else lastAt + ShownMs + 1
+      Some(View(signals, fresh, math.max(next, now + 1)))

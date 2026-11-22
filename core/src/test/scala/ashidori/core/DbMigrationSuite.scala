@@ -277,4 +277,20 @@ class DbMigrationSuite extends munit.FunSuite:
     run(db, insert("pics_adv", "start, end, addr, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan",
       "5000, 5000, 'a', 0, 1, -60, 5000, -60, '58', 'debug'"))
     assertEquals(run(db, "SELECT COUNT(*), MIN(iid IS NULL) FROM pics_adv;"), Vector("1|1"))
+    assertEquals(run(db, "SELECT parts, sub IS NULL FROM pics_adv;"), Vector("1|1"))
+  }
+
+  test("version 10 of a pre-release build (pics_adv without parts and sub): the columns are added, rows kept") {
+    val db = tempDb()
+    create(db)
+    val old = DbSchema.CreatePicsAdv.replace(", parts INTEGER NOT NULL DEFAULT 1, sub TEXT", "")
+    assert(old != DbSchema.CreatePicsAdv)
+    run(db, old + ";\n" + insert("pics_adv", "start, end, addr, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan",
+      "5000, 5000, 'a', 0, 1, -60, 5000, -60, '58', 'debug'"))
+    assert(!columns(db, "pics_adv")("parts"))
+    run(db, DbSchema.toV10(columns(db, "energy_state"), columns(db, "pics_adv")).map(_ + ";").mkString("\n"))
+    assertEquals(columns(db, "pics_adv"), Archive.PicsAdvs.colNames.toSet)
+    assertEquals(run(db, "SELECT start, parts, sub IS NULL FROM pics_adv;"), Vector("5000|1|1"))
+    // Again: nothing more.
+    assert(DbSchema.toV10(columns(db, "energy_state"), columns(db, "pics_adv")).forall(!_.startsWith("ALTER")))
   }

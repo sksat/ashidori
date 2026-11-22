@@ -100,16 +100,19 @@ object DbSchema:
     """CREATE TABLE IF NOT EXISTS pics_adv(start INTEGER NOT NULL, end INTEGER NOT NULL, addr TEXT NOT NULL, iid TEXT,
       |kind INTEGER, msg INTEGER, msg_last INTEGER, msg_changes INTEGER NOT NULL, n INTEGER NOT NULL,
       |rssi_max INTEGER NOT NULL, rssi_max_at INTEGER NOT NULL, rssi_min INTEGER NOT NULL, data TEXT NOT NULL,
-      |scan TEXT NOT NULL)""".stripMargin
+      |scan TEXT NOT NULL, parts INTEGER NOT NULL DEFAULT 1, sub TEXT)""".stripMargin
 
   /** From version 9 to 10: `pics_adv` and its index, and `energy_state.ble`
     * (the PICS scan, NULL where not known: rows before it stay NULL, never
-    * `off`). `energyState`: the columns `energy_state` has now. Only what is
-    * missing.
+    * `off`). `energyState`, `picsAdv`: the columns the tables have now (none:
+    * not there). Only what is missing: a pre-release build of version 10
+    * made `pics_adv` without `parts` and `sub`.
     */
-  def toV10(energyState: Set[String]): Seq[String] =
+  def toV10(energyState: Set[String], picsAdv: Set[String] = Set.empty): Seq[String] =
     Seq(CreatePicsAdv, "CREATE INDEX IF NOT EXISTS pics_adv_start ON pics_adv(start)") ++
-      Option.when(!energyState("ble"))("ALTER TABLE energy_state ADD COLUMN ble TEXT")
+      Option.when(!energyState("ble"))("ALTER TABLE energy_state ADD COLUMN ble TEXT") ++
+      Option.when(picsAdv.nonEmpty && !picsAdv("parts"))("ALTER TABLE pics_adv ADD COLUMN parts INTEGER NOT NULL DEFAULT 1") ++
+      Option.when(picsAdv.nonEmpty && !picsAdv("sub"))("ALTER TABLE pics_adv ADD COLUMN sub TEXT")
 
   /** Which rows of an archived table archiving takes (an SQL condition):
     * all but the open span of `energy_state`, which stays in SQLite until

@@ -111,23 +111,21 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val (picsRow, picsValue) = row("信号機")
   picsRow.setVisibility(View.GONE)
   private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow, picsRow)
-  /** The signals' colours are fresh for 2 s: the row is redrawn twice a second while shown. */
+  /** Redrawn at each reception (LoggerState) and at the time it changes
+    * without one: the colours go grey at exactly 2 s after their reception.
+    */
   private val picsTicker = android.os.Handler(android.os.Looper.getMainLooper)
-  private val picsTick: Runnable = () =>
-    showPics()
-    if picsRow.getVisibility == View.VISIBLE then picsTicker.postDelayed(picsTick, 500)
+  private val picsTick: Runnable = () => showPics()
   private def showPics(): Unit =
+    picsTicker.removeCallbacks(picsTick)
     PicsUi.statusLine match
-      case Some((line, spoken)) =>
+      case Some((line, spoken, nextAt)) =>
         picsValue.setText(line)
         picsValue.setContentDescription(spoken)
-        if picsRow.getVisibility != View.VISIBLE then
-          picsRow.setVisibility(View.VISIBLE)
-          picsTicker.removeCallbacks(picsTick)
-          picsTicker.postDelayed(picsTick, 500)
+        picsRow.setVisibility(View.VISIBLE)
+        picsTicker.postAtTime(picsTick, nextAt - android.os.SystemClock.elapsedRealtime() + android.os.SystemClock.uptimeMillis())
       case None =>
         picsRow.setVisibility(View.GONE)
-        picsTicker.removeCallbacks(picsTick)
   /** Why it is like this: supplementary, so quieter and marked with ⓘ.
     * The mode note keeps its line even when empty: switching modes adds or
     * removes it ("「高精度」で動作中: 充電中のため精度を1段階向上").

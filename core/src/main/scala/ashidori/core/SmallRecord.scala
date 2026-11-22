@@ -92,7 +92,7 @@ object SmallRecord:
       case FixMsl(vs) => Obj("t" -> "fix_msl", "v" -> Arr.from(vs.map((t, m, a) => Arr(l(t), d(m), f(a)))))
       case PicsAdvs(rs) => Obj("t" -> "pics_adv", "v" -> Arr.from(rs.map(a => Arr(l(a.start), l(a.end), a.addr,
         a.iid.fold(Null)(Str(_)), oi(a.kind), oi(a.msg), oi(a.msgLast), Num(a.msgChanges), Num(a.n), Num(a.rssiMax),
-        l(a.rssiMaxAt), Num(a.rssiMin), a.data, a.scan))))
+        l(a.rssiMaxAt), Num(a.rssiMin), a.data, a.scan, Num(a.parts), a.sub.fold(Null)(Str(_))))))
     ujson.write(o)
 
   /** The record of a line [[encode]] wrote; throws on anything else. */
@@ -115,5 +115,6 @@ object SmallRecord:
       case "fix_msl" => FixMsl(v.arr.toSeq.map(a => (gl(a(0)), gd(a(1)), gf(a(2)))))
       case "pics_adv" => PicsAdvs(v.arr.toSeq.map(a => PicsAdv(gl(a(0)), gl(a(1)), a(2).str,
         if a(3).isNull then None else Some(a(3).str), gi(a(4)), gi(a(5)), gi(a(6)), a(7).num.toInt, a(8).num.toInt,
-        a(9).num.toInt, gl(a(10)), a(11).num.toInt, a(12).str, a(13).str)))
+        a(9).num.toInt, gl(a(10)), a(11).num.toInt, a(12).str, a(13).str,
+        if a.arr.size > 14 then a(14).num.toInt else 1, if a.arr.size > 15 && !a(15).isNull then Some(a(15).str) else None)))
       case other => throw IllegalArgumentException(s"record type $other")

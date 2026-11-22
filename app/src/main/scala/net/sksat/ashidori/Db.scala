@@ -75,7 +75,7 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     * scan of the state spans (`energy_state.ble`). Only adds what is missing.
     */
   private def addPics(db: SQLiteDatabase): Unit =
-    DbSchema.toV10(columns(db, "energy_state")).foreach(db.execSQL)
+    DbSchema.toV10(columns(db, "energy_state"), columns(db, "pics_adv")).foreach(db.execSQL)
 
   /** Version 9: check-ins and places are deleted by a tombstone (`deleted`). */
   private def addTombstones(db: SQLiteDatabase): Unit =
@@ -94,6 +94,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         createArchiveBookkeeping(db)
         // A pre-release build of version 9 lacked some of its columns: only what is missing.
         addTombstones(db)
+        // A pre-release build of version 10 made pics_adv without parts and sub.
+        if db.getVersion >= 10 then addPics(db)
         // Rows an older app version inserted (it ignores the floor) are below it again.
         Db.ArchivedTables.keys.foreach(t => db.execSQL(ArchiveSql.raiseFloor(t)))
         db.setTransactionSuccessful()
@@ -595,8 +597,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     val del = deletedIn(db)
     val rs = rs0.filter(a => Deletion.keptRun(del, a.start, a.end))
     val st = db.compileStatement(
-      "INSERT INTO pics_adv(rowid, start, end, addr, iid, kind, msg, msg_last, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan) " +
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      "INSERT INTO pics_adv(rowid, start, end, addr, iid, kind, msg, msg_last, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan, parts, sub) " +
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     try
       var id = claimRowids(db, "pics_adv", rs.size)
       for a <- rs do
@@ -615,6 +617,8 @@ final class Db(ctx: Context, name: String = "ashidori.db")
         st.bindLong(13, a.rssiMin.toLong)
         st.bindString(14, a.data)
         st.bindString(15, a.scan)
+        st.bindLong(16, a.parts.toLong)
+        a.sub.fold(st.bindNull(17))(st.bindString(17, _))
         st.executeInsert()
     finally st.close()
   }
@@ -633,11 +637,11 @@ final class Db(ctx: Context, name: String = "ashidori.db")
     query(s"SELECT $picsCols FROM pics_adv WHERE 1$x ORDER BY start DESC, rowid DESC LIMIT $n", xa*)(picsOf)
   }
 
-  private val picsCols = "start,end,addr,iid,kind,msg,msg_last,msg_changes,n,rssi_max,rssi_max_at,rssi_min,data,scan"
+  private val picsCols = "start,end,addr,iid,kind,msg,msg_last,msg_changes,n,rssi_max,rssi_max_at,rssi_min,data,scan,parts,sub"
   private def picsOf(c: Cursor): PicsAdv =
     def oi(i: Int) = Option.when(!c.isNull(i))(c.getInt(i))
     PicsAdv(c.getLong(0), c.getLong(1), c.getString(2), Option(c.getString(3)), oi(4), oi(5), oi(6), c.getInt(7), c.getInt(8),
-      c.getInt(9), c.getLong(10), c.getInt(11), c.getString(12), c.getString(13))
+      c.getInt(9), c.getLong(10), c.getInt(11), c.getString(12), c.getString(13), c.getInt(14), Option(c.getString(15)))
 
   private def hotPics(from: Long, to: Long, maxRowid: Long = Long.MaxValue): Vector[PicsAdv] =
     val (x, xa) = notPending("pics_adv")

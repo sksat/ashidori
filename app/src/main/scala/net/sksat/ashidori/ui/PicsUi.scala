@@ -17,11 +17,6 @@ import Ui.*
   * once the reception stops. No sound, no countdown (design 7.5).
   */
 object PicsUi:
-  /** A signal's colour is shown this long after its reception. */
-  val FreshMs: Long = 2_000L
-  /** The status row stays this long after the last reception. */
-  val ShownMs: Long = 10 * 60_000L
-
   val Green = 0xff00a37a.toInt
   val Red = 0xffe0372f.toInt
 
@@ -56,21 +51,22 @@ object PicsUi:
     peds.sortBy(_.index).map(p => s"歩行者信号${p.index + 1} ${p.light.label}").mkString("、") + (if fresh then "" else "（受信から2秒以上）")
 
   /** The ステータス row 「信号機」: the intersection, its signals while
-    * receiving, and the time of the last reception. None: not shown (off,
-    * or nothing for 10 minutes).
+    * receiving, the time of the last reception, and when it changes next
+    * without a reception (elapsed ms: the grey at exactly 2 s,
+    * [[PicsDisplay]]). None: not shown (off, or nothing for 10 minutes).
     */
-  def statusLine(using Ctx): Option[(CharSequence, String)] =
+  def statusLine(using Ctx): Option[(CharSequence, String, Long)] =
     if !Settings.picsEnabled then None
     else
       val now = SystemClock.elapsedRealtime()
       val receiving = Set(PicsScanPolicy.State.Receiving, PicsScanPolicy.State.Test).contains(PicsLive.plan.state)
-      PicsLive.current.filter(h => receiving || now - h.lastAt <= ShownMs).map { h =>
+      PicsLive.current.flatMap(h => PicsDisplay.at(now, receiving, h.signalsAt, h.lastAt).map(h -> _)).map { (h, v) =>
         val sb = SpannableStringBuilder(h.label)
-        val showSignals = receiving && h.peds.nonEmpty && now - h.signalsAt <= PicsScanPolicy.QuietMs
-        val fresh = now - h.signalsAt <= FreshMs
-        if showSignals then sb.append("  ").append(marks(h.peds, fresh))
+        val showSignals = v.signals && h.peds.nonEmpty
+        if showSignals then sb.append("  ").append(marks(h.peds, v.fresh))
         sb.append("  ").append(time(h.lastWall))
-        (sb, s"${h.label}、" + (if showSignals then spoken(h.peds, fresh) + "、" else "") + s"最後の受信 ${time(h.lastWall)}")
+        (sb, s"${h.label}、" + (if showSignals then spoken(h.peds, v.fresh) + "、" else "") + s"最後の受信 ${time(h.lastWall)}",
+          v.nextAt)
       }
 
 /** 端末診断 「信号機の電波」 (design 6): what the reception can do here, its
@@ -179,7 +175,8 @@ final class PicsPanel(act: MainActivity, onReport: String => Unit):
             Option.when(unknown > 0)(s"不明 ${fmtDuration(unknown)}") ++
             Option.when(rows.exists(_.scan == "debug"))(s"注入 ${rows.filter(_.scan == "debug").map(_.n).sum} 件") ++
             Seq(s"行 ${rows.size}")).mkString("\n"))
-        log.setText(if recent.isEmpty then "なし" else recentText(recent))
+        // Each run as received (a folded row restored to its runs).
+        log.setText(if recent.isEmpty then "なし" else recentText(recent.flatMap(_.expand).sortBy(a => -a.start).take(50)))
         onReport(s"state=${PicsLive.plan.state} registered=${PicsLive.registered} refused=${PicsIngest.refused} " +
           s"today=${time.map((k, v) => s"${k.getOrElse("null")}:${v / 1000}s").mkString(",")} rows=${rows.size} " +
           s"receptions=${rows.map(_.n).sum} filtering=${PicsScanner.offloadedFiltering(act)} batching=${PicsScanner.offloadedBatching(act)} " +

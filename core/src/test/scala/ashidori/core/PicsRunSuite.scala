@@ -2,6 +2,7 @@ package ashidori.core
 
 import java.time.{LocalDate, ZoneId}
 import PicsRuns.Refused
+import PicsRuns.Fold.Off
 
 /** Runs of `pics_adv` (docs/design/pics.md 4.1): flows and their runs, what
   * closes them, the summaries, the acceptance caps, batches out of order,
@@ -23,7 +24,7 @@ class PicsRunSuite extends munit.FunSuite:
     PicsResult(at, addr, PicsFormat.CompanyId, data, rssi, scan)
 
   test("kinds alternating are separate flows; red, green, red is three rows") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     // 150 ms apart, kinds 1 and 2 alternating, the signal red, then green, then red.
     val rs = (0 until 30).map { i =>
       val at = t0 + i * 150L
@@ -37,28 +38,34 @@ class PicsRunSuite extends munit.FunSuite:
     assertEquals(closed.count(_.kind.contains(1)), 1)
     assertEquals(closed.find(_.kind.contains(1)).get.n, 15)
     assert(closed.forall(a => a.iid.contains("00CD0849") && a.addr == "02:00:00:00:00:01"))
+    // Folded: the three kind 2 runs in one row, each restored.
+    val folded = PicsRuns(zone)
+    val rows = folded.add(rs, still = false) ++ folded.closeAll()
+    val one = rows.filter(_.kind.contains(2))
+    assertEquals(one.map(_.parts), Seq(3))
+    assertEquals(one.head.expand, signals)
   }
 
   test("5 s from the first reception (60 s while still), 3 s without one, a scan change, the end: each closes") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val every = (0 until 60).map(i => res(t0 + i * 200L, red))
     val rows = r.add(every, still = false) ++ r.closeAll()
     // 12 s of receptions: 5 s, 5 s, 2 s.
     assertEquals(rows.map(_.n), Seq(25, 25, 10))
     assertEquals(rows.map(a => a.end - a.start), Seq(4800L, 4800L, 1800L))
-    val still = PicsRuns(zone)
+    val still = PicsRuns(zone, fold = Off)
     val longer = still.add((0 until 400).map(i => res(t0 + i * 200L, red)), still = true) ++ still.closeAll()
     assertEquals(longer.map(_.n), Seq(300, 100))
     // A gap over 3 s.
-    val g = PicsRuns(zone)
+    val g = PicsRuns(zone, fold = Off)
     val gap = g.add(Seq(res(t0, red), res(t0 + 1000, red), res(t0 + 4100, red)), still = false) ++ g.closeAll()
     assertEquals(gap.map(_.n), Seq(2, 1))
     // The scan changed (a result of the new scan).
-    val s = PicsRuns(zone)
+    val s = PicsRuns(zone, fold = Off)
     val scans = s.add(Seq(res(t0, red), res(t0 + 200, red, scan = "low")), still = false) ++ s.closeAll()
     assertEquals(scans.map(_.scan), Seq("bal", "low"))
     // tick: none for 3 s (plus the report delay), or past the longest.
-    val k = PicsRuns(zone)
+    val k = PicsRuns(zone, fold = Off)
     assertEquals(k.add(Seq(res(t0, red)), still = false), Nil)
     assertEquals(k.tick(t0 + 3000, still = false), Nil)
     assertEquals(k.tick(t0 + 3001, still = false, delayMs = 5000), Nil)
@@ -67,18 +74,18 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("local midnight closes a run; no row has two days") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val midnight = LocalDate.of(2026, 11, 21).atStartOfDay(zone).toInstant.toEpochMilli
     val rows = r.add((0 until 20).map(i => res(midnight - 2000 + i * 200L, red)), still = true) ++ r.closeAll()
     assertEquals(rows.map(_.n), Seq(10, 10))
     assert(rows.head.end < midnight && rows(1).start >= midnight)
-    val t = PicsRuns(zone)
+    val t = PicsRuns(zone, fold = Off)
     t.add(Seq(res(midnight - 500, red)), still = true)
     assertEquals(t.tick(midnight + 10, still = true).map(_.n), Seq(1))
   }
 
   test("byte 3: the first and last message IDs and how often it changed; RSSI extremes and the first time of the maximum") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val msgs = Seq(1, 1, 2, 3, 3, 1)
     val rssi = Seq(-80, -60, -70, -60, -90, -65)
     val rows = r.add(msgs.indices.map(i => res(t0 + i * 200L, sig(0x51, 0x43, msgs(i)), rssi = rssi(i))), still = false) ++
@@ -90,7 +97,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("short packets: nulls where their bytes end; kept whatever their form") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val rows = r.add(Seq(res(t0, bytes("58")), res(t0 + 10, bytes("580102")), res(t0 + 20, bytes("580102FF00")),
       res(t0 + 30, bytes("580107FF000000CD0849AA"))), still = false) ++ r.closeAll()
     val byData = rows.map(a => a.data -> (a.kind, a.msg, a.iid)).toMap
@@ -101,7 +108,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("a batch out of time order is sorted; a result older than the open run is a run of its own") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val batch = scala.util.Random(3).shuffle((0 until 20).map(i => res(t0 + i * 200L, red)))
     assertEquals(r.add(batch, still = false), Nil)
     // Late: before the open run's last reception.
@@ -111,7 +118,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("closed rows are final: kept in a file and read back, retried, they are the same") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     val rows = r.add((0 until 40).map(i => res(t0 + i * 200L, if i < 20 then red else green)), still = false) ++ r.closeAll()
     val rec = new SmallRecord.PicsAdvs(rows)
     assertEquals(SmallRecord.decode(SmallRecord.encode(rec)), rec)
@@ -124,7 +131,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("caps: per sender 2 rows a second after a burst of 20; refused receptions counted, not written") {
-    val r = PicsRuns(zone, PicsRuns.Caps(totalPerSec = 1000, totalBurst = 1000))
+    val r = PicsRuns(zone, PicsRuns.Caps(totalPerSec = 1000, totalBurst = 1000), Off)
     // A sender changing its content every reception: a row each.
     val flood = (0 until 200).map(i => res(t0 + i * 10L, sig(i % 256, 0x43)))
     val rows = r.add(flood, still = false) ++ r.closeAll()
@@ -137,33 +144,33 @@ class PicsRunSuite extends munit.FunSuite:
 
   test("caps: rows of all senders, a day's rows, open runs, new senders a minute") {
     val small = PicsRuns.Caps(perSourceBurst = 1000, perSourcePerSec = 1000, totalPerSec = 10, totalBurst = 10)
-    val r = PicsRuns(zone, small)
+    val r = PicsRuns(zone, small, Off)
     val many = (0 until 100).map(i => res(t0 + i * 10L, sig(i, 0x43), addr = s"02:00:00:00:00:${i % 5}"))
     val rows = r.add(many, still = false) ++ r.closeAll()
     // 1 s: the burst of 10 and 10 more.
     assert(rows.size >= 19 && rows.size <= 21, rows.size)
     assert(r.refusedTotal.contains(Refused.Total))
     // A day's rows: the rest of that day refused, the next day accepted again.
-    val d = PicsRuns(zone, PicsRuns.Caps(perDay = 5))
+    val d = PicsRuns(zone, PicsRuns.Caps(perDay = 5), Off)
     val day = (0 until 10).map(i => res(t0 + i * 10_000L, red))
     assertEquals((d.add(day, still = false) ++ d.closeAll()).size, 5)
     assertEquals(d.refusedTotal(Refused.Day), 5L)
     assertEquals(d.add(Seq(res(t0 + 86_400_000L, red)), still = false), Nil)
     assertEquals(d.openRuns, 1)
     // Open runs: a new flow is refused when 64 are open.
-    val o = PicsRuns(zone, PicsRuns.Caps(totalBurst = 1000, totalPerSec = 1000))
+    val o = PicsRuns(zone, PicsRuns.Caps(totalBurst = 1000, totalPerSec = 1000), Off)
     o.add((0 until 70).map(i => res(t0, red, addr = f"02:00:00:00:01:$i%02X")), still = false)
     assertEquals(o.openRuns, 32)
     assertEquals(o.refusedTotal(Refused.NewSenders), 38L)
-    val o2 = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 1000))
+    val o2 = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 1000), Off)
     o2.add((0 until 70).map(i => res(t0, red, addr = f"02:00:00:00:01:$i%02X")), still = false)
     assertEquals(o2.openRuns, 10) // the total burst
-    val o3 = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 1000, totalBurst = 1000, totalPerSec = 1000))
+    val o3 = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 1000, totalBurst = 1000, totalPerSec = 1000), Off)
     o3.add((0 until 70).map(i => res(t0, red, addr = f"02:00:00:00:01:$i%02X")), still = false)
     assertEquals(o3.openRuns, 64)
     assertEquals(o3.refusedTotal(Refused.Open), 6L)
     // New senders a minute: 32, then more once the minute is over.
-    val n = PicsRuns(zone, PicsRuns.Caps(totalBurst = 1000, totalPerSec = 1000))
+    val n = PicsRuns(zone, PicsRuns.Caps(totalBurst = 1000, totalPerSec = 1000), Off)
     n.add((0 until 40).map(i => res(t0 + i, red, addr = f"02:00:00:00:02:$i%02X")), still = false)
     assertEquals(n.refusedTotal(Refused.NewSenders), 8L)
     n.closeAll()
@@ -172,7 +179,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("caps: a batch out of order refills nothing twice; a clock set back over a minute starts the buckets again") {
-    val r = PicsRuns(zone)
+    val r = PicsRuns(zone, fold = Off)
     // A flood at t0 uses the total burst.
     r.add((0 until 100).map(i => res(t0 + i, sig(i, 0x43), addr = s"F$i")), still = false)
     val refused = r.refusedTotal.values.sum
@@ -187,7 +194,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("caps: the senders tracked are the 256 most recent") {
-    val r = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 10_000, totalBurst = 1e9, totalPerSec = 1e9, open = 10_000))
+    val r = PicsRuns(zone, PicsRuns.Caps(newPerMinute = 10_000, totalBurst = 1e9, totalPerSec = 1e9, open = 10_000), Off)
     // Sender 0 uses its burst, then 300 others come: it is forgotten, and comes back with a full burst.
     r.add((0 until 20).map(i => res(t0 + i, sig(i, 1), addr = "A")), still = false)
     r.add(Seq(res(t0 + 30, sig(99, 1), addr = "A")), still = false)
@@ -198,7 +205,7 @@ class PicsRunSuite extends munit.FunSuite:
   }
 
   test("「受信の試験」: each reception a row, under the test's own cap") {
-    val r = PicsRuns(zone, PicsRuns.Caps(testRows = 50))
+    val r = PicsRuns(zone, PicsRuns.Caps(testRows = 50), Off)
     r.add(Seq(res(t0, red)), still = false)
     // Starting the test closes what is open.
     assertEquals(r.setTest(true).map(_.n), Seq(1))
@@ -227,8 +234,10 @@ class PicsRunSuite extends munit.FunSuite:
     Seq(at -> name, at + 66 -> pos, at + 133 -> sig(byte(phase), byte((phase + 45) % 90)))
 
   /** A day of receptions of two units: `heard` tells which advertisements came through. */
-  private def day(heard: (Long, scala.util.Random) => Boolean): (PicsRuns, Seq[PicsAdv], Long) =
-    val r = PicsRuns(zone)
+  private def day(heard: (Long, scala.util.Random) => Boolean, fold: PicsRuns.Fold = PicsRuns.Fold.Signals,
+                  caps: PicsRuns.Caps = PicsRuns.Caps())
+      : (PicsRuns, Seq[PicsAdv], Long) =
+    val r = PicsRuns(zone, caps, fold)
     val rnd = scala.util.Random(11)
     val start = LocalDate.of(2026, 11, 20).atStartOfDay(zone).toInstant.toEpochMilli
     val out = Vector.newBuilder[PicsAdv]
@@ -245,25 +254,86 @@ class PicsRunSuite extends munit.FunSuite:
     out ++= r.closeAll()
     (r, out.result(), received)
 
-  test("a stationary day near a signal stays under the caps (opportunistic scans of other apps)") {
+  private val others = (t: Long, rnd: scala.util.Random) => (t / 1000) % 60 < 10 && rnd.nextDouble() < 0.4
+  private val always = (_: Long, rnd: scala.util.Random) => rnd.nextDouble() < 0.25
+
+  test("a stationary day near a signal stays well under the caps (opportunistic scans of other apps)") {
     // Still: no scan of ours; others' scans 10 s a minute, 40 % of the advertisements heard then.
-    val (r, rows, received) = day((t, rnd) => (t / 1000) % 60 < 10 && rnd.nextDouble() < 0.4)
+    val (r, rows, received) = day(others)
     assertEquals(r.refusedTotal, Map.empty[Refused, Long])
-    assert(rows.size < 20_000, rows.size)
+    assert(rows.size < 10_000, rows.size)
     // Every reception is in a row, every row in the day.
     assertEquals(rows.map(_.n.toLong).sum, received)
     val bytes = parquetBytes(rows)
-    println(f"pics stationary day: $received%,d receptions, ${rows.size}%,d rows, Parquet $bytes%,d bytes")
+    val (_, unfolded, _) = day(others, PicsRuns.Fold.Off)
+    val (_, gauge, _) = day(others, PicsRuns.Fold.Gauge)
+    println(f"pics stationary day: $received%,d receptions, ${rows.size}%,d rows (gauges only folded ${gauge.size}%,d, " +
+      f"none folded ${unfolded.size}%,d), Parquet $bytes%,d bytes")
     assert(bytes < 600_000, bytes)
   }
 
-  test("a stationary day heard all the time (worst case): the day's cap holds, the rest is refused and counted") {
-    val (r, rows, received) = day((_, rnd) => rnd.nextDouble() < 0.25)
-    assertEquals(rows.size, 20_000)
-    assert(r.refusedTotal(Refused.Day) > 0)
-    assertEquals(rows.map(_.n.toLong).sum + r.refusedTotal.values.sum, received)
+  test("a stationary day heard all the time (worst case): normal reception is all stored, nothing refused") {
+    val (r, rows, received) = day(always)
+    assertEquals(r.refusedTotal, Map.empty[Refused, Long])
+    assert(rows.size < 12_000, rows.size)
+    assertEquals(rows.map(_.n.toLong).sum, received)
     val bytes = parquetBytes(rows)
-    println(f"pics worst day: $received%,d receptions, ${rows.size}%,d rows (cap), ${r.refusedTotal(Refused.Day)}%,d refused, Parquet $bytes%,d bytes")
+    val (_, gauge, _) = day(always, PicsRuns.Fold.Gauge)
+    println(f"pics worst day: $received%,d receptions, ${rows.size}%,d rows (gauges only folded ${gauge.size}%,d), Parquet $bytes%,d bytes")
+  }
+
+  test("folding is lossless: every run of the unfolded rows comes back from the folded ones, exactly") {
+    for (heard, fold) <- Seq(others -> PicsRuns.Fold.Signals, always -> PicsRuns.Fold.Signals, always -> PicsRuns.Fold.Gauge) do
+      // Without the caps (the unfolded rows would reach them: the comparison is of the runs).
+      val free = PicsRuns.Caps(perDay = Int.MaxValue, totalPerSec = 1e9, totalBurst = 1e9, perSourcePerSec = 1e9, perSourceBurst = 1e9)
+      val (_, folded, _) = day(heard, fold, free)
+      val (_, plain, _) = day(heard, PicsRuns.Fold.Off, free)
+      assert(folded.exists(_.parts > 1))
+      assert(plain.forall(a => a.parts == 1 && a.sub.isEmpty))
+      def key(a: PicsAdv) = (a.addr, a.kind, a.start)
+      assertEquals(folded.flatMap(_.expand).sortBy(key), plain.sortBy(key))
+      // Through every store: the file record (.rec) and the archive row.
+      for a <- folded.filter(_.parts > 1).take(200) do
+        assertEquals(Archive.picsOf(Archive.picsRow(a).toIndexedSeq), a)
+        assertEquals(SmallRecord.decode(SmallRecord.encode(new SmallRecord.PicsAdvs(Seq(a)))), new SmallRecord.PicsAdvs(Seq(a)))
+  }
+
+  test("a folded row: the summary of its runs; only kind 2 folds, and only the signal bytes and byte 3 may differ") {
+    val r = PicsRuns(zone)
+    // Red with the gauge counting down, then green, byte 3 changing too: one row, 4 runs.
+    val seq = Seq(sig(0x71, 0x33, 1), sig(0x71, 0x33, 2), sig(0x61, 0x23, 2), sig(0x51, 0x13, 3), sig(0x73, 0x01, 3))
+    val rows = r.add(seq.zipWithIndex.map((d, i) => res(t0 + i * 200L, d, rssi = -70 + i)), still = true) ++ r.closeAll()
+    val a = rows.loneElement
+    assertEquals((a.parts, a.n, a.start, a.end, a.msg, a.msgLast, a.msgChanges), (4, 5, t0, t0 + 800, Some(1), Some(3), 2))
+    assertEquals((a.rssiMax, a.rssiMaxAt, a.rssiMin), (-66, t0 + 800, -70))
+    assertEquals(a.expand.map(_.data.slice(20, 24)), Seq("7133", "6123", "5113", "7301"))
+    assertEquals(a.expand.map(_.n), Seq(2, 1, 1, 1))
+    // Another intersection ID, or kind 1: not folded.
+    val k = PicsRuns(zone)
+    val other = bytes("580102FF000000CD08504351FFFFFFFF0000000000000000")
+    val kinds = k.add(Seq(res(t0, red), res(t0 + 100, other, addr = "02:00:00:00:00:01")), still = true) ++ k.closeAll()
+    assertEquals(kinds.map(_.parts), Seq(1, 1))
+    // Gauges only: a state change starts a new row.
+    val g = PicsRuns(zone, fold = PicsRuns.Fold.Gauge)
+    assertEquals((g.add(seq.zipWithIndex.map((d, i) => res(t0 + i * 200L, d)), still = true) ++ g.closeAll()).map(_.parts), Seq(3, 1))
+  }
+
+  test("the day's cap counts per local day: a late result of yesterday does not reset today's, and stored rows count") {
+    val midnight = LocalDate.of(2026, 11, 21).atStartOfDay(zone).toInstant.toEpochMilli
+    val r = PicsRuns(zone, PicsRuns.Caps(perDay = 10, perSourceBurst = 1000, totalBurst = 1000))
+    // An earlier process stored 6 rows today.
+    r.seedDay(midnight + 1000, 6)
+    val today = (0 until 3).map(i => res(midnight + 10_000 + i * 10_000L, sig(i, 1)))
+    r.add(today, still = false)
+    assertEquals(r.acceptedOn(midnight + 1), 9)
+    // A late result of yesterday counts there.
+    r.add(Seq(res(midnight - 500, red, addr = "Y")), still = false)
+    assertEquals(r.acceptedOn(midnight - 500), 1)
+    assertEquals(r.acceptedOn(midnight + 1), 9)
+    // Today goes on from 9: one more, then refused.
+    r.add((3 until 6).map(i => res(midnight + 60_000 + i * 10_000L, sig(i, 1))), still = false)
+    assertEquals(r.acceptedOn(midnight + 1), 10)
+    assertEquals(r.refusedTotal(Refused.Day), 2L)
   }
 
   private def parquetBytes(rows: Seq[PicsAdv]): Long =

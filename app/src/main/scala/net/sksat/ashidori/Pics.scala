@@ -1,9 +1,9 @@
 package net.sksat.ashidori
 
 import android.os.SystemClock
-import java.util.concurrent.{ArrayBlockingQueue, ConcurrentLinkedQueue, TimeUnit}
-import java.util.concurrent.atomic.AtomicLong
-import scala.collection.mutable
+
+
+
 import scala.util.Try
 import scala.util.control.NonFatal
 import ashidori.core.*
@@ -73,16 +73,10 @@ object PicsLive:
   * 端末診断).
   */
 object PicsIngest:
-  val QueueSize = 2000
+  val QueueSize = PicsPipeline.QueueSize
   val MaxFailures = 5
 
-  private final case class In(r: PicsResult, elapsed: Long)
-  private val queue = ArrayBlockingQueue[In](QueueSize)
-  private val dropped = AtomicLong()
-  private enum Cmd:
-    case CloseAll
-    case Test(on: Boolean)
-  private val commands = ConcurrentLinkedQueue[Cmd]()
+  private lazy val pipeline = PicsPipeline(AshidoriApp.zone)
 
   /** The logger is still (runs last up to 60 s), and the report delay of the scan. */
   @volatile var still = false
@@ -92,8 +86,10 @@ object PicsIngest:
   @volatile var lastSignals = 0L
   /** Rows refused by the caps in this process, by reason (端末診断). */
   @volatile var refused: Map[PicsRuns.Refused, Long] = Map.empty
-  /** Rows accepted today (the day cap). */
+  /** Rows accepted today (the day cap, with those stored before this process). */
   @volatile var acceptedToday = 0
+  /** The rows build as 「受信の試験」 (followed from the plan each round). */
+  @volatile var testing = false
   private val debuggable =
     (AshidoriApp.app.getApplicationInfo.flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
   private var lastReplan = 0L
@@ -105,18 +101,11 @@ object PicsIngest:
     if broken || !PicsFormat.accepts(r.company, debuggable) then false
     else
       thread
-      if queue.offer(In(r, elapsed)) then true
-      else
-        dropped.incrementAndGet()
-        false
+      pipeline.offer(r, elapsed)
 
   /** The scan changed or stopped: open runs are closed (design 4.1). */
   def scanChanged(): Unit =
-    commands.add(Cmd.CloseAll)
-    thread
-
-  def setTest(on: Boolean): Unit =
-    commands.add(Cmd.Test(on))
+    pipeline.scanChanged()
     thread
 
   private def broken: Boolean = PicsLive.broken.isDefined
@@ -127,38 +116,36 @@ object PicsIngest:
     t.start()
     t
 
+  /** The day's cap counts what earlier processes stored today and
+    * yesterday (a late result of yesterday counts on yesterday): read once
+    * at the start. A failure to read leaves it at 0 (logged).
+    */
+  private def seed(runs: PicsRuns): Unit =
+    try
+      val zone = AshidoriApp.zone
+      val today = java.time.LocalDate.now(zone)
+      for d <- Seq(today.minusDays(1), today) do
+        val from = d.atStartOfDay(zone).toInstant.toEpochMilli
+        val to = d.plusDays(1).atStartOfDay(zone).toInstant.toEpochMilli
+        runs.seedDay(from, AshidoriApp.db.picsAdv(from, to).size)
+    catch case NonFatal(e) => Log.w("PICS: the day's rows not read for the cap", e)
+
   private def loop(): Unit =
-    val runs = PicsRuns(AshidoriApp.zone)
+    val runs = pipeline.runs
+    seed(runs)
     var failures = 0
     var lastLog = SystemClock.elapsedRealtime()
-    val batch = mutable.ArrayBuffer.empty[In]
     while !broken do
       try
-        batch.clear()
-        Option(queue.poll(1, TimeUnit.SECONDS)).foreach { first =>
-          batch += first
-          var more = queue.poll()
-          while more != null && batch.size < QueueSize do
-            batch += more
-            more = queue.poll()
-        }
-        val out = Vector.newBuilder[PicsAdv]
-        var cmd = commands.poll()
-        while cmd != null do
-          cmd match
-            case Cmd.CloseAll => out ++= runs.closeAll()
-            case Cmd.Test(on) => out ++= runs.setTest(on)
-          cmd = commands.poll()
-        val d = dropped.getAndSet(0)
-        if d > 0 then runs.refuse(PicsRuns.Refused.Queue, d)
-        if batch.nonEmpty then
-          batch.foreach(live)
-          out ++= runs.add(batch.map(_.r).toSeq, still)
-        out ++= runs.tick(System.currentTimeMillis(), still, delayMs)
-        val rows = out.result()
+        // The test follows the plan each round: one that ended while the
+        // logger stopped (the plan reset) ends here too.
+        val test = PicsLive.plan.state == PicsScanPolicy.State.Test
+        val (batch, rows) = pipeline.step(1000L, System.currentTimeMillis(), still, delayMs, test)
+        testing = runs.isTesting
+        batch.foreach(i => live(i.r, i.elapsed))
         if rows.nonEmpty then LoggerWrites.small(SmallRecord.PicsAdvs(rows))
         refused = runs.refusedTotal
-        acceptedToday = runs.acceptedToday
+        acceptedToday = runs.acceptedOn(System.currentTimeMillis())
         val now = SystemClock.elapsedRealtime()
         if now - lastLog >= 60_000L then
           lastLog = now
@@ -178,12 +165,12 @@ object PicsIngest:
         else Thread.sleep(1000L)
 
   /** What the reception says now: the times the plan reads, and the intersections heard. */
-  private def live(in: In): Unit =
-    val p = in.r.packet
+  private def live(r: PicsResult, elapsed: Long): Unit =
+    val p = r.packet
     if p.qualifying then
-      val first = in.elapsed - lastQualifying > 2_000L
-      lastQualifying = math.max(lastQualifying, in.elapsed)
-      if p.kind.contains(2) then lastSignals = math.max(lastSignals, in.elapsed)
+      val first = elapsed - lastQualifying > 2_000L
+      lastQualifying = math.max(lastQualifying, elapsed)
+      if p.kind.contains(2) then lastSignals = math.max(lastSignals, elapsed)
       val iid = p.intersection.get
       val before = PicsLive.heard.get(iid)
       val body = p.body
@@ -194,14 +181,14 @@ object PicsIngest:
         case PicsFormat.Body.Text(t) => Some(t).filter(_.nonEmpty)
         case _                       => before.flatMap(_.text)
       val (peds, at) = body match
-        case PicsFormat.Body.Signals(ps) if in.elapsed >= before.fold(0L)(_.signalsAt) => (ps, in.elapsed)
+        case PicsFormat.Body.Signals(ps) if elapsed >= before.fold(0L)(_.signalsAt) => (ps, elapsed)
         case _ => (before.fold(Seq.empty[PicsFormat.Ped])(_.peds), before.fold(0L)(_.signalsAt))
-      val h = PicsLive.Heard(iid, site, text, peds, at, math.max(in.elapsed, before.fold(0L)(_.lastAt)),
-        math.max(in.r.at, before.fold(0L)(_.lastWall)), in.r.rssi)
+      val h = PicsLive.Heard(iid, site, text, peds, at, math.max(elapsed, before.fold(0L)(_.lastAt)),
+        math.max(r.at, before.fold(0L)(_.lastWall)), r.rssi)
       // A few intersections at once at most; forget the oldest beyond 16.
       val all = PicsLive.heard + (iid -> h)
       PicsLive.heard = if all.size <= 16 then all else all.toSeq.sortBy(-_._2.lastAt).take(16).toMap
       // The plan may start receiving: asked at most once a second.
-      if first || PicsLive.plan.state != PicsScanPolicy.State.Receiving && in.elapsed - lastReplan >= 1_000L then
-        lastReplan = in.elapsed
+      if first || PicsLive.plan.state != PicsScanPolicy.State.Receiving && elapsed - lastReplan >= 1_000L then
+        lastReplan = elapsed
         PicsLive.replan()

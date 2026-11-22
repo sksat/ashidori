@@ -23,7 +23,8 @@ import ashidori.core.*
 final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit):
   private lazy val manager = ctx.getSystemService(classOf[BluetoothManager])
   private def adapter: Option[BluetoothAdapter] = Option(manager).flatMap(m => Option(m.getAdapter))
-  private val gate = PicsScanGate()
+  /** One for the process: a new logger (stop and start) starts no faster. */
+  private def gate = PicsScanner.gate
   private var plan = PicsScanPolicy.Initial
   private var callback: Option[Callback] = None
   private var receiverOn = false
@@ -80,6 +81,8 @@ final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit
     onRegistered()
 
   private final class Callback(val scan: PicsScan, val delayMs: Long) extends ScanCallback:
+    /** Counted down when the results a flush asked for were handed over. */
+    @volatile var flushed: java.util.concurrent.CountDownLatch = java.util.concurrent.CountDownLatch(0)
     private def take(r: ScanResult): Unit =
       val rec = r.getScanRecord
       if rec != null then
@@ -89,7 +92,10 @@ final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit
           val wall = System.currentTimeMillis() - (SystemClock.elapsedRealtime() - elapsed)
           PicsIngest.onResult(PicsResult(wall, r.getDevice.getAddress, c, data.toIndexedSeq, r.getRssi, scan.key), elapsed)
     override def onScanResult(callbackType: Int, r: ScanResult): Unit = take(r)
-    override def onBatchScanResults(rs: java.util.List[ScanResult]): Unit = rs.asScala.foreach(take)
+    // Taken before the latch opens: the stop that waits for them comes after.
+    override def onBatchScanResults(rs: java.util.List[ScanResult]): Unit =
+      rs.asScala.foreach(take)
+      flushed.countDown()
     override def onScanFailed(code: Int): Unit = handler.post { () =>
       if callback.contains(this) then
         callback = None
@@ -133,12 +139,19 @@ final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit
           PicsLive.failure = Some((System.currentTimeMillis(), -1))
           LifeLog.add(LifeKind.PicsProblem, s"信号機の電波の走査を開始できず（${s.label}: ${LifeLog.describe(e)}）")
 
+  /** Stops the scan (a change, the reopening, the end): a batched one
+    * flushed first, and stopped once its results came (on the main thread,
+    * where the callbacks run: waiting here does not hold them up), at most
+    * [[PicsScanStop.TimeoutMs]]; results after that are still taken.
+    */
   private def stopScan(): Unit =
     callback.foreach { cb =>
       Try(adapter.flatMap(a => Option(a.getBluetoothLeScanner))).toOption.flatten.foreach { sc =>
-        // What the controller holds comes first (batched results).
-        if cb.delayMs > 0 then Try(sc.flushPendingScanResults(cb))
-        Try(sc.stopScan(cb)).failed.foreach(e => Log.w("PICS scan stop", e))
+        val came = PicsScanStop.run(cb.delayMs > 0,
+          () => { cb.flushed = java.util.concurrent.CountDownLatch(1); Try(sc.flushPendingScanResults(cb)) },
+          ms => cb.flushed.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS),
+          () => Try(sc.stopScan(cb)).failed.foreach(e => Log.w("PICS scan stop", e)))
+        if !came then Log.w("PICS: the flushed results did not come before the stop")
       }
     }
     if callback.isDefined then PicsIngest.scanChanged()
@@ -149,6 +162,9 @@ final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit
   def offloadedBatching: Option[Boolean] = Try(adapter.map(_.isOffloadedScanBatchingSupported)).toOption.flatten
 
 object PicsScanner:
+  /** The start gate of the process ([[PicsScanGate]]): kept across loggers. */
+  private[ashidori] val gate = PicsScanGate()
+
   /** SCAN_TYPE_PASSIVE: Android 16 QPR2 (36.1) and later. */
   def passiveScan: Boolean =
     Build.VERSION.SDK_INT >= 37 || Build.VERSION.SDK_INT == 36 && Try(Build.VERSION.SDK_INT_FULL >= 3_600_001).getOrElse(false)

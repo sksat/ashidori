@@ -55,12 +55,15 @@ object Archive:
     Column("end_unknown", Int32), Column("boot", Int64), Column("seq", Int64), Column("ble", Str)))
   /** Received 高度化PICS advertisements (schema 4): one row per run of one
     * flow with the same content, at most 5 s (60 s while still), never
-    * across local midnight ([[PicsAdv]], docs/design/pics.md 4.1).
+    * across local midnight; a kind 2 flow's runs that differ only in the
+    * signal bytes folded into one row (`parts`, every run kept in `sub`)
+    * ([[PicsAdv]], docs/design/pics.md 4.1).
     */
   val PicsAdvs = TableDef("pics_adv", Seq(
     Column("start", Int64), Column("end", Int64), Column("addr", Str), Column("iid", Str), Column("kind", Int32),
     Column("msg", Int32), Column("msg_last", Int32), Column("msg_changes", Int32), Column("n", Int32),
-    Column("rssi_max", Int32), Column("rssi_max_at", Int64), Column("rssi_min", Int32), Column("data", Str), Column("scan", Str)))
+    Column("rssi_max", Int32), Column("rssi_max_at", Int64), Column("rssi_min", Int32), Column("data", Str), Column("scan", Str),
+    Column("parts", Int32), Column("sub", Str)))
   val GnssStatus = TableDef("gnss_status", Seq(
     Column("time", Int64), Column("visible", Int32), Column("used", Int32), Column("top4", Float64), Column("l5", Int32),
     Column("env", Str), Column("acc", Float32)))
@@ -354,12 +357,13 @@ object Archive:
   def picsRow(a: PicsAdv): Seq[Any] =
     def i(v: Option[Int]): Any = v.map(Int.box).orNull
     Seq(a.start, a.end, a.addr, a.iid.orNull, i(a.kind), i(a.msg), i(a.msgLast), a.msgChanges, a.n, a.rssiMax, a.rssiMaxAt,
-      a.rssiMin, a.data, a.scan)
+      a.rssiMin, a.data, a.scan, a.parts, a.sub.orNull)
   def picsOf(r: IndexedSeq[Any]): PicsAdv =
     def s(k: Int) = Option(r(k)).map(_.toString).getOrElse("")
     PicsAdv(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]), s(2), opt[Any](r(3)).map(_.toString),
       opt[Int](r(4)), opt[Int](r(5)), opt[Int](r(6)), opt[Int](r(7)).getOrElse(0), opt[Int](r(8)).getOrElse(0),
-      opt[Int](r(9)).getOrElse(0), opt[Long](r(10)).getOrElse(0L), opt[Int](r(11)).getOrElse(0), s(12), s(13))
+      opt[Int](r(9)).getOrElse(0), opt[Long](r(10)).getOrElse(0L), opt[Int](r(11)).getOrElse(0), s(12), s(13),
+      if r.size > 14 then opt[Int](r(14)).getOrElse(1) else 1, if r.size > 15 then opt[Any](r(15)).map(_.toString) else None)
 
   /** Archive file names. */
   def dayFile(t: TableDef, day: java.time.LocalDate): String = s"${t.name}/$day.parquet"
