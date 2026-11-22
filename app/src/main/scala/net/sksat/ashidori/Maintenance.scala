@@ -335,6 +335,9 @@ object Maintenance:
           // Not a failure of this run: nothing to archive until it is resolved.
           Progress.set("記録の整理が停止（要確認）", running = false)
           return false
+      // Files of no known layout (pics_adv of unreleased builds) set aside
+      // first: archiving and merges then go on without them.
+      Try(archive.setAsideUnknownLayouts()).failed.foreach(e => Log.w("setting aside unknown layouts failed", e))
       // A commit it finished (the process died before the mark after it):
       // the 「訪れた日」 index marks its day now.
       VisitDays.settleArchiving()

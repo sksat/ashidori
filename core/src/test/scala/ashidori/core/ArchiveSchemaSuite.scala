@@ -233,4 +233,16 @@ class ArchiveSchemaSuite extends munit.FunSuite:
       assertEquals(rows.map(ArchiveMerge.hash), Vector(full, short, folded).map(a => ArchiveMerge.hash(Archive.picsRow(a).toIndexedSeq)))
     }
     assertEquals(Archive.layouts(Archive.PicsAdvs), Seq(4 -> Archive.PicsAdvs.columns))
+    // The 14 columns of unreleased builds (before the fold), named schema 4:
+    // no layout of this version, an error (set aside by the app), never nulls.
+    val unreleased = File.createTempFile("pics14", ".parquet")
+    unreleased.deleteOnExit()
+    Using.resource(BufferedOutputStream(FileOutputStream(unreleased))) { o =>
+      val w = ParquetWriter(o, Archive.PicsAdvs.columns.take(14), 100,
+        Seq(Archive.TableKey -> "pics_adv", Archive.SchemaKey -> "4"))
+      w.write(Archive.picsRow(full).take(14))
+      w.close()
+    }
+    intercept[Archive.LayoutError](Archive.open(Archive.PicsAdvs, unreleased.getPath))
+    intercept[Archive.LayoutError](Archive.open(Archive.PicsAdvs, unreleased.getPath, whole = true))
   }

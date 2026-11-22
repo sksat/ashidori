@@ -135,8 +135,11 @@ final class PicsPanel(act: MainActivity, onReport: String => Unit):
         Option.when(LoggerState.running)(p.why) ++
         Option.when(p.state == PicsScanPolicy.State.Test && testLeft > 0)(s"残り ${(testLeft + 999) / 1000} 秒") ++
         PicsLive.failure.map((t, c) => s"開始の失敗 ${PicsUi.time(t)}（コード $c）") ++
-        PicsLive.broken.map(e => s"処理の失敗のため停止: $e")).mkString("・"))
-    stateRow.subtitle.setTextColor(color(if PicsLive.broken.isDefined then attr.error else attr.onSurfaceVariant))
+        PicsLive.broken.map(e => s"処理の失敗のため停止: $e") ++
+        Option.when(AshidoriApp.archive.unreadableFiles.nonEmpty)(
+          s"形式の分からないファイル ${AshidoriApp.archive.unreadableFiles.size} 件（読み込まず保持）")).mkString("・"))
+    stateRow.subtitle.setTextColor(color(
+      if PicsLive.broken.isDefined || AshidoriApp.archive.unreadableFiles.nonEmpty then attr.error else attr.onSurfaceVariant))
     val refused = PicsIngest.refused
     refusedRow.setValue(s"${refused.values.sum} 件")
     refusedRow.value.setTextColor(color(if refused.nonEmpty then attr.error else attr.onSurfaceVariant))

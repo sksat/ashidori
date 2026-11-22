@@ -68,7 +68,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   def read(t: Archive.TableDef, from: Long, to: Long): Vector[IndexedSeq[Any]] =
     filesFor(t, from, to).flatMap { f =>
       val shown = visible(t, from, to)
-      orEmpty(Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).flatMap(shown).toVector))
+      orEmpty(t, f, Vector.empty)(Using.resource(Archive.open(t, f.getPath))(_.rowsBetween(from, to).flatMap(shown).toVector))
     }.toVector.sortBy(ArchiveMerge.key)
 
   /** A row as shown: in [from, to), and without what a range the user
@@ -89,7 +89,7 @@ final class ArchiveStore(val root: File, zone: ZoneId):
     * files with `close`. Call within [[reading]].
     */
   def stream(t: Archive.TableDef, from: Long, to: Long): (Iterator[IndexedSeq[Any]], () => Unit) =
-    val readers = filesFor(t, from, to).flatMap(f => orEmpty(None)(Some(Archive.open(t, f.getPath))))
+    val readers = filesFor(t, from, to).flatMap(f => orEmpty(t, f, None)(Some(Archive.open(t, f.getPath))))
     val shown = visible(t, from, to)
     // A state span cut at a deleted range may start later than the next
     // one: a file of them (small) is put in order again.
@@ -102,20 +102,59 @@ final class ArchiveStore(val root: File, zone: ZoneId):
   /** Most recent archived row of `t`, if any. */
   def lastRow(t: Archive.TableDef): Option[IndexedSeq[Any]] =
     archivedFiles(t).lastOption.flatMap { f =>
-      orEmpty(None)(Using.resource(Archive.open(t, f.getPath)) { r =>
+      orEmpty(t, f, None)(Using.resource(Archive.open(t, f.getPath)) { r =>
         val shown = visible(t, Long.MinValue, Long.MaxValue)
         if r.groups == 0 then None else r.readGroup(r.groups - 1).rowIterator.flatMap(shown).toSeq.sortBy(ArchiveMerge.key).lastOption
       })
     }
 
-  /** `f` on a file: one of an unknown layout is an error; one that cannot
-    * be read otherwise (cut short) reads as `empty`, as before.
+  /** `body` on the file `f` of `t`: one of an unknown layout is an error
+    * (for a table of [[SetAside]]: not read, noted for 端末診断, and set
+    * aside by the next maintenance run); one that cannot be read otherwise
+    * (cut short) reads as `empty`, as before.
     */
-  private def orEmpty[A](empty: => A)(f: => A): A =
-    try f
+  private def orEmpty[A](t: Archive.TableDef, f: File, empty: => A)(body: => A): A =
+    try body
     catch
-      case e: (Archive.LayoutError | ParquetReader.TypeMismatch) => throw e
-      case scala.util.control.NonFatal(_)                         => empty
+      case e: (Archive.LayoutError | ParquetReader.TypeMismatch) =>
+        if !SetAside(t) then throw e
+        val rel = root.toPath.relativize(f.toPath).toString
+        if !unreadable(rel) then
+          unreadable += rel
+          Log.w(s"$rel: an unknown layout, not read: ${e.getMessage}")
+        empty
+      case scala.util.control.NonFatal(_) => empty
+
+  @volatile private var unreadable = Set.empty[String]
+  /** Files of a table of [[SetAside]] that readers left out (an unknown layout). */
+  def unreadableFiles: Set[String] = unreadable
+
+  /** Sets aside the files of the tables of [[SetAside]] that are of no
+    * layout this version knows (rule A: moved to quarantine, listed in
+    * 端末診断, never deleted; [[SafeMove]], the entry made before the
+    * rename), so that readers, archiving and merges go on without them.
+    * Under each table's lock. The number set aside.
+    */
+  def setAsideUnknownLayouts(): Int =
+    var n = 0
+    for t <- SetAside.toSeq do
+      writing(Seq(t.name)) {
+        for f <- archivedFiles(t) do
+          Try(Using.resource(Archive.open(t, f.getPath))(_ => ())).failed.toOption.collect {
+            case e: (Archive.LayoutError | ParquetReader.TypeMismatch) => e
+          }.foreach { e =>
+            val rel = root.toPath.relativize(f.toPath).toString
+            val why = "形式の分からないファイル（読み込まず、削除せずに隔離）"
+            SafeMove.move(f.toPath, File(root, s"$QuarantineDir/layout/$rel").toPath, None,
+              to => Attention.add(Attention.Entry(System.currentTimeMillis(), rel, root.toPath.relativize(to).toString,
+                onlyCopy = true, why)),
+              p => ensureDir(p.toFile), p => syncFile(p.toFile), p => syncDir(p.toFile))
+            unreadable -= rel
+            LifeLog.add(LifeKind.ArchiveRepair, s"$rel: $why: ${e.getMessage}")
+            n += 1
+          }
+      }
+    n
 
   /** The time span [from, to) of an archive file's name (a day or a month). */
   def periodOf(name: String): Option[(Long, Long)] =
@@ -1035,6 +1074,13 @@ object ArchiveStore:
   val SettleMs: Long = 3_600_000L
 
   val MonthTables: Seq[Archive.TableDef] = Archive.SignalTables
+
+  /** Tables whose files of an unknown layout are set aside instead of
+    * stopping readers and archiving: `pics_adv`, whose earlier layout of
+    * schema 4 only unreleased builds wrote (it is not read: schema 4's
+    * layout is the folded one from the first release).
+    */
+  val SetAside: Set[Archive.TableDef] = Set(Archive.PicsAdvs)
 
   /** fsync of a directory: a rename or a new entry in it is durable after
     * this. Throws: whatever depends on it must not happen.
