@@ -55,7 +55,10 @@ object DayMap:
   /** The running snapshotter is its handle: referenced until it calls back. */
   private val queue = SnapshotQueue[MapSnapshotter](Settings.gate)
   Settings.gate.onChange(ds => if ds.exists(Dest.Tiles) then AshidoriApp.app.getMainExecutor.execute { () =>
-    queue.invalidate().foreach(_.cancel())
+    val dropped = queue.invalidate()
+    dropped.foreach(_.cancel())
+    // Its card's job is gone, with its hold of region files.
+    cards.asScala.toSeq.filter(c => dropped.exists(c.running.contains)).foreach(_.cancelJob())
     // Cards whose job was dropped would keep the plain sketch.
     cards.asScala.toSeq.foreach(_.invalidateMap())
   })
@@ -86,6 +89,19 @@ object DayMap:
     var generation = 0
     /** Its snapshot rendering now, cancelled when it leaves the window. */
     var running: Option[MapSnapshotter] = None
+    /** The region files it draws from, held for its job ([[SnapshotHold]]). */
+    val regions = SnapshotHold[MapSnapshotter](() => Regions.release(this))
+    /** Its job is cancelled or superseded (the rules changed, a cached
+      * picture shown instead): its rendering stops and its hold goes.
+      */
+    def cancelJob(): Unit =
+      running.foreach { s =>
+        running = None
+        waiting = false
+        s.cancel()
+        queue.finished(s)
+      }
+      regions.clear()
     /** In a window (its screen is shown; a page of it may be hidden): only then may a job of it start. */
     def onScreen: Boolean = isAttachedToWindow
     /** A job of it did not start (not in a window yet, or not any more): drawn when it is attached. */
@@ -93,6 +109,7 @@ object DayMap:
     /** The queue was held: its job (queued or rendering, cancelled) is gone; drawn again on [[resumed]]. */
     def held(): Unit =
       running = None
+      regions.clear()
       if waiting then stale = true
       waiting = false
     /** The queue was released: a card still in a window whose job was dropped asks again. */
@@ -117,7 +134,7 @@ object DayMap:
       generation += 1
       Net.guard.release("snapshot", this)
       OnlineStyles.forget(this)
-      Regions.release(this)
+      regions.clear()
       // Its rendering stops (its requests are cancelled), and the queue goes
       // on unless held (the screen is leaving: nothing starts until shown).
       waiting = false
@@ -271,6 +288,8 @@ object DayMap:
       val snap = MapSnapshotter(act, opts)
       frame.running = Some(snap)
       frame.waiting = true
+      // The region files the style was just built with are this job's.
+      frame.regions.started(snap)
       // What this job belongs to, read now: the card's generation, and the
       // cache key (the basemap's and the region packs' versions the style
       // was just built from, in this same turn of the main thread).
@@ -278,8 +297,9 @@ object DayMap:
       val keyAtStart = key(style)
       // Ends once: drawn, failed, or out of time (online only). A result
       // that is no longer the card's current job is dropped whole
-      // (SnapshotArrival.Stale): it shows, caches, queues and releases
-      // nothing, so a cancelled job can never touch the card's new one.
+      // (SnapshotArrival.Stale): it shows, caches and queues nothing, and
+      // releases its region hold only if no newer job of the card holds
+      // now ([[SnapshotHold]]), so it never touches the card's new job.
       var ended = false
       def arrival = SnapshotArrival.of(ended, startGen, frame.generation, frame.running.contains(snap),
         queue.isRunning(snap), keyAtStart, key(style))
@@ -287,6 +307,7 @@ object DayMap:
         ended = true
         main.removeCallbacksAndMessages(snap)
         Net.log(s"snapshot result dropped ($why): not the card's current job")
+        frame.regions.ended(snap)
         // The queue moved on from it already (finished, invalidated or held);
         // ignored there unless it is somehow still its job, which must not stall.
         queue.finished(snap)
@@ -296,7 +317,7 @@ object DayMap:
         if frame.running.contains(snap) then
           frame.running = None
           frame.waiting = false
-        Regions.release(frame)
+        frame.regions.ended(snap)
       def failed(why: String): Unit =
         end()
         // The basemap removed meanwhile: say so. An online map that could
@@ -345,7 +366,10 @@ object DayMap:
     def fallBack(): Unit =
       frame.fellBack = true
       cached(MapStyle.Offline) match
-        case Some(b) => show(b)
+        case Some(b) =>
+          // A job still drawing for the card is superseded by this picture.
+          frame.cancelJob()
+          show(b)
         case None =>
           pending()
           if MapStyle.offlineAvailable then
@@ -372,7 +396,10 @@ object DayMap:
       case Outcome.Draw(style) =>
         frame.fellBack = false
         cached(style) match
-          case Some(b) => show(b)
+          case Some(b) =>
+            // A job still drawing for the card is superseded by this picture.
+            frame.cancelJob()
+            show(b)
           // No validated network: the offline map now, not a job waiting for the online one.
           case None if style.online && !Net.reachable => fallBack()
           case None =>
@@ -401,6 +428,8 @@ object DayMap:
                     frame.fellBack = true
                     cached(s) match
                       case Some(b) =>
+                        // No job draws it: the region files the style was built with are not kept.
+                        frame.regions.clear()
                         show(b)
                         None
                       case None => start(s, json)

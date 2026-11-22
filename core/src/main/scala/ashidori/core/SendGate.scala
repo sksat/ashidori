@@ -323,6 +323,29 @@ object SnapshotArrival:
     else if keyAtStart != keyNow then Outdated
     else Current
 
+/** Which snapshot job of a card owns the region files the card holds
+  * ([[RegionUse]] keys the hold by the card, and building a style replaces
+  * it). The hold belongs to the job started with the style just built: it
+  * goes when that job ends (drawn, failed, timed out or dropped as stale),
+  * never when an older job of the card ends, and at once when the card's
+  * job is cancelled or superseded, or a style was built and no job started.
+  * Idempotent. `release` drops the card's hold. Not thread-safe: use from
+  * one thread (the main thread).
+  */
+final class SnapshotHold[J](release: () => Unit):
+  private var job: Option[J] = None
+  /** `j` started with the style just built (its hold, if any, was made then). */
+  def started(j: J): Unit = job = Some(j)
+  /** `j` ended: its hold goes, unless a newer job of the card holds now. */
+  def ended(j: J): Unit =
+    if job.contains(j) then
+      job = None
+      release()
+  /** The card's job was cancelled or superseded, or no job started: what the card holds goes. */
+  def clear(): Unit =
+    job = None
+    release()
+
 /** The map consents of versions before per-destination settings
   * (`mapConsents`): read once to migrate them, and written for those
   * versions ([[ExternalSettings]]).

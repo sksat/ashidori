@@ -223,6 +223,47 @@ class SendGateSuite extends munit.FunSuite:
     assertEquals(SnapshotArrival.of(false, 0, 0, cardJob = true, q.isRunning("new"), "k", "k"), Current)
   }
 
+  test("a card's region hold goes with the job that owns it, never with an older one") {
+    val use = RegionUse()
+    val card = new Object
+    val h = SnapshotHold[String](() => use.release(card): Unit)
+    def build(dirs: String*): Unit = use.hold(card, dirs.toSet)
+    // A job draws and ends: its hold goes.
+    build("packs/8-227-100/1")
+    h.started("a")
+    h.ended("a")
+    assert(!use.inUse("packs/8-227-100/1"))
+    // A job dropped by the queue, a newer job of the card holding now: the
+    // old one's late (stale) end leaves the newer hold.
+    build("packs/8-227-100/1")
+    h.started("old")
+    build("packs/8-227-100/2")
+    h.started("new")
+    h.ended("old")
+    assert(use.inUse("packs/8-227-100/2"))
+    h.ended("new")
+    assert(!use.inUse("packs/8-227-100/2"))
+    // Cancelled or superseded (the screen held, a change of the rules, a
+    // cached picture shown instead): released at once; the late end is a no-op.
+    build("packs/8-227-100/1")
+    h.started("c")
+    h.clear()
+    assert(!use.inUse("packs/8-227-100/1"))
+    build("packs/8-227-100/3")
+    h.started("d")
+    h.ended("c")
+    assert(use.inUse("packs/8-227-100/3"))
+    // A style built and no job started (its picture was cached): cleared.
+    h.clear()
+    build("packs/8-227-100/4")
+    h.clear()
+    assertEquals(use.holders, 0)
+    // Idempotent.
+    h.clear()
+    h.ended("d")
+    assertEquals(use.holders, 0)
+  }
+
   test("a queued job of an old generation is skipped even without invalidate, and the next one runs") {
     val g = gate()
     val q = SnapshotQueue[String](g)

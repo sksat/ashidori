@@ -67,11 +67,18 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     // Off screen: its snapshot holds no permit, and no style fetch is retried for it.
     Net.guard.release("snapshot", this)
     OnlineStyles.forget(this)
-    Regions.release(this)
+    regions.clear()
 
+  /** The region files its map draws from, held for its snapshot ([[SnapshotHold]]). */
+  private val regions = SnapshotHold[MapSnapshotter](() => Regions.release(this))
+
+  /** Its snapshot stops, and its hold of region files goes. Called before a
+    * new style is built (which holds anew), never after.
+    */
   private def stopMap(): Unit =
     snapshotter.foreach { s => s.cancel(); MapStyle.untrack(s) }
     snapshotter = None
+    regions.clear()
 
   // Label/value rows, as in the status card of the ステータス tab.
   private def row(label: String, value: View): View =
@@ -180,6 +187,8 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
     lp.setMargins(dp(12), dp(6), dp(12), dp(6))
     frame.setLayoutParams(lp)
 
+    // The previous snapshot stops before the new style is built (and holds).
+    stopMap()
     val acc = if f.acc.isNaN then 0.0 else f.acc
     val hex = f"#${dotColor & 0xffffff}%06x"
     // Show the circle with room around it; at least ~600 m across.
@@ -201,11 +210,9 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       // OpenFreeMap's style is being fetched: blank until it arrives.
       case None =>
         fellBack = false
-        stopMap()
         return frame
       case Some(_) =>
         fellBack = wantsOnline
-        stopMap()
         frame.addView(PositionSketchView(act, acc / (2 * half), dotColor),
           FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         val chip = DayMap.noMapChip(act)
@@ -238,14 +245,15 @@ final class DeviceScreen(act: MainActivity, deviceId: String) extends Screen:
       .withRegion(bounds)
       .withStyleBuilder(builder)
       .withLogo(false)
-    stopMap()
     MapStyle.applyNetworkPolicy(act)
     val snap = MapSnapshotter(act, opts)
     snapshotter = Some(snap)
+    regions.started(snap)
     MapStyle.track(snap)
+    // A late callback of a snapshot stopped since releases nothing of the new one's hold.
     snap.start(
-      s => { MapStyle.untrack(snap); Regions.release(this); img.setImageBitmap(s.getBitmap) },
-      (msg: String) => { MapStyle.untrack(snap); Regions.release(this); Log.w(s"device map: $msg") }
+      s => { MapStyle.untrack(snap); regions.ended(snap); img.setImageBitmap(s.getBitmap) },
+      (msg: String) => { MapStyle.untrack(snap); regions.ended(snap); Log.w(s"device map: $msg") }
     )
     frame
 
