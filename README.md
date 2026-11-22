@@ -103,7 +103,7 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 ## データフロー
 
-![端末はセンサーの記録を SQLite に書き、前日までの分を Parquet に移す。どちらも端末で暗号化して同期サーバに送り、サーバは R2 に置いて D1 に一覧を持つ。Web 版と別の端末は暗号化した記録を取得して、その中で復号する](docs/diagrams/data-flow.svg)
+![端末はセンサーの記録を SQLite に書き、前日までの分を Parquet に移す。記録は暗号化して同期サーバの Worker に送り、Worker は R2 に保存して D1 の一覧を更新する。Web 版と別の端末は暗号化した記録を取得して、その中で復号する](docs/diagrams/data-flow.svg)
 
 当日の記録は SQLite に書き、翌日以降に日・月の Parquet にまとめる。同期するのは、まとめた日・月のファイルと、場所・チェックイン・移動手段の修正・端末の状態で、どれも端末で暗号化してから送る。詳しくは [`docs/overview.md`](docs/overview.md)、[`docs/recording.md`](docs/recording.md)、[`docs/sync.md`](docs/sync.md) にある。地図と施設のデータの生成と公開の手順は [`docs/data-packages.md`](docs/data-packages.md) にある。
 
