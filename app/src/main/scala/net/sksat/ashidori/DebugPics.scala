@@ -128,7 +128,7 @@ object DebugPics:
     val p = PicsLive.plan
     val line = s"plan=${p.state}（${p.why}） scan=${p.scan.key} delay=${p.reportDelayMs} registered=${PicsLive.registered} " +
       s"input=${PicsLive.input} heard=${PicsLive.heard.values.map(h => s"${h.iid}:${h.label}:${h.peds.map(_.light.label).mkString("/")}").mkString(",")} " +
-      s"refused=${PicsIngest.refused} acceptedToday=${PicsIngest.acceptedToday} failure=${PicsLive.failure} broken=${PicsLive.broken} " +
+      s"refused=${PicsIngest.refused} testing=${PicsIngest.testing} testUntil=${PicsLive.testUntil} acceptedToday=${PicsIngest.acceptedToday} failure=${PicsLive.failure} broken=${PicsLive.broken} " +
       s"enabled=${Settings.picsEnabled} permission=${PicsScanner.hasPermission(AshidoriApp.app)} bt=${PicsScanner.bluetoothOn(AshidoriApp.app)} " +
       s"passive=${PicsScanner.passiveScan} sites=${PicsSitesData.index.sites.size}"
     LifeLog.add(LifeKind.Pics, s"PICS_STATE: $line")

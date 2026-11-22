@@ -18,8 +18,9 @@ import java.time.LocalDate
   *   ... -a ashidori.debug.PICS_WALK [--es site <name in the list>] [--ei wait 40] [--ez fast true] [--ei daysAgo 1]
   *                                                    a synthetic crossing (approach, red, green, walking away)
   *                                                    with fixes and motion, in real time (fast: back-dated at once)
-  *   ... -a ashidori.debug.PICS_STATE [--ez enable true]   the PICS plan's inputs and result to the lifecycle log
-  *                                                    (enable: 「信号機の電波を記録」 set first)
+  *   ... -a ashidori.debug.PICS_STATE [--ez enable true] [--ez test true]   the PICS plan's inputs and result to
+  *                                                    the lifecycle log (enable: 「信号機の電波を記録」 set first;
+  *                                                    test: 「受信の試験（60 秒）」 started)
   *   ... -a ashidori.debug.SPILL --ei files 100        overflow files, as if the write queue had been full
   *   ... -a ashidori.debug.LOG --es mode max        start recording in a mode
   *   ... -a ashidori.debug.STOP                       stop recording
@@ -105,6 +106,10 @@ class DebugReceiver extends BroadcastReceiver:
         if intent.hasExtra("enable") then
           Settings.picsEnabled = intent.getBooleanExtra("enable", false)
           if LoggerState.running then LoggerService.send(c, LoggerService.ActionRefresh)
+        if intent.getBooleanExtra("test", false) then
+          // 「受信の試験（60 秒）」, as its button does.
+          PicsLive.testUntil = android.os.SystemClock.elapsedRealtime() + ashidori.core.PicsScanPolicy.TestMs
+          PicsLive.replan()
         Log.i(s"PICS_STATE ${DebugPics.state()}")
       case "ashidori.debug.CORRUPT_TEST" =>
         Thread(() => Log.i(DebugData.corruptionTest(c)), "ashidori-corrupt-test").start()

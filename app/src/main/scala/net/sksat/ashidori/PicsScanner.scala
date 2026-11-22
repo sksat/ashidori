@@ -132,6 +132,7 @@ final class PicsScanner(ctx: Context, handler: Handler, onRegistered: () => Unit
         val cb = Callback(s, delayMs)
         try
           sc.startScan(filters.asJava, b.build(), cb)
+          Log.i(s"PICS scan started: ${s.key} delay $delayMs at elapsed $now")
           callback = Some(cb)
           PicsIngest.scanChanged()
         catch case e: Exception =>
