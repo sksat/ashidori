@@ -1,4 +1,4 @@
-# <img src="design/icon/ashidori.svg" width="48" height="48" alt="" align="top"> ashidori
+# <img src="design/icon/ashidori-rounded.svg" width="48" height="48" alt="" align="top"> ashidori
 
 [![server](https://github.com/sksat/ashidori/actions/workflows/server.yml/badge.svg)](https://github.com/sksat/ashidori/actions/workflows/server.yml)
 [![formal](https://github.com/sksat/ashidori/actions/workflows/formal.yml/badge.svg)](https://github.com/sksat/ashidori/actions/workflows/formal.yml)

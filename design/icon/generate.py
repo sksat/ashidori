@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generates the app icon from one set of parameters:
-design/icon/ashidori.svg (source, also used for the favicon) and
+design/icon/ashidori.svg (source), design/icon/ashidori-rounded.svg (the same with
+rounded corners, for the README) and
 app/src/main/res/drawable/ic_launcher_fg.xml (adaptive-icon foreground and
 monochrome layer). Shoe prints walk up-right to a place marker; the whole
 mark is centred and scaled to fit the 66 dp safe-zone circle of a 108 dp icon.
@@ -69,6 +70,10 @@ svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
 </svg>
 '''
 open(os.path.join(HERE, "ashidori.svg"), "w").write(svg)
+# The same with rounded corners, as launchers show it, for the README and other
+# pages (the mark lies within the safe zone, so nothing is cut).
+open(os.path.join(HERE, "ashidori-rounded.svg"), "w").write(
+    svg.replace(f'<rect width="108" height="108" fill="{BG}"/>', f'<rect width="108" height="108" rx="24" fill="{BG}"/>'))
 
 # --- VectorDrawable ---
 groups = "\n".join(f'''        <group android:translateX="{fx(p[0]+shift[0])}" android:translateY="{fx(p[1]+shift[1])}" android:rotation="{ANGLE}" android:scaleX="{fx(FOOT*s)}" android:scaleY="{fx(FOOT)}">
