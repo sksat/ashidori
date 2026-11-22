@@ -1,7 +1,7 @@
 # データフロー（README）
-# 端末は記録を暗号化したバッチにして送り、同期サーバは暗号化したバッチと
-# その一覧だけを持つ。復号できるのは利用者の端末とペアリングしたブラウザだけ。
-direction: down
+# 端末は記録を暗号化したファイルにして送り、同期サーバは暗号化したファイルと
+# その目録だけを持つ。復号できるのは利用者の端末とペアリングしたブラウザだけ。
+direction: up
 
 *.style.font-size: 26
 *.*.style.font-size: 26
@@ -19,13 +19,14 @@ classes: {
 phone: 端末 {
   sensors: "センサー\nGNSS・IMU・気圧・電池"
 
-  sqlite: SQLite {
-    today: 当日のセンサーの記録 {shape: cylinder}
-    edits: "場所・チェックイン\n移動手段の修正" {shape: cylinder}
+  # One database (ashidori.db); its tables are rectangles.
+  sqlite: "SQLite（ashidori.db）" {
+    today: 当日のセンサーの記録
+    edits: "場所・チェックイン\n移動手段の修正"
   }
 
-  parquet: Parquet {
-    files: 日・月のファイル {shape: cylinder}
+  parquet: "Parquet（files/archive）" {
+    files: 日・月のファイル {shape: page; style.multiple: true}
   }
 
   sensors -> sqlite.today: 記録 {class: local}
@@ -37,22 +38,22 @@ cf: 同期サーバ（Cloudflare） {
   worker: Worker
 
   r2: Cloudflare R2 {
-    batches: 暗号化したバッチ {shape: cylinder}
+    batches: 暗号化したファイル {shape: page; style.multiple: true}
   }
 
   d1: Cloudflare D1 {
-    index: "バッチの一覧\n端末・種類・大きさ・時刻" {shape: cylinder}
-    accounts: "利用者・端末" {shape: cylinder}
+    index: "ファイルの目録\n送った端末・種類・大きさ・時刻"
+    accounts: "利用者・端末"
   }
 
   worker <-> r2.batches: 保存・取り出し {class: encrypted}
-  worker -> d1.index: 一覧に追加 {class: local}
+  worker -> d1.index: 目録に追加 {class: local}
 }
 
 web: "Web 版（ブラウザ）\nブラウザの中で復号"
 other: "別の端末\n端末の中で復号"
 
 phone.sqlite.edits -> cf.worker: 暗号化して送る {class: encrypted}
-phone.parquet.files -> cf.worker: 暗号化して送る {class: encrypted}
-web <- cf.worker: 暗号化したバッチ {class: encrypted}
-other <- cf.worker: 暗号化したバッチ {class: encrypted}
+phone.parquet -> cf.worker: 暗号化して送る {class: encrypted}
+web <- cf.worker: 暗号化したファイル {class: encrypted}
+other <- cf.worker: 暗号化したファイル {class: encrypted}

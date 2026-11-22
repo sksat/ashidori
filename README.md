@@ -80,8 +80,8 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 | サーバが持つもの | サーバの運用者に見えるか |
 | --- | --- |
-| 暗号化した記録（R2） | 見えない |
-| 記録の一覧：端末、種類、大きさ、送った時刻（D1） | 見える |
+| 暗号化したファイル（R2） | 見えない |
+| ファイルの目録：送った端末、種類、大きさ、時刻（D1） | 見える |
 | ユーザ名、端末の名前、登録と最終アクセスの時刻（D1） | 見える |
 | 共有したチェックイン（D1） | 見える（共有の画面は未実装） |
 
@@ -103,7 +103,7 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 ## データフロー
 
-![端末はセンサーの記録を SQLite に書き、翌日以降に日・月の Parquet ファイルに移す。場所・チェックイン・修正と Parquet のファイルは暗号化して同期サーバの Worker に送り、Worker は暗号化したバッチを R2 に保存して D1 のバッチの一覧に加える。Web 版と別の端末は Worker から暗号化したバッチを受け取って、その中で復号する](docs/diagrams/data-flow.svg)
+![端末はセンサーの記録を SQLite に書き、翌日以降に日・月の Parquet ファイルに移す。場所・チェックイン・修正と Parquet のファイルは暗号化して同期サーバの Worker に送り、Worker は暗号化したファイルを R2 に保存して D1 のファイルの目録に加える。Web 版と別の端末は Worker から暗号化したファイルを受け取って、その中で復号する](docs/diagrams/data-flow.svg)
 
 当日の記録は SQLite に書き、翌日以降に日・月の Parquet にまとめる。同期するのは、まとめた日・月のファイルと、場所・チェックイン・移動手段の修正・端末の状態で、どれも端末で暗号化してから送る。詳しくは [`docs/overview.md`](docs/overview.md)、[`docs/recording.md`](docs/recording.md)、[`docs/sync.md`](docs/sync.md) にある。地図と施設のデータの生成と公開の手順は [`docs/data-packages.md`](docs/data-packages.md) にある。
 
