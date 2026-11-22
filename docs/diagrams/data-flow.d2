@@ -30,7 +30,7 @@ phone: 端末 {
   }
 
   sensors -> sqlite.today: 記録 {class: local}
-  sqlite.today -> parquet.files: 翌日以降に移す {class: local}
+  sqlite.today -> parquet.files: 翌日以降に書き出す {class: local}
 }
 
 cf: 同期サーバ（Cloudflare） {
