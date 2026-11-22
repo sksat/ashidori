@@ -76,25 +76,25 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 同期サーバは [`server/`](server/) にあり、Cloudflare Workers・D1・R2 で動く。アプリにサーバの URL は組み込まれておらず、サーバの管理者から受け取った登録リンクか URL で登録する。手順は [`docs/pairing.md`](docs/pairing.md)、サーバの立て方は [`server/README.md`](server/README.md) にある。
 
-### 外部への送信
+### 送信するもの
 
-地名は端末内の地名データベース（日本は大字・町丁目、国外は GeoNames の都市）から求める。オンライン地図、Android の Geocoder、施設のオンライン検索、地図と施設のデータの取得は、設定の「データの扱い」で送信先ごとに、送るかどうか（送信しない・操作したとき・自動）と粒度を選ぶ。アプリの要求は、送る直前と再試行、リダイレクトのたびに、その時点の設定を確かめる。
+地名と施設は端末内のデータベースから求め、通信しない。アプリが外に送るのは次のものだけで、同期サーバ以外への送信は設定の「データの扱い」で送信先ごとに選べる。アプリの要求は、送る直前と再試行、リダイレクトのたびに、その時点の設定を確かめる。
 
-OS の測位サービスや、地図アプリで開くなどの利用者の明示的な操作は、この設定の対象外である。詳しくは [`docs/privacy.md`](docs/privacy.md) にある。
+| 送信先 | 送るもの | 既定で送るとき |
+| --- | --- | --- |
+| 同期サーバ | 暗号化した記録 | 同期を設定したとき |
+| オンライン地図の配信元 | 表示範囲 | 「オンライン地図で表示」を押したとき |
+| Android の Geocoder | 位置 | 送らない |
+| OpenStreetMap の施設検索 | 位置 | 「オンラインで検索」を押したとき |
+| GitHub Releases | 取得するファイルの名前（地域データは選んだ区画） | 地図と施設のデータを取得するとき |
+
+取得したデータは、アプリに固定した sha256 で照合してから使う。OS の測位サービスと、地図アプリで開く・共有するなどの操作は、この設定の対象外である。詳しくは [`docs/privacy.md`](docs/privacy.md) にある。
 
 ## 仕組み
 
-### 記録と同期
-
 ![記録は端末の SQLite から日・月の Parquet にまとめられ、端末で暗号化してから同期サーバに送る。復号できるのは自分の端末とブラウザだけ](docs/diagrams/readme-dataflow.svg)
 
-当日の記録は SQLite に書き、翌日以降に日・月の Parquet にまとめる。同期するのは、まとめた日・月のファイルと、場所・チェックイン・移動手段の修正・端末の状態で、どれも端末で暗号化してから送る。詳しくは [`docs/overview.md`](docs/overview.md)、[`docs/recording.md`](docs/recording.md)、[`docs/sync.md`](docs/sync.md) にある。
-
-### 端末の外とのやり取り
-
-![地図・施設・地域のデータは GitHub Releases から取得して sha256 で照合し、外部サービスへの送信は「データの扱い」で許可した分だけ、同期サーバには暗号文だけを送る](docs/diagrams/readme-network.svg)
-
-地図と施設のデータは GitHub Releases から取得し、アプリに固定した sha256 で照合してから使う。取得した後の表示と検索は通信しない。データの生成と公開の手順は [`docs/data-packages.md`](docs/data-packages.md) にある。
+当日の記録は SQLite に書き、翌日以降に日・月の Parquet にまとめる。同期するのは、まとめた日・月のファイルと、場所・チェックイン・移動手段の修正・端末の状態で、どれも端末で暗号化してから送る。詳しくは [`docs/overview.md`](docs/overview.md)、[`docs/recording.md`](docs/recording.md)、[`docs/sync.md`](docs/sync.md) にある。地図と施設のデータの生成と公開の手順は [`docs/data-packages.md`](docs/data-packages.md) にある。
 
 ## 構成
 

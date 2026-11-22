@@ -64,22 +64,28 @@ tools/regionpacks/package.sh <版> <出力>              # カタログをアプ
 tools/regionpacks/release.sh <版> <出力>              # 照合し、公開のコマンドを表示する（実行はしない）
 ```
 
-## エミュレータで確かめる
+## 公開する前にデバッグ版で試す
 
-リリースを作らずに確かめるには、`package.sh` で固定値を更新してデバッグ版をビルドし、アーカイブを端末に置いて取り込む。取り込みも固定値で照合する。
+作ったデータを GitHub Releases に公開する前に、デバッグ版のアプリで試せる。
+アプリはどの経路でも、固定した大きさと sha256 で照合する。先に `package.sh` で固定値を更新し、デバッグ版をビルドして入れる。
 
 ```sh
 ./gradlew :app:installDebug
+```
+
+**ファイルを端末に置いて取り込む。** データの中身と表示を試すときに使う。
+
+```sh
 v=$(python3 -c 'import json; print(json.load(open("app/src/main/assets/basemap-pin.json"))["version"])')
 adb push tools/basemap/dist/ashidori-basemap-$v.zip /sdcard/Android/data/net.sksat.ashidori.debug/files/basemap/
 adb shell am start -n net.sksat.ashidori.debug/net.sksat.ashidori.MainActivity --ez ashidori.basemapImport true
 ```
 
-ダウンロードの経路を確かめるには、手元の HTTP サーバから取得させる（デバッグ版のみ。`""` で既定の取得元に戻す）。
+**手元の HTTP サーバから取得させる。** ダウンロードの処理（進み具合、中断と再開）も試すときに使う。`""` を渡すと既定の取得元に戻る。
 
 ```sh
 (cd tools/basemap/dist && python3 -m http.server 8000) &
 adb shell am start -n net.sksat.ashidori.debug/net.sksat.ashidori.MainActivity --es ashidori.basemapUrl http://10.0.2.2:8000
 ```
 
-施設データは `--es ashidori.venuesUrl <URL>` で手元の HTTP サーバから、`--ez ashidori.venuesImport true` で `files/venues/` に置いたアーカイブから取り込める。
+施設データは、`--ez ashidori.venuesImport true`（`files/venues/` に置いたファイル）と `--es ashidori.venuesUrl <URL>` で同じように試せる。
