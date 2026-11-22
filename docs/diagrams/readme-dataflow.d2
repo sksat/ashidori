@@ -1,5 +1,5 @@
 # 記録と同期（README）
-# 鍵 K を持つのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号文だけが届く。
+# 復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号文だけが届く。
 direction: down
 
 phone: 端末 {
@@ -8,7 +8,7 @@ phone: 端末 {
   # The grid fills column by column: sensors over db, enc over archive.
   sensors: "センサー\nGNSS・IMU・気圧・電池"
   db: "SQLite\n当日の記録、場所\nチェックイン、修正" {shape: cylinder}
-  enc: "暗号化（鍵 K）"
+  enc: 暗号化
   archive: "Parquet\n翌日以降にまとめた\n日・月のアーカイブ" {shape: cylinder}
 
   sensors -> db
@@ -19,11 +19,11 @@ phone: 端末 {
 
 server: "同期サーバ\nCloudflare Workers・D1・R2\n暗号文だけを保存" {shape: cylinder}
 
-readers: "鍵 K を持つ側" {
+readers: "自分の端末とブラウザ" {
   grid-columns: 2
   grid-gap: 40
   web: "Web ブラウザ\nブラウザ内で復号"
-  other: "別の端末"
+  other: "別の端末\n端末内で復号"
 }
 
 phone.enc -> server

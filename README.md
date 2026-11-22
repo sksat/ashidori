@@ -86,7 +86,7 @@ OS の測位サービスや、地図アプリで開くなどの利用者の明�
 
 ### 記録と同期
 
-![記録は端末の SQLite から日・月の Parquet にまとめられ、端末で暗号化してから同期サーバに送る。読めるのは鍵 K を持つ端末とブラウザだけ](docs/diagrams/readme-dataflow.svg)
+![記録は端末の SQLite から日・月の Parquet にまとめられ、端末で暗号化してから同期サーバに送る。復号できるのは自分の端末とブラウザだけ](docs/diagrams/readme-dataflow.svg)
 
 当日の記録は SQLite に書き、翌日以降に日・月の Parquet にまとめる。同期するのは、まとめた日・月のファイルと、場所・チェックイン・移動手段の修正・端末の状態で、どれも端末で暗号化してから送る。詳しくは [`docs/overview.md`](docs/overview.md)、[`docs/recording.md`](docs/recording.md)、[`docs/sync.md`](docs/sync.md) にある。
 
