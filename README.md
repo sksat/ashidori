@@ -147,4 +147,4 @@ Gradle のプロパティ（リポジトリの外の `~/.gradle/gradle.propertie
 
 ## ライセンス
 
-[GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0-only）。改変した同期サーバをネットワーク越しに提供する場合は、その利用者にソースコードを提供する必要がある（第 13 条）。依存するライブラリは、それぞれのライセンスに従う。
+[GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0-only）
