@@ -11,9 +11,8 @@
 APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入手できる。対応 OS は Android 13 以降。
 
 <p>
-  <img src="docs/images/timeline-scroll.gif" width="240" alt="タイムライン（日）">
-  <img src="docs/images/timeline-units.gif" width="240" alt="日・週・月の切り替え">
-  <img src="docs/images/map.png" width="240" alt="マップ">
+  <img src="docs/images/overview.gif" width="240" alt="アプリの概要：地図、日の記録、日・週・月、ステータス">
+  <img src="docs/images/map.png" width="240" alt="マップ：日の経路と滞在">
 </p>
 
 ## 機能
@@ -23,9 +22,8 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 日・週・月の単位で、新しい順に過去へ遡って表示する。日単位では滞在と移動を時系列に並べ、経路の地図を付ける。経路は移動手段ごとに色分けする。場所の名前と移動手段は一覧上で修正できる。
 
 <p>
-  <img src="docs/images/timeline-day.png" width="240" alt="タイムライン（日）">
-  <img src="docs/images/timeline-week.png" width="240" alt="タイムライン（週）">
-  <img src="docs/images/timeline-month.png" width="240" alt="タイムライン（月）">
+  <img src="docs/images/day.gif" width="240" alt="日の記録：区間を地図で強調し、前の日へ">
+  <img src="docs/images/units.gif" width="240" alt="タイムラインの日・週・月">
 </p>
 
 - 滞在の検出、移動区間の分割、移動手段の推定（徒歩・自転車・車・バス・電車・地下鉄・飛行機など）
@@ -37,11 +35,16 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 
 背景の地図は、端末内のオフライン地図、OpenStreetMap（OpenFreeMap）、国土地理院の地図（標準・淡色・航空写真・色別標高）、任意の XYZ タイルから選ぶ。オフライン地図は日本をズーム 10、全世界をズーム 5 まで収め、地域データ（日本の区画ごとにズーム 14 まで）を選んで足せる。
 
+<p>
+  <img src="docs/images/regions.gif" width="240" alt="地域データを範囲で選んで取得し、地図を拡大">
+  <img src="docs/images/base-maps.png" width="240" alt="地図の種類">
+</p>
+
 地図には施設データ（OpenStreetMap から作った日本の施設）の店や駅を表示し、押すとチェックインできる。施設の検索は端末内で行い、「オンラインで検索」を押したときだけ OpenStreetMap のサーバに問い合わせる。
 
 <p>
-  <img src="docs/images/period.png" width="240" alt="期間の記録">
-  <img src="docs/images/base-maps.png" width="240" alt="地図の種類">
+  <img src="docs/images/checkin.gif" width="240" alt="近くの施設にチェックイン">
+  <img src="docs/images/place.gif" width="240" alt="滞在の場所を施設で直し、訪れた日を見る">
 </p>
 
 ### 記録モードと省電力
@@ -49,9 +52,9 @@ APK は [Releases](https://github.com/sksat/ashidori/releases/latest) から入�
 記録は停止するまで続き、普段の操作はモードの切り替えだけである。静止中は GNSS と加速度センサーを止め、移動の開始をセンサーの割り込み（significant motion）で検知する。屋内では Wi-Fi・基地局で測位し、屋内の歩行は歩数と方位から位置を推定する（PDR）。
 
 <p>
-  <img src="docs/images/recording-mode.gif" width="240" alt="記録モードの切り替え">
-  <img src="docs/images/status.png" width="240" alt="ステータス">
-  <img src="docs/images/status-imu.png" width="240" alt="IMU と生データ">
+  <img src="docs/images/mode.gif" width="240" alt="記録モードの切り替え">
+  <img src="docs/images/status.png" width="240" alt="ステータス：記録の状態と記録モード">
+  <img src="docs/images/status-imu.png" width="240" alt="ステータス：加速度・ジャイロ・方位・気圧">
 </p>
 
 | モード | 移動中の測位間隔 | 生データ |
