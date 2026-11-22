@@ -17,7 +17,7 @@ phone: 端末 {
 
 server: 同期サーバ {
   grid-columns: 2
-  horizontal-gap: 150
+  horizontal-gap: 140
   # The Worker on the left (under the device's encryption and above the readers),
   # the stores on the right, so no arrow crosses a store.
   api: "Worker（Cloudflare Workers）\n認証・記録の受け渡し\nWeb 版と管理ページの配信"
@@ -26,8 +26,8 @@ server: 同期サーバ {
     style.stroke: transparent
     grid-rows: 2
     vertical-gap: 24
-    blobs: "暗号化した記録\n（Cloudflare R2）" {shape: cylinder}
-    meta: "利用者・端末・記録の一覧\n（Cloudflare D1）" {shape: cylinder}
+    blobs: "Cloudflare R2\n暗号化した記録そのもの\n日・月のファイル、場所、チェックイン\n移動手段の修正、端末の状態" {shape: cylinder}
+    meta: "Cloudflare D1\n利用者・端末・招待\n記録の一覧（端末・種類・大きさ・時刻）\n共有したチェックイン" {shape: cylinder}
   }
   api -> stores.blobs: 保存・取り出し
   api -> stores.meta: 更新・参照
