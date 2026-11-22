@@ -256,3 +256,25 @@ class DbMigrationSuite extends munit.FunSuite:
     // Again (a step run twice): nothing more to add.
     assert(DbSchema.toV8(columns(db, "fixes"), columns(db, "sync_outbox")).forall(!_.contains("sync_outbox")))
   }
+
+  test("version 10: pics_adv and energy_state.ble; old spans keep ble NULL (not off); safe to run again") {
+    val db = tempDb()
+    create(db)
+    val cols = "start, end, gnss, gnss_interval_ms, provider, detail, still, screen_on, charging, mode, eff_mode, motion, env"
+    run(db, insert("energy_state", cols, "1000, 2000, 1, 10000, 'gps', 0, 0, 1, 0, 'balanced', 'balanced', 'OnFoot', 'Outdoor'"))
+    def v10() = run(db, ("BEGIN" +: DbSchema.toV10(columns(db, "energy_state")) :+ "COMMIT").map(_ + ";").mkString("\n"))
+    v10()
+    assert(columns(db, "energy_state")("ble"))
+    assertEquals(run(db, "SELECT start, ble IS NULL FROM energy_state;"), Vector("1000|1"))
+    assertEquals(columns(db, "pics_adv"), Archive.PicsAdvs.colNames.toSet)
+    assert(run(db, "SELECT name FROM sqlite_master WHERE type='index';").contains("pics_adv_start"))
+    // Again: nothing to add (no ALTER), the same tables.
+    assert(DbSchema.toV10(columns(db, "energy_state")).forall(!_.startsWith("ALTER")))
+    val info = tableInfo(db, "energy_state")
+    v10()
+    assertEquals(tableInfo(db, "energy_state"), info)
+    // Rows take rowids from the floor like the other archived tables.
+    run(db, insert("pics_adv", "start, end, addr, msg_changes, n, rssi_max, rssi_max_at, rssi_min, data, scan",
+      "5000, 5000, 'a', 0, 1, -60, 5000, -60, '58', 'debug'"))
+    assertEquals(run(db, "SELECT COUNT(*), MIN(iid IS NULL) FROM pics_adv;"), Vector("1|1"))
+  }

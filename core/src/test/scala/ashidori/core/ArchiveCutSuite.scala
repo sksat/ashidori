@@ -79,7 +79,7 @@ class ArchiveCutSuite extends munit.FunSuite:
     assertEquals(CommitRepair.verify(target, 4, rows(Archive.EnergyStates, out).iterator), Right(()))
     // Written unsorted, the check would refuse to publish it.
     val unsorted = file(Archive.EnergyStates.columns, spans.flatMap(sp => ArchiveCut.cutRow(Archive.EnergyStates,
-      Archive.energyRow(sp).toIndexedSeq, t0 + 40 * Min, t0 + 80 * Min)), Seq(Archive.TableKey -> "energy_state", Archive.SchemaKey -> "3"))
+      Archive.energyRow(sp).toIndexedSeq, t0 + 40 * Min, t0 + 80 * Min)), Seq(Archive.TableKey -> "energy_state", Archive.SchemaKey -> Archive.SchemaVersion.toString))
     val u = rows(Archive.EnergyStates, unsorted)
     val wu = ArchiveCut.Written(4, u.foldLeft(17L)((h, r) => h * 31 + ArchiveMerge.hash(r)))
     assertEquals(ArchiveCut.check(Archive.EnergyStates, unsorted.getPath, wu, t0 + 40 * Min, t0 + 80 * Min), Left("rows not in time order"))
@@ -96,4 +96,16 @@ class ArchiveCutSuite extends munit.FunSuite:
     val (out2, w2) = cutTo(Archive.Pressure, src, t0, t0 + 20_000L)
     assert(ArchiveCut.check(Archive.Pressure, out2.getPath, w2.copy(hash = w2.hash + 1), t0, t0 + 20_000L).isLeft)
     assert(ArchiveCut.check(Archive.Pressure, src.getPath, w2, t0, t0 + 20_000L).isLeft)
+  }
+
+  test("a PICS run touching the range goes whole; the others stay") {
+    def run(s: Long, e: Long) = Archive.picsRow(PicsAdv(s, e, "a", Some("00CD0849"), Some(2), Some(1), Some(1), 0, 5, -60, s, -70,
+      "580102", "bal"))
+    val rs = Seq(run(t0, t0 + 4000), run(t0 + 9 * Min + 58_000, t0 + 10 * Min + 1000), run(t0 + 15 * Min, t0 + 15 * Min + 3000),
+      run(t0 + 20 * Min, t0 + 20 * Min + 4000))
+    val src = file(Archive.PicsAdvs.columns, rs, Seq(Archive.TableKey -> "pics_adv", Archive.SchemaKey -> "4"))
+    val (from, to) = (t0 + 10 * Min, t0 + 20 * Min)
+    val (out, w) = cutTo(Archive.PicsAdvs, src, from, to)
+    assertEquals(ArchiveCut.check(Archive.PicsAdvs, out.getPath, w, from, to), Right(()))
+    assertEquals(rows(Archive.PicsAdvs, out).map(r => r(0)), Vector[Any](t0, t0 + 20 * Min))
   }

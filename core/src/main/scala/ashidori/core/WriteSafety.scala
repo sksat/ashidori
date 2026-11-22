@@ -13,6 +13,7 @@ enum WriteKind(val key: String, val label: String):
   case EnergyState extends WriteKind("energy_state", "記録の状態")
   case Pressure extends WriteKind("pressure", "気圧")
   case FixMsl extends WriteKind("fix_msl", "海抜高度")
+  case PicsAdv extends WriteKind("pics_adv", "信号機の電波")
 
 object WriteKind:
   def fromKey(k: String): Option[WriteKind] = values.find(_.key == k)

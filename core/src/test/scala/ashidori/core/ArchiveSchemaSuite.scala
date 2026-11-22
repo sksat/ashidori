@@ -97,8 +97,12 @@ class ArchiveSchemaSuite extends munit.FunSuite:
         w.close()
       }
       g
-    val v4 = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "pressure", Archive.SchemaKey -> "4"))
-    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, v4.getPath))
+    val v5 = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "pressure", Archive.SchemaKey -> "5"))
+    intercept[Archive.LayoutError](Archive.open(Archive.Pressure, v5.getPath))
+    // energy_state of schema 4 has ble; one named 4 without it is not schema 4.
+    val noBle = tagged(Archive.EnergyStates, Archive.EnergyStates.columns.take(16),
+      Seq(Archive.TableKey -> "energy_state", Archive.SchemaKey -> "4"))
+    intercept[Archive.LayoutError](Archive.open(Archive.EnergyStates, noBle.getPath))
     val other = tagged(Archive.Pressure, Archive.Pressure.columns, Seq(Archive.TableKey -> "motion", Archive.SchemaKey -> "3"))
     intercept[Archive.LayoutError](Archive.open(Archive.Pressure, other.getPath))
     // Battery of schema 1 named as schema 2: its columns are not schema 2's.
@@ -157,7 +161,72 @@ class ArchiveSchemaSuite extends munit.FunSuite:
     assertEquals(Archive.pressureOf(Archive.pressureRow(p).toIndexedSeq), p)
     // Every signal table is archived, merged by month and uploaded.
     assertEquals(Archive.SignalTables.map(_.name).toSet,
-      Set("fixes", "motion", "battery", "gnss_status", "energy_state", "pressure"))
+      Set("fixes", "motion", "battery", "gnss_status", "energy_state", "pressure", "pics_adv"))
     assertEquals(Archive.UploadedSignalTables, Archive.SignalTables)
     assert(Archive.SignalTables.forall(Archive.All.contains))
+  }
+
+  test("schema 4: energy_state files of schema 2 and 3 read with ble null (never off), and merge with rows that have it") {
+    val st = EnergyState(true, 1000L, "gps", false, false, true, false, "balanced", "max", "Walking", "Outdoor")
+    val old = EnergySpan(t0, t0 + 60_000L, st)
+    // As schema 2 and 3 wrote it: 16 columns (schema 3 with its footer).
+    val v2 = file(Archive.EnergyStates.columns.take(16), Seq(Archive.energyRow(old).take(16)))
+    val v3 = File.createTempFile("ver3", ".parquet")
+    v3.deleteOnExit()
+    Using.resource(BufferedOutputStream(FileOutputStream(v3))) { o =>
+      val w = ParquetWriter(o, Archive.EnergyStates.columns.take(16), 100,
+        Seq(Archive.TableKey -> "energy_state", Archive.SchemaKey -> "3"))
+      w.write(Archive.energyRow(old).take(16))
+      w.close()
+    }
+    for f <- Seq(v2, v3) do
+      Using.resource(Archive.open(Archive.EnergyStates, f.getPath)) { r =>
+        val row = r.rowIterator.next()
+        assertEquals(row.size, 17)
+        assertEquals(row(16), null)
+        assertEquals(Archive.energyOf(row).state.ble, None)
+      }
+    // A late span with ble merged into the schema 2 file: decoded, both kept, each as it was.
+    val late = EnergySpan(t0 + 60_000L, t0 + 120_000L, st.copy(ble = Some("bal")))
+    val out = File.createTempFile("merged", ".parquet")
+    out.deleteOnExit()
+    Using.resource(Archive.open(Archive.EnergyStates, v2.getPath, whole = true)) { ex =>
+      Using.resource(BufferedOutputStream(FileOutputStream(out))) { o =>
+        val w = Archive.writer(Archive.EnergyStates, o, 100)
+        val m = FileMerge(Some(ex), w)
+        m.push(Archive.energyRow(late).toIndexedSeq)
+        m.finish()
+        w.close()
+        assertEquals(m.copied, 0L)
+      }
+    }
+    Using.resource(Archive.open(Archive.EnergyStates, out.getPath)) { r =>
+      assertEquals(r.rowIterator.map(Archive.energyOf).toVector, Vector(old, late))
+    }
+    // The repair fits SQLite's rows of before the upgrade (ble NULL) to a 16-column file; one with ble is not fitted.
+    val hot = Archive.energyRow(old).toIndexedSeq
+    assertEquals(CommitRepair.fit(hot, 16), hot.take(16))
+    val withBle = Archive.energyRow(late).toIndexedSeq
+    assertEquals(CommitRepair.fit(withBle, 16), withBle)
+  }
+
+  test("schema 4: pics_adv rows round-trip, nulls where a packet was short") {
+    val full = PicsAdv(t0, t0 + 4800, "02:00:00:00:00:01", Some("00CD0849"), Some(2), Some(255), Some(3), 2, 25, -61, t0 + 200,
+      -88, "580102FF000000CD08494351FFFFFFFF0000000000000000", "bal")
+    val short = PicsAdv(t0 + 10, t0 + 10, "02:00:00:00:00:02", None, Some(2), None, None, 0, 1, -70, t0 + 10, -70, "580102", "debug")
+    val f = File.createTempFile("pics", ".parquet")
+    f.deleteOnExit()
+    Using.resource(BufferedOutputStream(FileOutputStream(f))) { o =>
+      val w = Archive.writer(Archive.PicsAdvs, o, 100)
+      Seq(full, short).foreach(a => w.write(Archive.picsRow(a)))
+      w.close()
+    }
+    assertEquals(ParquetReader.meta(f.getPath).keyValues.get(Archive.SchemaKey), Some("4"))
+    Using.resource(Archive.open(Archive.PicsAdvs, f.getPath)) { r =>
+      val rows = r.rowIterator.toVector
+      assertEquals(rows.map(Archive.picsOf), Vector(full, short))
+      // The values a file gives are the values a row from SQLite has (the repair's hash compares them).
+      assertEquals(rows.map(ArchiveMerge.hash), Vector(full, short).map(a => ArchiveMerge.hash(Archive.picsRow(a).toIndexedSeq)))
+    }
+    assertEquals(Archive.layouts(Archive.PicsAdvs), Seq(4 -> Archive.PicsAdvs.columns))
   }

@@ -26,6 +26,8 @@ enum SmallRecord:
   case Energy(boot: Long, transitions: Seq[EnergyTransition], confirmedAt: Long, current: Option[EnergyState])
   /** MSL altitudes computed after their fixes were saved: (fix time, msl, accuracy). */
   case FixMsl(values: Seq[(Long, Double, Float)])
+  /** Closed runs of received PICS advertisements ([[PicsRuns]]). */
+  case PicsAdvs(runs: Seq[PicsAdv])
 
   def kind: WriteKind = this match
     case _: Fixes      => WriteKind.Fixes
@@ -36,6 +38,7 @@ enum SmallRecord:
     case _: Pressure   => WriteKind.Pressure
     case _: Energy     => WriteKind.EnergyState
     case _: FixMsl     => WriteKind.FixMsl
+    case _: PicsAdvs   => WriteKind.PicsAdv
 
   /** Rows, as the write queue counts them. */
   def rows: Int = this match
@@ -44,6 +47,7 @@ enum SmallRecord:
     case Pressure(ps)       => ps.size
     case Energy(_, ts, _, _) => math.max(1, ts.size)
     case FixMsl(vs)         => vs.size
+    case PicsAdvs(rs)       => rs.size
     case _                  => 1
 
 object SmallRecord:
@@ -58,11 +62,16 @@ object SmallRecord:
   private def oi(v: Option[Int]): Value = v.fold(Null)(x => Num(x.toDouble))
   private def gi(v: Value): Option[Int] = if v.isNull then None else Some(v.num.toInt)
 
-  private def state(s: EnergyState): Value = Obj("gnss" -> s.gnss, "interval" -> l(s.gnssIntervalMs), "provider" -> s.provider,
-    "detail" -> s.detail, "still" -> s.still, "screen" -> s.screenOn, "charging" -> s.charging, "mode" -> s.mode,
-    "eff" -> s.effMode, "motion" -> s.motion, "env" -> s.env)
+  private def state(s: EnergyState): Value =
+    val o = Obj("gnss" -> s.gnss, "interval" -> l(s.gnssIntervalMs), "provider" -> s.provider,
+      "detail" -> s.detail, "still" -> s.still, "screen" -> s.screenOn, "charging" -> s.charging, "mode" -> s.mode,
+      "eff" -> s.effMode, "motion" -> s.motion, "env" -> s.env)
+    // Absent, not null, when not known: a record of an earlier version has none.
+    s.ble.foreach(b => o("ble") = b)
+    o
   private def stateOf(v: Value): EnergyState = EnergyState(v("gnss").bool, gl(v("interval")), v("provider").str, v("detail").bool,
-    v("still").bool, v("screen").bool, v("charging").bool, v("mode").str, v("eff").str, v("motion").str, v("env").str)
+    v("still").bool, v("screen").bool, v("charging").bool, v("mode").str, v("eff").str, v("motion").str, v("env").str,
+    v.obj.get("ble").filterNot(_.isNull).map(_.str))
 
   /** One line of JSON (no newline in it). Longs are strings: JSON numbers
     * are doubles, which do not hold every ms time exactly.
@@ -81,6 +90,9 @@ object SmallRecord:
       case Energy(boot, ts, at, cur) => Obj("t" -> "energy", "boot" -> l(boot), "at" -> l(at), "current" -> cur.fold(Null)(state),
         "v" -> Arr.from(ts.map(x => Arr(l(x.seq), l(x.at), x.state.fold(Null)(state)))))
       case FixMsl(vs) => Obj("t" -> "fix_msl", "v" -> Arr.from(vs.map((t, m, a) => Arr(l(t), d(m), f(a)))))
+      case PicsAdvs(rs) => Obj("t" -> "pics_adv", "v" -> Arr.from(rs.map(a => Arr(l(a.start), l(a.end), a.addr,
+        a.iid.fold(Null)(Str(_)), oi(a.kind), oi(a.msg), oi(a.msgLast), Num(a.msgChanges), Num(a.n), Num(a.rssiMax),
+        l(a.rssiMaxAt), Num(a.rssiMin), a.data, a.scan))))
     ujson.write(o)
 
   /** The record of a line [[encode]] wrote; throws on anything else. */
@@ -101,4 +113,7 @@ object SmallRecord:
       case "energy" => Energy(gl(o("boot")), v.arr.toSeq.map(a => EnergyTransition(gl(a(0)), gl(a(1)),
         if a(2).isNull then None else Some(stateOf(a(2))))), gl(o("at")), if o("current").isNull then None else Some(stateOf(o("current"))))
       case "fix_msl" => FixMsl(v.arr.toSeq.map(a => (gl(a(0)), gd(a(1)), gf(a(2)))))
+      case "pics_adv" => PicsAdvs(v.arr.toSeq.map(a => PicsAdv(gl(a(0)), gl(a(1)), a(2).str,
+        if a(3).isNull then None else Some(a(3).str), gi(a(4)), gi(a(5)), gi(a(6)), a(7).num.toInt, a(8).num.toInt,
+        a(9).num.toInt, gl(a(10)), a(11).num.toInt, a(12).str, a(13).str)))
       case other => throw IllegalArgumentException(s"record type $other")

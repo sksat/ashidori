@@ -5,6 +5,7 @@ class WriteKindSuite extends munit.FunSuite:
     assertEquals(WriteKind.values.map(_.key).distinct.size, WriteKind.values.size)
     assertEquals(WriteKind.fromKey("energy_state"), Some(WriteKind.EnergyState))
     assertEquals(WriteKind.fromKey("pressure"), Some(WriteKind.Pressure))
+    assertEquals(WriteKind.fromKey("pics_adv"), Some(WriteKind.PicsAdv))
     // A label is not a key.
     assertEquals(WriteKind.fromKey(WriteKind.Pressure.label), None)
     assertEquals(WriteKind.label("pressure"), WriteKind.Pressure.label)

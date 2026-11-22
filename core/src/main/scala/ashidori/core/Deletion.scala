@@ -10,6 +10,14 @@ object Deletion:
   def kept(ranges: Seq[(Long, Long)], t: Long): Boolean =
     ranges.isEmpty || !ranges.exists((a, b) => t >= a && t < b)
 
+  /** Whether a run [start, end] (a `pics_adv` row: its summary cannot be
+    * cut) touches no range: one that does goes whole, up to 5 s (60 s while
+    * still) outside the range with it (design 4.4: on the deleting side).
+    * The same test for SQLite, inserts, reads, the archive's cut and sends.
+    */
+  def keptRun(ranges: Seq[(Long, Long)], start: Long, end: Long): Boolean =
+    ranges.isEmpty || !ranges.exists((a, b) => start < b && end >= a)
+
   /** [start, end) without the ranges: the parts left, in order. */
   def cut(ranges: Seq[(Long, Long)], start: Long, end: Long): Seq[(Long, Long)] =
     ranges.sortBy(_._1).foldLeft(Seq((start, end))) { case (parts, (a, b)) =>

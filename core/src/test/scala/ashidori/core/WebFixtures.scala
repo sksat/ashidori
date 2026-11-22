@@ -321,7 +321,7 @@ object WebFixtures:
     archiveParts(s"fixes/$Date.parquet", "1f00d", fixesPq.dropRight(17), 4 * 1024, only = Some(2))
     // The apps were updated to v1.1 here: ASHM from now on.
     legacy = false
-    // Tables the viewer does not use (state spans, pressure): sent like the
+    // Tables the viewer does not use (state spans, pressure, PICS): sent like the
     // others, skipped by the viewer without counting as a failure.
     val dayStart = Date.atStartOfDay(Zone).toInstant.toEpochMilli
     val st = EnergyState(true, 1000, "gps", false, false, false, false, "balanced", "balanced", "OnFoot", "Outdoor")
@@ -332,6 +332,12 @@ object WebFixtures:
     archiveParts(s"pressure/$Date.parquet", "5a7c2", parquet(Archive.Pressure.columns,
       (0 until 720).map(i => Archive.pressureRow(PressureSample(dayStart + 8 * hour + i * 5000L, 1008f + i * 0.001f))),
       table = Some(Archive.Pressure)), 3 * 1024 * 1024)
+    // Received PICS runs (archive schema 4, synthetic values).
+    archiveParts(s"pics_adv/$Date.parquet", "6d3f0", parquet(Archive.PicsAdvs.columns,
+      (0 until 40).map(i => Archive.picsRow(PicsAdv(dayStart + 8 * hour + i * 5000L, dayStart + 8 * hour + i * 5000L + 4800,
+        "02:00:00:00:00:01", Some("00CD0849"), Some(2), Some(255), Some(255), 0, 24, -60, dayStart + 8 * hour + i * 5000L, -80,
+        if i % 2 == 0 then "580102FF000000CD08494351FFFFFFFF0000000000000000" else "580102FF000000CD08495143FFFFFFFF0000000000000000",
+        "bal"))), table = Some(Archive.PicsAdvs)), 3 * 1024 * 1024)
     archiveParts(s"fixes/$Date.parquet", "2b7e1", fixesPq, 4 * 1024)
     archiveParts(s"motion/$Date.parquet", "3c9a4", motionPq, 3 * 1024 * 1024)
 

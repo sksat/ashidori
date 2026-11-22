@@ -9,7 +9,8 @@ import ashidori.core.parquet.*
   */
 object ArchiveCut:
   /** The row as it stays after cutting [from, to) out: none, itself, or (a
-    * state span crossing an edge) its parts outside ([[EnergyLog.clip]]).
+    * state span crossing an edge) its parts outside ([[EnergyLog.clip]]). A
+    * PICS run touching the range goes whole ([[Deletion.keptRun]]).
     */
   def cutRow(t: Archive.TableDef, r: IndexedSeq[Any], from: Long, to: Long): Seq[IndexedSeq[Any]] =
     if t == Archive.EnergyStates then
@@ -17,6 +18,9 @@ object ArchiveCut:
       val row = EnergyRow(s.start, Some(s.end), s.state, !s.endKnown, s.boot, s.seq)
       val parts = EnergyLog.clip(Seq(row), Seq((from, to)), Long.MaxValue)
       if parts == Seq(row) then Seq(r) else parts.map(p => Archive.energyRow(p.span).toIndexedSeq)
+    else if t == Archive.PicsAdvs then
+      val (s, e) = (r(0).asInstanceOf[Long], Option(r(1)).fold(r(0).asInstanceOf[Long])(_.asInstanceOf[Long]))
+      if Deletion.keptRun(Seq((from, to)), s, e) then Seq(r) else Nil
     else
       val k = ArchiveMerge.key(r)
       if k >= from && k < to then Nil else Seq(r)

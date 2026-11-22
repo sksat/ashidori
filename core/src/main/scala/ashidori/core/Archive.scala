@@ -44,13 +44,23 @@ object Archive:
   /** What the logger was doing from `start` to `end` (ms, schema 2): one row
     * per stretch of unchanged state, split at local midnight. `end_unknown`
     * 1: the state was last confirmed at `end`, and when it really ended is
-    * not known (the process was killed). See [[EnergyState]].
+    * not known (the process was killed). See [[EnergyState]]. `ble` (schema
+    * 4): the PICS scan registered ([[PicsScan]] key); null where not known
+    * (rows and files from before it), never read as `off`.
     */
   val EnergyStates = TableDef("energy_state", Seq(
     Column("start", Int64), Column("end", Int64), Column("gnss", Int32), Column("gnss_interval_ms", Int64),
     Column("provider", Str), Column("detail", Int32), Column("still", Int32), Column("screen_on", Int32),
     Column("charging", Int32), Column("mode", Str), Column("eff_mode", Str), Column("motion", Str), Column("env", Str),
-    Column("end_unknown", Int32), Column("boot", Int64), Column("seq", Int64)))
+    Column("end_unknown", Int32), Column("boot", Int64), Column("seq", Int64), Column("ble", Str)))
+  /** Received 高度化PICS advertisements (schema 4): one row per run of one
+    * flow with the same content, at most 5 s (60 s while still), never
+    * across local midnight ([[PicsAdv]], docs/design/pics.md 4.1).
+    */
+  val PicsAdvs = TableDef("pics_adv", Seq(
+    Column("start", Int64), Column("end", Int64), Column("addr", Str), Column("iid", Str), Column("kind", Int32),
+    Column("msg", Int32), Column("msg_last", Int32), Column("msg_changes", Int32), Column("n", Int32),
+    Column("rssi_max", Int32), Column("rssi_max_at", Int64), Column("rssi_min", Int32), Column("data", Str), Column("scan", Str)))
   val GnssStatus = TableDef("gnss_status", Seq(
     Column("time", Int64), Column("visible", Int32), Column("used", Int32), Column("top4", Float64), Column("l5", Int32),
     Column("env", Str), Column("acc", Float32)))
@@ -103,7 +113,7 @@ object Archive:
   /** Tables kept in SQLite until their day is archived (one row per
     * reading or span), merged into month files.
     */
-  val SignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus, EnergyStates, Pressure)
+  val SignalTables: Seq[TableDef] = Seq(Fixes, Motion, Battery, GnssStatus, EnergyStates, Pressure, PicsAdvs)
   /** Signal tables the sync uploads (small stream, end-to-end encrypted
     * like every archive file): all of them.
     */
@@ -112,7 +122,8 @@ object Archive:
 
   /** Version of the archive layout. 1: up to app 0.21.0. 2 added the
     * battery columns after `mode` and the `energy_state` table; 3 the
-    * elevation columns of `fixes` and the `pressure` table.
+    * elevation columns of `fixes` and the `pressure` table; 4 the
+    * `pics_adv` table and `energy_state.ble`.
     *
     * The version is a contract on each column's name, type, unit, sign and
     * reference (datum, epoch), as documented on the tables here: a change
@@ -125,7 +136,7 @@ object Archive:
     * 0.21.0) are taken for the layout their columns match exactly, of
     * those the table had ([[layouts]]); any other file is an error.
     */
-  val SchemaVersion = 3
+  val SchemaVersion = 4
 
   val TableKey = "ashidori.table"
   val SchemaKey = "ashidori.schema"
@@ -137,8 +148,9 @@ object Archive:
   def layouts(t: TableDef): Seq[(Int, Seq[Column])] = t match
     case Battery      => Seq(1 -> Battery.columns.take(5), 2 -> Battery.columns)
     case Fixes        => Seq(1 -> Fixes.columns.take(8), 3 -> Fixes.columns)
-    case EnergyStates => Seq(2 -> EnergyStates.columns)
+    case EnergyStates => Seq(2 -> EnergyStates.columns.take(16), 4 -> EnergyStates.columns)
     case Pressure     => Seq(3 -> Pressure.columns)
+    case PicsAdvs     => Seq(4 -> PicsAdvs.columns)
     case _            => Seq(1 -> t.columns)
 
   /** The columns of `t` in archive version `v`, if it had the table then. */
@@ -331,13 +343,23 @@ object Archive:
     val e = s.state
     def b(x: Boolean) = if x then 1 else 0
     Seq(s.start, s.end, b(e.gnss), e.gnssIntervalMs, e.provider, b(e.detail), b(e.still), b(e.screenOn), b(e.charging),
-      e.mode, e.effMode, e.motion, e.env, b(!s.endKnown), s.boot, s.seq)
+      e.mode, e.effMode, e.motion, e.env, b(!s.endKnown), s.boot, s.seq, e.ble.orNull)
   def energyOf(r: IndexedSeq[Any]): EnergySpan =
     def s(i: Int) = Option(r(i)).map(_.toString).getOrElse("")
     EnergySpan(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]),
       EnergyState(r(2) == 1, opt[Long](r(3)).getOrElse(0L), s(4), r(5) == 1, r(6) == 1, r(7) == 1, r(8) == 1,
-        s(9), s(10), s(11), s(12)), endKnown = !(r.size > 13 && r(13) == 1),
+        s(9), s(10), s(11), s(12), if r.size > 16 then opt[Any](r(16)).map(_.toString) else None), endKnown = !(r.size > 13 && r(13) == 1),
       boot = if r.size > 14 then opt[Long](r(14)).getOrElse(0L) else 0L, seq = if r.size > 15 then opt[Long](r(15)).getOrElse(0L) else 0L)
+
+  def picsRow(a: PicsAdv): Seq[Any] =
+    def i(v: Option[Int]): Any = v.map(Int.box).orNull
+    Seq(a.start, a.end, a.addr, a.iid.orNull, i(a.kind), i(a.msg), i(a.msgLast), a.msgChanges, a.n, a.rssiMax, a.rssiMaxAt,
+      a.rssiMin, a.data, a.scan)
+  def picsOf(r: IndexedSeq[Any]): PicsAdv =
+    def s(k: Int) = Option(r(k)).map(_.toString).getOrElse("")
+    PicsAdv(r(0).asInstanceOf[Long], opt[Long](r(1)).getOrElse(r(0).asInstanceOf[Long]), s(2), opt[Any](r(3)).map(_.toString),
+      opt[Int](r(4)), opt[Int](r(5)), opt[Int](r(6)), opt[Int](r(7)).getOrElse(0), opt[Int](r(8)).getOrElse(0),
+      opt[Int](r(9)).getOrElse(0), opt[Long](r(10)).getOrElse(0L), opt[Int](r(11)).getOrElse(0), s(12), s(13))
 
   /** Archive file names. */
   def dayFile(t: TableDef, day: java.time.LocalDate): String = s"${t.name}/$day.parquet"

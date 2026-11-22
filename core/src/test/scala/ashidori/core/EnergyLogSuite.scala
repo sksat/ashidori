@@ -225,4 +225,11 @@ class EnergyLogSuite extends munit.FunSuite:
                  SmallRecord.GnssStatus(1, 20, 10, 35.5, 3, "Outdoor", 4.5f), SmallRecord.RawSession(1, 2, "", "manual"),
                  SmallRecord.FixMsl(Seq((7L, 40.25, 3.5f)))) do
       assertEquals(SmallRecord.decode(SmallRecord.encode(r)), r)
+    // The PICS scan in the state: kept when known; a record of an earlier version (none) reads as not known.
+    val s0 = EnergyState(true, 1000L, "gps", false, false, true, false, "balanced", "balanced", "Walking", "Outdoor")
+    val withBle = new SmallRecord.Energy(3, Seq(EnergyTransition(1, 100, Some(s0.copy(ble = Some("opp"))))), 150, Some(s0.copy(ble = Some("opp"))))
+    assertEquals(SmallRecord.decode(SmallRecord.encode(withBle)), withBle)
+    val earlier = SmallRecord.encode(withBle.copy(transitions = Seq(EnergyTransition(1, 100, Some(s0))), current = Some(s0)))
+    assert(!earlier.contains("ble"), earlier)
+    assertEquals(SmallRecord.decode(earlier).asInstanceOf[SmallRecord.Energy].current.get.ble, None)
   }

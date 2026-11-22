@@ -29,3 +29,16 @@ class DeletionSuite extends munit.FunSuite:
     // (a state confirmed after the range ends opens a new one).
     assertEquals(EnergyLog.clip(Seq(EnergyRow(a + 100, None, s)), Seq(day), now = a + 200), Nil)
   }
+
+  test("a PICS run touching a range goes whole: its counts and RSSI cannot be cut") {
+    val d = Seq((1000L, 2000L))
+    assert(Deletion.keptRun(Nil, 1500, 1600))
+    assert(!Deletion.keptRun(d, 1500, 1600))
+    // Crossing either edge, or ending on its start.
+    assert(!Deletion.keptRun(d, 990, 1000))
+    assert(!Deletion.keptRun(d, 1990, 2500))
+    assert(!Deletion.keptRun(d, 500, 2500))
+    // Outside: before its start, or starting at its end.
+    assert(Deletion.keptRun(d, 900, 999))
+    assert(Deletion.keptRun(d, 2000, 2400))
+  }

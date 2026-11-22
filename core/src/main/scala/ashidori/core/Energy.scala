@@ -51,7 +51,9 @@ final case class EnergyState(
     effMode: String,
     /** [[MotionState]] and [[Environment]] names */
     motion: String,
-    env: String
+    env: String,
+    /** the PICS scan registered ([[PicsScan]] key); None: not known (before it was kept) */
+    ble: Option[String] = None
 )
 
 /** The logger in `state` from `start` to `end`. `endKnown` false: the

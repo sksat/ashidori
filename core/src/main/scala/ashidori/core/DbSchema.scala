@@ -1,8 +1,8 @@
 package ashidori.core
 
-/** SQL of the signal tables that the battery measurement and the elevation
-  * recording extend, and of the migrations that extend them (database
-  * versions 7 and 8). Shared by the app's `Db` and the tests, which run it
+/** SQL of the signal tables that the battery measurement, the elevation
+  * recording and the PICS reception extend, and of the migrations that
+  * extend them (database versions 7, 8 and 10). Shared by the app's `Db` and the tests, which run it
   * with the sqlite3 shell.
   *
   * The migrations only add: nullable columns at the end of `battery` and
@@ -91,6 +91,25 @@ object DbSchema:
         CreateFixMsl, "CREATE INDEX IF NOT EXISTS fix_msl_time ON fix_msl(time)") ++
       Option.when(outbox.nonEmpty && !outbox("file"))("ALTER TABLE sync_outbox ADD COLUMN file TEXT") ++
       Option.when(outbox.nonEmpty && !outbox("del_seq"))("ALTER TABLE sync_outbox ADD COLUMN del_seq INTEGER")
+
+  /** Version 10: received 高度化PICS advertisements, one row per run
+    * ([[PicsAdv]], docs/design/pics.md 4.1). Archived like the other
+    * signal tables (rowids from the floor).
+    */
+  val CreatePicsAdv: String =
+    """CREATE TABLE IF NOT EXISTS pics_adv(start INTEGER NOT NULL, end INTEGER NOT NULL, addr TEXT NOT NULL, iid TEXT,
+      |kind INTEGER, msg INTEGER, msg_last INTEGER, msg_changes INTEGER NOT NULL, n INTEGER NOT NULL,
+      |rssi_max INTEGER NOT NULL, rssi_max_at INTEGER NOT NULL, rssi_min INTEGER NOT NULL, data TEXT NOT NULL,
+      |scan TEXT NOT NULL)""".stripMargin
+
+  /** From version 9 to 10: `pics_adv` and its index, and `energy_state.ble`
+    * (the PICS scan, NULL where not known: rows before it stay NULL, never
+    * `off`). `energyState`: the columns `energy_state` has now. Only what is
+    * missing.
+    */
+  def toV10(energyState: Set[String]): Seq[String] =
+    Seq(CreatePicsAdv, "CREATE INDEX IF NOT EXISTS pics_adv_start ON pics_adv(start)") ++
+      Option.when(!energyState("ble"))("ALTER TABLE energy_state ADD COLUMN ble TEXT")
 
   /** Which rows of an archived table archiving takes (an SQL condition):
     * all but the open span of `energy_state`, which stays in SQLite until

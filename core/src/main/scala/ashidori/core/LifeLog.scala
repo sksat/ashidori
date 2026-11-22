@@ -39,6 +39,10 @@ enum LifeKind(val key: String, val label: String, val problem: Boolean = false):
   case SafeMode extends LifeKind("safemode", "自動処理を停止", problem = true)
   /** The logger's emergency path: space ran short, batches to overflow files (plan C stage 2). */
   case Emergency extends LifeKind("emergency", "記録の緊急退避", problem = true)
+  /** The PICS reception: its scan state (docs/design/pics.md 3.1). */
+  case Pics extends LifeKind("pics", "信号機の電波")
+  /** PICS receptions not written (the acceptance caps), or the reception stopped by failures. */
+  case PicsProblem extends LifeKind("picsproblem", "信号機の電波の上限・失敗", problem = true)
 
 object LifeKind:
   def fromKey(k: String): Option[LifeKind] = values.find(_.key == k)
