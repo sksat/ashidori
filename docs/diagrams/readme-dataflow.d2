@@ -1,14 +1,17 @@
 # 記録と同期（README）
 # 復号できるのは利用者の端末とペアリングしたブラウザだけで、同期サーバには暗号文だけが届く。
 direction: down
+grid-rows: 3
+grid-gap: 64
 
 phone: 端末 {
   grid-columns: 2
   grid-gap: 56
-  # The grid fills column by column: sensors over db, enc over archive.
+  # The grid fills column by column: sensors over enc, db over archive,
+  # so the ciphertext leaves from the bottom left, straight down to the server.
   sensors: "センサー\nGNSS・IMU・気圧・電池"
-  db: "SQLite\n当日の記録、場所\nチェックイン、修正" {shape: cylinder}
   enc: 暗号化
+  db: "SQLite\n当日の記録、場所\nチェックイン、修正" {shape: cylinder}
   archive: "Parquet\n翌日以降にまとめた\n日・月のアーカイブ" {shape: cylinder}
 
   sensors -> db
@@ -17,7 +20,13 @@ phone: 端末 {
   db -> enc
 }
 
-server: "同期サーバ\nCloudflare Workers・D1・R2\n暗号文だけを保存" {shape: cylinder}
+server: "同期サーバ（Cloudflare）" {
+  grid-columns: 3
+  grid-gap: 24
+  workers: "Workers\nAPI・Web 版の配信・管理ページ"
+  r2: "R2\n暗号化した記録" {shape: cylinder}
+  d1: "D1\n利用者・端末\n記録の一覧（大きさ・時刻）" {shape: cylinder}
+}
 
 readers: "自分の端末とブラウザ" {
   grid-columns: 2
@@ -26,5 +35,5 @@ readers: "自分の端末とブラウザ" {
   other: "別の端末\n端末内で復号"
 }
 
-phone.enc -> server
-server -> readers: 暗号文
+phone.enc -> server.workers: 暗号文
+server.workers -> readers: 暗号文
