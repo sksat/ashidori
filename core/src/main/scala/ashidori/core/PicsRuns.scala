@@ -164,7 +164,10 @@ final class PicsRuns(zone: ZoneId, caps: PicsRuns.Caps = PicsRuns.Caps(), fold: 
 
   /** An open row: its runs; the last one open unless `lastClosed`. A row
     * takes a new run while it is younger than the run's longest (5 s, 60 s
-    * still), so it holds at most that and one run more.
+    * still). At that age it is committed with the runs already closed; a
+    * last run still open goes on alone, as a row of its own, and is
+    * committed by its own longest. No run is split, and nothing waits in
+    * memory longer than a run's longest.
     */
   private final class Open(first: Run):
     val runs = mutable.ArrayBuffer(first)
@@ -340,10 +343,28 @@ final class PicsRuns(zone: ZoneId, caps: PicsRuns.Caps = PicsRuns.Caps(), fold: 
     for o <- open.values do
       val l = o.last
       if now - l.end > GapMs + delayMs || now - l.start >= maxMs || l.day != today then o.lastClosed = true
-    val over = open.values.filter(o => o.lastClosed &&
-      (fold == Fold.Off || now - o.start >= maxMs || o.day != today || o.runs.size >= MaxParts)).toVector
-    over.foreach(o => open.remove(o.flow))
-    over.map(_.row)
+    val out = Vector.newBuilder[PicsAdv]
+    for o <- open.values.toVector do
+      val due = now - o.start >= maxMs || o.runs.size >= MaxParts
+      if o.lastClosed && (fold == Fold.Off || due || o.day != today) then
+        open.remove(o.flow)
+        out += o.row
+      else if !o.lastClosed && due && o.runs.size > 1 then
+        // The runs closed so far are committed now; the open one goes on as a row of its own.
+        out += PicsAdv.fold(o.runs.init.map(_.row).toSeq)
+        open(o.flow) = Open(o.last)
+        charge(o.last)
+    out.result()
+
+  /** A row that continues a run already accepted (its row was committed
+    * without it): counted on its day and in the rates, never refused (the
+    * run's receptions were taken).
+    */
+  private def charge(r: Run): Unit =
+    dayRows(r.day) = dayRows.getOrElse(r.day, 0) + 1
+    trimDays()
+    senders.get(r.flow.addr).foreach((t, at) => senders(r.flow.addr) = (t - 1, at))
+    if total._2 != Long.MinValue then total = (total._1 - 1, total._2)
 
   /** Closes every row (the scan changed or stopped). */
   def closeAll(): Seq[PicsAdv] =

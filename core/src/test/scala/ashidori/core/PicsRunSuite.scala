@@ -9,6 +9,8 @@ import PicsRuns.Fold.Off
   * and a stationary day near a signal within the caps.
   */
 class PicsRunSuite extends munit.FunSuite:
+  // Whole synthetic days, several times over.
+  override val munitTimeout = scala.concurrent.duration.Duration(5, "min")
   private val zone = ZoneId.of("Asia/Tokyo")
   private val t0 = LocalDate.of(2026, 11, 20).atStartOfDay(zone).toInstant.toEpochMilli + 10 * 3_600_000L
 
@@ -275,7 +277,7 @@ class PicsRunSuite extends munit.FunSuite:
   test("a stationary day heard all the time (worst case): normal reception is all stored, nothing refused") {
     val (r, rows, received) = day(always)
     assertEquals(r.refusedTotal, Map.empty[Refused, Long])
-    assert(rows.size < 12_000, rows.size)
+    assert(rows.size < 13_000, rows.size)
     assertEquals(rows.map(_.n.toLong).sum, received)
     val bytes = parquetBytes(rows)
     val (_, gauge, _) = day(always, PicsRuns.Fold.Gauge)
@@ -291,11 +293,51 @@ class PicsRunSuite extends munit.FunSuite:
       assert(folded.exists(_.parts > 1))
       assert(plain.forall(a => a.parts == 1 && a.sub.isEmpty))
       def key(a: PicsAdv) = (a.addr, a.kind, a.start)
-      assertEquals(folded.flatMap(_.expand).sortBy(key), plain.sortBy(key))
-      // Through every store: the file record (.rec) and the archive row.
-      for a <- folded.filter(_.parts > 1).take(200) do
-        assertEquals(Archive.picsOf(Archive.picsRow(a).toIndexedSeq), a)
-        assertEquals(SmallRecord.decode(SmallRecord.encode(new SmallRecord.PicsAdvs(Seq(a)))), new SmallRecord.PicsAdvs(Seq(a)))
+      val expected = plain.sortBy(key)
+      assertEquals(folded.flatMap(_.expand).sortBy(key), expected)
+      // The whole day through a file record (.rec, in batches as the write path hands them over) ...
+      val viaRec = folded.grouped(500).toSeq.flatMap { b =>
+        SmallRecord.decode(SmallRecord.encode(new SmallRecord.PicsAdvs(b))).asInstanceOf[SmallRecord.PicsAdvs].runs
+      }
+      assertEquals(viaRec, folded)
+      assertEquals(viaRec.flatMap(_.expand).sortBy(key), expected)
+      // ... and through a Parquet file (the archive's writer and reader).
+      val f = java.io.File.createTempFile("pics-day", ".parquet")
+      f.deleteOnExit()
+      scala.util.Using.resource(java.io.BufferedOutputStream(java.io.FileOutputStream(f))) { o =>
+        val w = Archive.writer(Archive.PicsAdvs, o, 5000)
+        folded.sortBy(_.start).foreach(a => w.write(Archive.picsRow(a)))
+        w.close()
+      }
+      val viaParquet = scala.util.Using.resource(Archive.open(Archive.PicsAdvs, f.getPath))(_.rowIterator.map(Archive.picsOf).toVector)
+      assertEquals(viaParquet.size, folded.size)
+      assertEquals(viaParquet.flatMap(_.expand).sortBy(key), expected)
+  }
+
+  test("a folded row is committed 60 s after it starts; its open last run goes on as a row of its own, counted") {
+    val r = PicsRuns(zone, PicsRuns.Caps(perDay = 3, perSourceBurst = 1000, totalBurst = 1000))
+    val plain = PicsRuns(zone, fold = Off)
+    // Still: the gauge changes at 0, 10 and 20 s, then the same content goes on to 110 s.
+    def d(t: Long) = if t < 10_000 then sig(0x71, 0x33) else if t < 20_000 then sig(0x61, 0x23) else sig(0x51, 0x13)
+    val rs = (0L until 110_000L by 1000L).map(t => res(t0 + t, d(t)))
+    val out = scala.collection.mutable.ArrayBuffer.empty[(Long, PicsAdv)]
+    val plainOut = scala.collection.mutable.ArrayBuffer.empty[PicsAdv]
+    for x <- rs do
+      plainOut ++= plain.add(Seq(x), still = true)
+      plainOut ++= plain.tick(x.at, still = true)
+      r.add(Seq(x), still = true).foreach(a => out += x.at -> a)
+      r.tick(x.at, still = true).foreach(a => out += x.at -> a)
+    out ++= r.closeAll().map(t0 + 110_000L -> _)
+    // At 60 s: the two closed runs; the run from 20 s commits by its own 60 s (at 80 s); the rest after.
+    assertEquals(out.map((at, a) => (at - t0, a.start - t0, a.parts)).toSeq, Seq((60_000L, 0L, 2), (80_000L, 20_000L, 1), (110_000L, 80_000L, 1)))
+    // Nothing waited longer than a run's longest.
+    assert(out.forall((at, a) => at - a.start <= PicsRuns.StillMaxMs))
+    // No run split: the same runs as without folding.
+    plainOut ++= plain.closeAll()
+    assertEquals(out.toSeq.flatMap(_._2.expand), plainOut.toSeq.sortBy(_.start))
+    // The row of the continued run counts on the day's cap (3 here): the third row was not refused, but counted.
+    assertEquals(r.acceptedOn(t0), 3)
+    assertEquals(r.refusedTotal, Map.empty[Refused, Long])
   }
 
   test("a folded row: the summary of its runs; only kind 2 folds, and only the signal bytes and byte 3 may differ") {
