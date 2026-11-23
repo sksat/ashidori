@@ -169,7 +169,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_DEV_TOKEN" -H "Content-Type: appli
 
 ## デプロイ手順
 
-GitHub Actions のテスト（[`.github/workflows/server-test.yml`](../.github/workflows/server-test.yml)）は、Pull Request では [`ci.yml`](../.github/workflows/ci.yml) から、`main` では [`server.yml`](../.github/workflows/server.yml) から `server/` の変更ごとに実行する。マイグレーションとデプロイは `main` の `server.yml` だけが行い、Pull Request からは実行しない。D1・R2・カスタムドメイン・Access アプリケーションは事前に用意しておく。これらはダッシュボード、wrangler、IaC のいずれで作成してもよい。`wrangler.jsonc` にはルーティングを書かないため、デプロイによってルーティングが変わることはない。
+GitHub Actions（[`.github/workflows/server.yml`](../.github/workflows/server.yml)）は `server/` の変更ごとにテストを実行し、`main` ではマイグレーションとデプロイを行う。Pull Request ではテストだけを実行し、デプロイは実行しない。D1・R2・カスタムドメイン・Access アプリケーションは事前に用意しておく。これらはダッシュボード、wrangler、IaC のいずれで作成してもよい。`wrangler.jsonc` にはルーティングを書かないため、デプロイによってルーティングが変わることはない。
 
 ### 1. リソースを用意する
 

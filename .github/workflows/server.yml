@@ -1,27 +1,90 @@
 name: server
 
-# Pull requests run the tests through ci.yml (server-test.yml), never this
-# workflow: the deploy job below runs only from main.
+# The server's and the web viewer's tests, and on main the deploy. Every pull
+# request runs the tests, so that the required check "server" always reports;
+# tools/ci/changes.sh skips their work when no server file changed. The deploy
+# job never runs from a pull request (its "if").
 on:
   push:
     branches: [main]
-    paths: ["server/**", ".github/workflows/server.yml", ".github/workflows/server-test.yml"]
+    paths: ["server/**", ".github/workflows/server.yml"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A new push to a pull request cancels its previous run; runs on main are
+# never cancelled (each has its own group; the deploy job has its own too).
+concurrency:
+  group: server-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 defaults:
   run:
     working-directory: server
 
 jobs:
-  # The server's and the web viewer's tests (server-test.yml, shared with ci.yml).
+  # The required check: one job, named "server", that decides by itself
+  # whether the work is needed (a skipped job would count as passed).
   test:
-    uses: ./.github/workflows/server-test.yml
+    name: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: changes
+        working-directory: .
+        run: tools/ci/changes.sh server
+      - uses: pnpm/action-setup@v6.1.0
+        if: steps.changes.outputs.run == 'true'
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@v7.1.0
+        if: steps.changes.outputs.run == 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        if: steps.changes.outputs.run == 'true'
+      # The web viewer (server/web): typecheck, build and its own tests. The
+      # build comes first: the server's tests serve web/dist (wrangler.jsonc "assets").
+      - name: Build web viewer
+        if: steps.changes.outputs.run == 'true'
+        run: pnpm --dir web build
+      - name: Test web viewer
+        if: steps.changes.outputs.run == 'true'
+        run: pnpm --dir web test
+      - run: pnpm exec tsc --noEmit
+        if: steps.changes.outputs.run == 'true'
+      - run: pnpm test
+        if: steps.changes.outputs.run == 'true'
+      # Validates the repository variables a deploy would pass, so that a
+      # typo fails here, before anything is deployed. The values reach the
+      # shell only as environment variables, never as interpolated code.
+      - name: Check server variables
+        if: steps.changes.outputs.run == 'true'
+        env:
+          REGISTRATION: ${{ vars.REGISTRATION }}
+          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
+          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
+          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
+          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
+          MAX_USERS: ${{ vars.MAX_USERS }}
+          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: node scripts/check-config.ts
 
-  # The formal models (formal/README.md) must pass on the same commit.
+  # The formal models (formal/README.md) must pass on the same commit before a
+  # deploy. Pull requests have their own "formal" check (formal.yml), so this
+  # call is only for the deploy, and is named apart from that check.
   formal:
+    name: formal before deploy
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/formal.yml
 
   # Runs only when the repository variable DEPLOY_SERVER is "true". The D1

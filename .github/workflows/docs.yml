@@ -1,7 +1,9 @@
 name: docs
 
 # Checks that the committed SVGs in docs/diagrams match a fresh render of their
-# D2 sources (docs/diagrams/README.md).
+# D2 sources (docs/diagrams/README.md). Every pull request runs it, so that the
+# required check "docs" always reports; tools/ci/changes.sh skips the work
+# when none of the paths below changed.
 on:
   push:
     branches: [main]
@@ -9,22 +11,37 @@ on:
       - "docs/diagrams/**"
       - "tools/docs/render-diagrams.sh"
       - ".github/workflows/docs.yml"
-  # Pull requests: called by ci.yml, with the same paths.
-  workflow_call:
+  pull_request:
 
 permissions:
   contents: read
 
+# A new push to a pull request cancels its previous run; runs on main are
+# never cancelled (each has its own group).
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  # The required check: one job, named "docs", that decides by itself whether
+  # the work is needed (a skipped job would count as passed).
   diagrams:
+    name: docs
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: changes
+        run: tools/ci/changes.sh docs
       # D2 and the fonts are pinned by SHA-256 in the script, which also
       # verifies cached copies.
       - uses: actions/cache@v6.1.0
+        if: steps.changes.outputs.run == 'true'
         with:
           path: ~/.cache/ashidori-docs
           key: ashidori-docs-${{ hashFiles('tools/docs/render-diagrams.sh') }}
-      - run: tools/docs/render-diagrams.sh --check
+      - if: steps.changes.outputs.run == 'true'
+        run: tools/docs/render-diagrams.sh --check
