@@ -1,0 +1,159 @@
+name: ci
+
+# The pull request gate. It runs on every pull request, with no path filter,
+# so that its last job, "ci" (the required check), always reports. The
+# "changes" job lists the files the pull request changes and decides which
+# areas need their checks; the other areas are skipped. "ci" fails if a check
+# that was needed did not succeed, or if any job failed or was cancelled.
+#
+# The areas call the workflows that also run on main: app.yml, server-test.yml
+# (never server.yml, which deploys), docs.yml and formal.yml (the fast set).
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.areas.outputs.app }}
+      server: ${{ steps.areas.outputs.server }}
+      docs: ${{ steps.areas.outputs.docs }}
+      formal: ${{ steps.areas.outputs.formal }}
+    steps:
+      # A pull request checks out its merge commit: the first parent is the
+      # base branch, so the diff against it is what the pull request changes.
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: areas
+        name: Find the areas the changes need
+        env:
+          EVENT: ${{ github.event_name }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          base=
+          if [ "$EVENT" = merge_group ]; then
+            git fetch --no-tags --depth=1 origin "$GROUP_BASE"
+            base=$GROUP_BASE
+          elif git rev-parse -q --verify HEAD^2 > /dev/null; then
+            base=HEAD^1
+          fi
+
+          app=false server=false docs=false formal=false
+          if [ -z "$base" ]; then
+            echo "No base to compare with: every area runs."
+            app=true server=true docs=true formal=true
+            changed=
+          else
+            # --no-renames lists both paths of a moved file.
+            changed=$(git diff --no-renames --name-only "$base" HEAD)
+          fi
+
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # This workflow decides what runs: a change to it runs everything.
+              .github/workflows/ci.yml)
+                app=true server=true docs=true formal=true ;;
+            esac
+            # Same paths as app.yml's push trigger.
+            case "$f" in
+              app/* | core/* | build.gradle.kts | settings.gradle.kts | gradle.properties | \
+              gradle/* | gradlew | gradlew.bat | tools/licenses/* | server/web/test/fixtures/* | \
+              .github/workflows/app.yml)
+                app=true ;;
+            esac
+            # server.yml's push paths, and the files outside server/ that the
+            # server's tests and the viewer's build read.
+            case "$f" in
+              server/* | .github/workflows/server.yml | .github/workflows/server-test.yml | \
+              docs/protocol-constants.json | core/src/main/scala/ashidori/core/sync/DeviceStatus.scala | \
+              app/src/main/assets/basemap-pin.json)
+                server=true ;;
+            esac
+            # Same paths as docs.yml's push trigger.
+            case "$f" in
+              docs/diagrams/* | tools/docs/render-diagrams.sh | .github/workflows/docs.yml)
+                docs=true ;;
+            esac
+            # Same paths as formal.yml's push trigger.
+            case "$f" in
+              formal/* | docs/sync-protocol.md | docs/design/detail-log-format.md | \
+              app/src/main/scala/net/sksat/ashidori/GnssRecorder.scala | server/src/* | server/migrations/* | \
+              app/src/main/scala/net/sksat/ashidori/sync/* | core/src/main/scala/ashidori/core/sync/* | \
+              core/src/main/scala/ashidori/core/SendGate.scala | app/src/main/scala/net/sksat/ashidori/Db.scala | \
+              app/src/main/scala/net/sksat/ashidori/ArchiveStore.scala | \
+              app/src/main/scala/net/sksat/ashidori/ui/SyncSettingsScreen.scala | .github/workflows/formal.yml)
+                formal=true ;;
+            esac
+          done <<< "$changed"
+
+          areas="app=$app
+          server=$server
+          docs=$docs
+          formal=$formal"
+          echo "$areas"
+          echo "$areas" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Areas to check"
+            echo '```'
+            echo "$areas"
+            echo '```'
+            echo "### Changed files"
+            echo '```'
+            if [ -n "$changed" ]; then echo "$changed"; else echo "(none)"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  app:
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    uses: ./.github/workflows/app.yml
+
+  server:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    uses: ./.github/workflows/server-test.yml
+
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    uses: ./.github/workflows/docs.yml
+
+  formal:
+    needs: changes
+    if: needs.changes.outputs.formal == 'true'
+    uses: ./.github/workflows/formal.yml
+
+  # The required check. always(): it must report even when a job it needs
+  # failed or was cancelled (a skipped required check would count as passed).
+  ci:
+    needs: [changes, app, server, docs, formal]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the needed jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          # changes must succeed; no job may fail or be cancelled; each area
+          # that changes asked for must have succeeded (not been skipped).
+          jq -e '
+            . as $n
+            | $n.changes.result == "success"
+            and ([$n[].result] | all(. == "success" or . == "skipped"))
+            and (["app", "server", "docs", "formal"]
+                 | all(. as $a | $n.changes.outputs[$a] != "true" or $n[$a].result == "success"))
+          ' <<< "$NEEDS" > /dev/null || { echo "::error::a needed check did not succeed"; exit 1; }

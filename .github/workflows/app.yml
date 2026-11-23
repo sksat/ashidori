@@ -1,0 +1,59 @@
+name: app
+
+# The app's unit tests (core) and a debug build, signed with the debug key.
+# Pull requests call it through ci.yml (the "app" paths there). Runs on main
+# too, so that pull requests start from main's Gradle cache.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "core/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      # Assets of the app (app/build.gradle.kts) and fixtures core's tests read.
+      - "tools/licenses/**"
+      - "server/web/test/fixtures/**"
+      - ".github/workflows/app.yml"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # cache: gradle keeps ~/.gradle/caches and the wrapper, keyed on the
+      # Gradle files (including gradle/libs.versions.toml).
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # compileSdk 37 (app/build.gradle.kts) and the build tools AGP 9.4.1
+      # uses by default; the runner's SDK may not have them yet.
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          (yes || true) | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" --install "platforms;android-37.0" "build-tools;36.0.0"
+      - name: Test core and build the debug APK
+        run: ./gradlew --no-daemon --stacktrace :core:test :app:assembleDebug
+      - if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: app-reports
+          path: |
+            core/build/reports/tests/
+            core/build/test-results/
+          retention-days: 7

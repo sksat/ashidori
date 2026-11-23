@@ -1,11 +1,11 @@
 name: server
 
+# Pull requests run the tests through ci.yml (server-test.yml), never this
+# workflow: the deploy job below runs only from main.
 on:
   push:
     branches: [main]
-    paths: ["server/**", ".github/workflows/server.yml"]
-  pull_request:
-    paths: ["server/**", ".github/workflows/server.yml"]
+    paths: ["server/**", ".github/workflows/server.yml", ".github/workflows/server-test.yml"]
   workflow_dispatch:
 
 permissions:
@@ -16,41 +16,9 @@ defaults:
     working-directory: server
 
 jobs:
+  # The server's and the web viewer's tests (server-test.yml, shared with ci.yml).
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: pnpm/action-setup@v6.1.0
-        with:
-          package_json_file: server/package.json
-      - uses: actions/setup-node@v7.1.0
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: server/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      # The web viewer (server/web): typecheck, build and its own tests. The
-      # build comes first: the server's tests serve web/dist (wrangler.jsonc "assets").
-      - name: Build web viewer
-        run: pnpm --dir web build
-      - name: Test web viewer
-        run: pnpm --dir web test
-      - run: pnpm exec tsc --noEmit
-      - run: pnpm test
-      # Validates the repository variables a deploy would pass, so that a
-      # typo fails here, before anything is deployed. The values reach the
-      # shell only as environment variables, never as interpolated code.
-      - name: Check server variables
-        env:
-          REGISTRATION: ${{ vars.REGISTRATION }}
-          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
-          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
-          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
-          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
-          MAX_USERS: ${{ vars.MAX_USERS }}
-          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
-          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
-        run: node scripts/check-config.ts
+    uses: ./.github/workflows/server-test.yml
 
   # The formal models (formal/README.md) must pass on the same commit.
   formal:

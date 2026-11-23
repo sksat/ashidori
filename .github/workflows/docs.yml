@@ -9,11 +9,8 @@ on:
       - "docs/diagrams/**"
       - "tools/docs/render-diagrams.sh"
       - ".github/workflows/docs.yml"
-  pull_request:
-    paths:
-      - "docs/diagrams/**"
-      - "tools/docs/render-diagrams.sh"
-      - ".github/workflows/docs.yml"
+  # Pull requests: called by ci.yml, with the same paths.
+  workflow_call:
 
 permissions:
   contents: read

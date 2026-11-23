@@ -19,23 +19,9 @@ on:
       - "app/src/main/scala/net/sksat/ashidori/ArchiveStore.scala"
       - "app/src/main/scala/net/sksat/ashidori/ui/SyncSettingsScreen.scala"
       - ".github/workflows/formal.yml"
-  pull_request:
-    paths:
-      - "formal/**"
-      - "docs/sync-protocol.md"
-      - "docs/design/detail-log-format.md"
-      - "app/src/main/scala/net/sksat/ashidori/GnssRecorder.scala"
-      - "server/src/**"
-      - "server/migrations/**"
-      - "app/src/main/scala/net/sksat/ashidori/sync/**"
-      - "core/src/main/scala/ashidori/core/sync/**"
-      - "core/src/main/scala/ashidori/core/SendGate.scala"
-      - "app/src/main/scala/net/sksat/ashidori/Db.scala"
-      - "app/src/main/scala/net/sksat/ashidori/ArchiveStore.scala"
-      - "app/src/main/scala/net/sksat/ashidori/ui/SyncSettingsScreen.scala"
-      - ".github/workflows/formal.yml"
-  # The slow configs run once a day and on demand; pushes, pull requests and
-  # the server deploy run the fast set (formal/run.sh fast).
+  # The slow configs run once a day and on demand; pushes, pull requests
+  # (called by ci.yml, with the same paths) and the server deploy run the fast
+  # set (formal/run.sh fast).
   schedule:
     - cron: "17 18 * * *"
   workflow_dispatch:

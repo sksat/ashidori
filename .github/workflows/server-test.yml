@@ -1,0 +1,54 @@
+name: server-test
+
+# The server's and the web viewer's tests, called by server.yml (before a
+# deploy) and by ci.yml (pull requests). It has no deploy job and no
+# environment: ci.yml calls this, never server.yml.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: server
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # The web viewer (server/web): typecheck, build and its own tests. The
+      # build comes first: the server's tests serve web/dist (wrangler.jsonc "assets").
+      - name: Build web viewer
+        run: pnpm --dir web build
+      - name: Test web viewer
+        run: pnpm --dir web test
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm test
+      # Validates the repository variables a deploy would pass, so that a
+      # typo fails here, before anything is deployed. The values reach the
+      # shell only as environment variables, never as interpolated code.
+      - name: Check server variables
+        env:
+          REGISTRATION: ${{ vars.REGISTRATION }}
+          USER_QUOTA_BYTES: ${{ vars.USER_QUOTA_BYTES }}
+          USER_MAX_BATCHES: ${{ vars.USER_MAX_BATCHES }}
+          USER_MAX_DEVICES: ${{ vars.USER_MAX_DEVICES }}
+          USER_MAX_SHARED_CHECKINS: ${{ vars.USER_MAX_SHARED_CHECKINS }}
+          MAX_USERS: ${{ vars.MAX_USERS }}
+          MAX_TOTAL_BYTES: ${{ vars.MAX_TOTAL_BYTES }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: node scripts/check-config.ts
