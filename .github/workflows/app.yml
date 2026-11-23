@@ -49,6 +49,23 @@ jobs:
           "$sdkmanager" --install "platforms;android-37.0" "build-tools;36.0.0"
       - name: Test core and build the debug APK
         run: ./gradlew --no-daemon --stacktrace :core:test :app:assembleDebug
+      # Counts the test results (Gradle prints none), so that a run where no
+      # test ran fails instead of passing.
+      - name: Count the test results
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, sys, xml.etree.ElementTree as ET
+          n = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          files = glob.glob("core/build/test-results/test/*.xml")
+          for f in files:
+              r = ET.parse(f).getroot()
+              for k in n:
+                  n[k] += int(r.get(k, 0))
+          print(f"core: {len(files)} suites, " + ", ".join(f"{v} {k}" for k, v in n.items()))
+          sys.exit(0 if n["tests"] > 0 and n["failures"] + n["errors"] == 0 else 1)
+          EOF
+      - name: Show the APK
+        run: ls -l app/build/outputs/apk/debug/
       - if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:
