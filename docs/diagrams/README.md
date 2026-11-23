@@ -9,3 +9,4 @@
   日本語は Noto Sans JP（SIL Open Font License 1.1）のうち使う字だけを SVG に埋め込む。
 - 構成要素の境界や包含を示す構成図には D2 を使い、Markdown から `![短い説明](diagrams/名前.svg)` で参照する。
   シーケンス図と単純な状態遷移図は、GitHub がそのまま表示する Mermaid で Markdown に直接書く。
+
