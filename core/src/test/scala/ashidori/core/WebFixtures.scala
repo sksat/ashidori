@@ -216,6 +216,37 @@ object WebFixtures:
       })
     )))
 
+    // --- 電車 and 地下鉄 of one ride merged (RailDay), with corrections ---------
+    val rd = RailDay.build()
+    val railParts = TimelineBuilder.unmerged(rd.fixes, rd.motion).collect { case t: Trip => t.legs }.flatten
+      .filter(l => l.start >= RailDay.at(9, 0) && l.start < RailDay.at(10, 0) && TimelineBuilder.isRail(l.mode))
+    val ride = TimelineBuilder.build(rd.fixes, rd.motion).collect { case t: Trip => t.legs }.flatten
+      .find(_.start == railParts.head.start).get
+    val toSubway = ModeOverride(ride.wholeStart, ride.wholeEnd, TransportMode.Subway, 1)
+    val railCases = Seq(
+      "none" -> Seq.empty,
+      "partOtherRail" -> Seq(ModeOverride(railParts(2).start, railParts(2).end, TransportMode.Subway, 1)),
+      "partOtherMode" -> Seq(ModeOverride(railParts(1).start, railParts(1).end, TransportMode.Bus, 1)),
+      "partRideMode" -> Seq(ModeOverride(railParts(1).start, railParts(1).end, TransportMode.Train, 1)),
+      "wholeRide" -> Seq(toSubway),
+      "wholeRideUndone" -> Seq(toSubway, ModeOverride(ride.wholeStart, ride.wholeEnd, TimelineBuilder.undoMode(ride), 2))
+    )
+    write(dir, "rail-timeline.json", ujson.write(ujson.Obj(
+      "date" -> RailDay.Date.toString,
+      "fixes" -> ujson.Arr.from(rd.fixes.map(f => ujson.Arr(num(f.time), f.lat, f.lon, f.accuracy.toDouble))),
+      "motion" -> ujson.Arr.from(rd.motion.map(m => ujson.Arr(num(m.start), num(m.end), m.accelStd.toDouble, m.accelMean.toDouble, m.steps))),
+      "cases" -> ujson.Arr.from(railCases.map { (name, os) =>
+        val segs = TimelineBuilder.build(rd.fixes, rd.motion, overrides = os)
+        val sum = Stats.day(RailDay.Date, Stats.splitByDay(segs, RailDay.Zone).getOrElse(RailDay.Date, Vector.empty), 0)
+        ujson.Obj(
+          "name" -> name,
+          "overrides" -> ujson.Arr.from(os.map(o => ujson.Obj("s" -> num(o.start), "e" -> num(o.end), "mode" -> o.mode.key, "updatedAt" -> num(o.updatedAt)))),
+          "segments" -> ujson.Arr.from(segs.map(segJson(_, inferred = true))),
+          "durationByMode" -> ujson.Obj.from(sum.durationByMode.map((m, d) => m.key -> num(d)))
+        )
+      })
+    )))
+
     // --- Ties in the smoothing of coarse classes --------------------------------
     import ModeClassifier.Coarse
     val tieCases = Seq(

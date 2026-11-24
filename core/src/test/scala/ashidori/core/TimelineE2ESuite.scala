@@ -54,13 +54,17 @@ class TimelineE2ESuite extends munit.FunSuite:
   }
 
   test("legs without good positions are marked uncertain") {
-    val (_, segments, _) = runScenario(Scenarios.commute())
+    val (out, segments, _) = runScenario(Scenarios.commute())
     val legs = segments.collect { case t: Trip => t.legs }.flatten
     // The Tsukuba Express runs underground south of 北千住: no fixes there, so
-    // the detector sees an underground train (subway) whose route is a guess.
-    val underground = legs.filter(_.mode == TransportMode.Subway)
-    assert(underground.nonEmpty, legs.map(_.mode))
-    assert(underground.forall(_.isUncertain), legs.map(l => l.mode -> l.uncertain))
+    // as cut by speed that is an underground train (subway) whose route is a guess.
+    val split = TimelineBuilder.unmerged(out.fixes, out.motion).collect { case t: Trip => t.legs }.flatten
+    val underground = split.filter(_.mode == TransportMode.Subway)
+    assert(underground.nonEmpty, split.map(_.mode))
+    assert(underground.forall(_.isUncertain), split.map(l => l.mode -> l.uncertain))
+    // As built it is part of one train ride, which keeps the share of its time without a position.
+    val rides = legs.filter(l => underground.exists(u => u.start >= l.start && u.end <= l.end))
+    assert(rides.nonEmpty && rides.forall(l => l.mode == TransportMode.Train && l.uncertain > 0), rides.map(l => l.mode -> l.uncertain))
     assert(legs.filter(_.mode == TransportMode.Walking).exists(!_.isUncertain))
   }
 

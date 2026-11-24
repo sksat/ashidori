@@ -30,7 +30,7 @@ object TimelineBuilder:
 
   /** The timeline, with the user's corrections (`overrides`) applied to the
     * legs as built ([[applyOverrides]]) and then adjacent legs of a trip
-    * that show the same mode made one ([[mergeSameMode]]).
+    * that show the same mode, or are one train ride, made one ([[Merge]]).
     */
   def build(
       rawFixes: IndexedSeq[Fix],
@@ -227,9 +227,15 @@ object TimelineBuilder:
       else k += 1
     val built = runs.toVector.map { case (a, b, _) =>
       val (l, unrecorded) = makeLeg(iv.slice(a, b + 1), motion, p, ground)
-      Piece(a, b, if unrecorded then l else applyOverride(l, ordered), unrecorded)
+      val leg = if unrecorded then l else applyOverride(l, ordered)
+      Piece(a, b, leg, unrecorded, Vector(leg))
     }
-    (if merge then mergeSameMode(built, iv, motion, p, ground) else built).map(x => (x.leg, x.unrecorded))
+    val merged =
+      if !merge then built
+      else
+        val m = Merge(iv, motion, p, ground)
+        m.sameMode(m.rail(m.sameMode(built, all = true)), all = false)
+    merged.map(x => (x.leg, x.unrecorded))
 
   /** Each interval's coarse class by a duration-weighted majority over it
     * and two neighbours on either side, gaps left out (and kept). On equal
@@ -247,53 +253,140 @@ object TimelineBuilder:
           ._1
     }
 
-  /** A leg of intervals `from` to `to` (inclusive). */
-  private final case class Piece(from: Int, to: Int, leg: Leg, unrecorded: Boolean)
+  /** A leg of intervals `from` to `to` (inclusive), and the legs as cut by
+    * speed (corrected) that it was made of.
+    */
+  private final case class Piece(from: Int, to: Int, leg: Leg, unrecorded: Boolean, parts: Vector[Leg]):
+    /** A correction changed the mode of one of its parts. */
+    def fixed: Boolean = parts.exists(_.corrected)
 
-  /** Adjacent legs that show the same mode are one leg: the coarse speed
-    * classes cut a drive into a slow start and the rest, or around a short
-    * outage, though both parts end as 車. Each longest run of such legs is
-    * built again as one leg from all their intervals, kept if it still
-    * shows that mode:
-    *  - without a correction on any part, if it is classified so itself;
-    *  - with one, always: the user said what the parts were. It shows the
-    *    corrected mode, with the mode the record says for the whole as
-    *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
-    * If not, each half of the run (by legs) is tried in the same way, and
-    * then the two legs on either side of the cut, if they show the same
-    * mode, are tried once as a pair (the cut must not leave 車, 車). Each
-    * interval is built at most a few times per halving: O(n log n), however
-    * many legs.
+  /** 電車 and 地下鉄 are one family for merging: a line that runs underground
+    * near the centre, or a through service onto a subway, is cut by speed
+    * into 地下鉄 where it has no positions and 電車 where it has them.
+    */
+  def isRail(m: TransportMode): Boolean = m == TransportMode.Train || m == TransportMode.Subway
+
+  /** The mode of one ride made of rail legs: the one the record says for
+    * the longer total time; 電車 on a tie.
+    */
+  def railMode(legs: Seq[Leg]): TransportMode =
+    def time(m: TransportMode) = legs.filter(_.autoMode == m).map(_.durationMs).sum
+    if time(TransportMode.Subway) > time(TransportMode.Train) then TransportMode.Subway else TransportMode.Train
+
+  /** Steps between two rail legs that say the user changed trains: at
+    * least this many, a minute's walk at 60 a minute (half the usual pace).
+    * Counted, not taken as a rate: the step counter delivers steps in
+    * batches (up to 5 min late). A few steps to the door stay below it.
+    */
+  val TransferSteps = 60
+
+  /** How far from the cut between two rail legs the steps of a transfer are
+    * counted: the longest stretch next to a cut that becomes part of a leg
+    * (a walk shorter than a leg, then a wait shorter than a visit).
+    */
+  def transferWindowMs(p: TimelineParams): Long = p.minLegDurationMs + p.stay.minDurationMs
+
+  /** The user changed trains between the adjacent legs `a` and `b` (as cut
+    * by speed): [[TransferSteps]] steps or more from [[transferWindowMs]]
+    * before the cut to as long after it, but no further than the middle of
+    * either leg (steps at the far end of a leg are the walk to or from it).
+    */
+  private def transfer(a: Leg, b: Leg, motion: MotionIndex, p: TimelineParams): Boolean =
+    val w = transferWindowMs(p)
+    val from = math.max(a.end - w, a.start + (a.end - a.start) / 2)
+    val to = math.min(b.start + w, b.start + (b.end - b.start) / 2)
+    motion.summary(from, to).steps >= TransferSteps
+
+  /** Merges adjacent legs of a trip, in three passes:
+    *  1. [[sameMode]]: legs that show the same mode are one leg. The coarse
+    *     speed classes cut a drive into a slow start and the rest, or around
+    *     a short outage, though both parts end as 車.
+    *  2. [[rail]]: legs of 電車 and 地下鉄 ([[isRail]]) are one ride unless the
+    *     user changed trains between them ([[transfer]]), shown with the
+    *     mode of the longer time ([[railMode]]).
+    *  3. [[sameMode]] again, for legs with a correction that now sit next to
+    *     a ride of their mode.
     * Corrections are applied to the parts first, so a correction saved for
     * one part keeps the span it was saved for: it neither drops off nor
     * spreads to its neighbour. One saved for a merged leg covers each of its
     * parts whole, so the parts merge again. Never across a stretch without
     * a record (the trip ends there) or a visit (another trip).
     */
-  private def mergeSameMode(ps: Vector[Piece], iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams, ground: Double): Vector[Piece] =
-    /** `run` as one leg, if it still shows its mode. */
-    def asOne(run: Seq[Piece]): Option[Piece] =
-      val mode = run.head.leg.mode
+  private final class Merge(iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams, ground: Double):
+    /** `run` as one leg, as the record shows it: built again from all its
+      * intervals and, if its parts are rail legs without a transfer between
+      * them, with the mode of the ride ([[railMode]]). Also whether its
+      * parts are rail legs with a transfer between them.
+      */
+    private def whole(run: Seq[Piece]): (Piece, Boolean) =
+      val parts = run.flatMap(_.parts).toVector
       val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p, ground)
-      Option.when(!unrecorded && (run.exists(_.leg.corrected) || l.mode == mode))(Piece(run.head.from, run.last.to,
-        if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode)), false))
-    def joined(run: Vector[Piece]): Vector[Piece] =
-      if run.size < 2 then run
-      else
-        asOne(run).fold {
-          val (a, b) = (joined(run.take(run.size / 2)), joined(run.drop(run.size / 2)))
-          // The halves keep the run's mode; their legs at the cut may still go together.
-          asOne(Seq(a.last, b.head)).fold(a ++ b)(m => (a.init :+ m) ++ b.tail)
-        }(Vector(_))
-    val out = Vector.newBuilder[Piece]
-    var i = 0
-    while i < ps.size do
-      var j = i + 1
-      if !ps(i).unrecorded then
-        while j < ps.size && !ps(j).unrecorded && ps(j).leg.mode == ps(i).leg.mode do j += 1
-      out ++= joined(ps.slice(i, j))
-      i = j
-    out.result()
+      val rail = parts.forall(x => isRail(x.autoMode))
+      val ride = rail && parts.lazyZip(parts.tail).forall((a, b) => !transfer(a, b, motion, p))
+      (Piece(run.head.from, run.last.to, if ride then l.copy(mode = railMode(parts)) else l, unrecorded, parts), rail && !ride)
+
+    /** `run` (of one mode) as one leg, if it still shows its mode:
+      *  - without a correction on any part, if it is so as a whole
+      *    ([[whole]]); rail legs with a transfer between them never are;
+      *  - with one, always: the user said what the parts were. It shows the
+      *    corrected mode, with the mode the record says for the whole as
+      *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
+      */
+    private def asOne(run: Seq[Piece]): Option[Piece] =
+      val mode = run.head.leg.mode
+      val (w, transferred) = whole(run)
+      val l = w.leg
+      Option.when(!w.unrecorded && (w.fixed || (l.mode == mode && !transferred)))(
+        w.copy(leg = if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode))))
+
+    /** Each longest run of adjacent legs that show the same mode is one leg
+      * ([[asOne]]). If it cannot be, each half of the run (by legs) is tried
+      * in the same way, and then the two legs on either side of the cut, if
+      * they show the same mode, are tried once as a pair (the cut must not
+      * leave 車, 車). Each interval is built at most a few times per halving:
+      * O(n log n), however many legs. With `all` false only runs with a
+      * correction are tried: the others were tried in the first pass.
+      */
+    def sameMode(ps: Vector[Piece], all: Boolean): Vector[Piece] =
+      def joined(run: Vector[Piece]): Vector[Piece] =
+        if run.size < 2 then run
+        else
+          asOne(run).fold {
+            val (a, b) = (joined(run.take(run.size / 2)), joined(run.drop(run.size / 2)))
+            // The halves keep the run's mode; their legs at the cut may still go together.
+            asOne(Seq(a.last, b.head)).fold(a ++ b)(m => (a.init :+ m) ++ b.tail)
+          }(Vector(_))
+      val out = Vector.newBuilder[Piece]
+      var i = 0
+      while i < ps.size do
+        var j = i + 1
+        if !ps(i).unrecorded then
+          while j < ps.size && !ps(j).unrecorded && ps(j).leg.mode == ps(i).leg.mode do j += 1
+        val run = ps.slice(i, j)
+        out ++= (if all || run.exists(_.fixed) then joined(run) else run)
+        i = j
+      out.result()
+
+    /** Each longest run of adjacent rail legs, none with a correction on a
+      * part and without a transfer between them, is one leg with the mode of
+      * the ride ([[railMode]]). A leg with a corrected part stays apart from
+      * its neighbours of the other rail mode: the user said what it was.
+      */
+    def rail(ps: Vector[Piece]): Vector[Piece] =
+      def free(x: Piece) = !x.unrecorded && !x.fixed && isRail(x.leg.mode)
+      val out = Vector.newBuilder[Piece]
+      var i = 0
+      while i < ps.size do
+        var j = i + 1
+        if free(ps(i)) then
+          while j < ps.size && free(ps(j)) && !transfer(ps(j - 1).parts.last, ps(j).parts.head, motion, p) do j += 1
+        val run = ps.slice(i, j)
+        if run.size < 2 then out ++= run
+        else
+          val (w, _) = whole(run)
+          out ++= (if w.unrecorded then run else Vector(w))
+        i = j
+      out.result()
 
   private final case class Interval(
       start: Long,
