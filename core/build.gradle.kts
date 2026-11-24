@@ -48,3 +48,14 @@ tasks.register<JavaExec>("viewerPairingFixtures") {
     mainClass.set("ashidori.core.ViewerPairingFixtures")
     args(rootProject.file("server/web/test/fixtures").absolutePath)
 }
+
+// Time and allocation of reading archive files, the reader against that of
+// app 0.24.0 (bench/ReadBench.scala).
+tasks.register<JavaExec>("readBench") {
+    group = "verification"
+    description = "Times the Parquet reader on synthetic archive files."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("ashidori.core.bench.ReadBench")
+    maxHeapSize = "1g"
+    args((project.findProperty("args") as String? ?: "").split(" ").filter { it.isNotEmpty() })
+}

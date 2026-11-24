@@ -4,7 +4,6 @@ import java.io.{ByteArrayInputStream, RandomAccessFile}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.zip.GZIPInputStream
-import scala.collection.mutable.ArrayBuffer
 
 /** Reads files written by [[ParquetWriter]]: flat optional columns, PLAIN
   * values, RLE definition levels, data page v1, GZIP or uncompressed. Not a
@@ -16,8 +15,18 @@ object ParquetReader:
     def col(name: String): Array[Any] = data(name)
     /** Rows as value sequences in schema order (null for missing). */
     def rowIterator: Iterator[IndexedSeq[Any]] =
-      val arrays = columns.map(c => data(c.name)).toIndexedSeq
-      Iterator.range(0, rows).map(i => arrays.map(_(i)))
+      val arrays = columns.map(c => data(c.name)).toArray
+      val width = arrays.length
+      // Each row is its own array (not a view of the columns): a row kept
+      // does not keep the row group's columns alive.
+      Iterator.range(0, rows).map { i =>
+        val row = new Array[Any](width)
+        var k = 0
+        while k < width do
+          row(k) = arrays(k)(i)
+          k += 1
+        scala.collection.immutable.ArraySeq.unsafeWrapArray(row)
+      }
 
   /** Footer of a file: the schema, the total row count and where each row
     * group's column chunks lie (absolute byte offsets).
@@ -92,10 +101,46 @@ object ParquetReader:
         pos += compressed
         val body = chunk.codec match
           case 0 => page
-          case 2 => GZIPInputStream(ByteArrayInputStream(page)).readAllBytes()
+          case 2 => inflate(page, ph.get(2).collect { case l: Long => l }.getOrElse(-1L))
           case x => throw IllegalArgumentException(s"unsupported codec $x")
         decodePage(body, count, c.tpe, dph(2).asInstanceOf[Long].toInt, out(k), base + filled)
         filled += count
+
+  /** The GZIP page inflated: every byte the stream gives, as `readAllBytes`
+    * would. `hint`: the page header's uncompressed size, so that the output
+    * is normally allocated once.
+    */
+  private def inflate(page: Array[Byte], hint: Long): Array[Byte] =
+    val len = page.length
+    val in = GZIPInputStream(ByteArrayInputStream(page), math.max(512, math.min(len, 1 << 16)))
+    try
+      // A header's size is taken only up to 64 times the compressed page
+      // (the writer's pages compress far less) and MaxPage: a damaged one
+      // cannot make it allocate much more than the page itself. A page that
+      // inflates further grows as it is read.
+      val cap = math.min(MaxPage, len.toLong * 64 + 65536)
+      var out = new Array[Byte](math.min(cap, if hint >= 0 then hint else 8192L).toInt)
+      var n = 0
+      var done = false
+      while !done do
+        if n == out.length then
+          // Full: more only if the stream has more.
+          val b = in.read()
+          if b < 0 then done = true
+          else
+            out = java.util.Arrays.copyOf(out, math.max(out.length * 2, 8192))
+            out(n) = b.toByte
+            n += 1
+        else
+          val r = in.read(out, n, out.length - n)
+          if r < 0 then done = true else n += r
+      if n == out.length then out else java.util.Arrays.copyOf(out, n)
+    finally in.close()
+
+  /** The largest uncompressed page size taken from a header as is (the
+    * writer's pages are at most a few MiB); a larger page grows as read.
+    */
+  private val MaxPage = 16L << 20
 
   def read(bytes: Array[Byte]): Table =
     require(bytes.length >= 12 && String(bytes.take(4), UTF_8) == "PAR1", "not parquet")
@@ -202,39 +247,62 @@ object ParquetReader:
     try readMeta(raf)
     finally raf.close()
 
+  // The decoders below are written as plain loops over arrays: they run for
+  // every value of a day or a month the app shows, and on Android a closure
+  // or a boxed level per value costs more than the decoding itself.
+
   private def decodePage(body: Array[Byte], count: Int, t: ColType, encoding: Int, into: Array[Any], at: Int): Unit =
+    // More values than the group has rows left (a damaged header) cannot
+    // be stored: fail before the levels are allocated for them.
+    if count > 0 && count > into.length - at then
+      throw IndexOutOfBoundsException(s"page of $count values at row $at of ${into.length}")
     val bb = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN)
     val levelsLen = bb.getInt()
     val defined = rleDecode(body, 4, levelsLen, count)
     val start = 4 + levelsLen
-    val present = defined.count(identity)
+    var present = 0
+    var d = 0
+    while d < defined.length do
+      if defined(d) then present += 1
+      d += 1
     encoding match
       case ParquetWriter.DeltaBinaryPacked =>
         val vs = deltaDecode(body, start, present)
+        val int32 = t == ColType.Int32
         var k = 0
-        for i <- 0 until count do
+        var i = 0
+        while i < count do
           into(at + i) =
             if !defined(i) then null
             else
               val v = vs(k)
               k += 1
-              if t == ColType.Int32 then v.toInt else v
+              if int32 then v.toInt else v
+          i += 1
         return
       case ParquetWriter.ByteStreamSplit =>
         val width = if t == ColType.Float32 then 4 else 8
         var k = 0
-        for i <- 0 until count do
+        var i = 0
+        while i < count do
           into(at + i) =
             if !defined(i) then null
             else
               var bits = 0L
-              for j <- 0 until width do bits |= (body(start + j * present + k) & 0xffL) << (8 * j)
+              var j = 0
+              var p = start + k
+              while j < width do
+                bits |= (body(p) & 0xffL) << (8 * j)
+                p += present
+                j += 1
               k += 1
               if width == 4 then java.lang.Float.intBitsToFloat(bits.toInt) else java.lang.Double.longBitsToDouble(bits)
+          i += 1
         return
       case _ => ()
     bb.position(start)
-    for i <- 0 until count do
+    var i = 0
+    while i < count do
       into(at + i) =
         if !defined(i) then null
         else
@@ -248,6 +316,7 @@ object ParquetReader:
               val s = String(body, bb.position(), len, UTF_8)
               bb.position(bb.position() + len)
               s
+      i += 1
 
   private def deltaDecode(b: Array[Byte], start: Int, expected: Int): Array[Long] =
     var p = start
@@ -273,35 +342,55 @@ object ParquetReader:
     out(0) = zigzag()
     var n = 1
     val perMini = blockSize / miniblocks
+    // Only when a block follows: a header of one value is all there is.
+    val widths = new Array[Int](if total > 1 then miniblocks else 0)
     while n < total do
       val minDelta = zigzag()
-      val widths = (0 until miniblocks).map(_ => b(p + 0) & 0xff).toArray
-      for m <- 0 until miniblocks do widths(m) = b(p + m) & 0xff
-      p += miniblocks
       var m = 0
+      while m < miniblocks do
+        widths(m) = b(p + m) & 0xff
+        m += 1
+      p += miniblocks
+      m = 0
       while m < miniblocks && n < total do
         val w = widths(m)
-        var bitPos = 0L
-        val base = p
-        for _ <- 0 until perMini do
+        if w > 64 then throw IllegalArgumentException(s"bit width $w")
+        // `perMini` values of `w` bits, least significant bit first, taken
+        // a byte at a time (the bits of a value span at most 9 bytes).
+        var q = p
+        var acc = 0L
+        var accBits = 0
+        var j = 0
+        while j < perMini do
           var v = 0L
-          for bit <- 0 until w do
-            val pos = bitPos + bit
-            if ((b(base + (pos >> 3).toInt) >> (pos & 7).toInt) & 1) == 1 then v |= 1L << bit
-          bitPos += w
+          var got = 0
+          while got < w do
+            if accBits == 0 then
+              acc = b(q) & 0xffL
+              q += 1
+              accBits = 8
+            val take = math.min(w - got, accBits)
+            v |= (acc & ((1L << take) - 1)) << got
+            acc >>>= take
+            accBits -= take
+            got += take
           if n < total then
             out(n) = out(n - 1) + minDelta + v
             n += 1
+          j += 1
         p += perMini * w / 8
         m += 1
     out
 
-  /** RLE/bit-packed hybrid, bit width 1. */
+  /** RLE/bit-packed hybrid, bit width 1: at most `count` levels (fewer
+    * if the data ends first).
+    */
   private def rleDecode(b: Array[Byte], start: Int, len: Int, count: Int): Array[Boolean] =
-    val out = ArrayBuffer.empty[Boolean]
+    val out = new Array[Boolean](math.max(count, 0))
+    var n = 0
     var p = start
     val end = start + len
-    while p < end && out.size < count do
+    while p < end && n < count do
       var header = 0L
       var shift = 0
       var more = true
@@ -315,12 +404,23 @@ object ParquetReader:
         val run = (header >>> 1).toInt
         val v = (b(p) & 1) == 1
         p += 1
-        for _ <- 0 until run do out += v
+        val stop = math.min(count.toLong, n.toLong + math.max(run, 0)).toInt
+        if v then java.util.Arrays.fill(out, n, stop, true)
+        n = stop
       else
         val groups = (header >>> 1).toInt
-        for g <- 0 until groups; bit <- 0 until 8 do out += ((b(p + g) >> bit) & 1) == 1
+        var g = 0
+        while g < groups do
+          val x = b(p + g)
+          var bit = 0
+          while bit < 8 do
+            if n < count then out(n) = ((x >> bit) & 1) == 1
+            n += 1
+            bit += 1
+          g += 1
         p += groups
-    out.take(count).toArray
+        if n > count then n = count
+    if n == count then out else java.util.Arrays.copyOf(out, n)
 
 /** A Thrift binary value: bytes, or (toString) the UTF-8 string. */
 private final class Bin(val bytes: Array[Byte]):
