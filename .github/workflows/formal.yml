@@ -2,6 +2,9 @@ name: formal
 
 # Formal models of the sync protocol (formal/README.md). Runs when the models,
 # the protocol document, or the server and app code they describe change.
+# Every pull request runs it, so that the required check "formal" always
+# reports; tools/ci/changes.sh skips the work when none of the paths below
+# changed.
 on:
   push:
     branches: [main]
@@ -20,22 +23,9 @@ on:
       - "app/src/main/scala/net/sksat/ashidori/ui/SyncSettingsScreen.scala"
       - ".github/workflows/formal.yml"
   pull_request:
-    paths:
-      - "formal/**"
-      - "docs/sync-protocol.md"
-      - "docs/design/detail-log-format.md"
-      - "app/src/main/scala/net/sksat/ashidori/GnssRecorder.scala"
-      - "server/src/**"
-      - "server/migrations/**"
-      - "app/src/main/scala/net/sksat/ashidori/sync/**"
-      - "core/src/main/scala/ashidori/core/sync/**"
-      - "core/src/main/scala/ashidori/core/SendGate.scala"
-      - "app/src/main/scala/net/sksat/ashidori/Db.scala"
-      - "app/src/main/scala/net/sksat/ashidori/ArchiveStore.scala"
-      - "app/src/main/scala/net/sksat/ashidori/ui/SyncSettingsScreen.scala"
-      - ".github/workflows/formal.yml"
   # The slow configs run once a day and on demand; pushes, pull requests and
-  # the server deploy run the fast set (formal/run.sh fast).
+  # the server deploy (server.yml calls this) run the fast set
+  # (formal/run.sh fast).
   schedule:
     - cron: "17 18 * * *"
   workflow_dispatch:
@@ -44,8 +34,17 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its previous run; other runs are never
+# cancelled (each has its own group, also when server.yml calls this).
+concurrency:
+  group: formal-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
+  # The required check: one job, named "formal", that decides by itself
+  # whether the work is needed (a skipped job would count as passed).
   check:
+    name: formal
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -53,18 +52,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - id: changes
+        run: tools/ci/changes.sh formal
       - uses: actions/setup-java@v6.0.1
+        if: steps.changes.outputs.run == 'true'
         with:
           distribution: temurin
           java-version: "17"
       # Only the downloads are cached; run.sh verifies their checksums anyway.
       - uses: actions/cache@v6.1.0
+        if: steps.changes.outputs.run == 'true'
         with:
           path: .formal-cache/dl
           key: formal-tools-${{ hashFiles('formal/run.sh') }}
-      - run: formal/run.sh ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'all' || 'fast' }}
-      - if: failure()
+      - if: steps.changes.outputs.run == 'true'
+        run: formal/run.sh ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'all' || 'fast' }}
+      - if: failure() && steps.changes.outputs.run == 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: formal-logs
