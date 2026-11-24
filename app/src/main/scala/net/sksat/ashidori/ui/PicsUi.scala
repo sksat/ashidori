@@ -3,9 +3,8 @@ package net.sksat.ashidori.ui
 import android.os.{Handler, Looper, SystemClock}
 import android.text.{SpannableStringBuilder, Spanned}
 import android.text.style.ForegroundColorSpan
-import android.view.View
-import java.time.Instant
-import java.time.format.DateTimeFormatter
+import android.view.{View, ViewGroup}
+import android.widget.LinearLayout
 import scala.util.Try
 import net.sksat.ashidori.*
 import ashidori.core.*
@@ -20,8 +19,7 @@ object PicsUi:
   val Green = 0xff00a37a.toInt
   val Red = 0xffe0372f.toInt
 
-  private val timeFmt = DateTimeFormatter.ofPattern("H:mm:ss")
-  def time(wall: Long): String = Instant.ofEpochMilli(wall).atZone(AshidoriApp.zone).format(timeFmt)
+  def time(wall: Long): String = PicsStatus.time(wall, AshidoriApp.zone)
 
   /** One mark per crosswalk: ● green, ◐ flashing green, ● red, – none. */
   def mark(l: Light): String = l match
@@ -50,24 +48,104 @@ object PicsUi:
   def spoken(peds: Seq[Ped], fresh: Boolean): String =
     peds.sortBy(_.index).map(p => s"歩行者信号${p.index + 1} ${p.light.label}").mkString("、") + (if fresh then "" else "（受信から2秒以上）")
 
-  /** The ステータス row 「信号機」: the intersection, its signals while
-    * receiving, the time of the last reception, and when it changes next
-    * without a reception (elapsed ms: the grey at exactly 2 s,
-    * [[PicsDisplay]]). None: not shown (off, or nothing for 10 minutes).
-    */
-  def statusLine(using Ctx): Option[(CharSequence, String, Long)] =
-    if !Settings.picsEnabled then None
+/** The ステータス row 「信号機」 (design 6), whenever the reception is on: the
+  * label, two lines ([[PicsStatus.row]]) and a chevron while a tap opens
+  * the settings to fix it. As tall in every state: the first line keeps the
+  * height of the signals' marks. Redrawn on each change of the logger's
+  * state (each fix and reception) and at the time it changes without one
+  * (the colours go grey at exactly 2 s); nothing runs while hidden.
+  */
+final class PicsStatusRow(act: MainActivity, labelWidth: Int):
+  private given Ctx = act
+  private val label = text("信号機", 14f, colorAttr = attr.onSurfaceVariant)
+  label.setLayoutParams(LinearLayout.LayoutParams(labelWidth, ViewGroup.LayoutParams.WRAP_CONTENT))
+  private val sample: CharSequence =
+    SpannableStringBuilder("信号機").append("  ").append(PicsUi.marks(Seq(Ped(0, Light.Green, 3, None)), fresh = true))
+  private val main =
+    val t = tabular(oneLine(StableText(act, () => Seq(sample))))
+    t.setTextSize(15f)
+    t.setTextColor(color(attr.onSurface))
+    t
+  private val sub = tabular(oneLine(caption("")))
+  private val chevron =
+    val v = icon(net.sksat.ashidori.R.drawable.ic_chevron_right, attr.error)
+    v.setLayoutParams(LinearLayout.LayoutParams(dp(20), dp(20)))
+    v.setVisibility(View.INVISIBLE)
+    v
+  private val lines =
+    val v = vbox(main, sub)
+    v.setLayoutParams(weighted())
+    v
+  val view: LinearLayout =
+    val h = hbox(label, lines, chevron)
+    h.setPadding(0, dp(3), 0, dp(3))
+    h.setVisibility(View.GONE)
+    h
+  ripple(view)
+  /** The last reception stored today (read at onShow). */
+  private var stored: Option[PicsStatus.Last] = None
+  private var shown = false
+  private val ticker = Handler(Looper.getMainLooper)
+  private val tick: Runnable = () => show()
+
+  def onShow(): Unit =
+    shown = true
+    show()
+    if Settings.picsEnabled then
+      AshidoriApp.io.execute { () =>
+        val zone = AshidoriApp.zone
+        val day = java.time.LocalDate.now(zone).atStartOfDay(zone).toInstant.toEpochMilli
+        val last = Try(AshidoriApp.db.recentPicsAdv(50)).toOption.flatMap(rs =>
+          PicsStatus.lastStored(rs, day, (lat, lon) => PicsSitesData.index.matching(lat, lon).map(_.name),
+            iid => PicsLive.heard.get(iid).fold(s"ID ${PicsFormat.idNumber(iid)}")(_.label)))
+        act.runOnUiThread { () =>
+          stored = last
+          if shown then show()
+        }
+      }
+
+  def onHide(): Unit =
+    shown = false
+    ticker.removeCallbacks(tick)
+
+  private def tone(t: PicsStatus.Tone): Int = color(t match
+    case PicsStatus.Tone.Active => attr.primary
+    case PicsStatus.Tone.Normal => attr.onSurface
+    case PicsStatus.Tone.Muted  => attr.onSurfaceVariant
+    case PicsStatus.Tone.Error  => attr.error)
+
+  def show(): Unit =
+    ticker.removeCallbacks(tick)
+    if !shown || !Settings.picsEnabled then view.setVisibility(View.GONE)
     else
       val now = SystemClock.elapsedRealtime()
-      val receiving = Set(PicsScanPolicy.State.Receiving, PicsScanPolicy.State.Test).contains(PicsLive.plan.state)
-      PicsLive.current.flatMap(h => PicsDisplay.at(now, receiving, h.signalsAt, h.lastAt).map(h -> _)).map { (h, v) =>
-        val sb = SpannableStringBuilder(h.label)
-        val showSignals = v.signals && h.peds.nonEmpty
-        if showSignals then sb.append("  ").append(marks(h.peds, v.fresh))
-        sb.append("  ").append(time(h.lastWall))
-        (sb, s"${h.label}、" + (if showSignals then spoken(h.peds, v.fresh) + "、" else "") + s"最後の受信 ${time(h.lastWall)}",
-          v.nextAt)
-      }
+      val r = PicsStatus.row(PicsStatus.Input(now, System.currentTimeMillis(), AshidoriApp.zone,
+        PicsScanner.hasPermission(act), PicsScanner.bluetoothOn(act),
+        if LoggerState.running then PicsLive.plan.state else PicsScanPolicy.State.Stopped,
+        PicsLive.current.map(_.status), PicsLive.nearest, stored))
+      val sb = SpannableStringBuilder(r.main)
+      sb.setSpan(ForegroundColorSpan(tone(r.tone)), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+      r.signals.foreach((ps, fresh) => sb.append("  ").append(PicsUi.marks(ps, fresh)))
+      r.detail.foreach(d => sb.append("・").append(d))
+      main.setText(sb)
+      sub.setText(r.sub)
+      chevron.setVisibility(if r.opens.isDefined then View.VISIBLE else View.INVISIBLE)
+      view.setClickable(r.opens.isDefined)
+      view.setOnClickListener(r.opens.fold(null: View.OnClickListener)(o => _ => open(o)))
+      if r.opens.isDefined then a11yRole(view, classOf[android.widget.Button])
+      else androidx.core.view.ViewCompat.setAccessibilityDelegate(view, null)
+      view.setContentDescription((Seq("信号機", r.main) ++ r.signals.map(PicsUi.spoken(_, _)) ++ r.detail :+ r.sub).mkString("、"))
+      view.setVisibility(View.VISIBLE)
+      if r.nextAt != Long.MaxValue then
+        ticker.postAtTime(tick, r.nextAt - now + SystemClock.uptimeMillis())
+
+  private def open(o: PicsStatus.Opens): Unit =
+    val i = o match
+      case PicsStatus.Opens.AppPermission =>
+        android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+          android.net.Uri.fromParts("package", act.getPackageName, null))
+      case PicsStatus.Opens.BluetoothSettings => android.content.Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+    Try(act.startActivity(i)).failed.foreach(e => Log.w("PICS: settings not opened", e))
 
 /** 端末診断 「信号機の電波」 (design 6): what the reception can do here, its
   * state, today's scans, what the caps refused, the last 50 rows and

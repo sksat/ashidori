@@ -40,6 +40,7 @@ object PicsLive:
   final case class Heard(iid: String, site: Option[PicsSite], text: Option[String], peds: Seq[PicsFormat.Ped],
                          signalsAt: Long, lastAt: Long, lastWall: Long, rssi: Int):
     def label: String = site.map(_.name).getOrElse(s"ID ${PicsFormat.idNumber(iid)}")
+    def status: PicsStatus.Heard = PicsStatus.Heard(label, peds, signalsAt, lastAt, lastWall)
 
   @volatile var heard: Map[String, Heard] = Map.empty
   @volatile var plan: PicsScanPolicy.Plan = PicsScanPolicy.Initial
@@ -53,6 +54,8 @@ object PicsLive:
   @volatile var broken: Option[String] = None
   /** Asks the running logger to plan the scan again (set by it). */
   @volatile var replan: () => Unit = () => ()
+  /** The nearest listed intersection from the latest fix (the ステータス row). */
+  @volatile var nearest: Option[PicsStatus.Nearest] = None
   /** 「受信の試験」 until then (elapsed); 0: none. */
   @volatile var testUntil: Long = 0L
 

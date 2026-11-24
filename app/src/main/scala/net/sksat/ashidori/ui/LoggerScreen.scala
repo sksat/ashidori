@@ -107,25 +107,9 @@ final class LoggerScreen(act: MainActivity) extends Screen:
   private val (motionRow, motionValue) = row("動き")
   private val (envRow, envValue) = row("屋内外")
   private val (batteryRow, batteryValue) = row("電池")
-  /** 信号機の電波: shown while it is on and something came in the last 10 minutes. */
-  private val (picsRow, picsValue) = row("信号機")
-  picsRow.setVisibility(View.GONE)
-  private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow, picsRow)
-  /** Redrawn at each reception (LoggerState) and at the time it changes
-    * without one: the colours go grey at exactly 2 s after their reception.
-    */
-  private val picsTicker = android.os.Handler(android.os.Looper.getMainLooper)
-  private val picsTick: Runnable = () => showPics()
-  private def showPics(): Unit =
-    picsTicker.removeCallbacks(picsTick)
-    PicsUi.statusLine match
-      case Some((line, spoken, nextAt)) =>
-        picsValue.setText(line)
-        picsValue.setContentDescription(spoken)
-        picsRow.setVisibility(View.VISIBLE)
-        picsTicker.postAtTime(picsTick, nextAt - android.os.SystemClock.elapsedRealtime() + android.os.SystemClock.uptimeMillis())
-      case None =>
-        picsRow.setVisibility(View.GONE)
+  /** 信号機の電波: shown whenever it is on (design 6). */
+  private val pics = PicsStatusRow(act, dp(72))
+  private val stateRows = vbox(sourceRow, motionRow, envRow, batteryRow, pics.view)
   /** Why it is like this: supplementary, so quieter and marked with ⓘ.
     * The mode note keeps its line even when empty: switching modes adds or
     * removes it ("「高精度」で動作中: 充電中のため精度を1段階向上").
@@ -332,6 +316,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     unobserve()
     banner.refresh()
     unobserve = LoggerState.observe(() => refresh())
+    pics.onShow()
     peers.onShow()
     paintModes()
     if Settings.showEstimates then EnergyStats.load(_ => modeMeasured.setText(EnergyUi.modeLine(Settings.mode)))
@@ -341,8 +326,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
     loadFiles()
   override def onHide(): Unit =
     unobserve()
-    picsTicker.removeCallbacks(picsTick)
-    picsRow.setVisibility(View.GONE)
+    pics.onHide()
     peers.onHide()
     panel.onHide()
     sensorPanel.onHide()
@@ -418,7 +402,7 @@ final class LoggerScreen(act: MainActivity) extends Screen:
       else
         val d = LoggerState.drainPctPerHour
         s"${LoggerState.battery}%" + (if d.isNaN then "" else f"・$d%.1f%%/時"))
-    showPics()
+    pics.show()
     modeNote.setText(plan.flatMap(PositioningPanel.modeNote(_, Settings.mode)).fold("")("ⓘ " + _))
     // Indoors the note keeps its room in every mode (最高精度 has none);
     // elsewhere it does not appear.

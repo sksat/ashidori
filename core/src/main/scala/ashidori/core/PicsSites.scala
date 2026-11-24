@@ -51,6 +51,15 @@ object PicsSites:
 
     def nearest(lat: Double, lon: Double, radiusM: Double): Option[(PicsSite, Double)] = within(lat, lon, radiusM).headOption
 
+    /** The nearest site at any distance (the ステータス row, design 6):
+      * the grid within 1, 4 and 16 km, then every site.
+      */
+    def nearestAny(lat: Double, lon: Double): Option[(PicsSite, Double)] =
+      if sites.isEmpty || lat.isNaN || lon.isNaN then None
+      else
+        Iterator(1_000.0, 4_000.0, 16_000.0).map(nearest(lat, lon, _)).collectFirst { case Some(n) => n }
+          .orElse(sites.map(s => s -> Geo.distance(lat, lon, s.lat, s.lon)).minByOption(_._2))
+
     /** The listed site a received kind 1 position names: the only one within
       * [[MatchM]] (two or more: none; 96 pairs are under 100 m apart).
       */
