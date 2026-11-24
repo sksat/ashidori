@@ -39,6 +39,16 @@ tasks.register<JavaExec>("webFixtures") {
     finalizedBy("viewerPairingFixtures")
 }
 
+// CPU cost of archiving detail-log lines, stage by stage (bench/CompactionBench.scala).
+tasks.register<JavaExec>("compactionBench") {
+    group = "verification"
+    description = "Times the archiving pipeline on synthetic detail-log lines."
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("ashidori.core.bench.CompactionBench")
+    maxHeapSize = "2g"
+    args((project.findProperty("args") as String? ?: "").split(" ").filter { it.isNotEmpty() })
+}
+
 // Interop vectors of browser pairing v1 (server/web/test/fixtures/viewer-pairing.json),
 // with grants sealed by Tink (ViewerPairingFixtures.scala).
 tasks.register<JavaExec>("viewerPairingFixtures") {

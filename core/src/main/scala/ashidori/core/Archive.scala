@@ -268,32 +268,42 @@ object Archive:
     */
   def parse(line: String, time: Long): Either[String, (TableDef, IndexedSeq[Any])] =
     val a = line.split(",", -1)
-    def cells(t: TableDef, fields: Seq[String]): Either[String, IndexedSeq[Any]] =
-      val out = IndexedSeq.newBuilder[Any]
-      var err: Option[String] = None
-      for (c, s) <- t.columns.zip(fields) if err.isEmpty do
-        strictCell(s, c.tpe).fold(e => err = Some(s"${c.name}: $e"), out += _)
-      err.toLeft(out.result())
-    def fields(n: Int, from: Int): Either[String, Seq[String]] =
-      if a.length - from > n then Left(s"${a.length - from} fields, ${n} columns")
-      else Right((from until from + n).map(i => a.lift(i).getOrElse("")))
+    def cells(t: TableDef, fields: Array[String], positions: Array[Int], offset: Int): Either[String, IndexedSeq[Any]] =
+      val out = new Array[Any](t.columns.size)
+      var i = 0
+      while i < out.length do
+        val at = if positions == null then i + offset else positions(i)
+        val s = if at < fields.length then fields(at) else ""
+        strictCell(s, t.columns(i).tpe) match
+          case Left(e) => return Left(s"${t.columns(i).name}: $e")
+          case Right(v) => out(i) = v
+        i += 1
+      Right(scala.collection.immutable.ArraySeq.unsafeWrapArray(out))
+    def checked(t: TableDef, count: Int, positions: Array[Int] = null): Either[String, (TableDef, IndexedSeq[Any])] =
+      if a.length - 1 > count then Left(s"${a.length - 1} fields, ${count} columns")
+      else cells(t, a, positions, 1).map(t -> _)
     val row: Either[String, (TableDef, IndexedSeq[Any])] = tableFor(a(0)) match
       case None => Left(s"no table for '${a(0)}'")
-      case Some(t @ (GnssRaw | GnssSat)) => fields(t.columns.size, 1).flatMap(cells(t, _)).map(t -> _)
+      case Some(t @ (GnssRaw | GnssSat)) => checked(t, t.columns.size)
       case Some(GnssNav) =>
         if a.length < 6 then Left("navigation message without its fields")
-        else cells(GnssNav, time.toString +: (1 to 5).map(a(_)) :+ a.drop(6).mkString(" ")).map(GnssNav -> _)
+        else
+          val fields = new Array[String](7)
+          fields(0) = time.toString
+          var i = 1
+          while i <= 5 do
+            fields(i) = a(i)
+            i += 1
+          fields(6) = a.drop(6).mkString(" ")
+          cells(GnssNav, fields, null, 0).map(GnssNav -> _)
       case Some(Nmea) =>
         if a.length < 3 then Left("NMEA without its time")
         else a.last.toLongOption.toRight("NMEA time").map(t => Nmea -> IndexedSeq(t, a.slice(1, a.length - 1).mkString(",")))
       case Some(Imu) =>
         if a.length != 6 then Left(s"${a.length} fields in an IMU line")
-        else cells(Imu, Seq(a(1), a(2), a(0), a(3), a(4), a(5))).map(Imu -> _)
+        else cells(Imu, a, Array(1, 2, 0, 3, 4, 5), 0).map(Imu -> _)
       case Some(GnssFix) =>
-        fields(16, 1).flatMap { f =>
-          val order = Seq(7, 0, 1, 2, 3, 4, 5, 6) ++ (8 to 15)
-          cells(GnssFix, order.map(f))
-        }.map(GnssFix -> _)
+        checked(GnssFix, 16, Array(8, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16))
       case Some(other) => Left(s"no conversion for ${other.name}")
     row.filterOrElse((_, r) => r.nonEmpty && r(0) != null, "no time")
 

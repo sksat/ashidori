@@ -35,10 +35,11 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
   sink.write(Magic)
 
   // Present values per column until the page is encoded.
-  private val strings = schema.map(_ => ByteArrayOutputStream())
-  private val longs = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Long])
-  private val doubles = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Double])
-  private val defined = schema.map(_ => scala.collection.mutable.ArrayBuffer.empty[Boolean])
+  private val columns = schema.toArray
+  private val strings = Array.fill(columns.length)(ByteArrayOutputStream())
+  private val longs = Array.fill(columns.length)(LongValues())
+  private val doubles = Array.fill(columns.length)(DoubleValues())
+  private val defined = Array.fill(columns.length)(BooleanValues())
   private var rowsInGroup = 0
   private var totalRows = 0L
   // Min and max of the first column (the time) in this row group, written as
@@ -51,49 +52,60 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
   private val rowGroups = Vector.newBuilder[RowGroupMeta]
 
   def write(row: Seq[Any]): Unit =
-    require(row.size == schema.size, s"row has ${row.size} values, schema ${schema.size}")
+    require(row.size == columns.length, s"row has ${row.size} values, schema ${schema.size}")
     // The whole row is checked before any of it is taken.
-    for (v, c) <- row.zip(schema) if v != null do
-      val ok = (c.tpe, v) match
-        case (ColType.Int32, _: Int)                 => true
-        case (ColType.Int64, _: Long | _: Int)       => true
-        case (ColType.Float32, _: Float)             => true
-        case (ColType.Float64, _: Double | _: Float) => true
-        case (ColType.Str, _: String)                => true
-        case _                                       => false
-      if !ok then throw IllegalArgumentException(s"column ${c.name} (${c.tpe}): ${v.getClass.getSimpleName} $v")
-    for ((v, c), i) <- row.zip(schema).zipWithIndex do
+    val check = row.iterator
+    var i = 0
+    while check.hasNext do
+      val v = check.next()
+      val c = columns(i)
+      if v != null then
+        val ok = (c.tpe, v) match
+          case (ColType.Int32, _: Int)                 => true
+          case (ColType.Int64, _: Long | _: Int)       => true
+          case (ColType.Float32, _: Float)             => true
+          case (ColType.Float64, _: Double | _: Float) => true
+          case (ColType.Str, _: String)                => true
+          case _                                       => false
+        if !ok then throw IllegalArgumentException(s"column ${c.name} (${c.tpe}): ${v.getClass.getSimpleName} $v")
+      i += 1
+    val values = row.iterator
+    i = 0
+    while values.hasNext do
+      val v = values.next()
+      val c = columns(i)
       val present = v match
         case null                  => false
         case d: Double if d.isNaN  => false
         case f: Float if f.isNaN   => false
         case _                     => true
-      defined(i) += present
+      defined(i).add(present)
       if i == 0 && !present then nullTime = true
       if present then
         c.tpe match
           case ColType.Int32 | ColType.Int64 =>
             val l = long(v)
-            longs(i) += l
+            longs(i).add(l)
             if i == 0 then
               if l < minTime then minTime = l
               if l > maxTime then maxTime = l
-          case ColType.Float32 | ColType.Float64 => doubles(i) += double(v)
+          case ColType.Float32 | ColType.Float64 => doubles(i).add(double(v))
           case ColType.Str =>
             val bytes = v.toString.getBytes(UTF_8)
             le(strings(i), bytes.length.toLong, 4)
             strings(i).write(bytes)
+      i += 1
     rowsInGroup += 1
     if rowsInGroup >= rowGroupRows then flushGroup()
 
   /** Encoded values of column i and the encoding id used. */
   private def encodeValues(i: Int): (Array[Byte], Int) =
     schema(i).tpe match
-      case ColType.Int32 => (deltaBinaryPacked(longs(i), 32), DeltaBinaryPacked)
-      case ColType.Int64 => (deltaBinaryPacked(longs(i), 64), DeltaBinaryPacked)
+      case ColType.Int32 => (deltaBinaryPackedArray(longs(i).data, longs(i).size, 32), DeltaBinaryPacked)
+      case ColType.Int64 => (deltaBinaryPackedArray(longs(i).data, longs(i).size, 64), DeltaBinaryPacked)
       case ColType.Float32 =>
-        (byteStreamSplit(doubles(i).map(d => java.lang.Float.floatToIntBits(d.toFloat).toLong & 0xffffffffL), 4), ByteStreamSplit)
-      case ColType.Float64 => (byteStreamSplit(doubles(i).map(java.lang.Double.doubleToLongBits), 8), ByteStreamSplit)
+        (byteStreamSplitDoubles(doubles(i).data, doubles(i).size, 4), ByteStreamSplit)
+      case ColType.Float64 => (byteStreamSplitDoubles(doubles(i).data, doubles(i).size, 8), ByteStreamSplit)
       case ColType.Str     => (strings(i).toByteArray, Plain)
 
   private def long(v: Any): Long = v match
@@ -117,7 +129,7 @@ final class ParquetWriter(out: OutputStream, schema: Seq[Column], rowGroupRows: 
     if rowsInGroup > 0 then
       val chunks = schema.zipWithIndex.map { (c, i) =>
         // Page body: definition levels (length-prefixed RLE) then values.
-        val levels = rle(defined(i))
+        val levels = rleArray(defined(i).data, defined(i).size)
         val body = ByteArrayOutputStream()
         le(body, levels.length.toLong, 4)
         body.write(levels)
@@ -271,54 +283,130 @@ object ParquetWriter:
   val DeltaBinaryPacked = 5
   val ByteStreamSplit = 9
 
+  // Present values of a column until its page is encoded, unboxed. Cleared
+  // after each row group, keeping the array for the next.
+  private final class LongValues:
+    var data = new Array[Long](128)
+    var size = 0
+    def add(v: Long): Unit =
+      if size == data.length then data = java.util.Arrays.copyOf(data, data.length * 2)
+      data(size) = v
+      size += 1
+    def clear(): Unit = size = 0
+
+  private final class DoubleValues:
+    var data = new Array[Double](128)
+    var size = 0
+    def add(v: Double): Unit =
+      if size == data.length then data = java.util.Arrays.copyOf(data, data.length * 2)
+      data(size) = v
+      size += 1
+    def clear(): Unit = size = 0
+
+  private final class BooleanValues:
+    var data = new Array[Boolean](128)
+    var size = 0
+    def add(v: Boolean): Unit =
+      if size == data.length then data = java.util.Arrays.copyOf(data, data.length * 2)
+      data(size) = v
+      size += 1
+    def clear(): Unit = size = 0
+
   /** BYTE_STREAM_SPLIT: byte k of every value, then byte k+1, ... Groups the
     * slowly-changing high bytes of time series so GZIP compresses them well.
     */
   def byteStreamSplit(bits: collection.IndexedSeq[Long], width: Int): Array[Byte] =
     val n = bits.size
     val out = new Array[Byte](n * width)
-    for i <- 0 until n; k <- 0 until width do out(k * n + i) = ((bits(i) >>> (8 * k)) & 0xff).toByte
+    var k = 0
+    while k < width do
+      var i = 0
+      while i < n do
+        out(k * n + i) = (bits(i) >>> (8 * k)).toByte
+        i += 1
+      k += 1
+    out
+
+  private def byteStreamSplitDoubles(values: Array[Double], n: Int, width: Int): Array[Byte] =
+    val out = new Array[Byte](n * width)
+    var i = 0
+    while i < n do
+      val bits = if width == 4 then java.lang.Float.floatToIntBits(values(i).toFloat).toLong & 0xffffffffL
+                 else java.lang.Double.doubleToLongBits(values(i))
+      var k = 0
+      while k < width do
+        out(k * n + i) = (bits >>> (8 * k)).toByte
+        k += 1
+      i += 1
     out
 
   /** DELTA_BINARY_PACKED (blocks of 128 values, 4 miniblocks of 32): stores
     * the first value and bit-packed deltas, ideal for timestamps and ids.
     */
   def deltaBinaryPacked(values: collection.IndexedSeq[Long], typeBits: Int): Array[Byte] =
+    val data = new Array[Long](values.size)
+    var i = 0
+    while i < data.length do
+      data(i) = values(i)
+      i += 1
+    deltaBinaryPackedArray(data, data.length, typeBits)
+
+  private def deltaBinaryPackedArray(values: Array[Long], n: Int, typeBits: Int): Array[Byte] =
     val b = ByteArrayOutputStream()
-    val blockSize = 128
-    val miniblocks = 4
-    val perMini = blockSize / miniblocks
-    Thrift.varint(b, blockSize.toLong)
-    Thrift.varint(b, miniblocks.toLong)
-    Thrift.varint(b, values.size.toLong)
-    Thrift.varint(b, Thrift.zigzag(if values.isEmpty then 0L else values(0)))
-    def wrap(d: Long) = if typeBits == 32 then d.toInt.toLong else d
-    val deltas = (1 until values.size).map(i => wrap(values(i) - values(i - 1)))
-    for block <- deltas.grouped(blockSize) do
-      val minDelta = block.min
+    Thrift.varint(b, 128)
+    Thrift.varint(b, 4)
+    Thrift.varint(b, n.toLong)
+    Thrift.varint(b, Thrift.zigzag(if n == 0 then 0L else values(0)))
+    val deltas = new Array[Long](128)
+    val widths = new Array[Int](4)
+    var start = 1
+    while start < n do
+      val count = math.min(128, n - start)
+      var minDelta = Long.MaxValue
+      var i = 0
+      while i < count do
+        val d = values(start + i) - values(start + i - 1)
+        val wrapped = if typeBits == 32 then d.toInt.toLong else d
+        deltas(i) = wrapped
+        if wrapped < minDelta then minDelta = wrapped
+        i += 1
       Thrift.varint(b, Thrift.zigzag(minDelta))
-      val minis = block.grouped(perMini).toVector
-      val adjusted = minis.map(_.map(d => wrap(d - minDelta) & (if typeBits == 32 then 0xffffffffL else -1L)))
-      val widths = (0 until miniblocks).map { m =>
-        adjusted.lift(m).map(ms => ms.map(v => 64 - java.lang.Long.numberOfLeadingZeros(v)).max).getOrElse(0)
-      }
-      widths.foreach(w => b.write(w))
-      for (ms, m) <- adjusted.zipWithIndex do
-        val w = widths(m)
-        // Bit-pack 32 values (pad the last miniblock with zeros), LSB first.
-        val padded = ms ++ Seq.fill(perMini - ms.size)(0L)
-        var acc = BigInt(0)
-        var nbits = 0
-        val bytes = ByteArrayOutputStream()
-        for v <- padded do
-          acc |= BigInt(v) << nbits
-          nbits += w
-          while nbits >= 8 do
-            bytes.write((acc & 0xff).toInt)
-            acc >>= 8
-            nbits -= 8
-        if nbits > 0 then bytes.write((acc & 0xff).toInt)
-        b.write(bytes.toByteArray)
+      java.util.Arrays.fill(widths, 0)
+      i = 0
+      while i < count do
+        val d = deltas(i) - minDelta
+        val adjusted = if typeBits == 32 then d.toInt.toLong & 0xffffffffL else d
+        deltas(i) = adjusted
+        val width = 64 - java.lang.Long.numberOfLeadingZeros(adjusted)
+        val m = i >>> 5
+        if width > widths(m) then widths(m) = width
+        i += 1
+      i = 0
+      while i < 4 do
+        b.write(widths(i))
+        i += 1
+      var m = 0
+      while m < (count + 31) / 32 do
+        val width = widths(m)
+        // Exactly 32 padded values; unused bits remain zero in the byte array.
+        val packed = new Array[Byte](width * 4)
+        val end = math.min(count, (m + 1) * 32)
+        i = m * 32
+        while i < end do
+          val value = deltas(i)
+          var bit = 0
+          while bit < width do
+            val pos = (i - m * 32) * width + bit
+            val byteIndex = pos >>> 3
+            val space = 8 - (pos & 7)
+            val take = math.min(width - bit, space)
+            val mask = (1L << take) - 1L
+            packed(byteIndex) = (packed(byteIndex) | (((value >>> bit) & mask) << (pos & 7)).toInt).toByte
+            bit += take
+          i += 1
+        b.write(packed)
+        m += 1
+      start += count
     b.toByteArray
   private final case class RowGroupMeta(chunks: Seq[ChunkMeta], rows: Int)
 
@@ -327,11 +415,19 @@ object ParquetWriter:
 
   /** RLE/bit-packing hybrid with bit width 1, using RLE runs only. */
   def rle(levels: collection.IndexedSeq[Boolean]): Array[Byte] =
+    val data = new Array[Boolean](levels.size)
+    var i = 0
+    while i < data.length do
+      data(i) = levels(i)
+      i += 1
+    rleArray(data, data.length)
+
+  private def rleArray(levels: Array[Boolean], n: Int): Array[Byte] =
     val b = ByteArrayOutputStream()
     var i = 0
-    while i < levels.size do
-      var j = i
-      while j < levels.size && levels(j) == levels(i) do j += 1
+    while i < n do
+      var j = i + 1
+      while j < n && levels(j) == levels(i) do j += 1
       Thrift.varint(b, ((j - i).toLong << 1))
       b.write(if levels(i) then 1 else 0)
       i = j
