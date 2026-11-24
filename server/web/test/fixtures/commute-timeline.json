@@ -44,39 +44,12 @@
     },
     {
      "start": 1791153955000,
-     "end": 1791154255000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 2909.759637274769,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791154255000,
-     "end": 1791156270000,
-     "mode": "IN_TRAIN",
-     "distanceM": 43425.26024896384,
-     "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.65
-    },
-    {
-     "start": 1791156270000,
-     "end": 1791157092000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 7472.435566667486,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791157092000,
      "end": 1791157387000,
      "mode": "IN_TRAIN",
-     "distanceM": 2566.728895685126,
+     "distanceM": 56374.184348591225,
      "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.5
+     "uncertain": 0.3269230769230769,
+     "confidence": 0.65
     },
     {
      "start": 1791157387000,
@@ -212,29 +185,11 @@
     },
     {
      "start": 1791193387000,
-     "end": 1791193682000,
-     "mode": "IN_TRAIN",
-     "distanceM": 2607.2244251352117,
-     "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.5
-    },
-    {
-     "start": 1791193682000,
-     "end": 1791194359000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 6338.58876343859,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791194359000,
      "end": 1791196554000,
      "mode": "IN_TRAIN",
-     "distanceM": 46831.25671954649,
+     "distanceM": 55777.0699081203,
      "steps": 100,
-     "uncertain": 0,
+     "uncertain": 0.21376697189769497,
      "confidence": 0.65
     }
    ]
@@ -311,39 +266,12 @@
     },
     {
      "start": 1791153955000,
-     "end": 1791154255000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 2909.759637274769,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791154255000,
-     "end": 1791156270000,
-     "mode": "IN_TRAIN",
-     "distanceM": 43425.26024896384,
-     "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.65
-    },
-    {
-     "start": 1791156270000,
-     "end": 1791157092000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 7472.435566667486,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791157092000,
      "end": 1791157387000,
      "mode": "IN_TRAIN",
-     "distanceM": 2566.728895685126,
+     "distanceM": 56374.184348591225,
      "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.5
+     "uncertain": 0.3269230769230769,
+     "confidence": 0.65
     },
     {
      "start": 1791157387000,
@@ -479,29 +407,11 @@
     },
     {
      "start": 1791193387000,
-     "end": 1791193682000,
-     "mode": "IN_TRAIN",
-     "distanceM": 2607.2244251352117,
-     "steps": 0,
-     "uncertain": 0,
-     "confidence": 0.5
-    },
-    {
-     "start": 1791193682000,
-     "end": 1791194359000,
-     "mode": "IN_SUBWAY",
-     "distanceM": 6338.58876343859,
-     "steps": 0,
-     "uncertain": 1,
-     "confidence": 0.55
-    },
-    {
-     "start": 1791194359000,
      "end": 1791196554000,
      "mode": "IN_TRAIN",
-     "distanceM": 46831.25671954649,
+     "distanceM": 55777.0699081203,
      "steps": 100,
-     "uncertain": 0,
+     "uncertain": 0.21376697189769497,
      "confidence": 0.65
     }
    ]
@@ -546,14 +456,12 @@
   "distanceByMode": {
    "WALKING": 3243.34202933926,
    "IN_PASSENGER_VEHICLE": 6492.015564364981,
-   "IN_TRAIN": 111577.04875244403,
-   "IN_SUBWAY": 16720.783967380845
+   "IN_TRAIN": 128297.83271982489
   },
   "durationByMode": {
    "WALKING": 2115000,
    "IN_PASSENGER_VEHICLE": 1310000,
-   "IN_TRAIN": 7045000,
-   "IN_SUBWAY": 1799000
+   "IN_TRAIN": 8844000
   },
   "steps": 4991,
   "visits": 6,

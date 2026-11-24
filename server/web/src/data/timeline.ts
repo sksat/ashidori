@@ -333,8 +333,8 @@ export class MotionIndex {
 
 /**
  * TimelineBuilder.build: with the user's corrections applied to the legs as
- * built, then adjacent legs of a trip that show the same mode made one
- * (mergeSameMode).
+ * built, then adjacent legs of a trip that show the same mode, or are one
+ * train ride, made one (merger).
  */
 export function buildTimeline(rawFixes: readonly Fix[], motion: readonly MotionWindow[] = [], overrides: readonly ModeOverride[] = []): Segment[] {
   if (rawFixes.length === 0) return [];
@@ -589,58 +589,142 @@ function pieces(path: Fix[], motion: MotionIndex, newest: readonly ModeOverride[
   }
   const built = runs.map(([a, b]): Piece => {
     const [l, unrecorded] = makeLeg(iv.slice(a, b + 1), motion, ground);
-    return { from: a, to: b, leg: unrecorded ? l : applyOverride(l, newest), unrecorded };
+    const leg = unrecorded ? l : applyOverride(l, newest);
+    return { from: a, to: b, leg, unrecorded, parts: [leg] };
   });
-  return mergeSameMode(built, iv, motion, ground).map((x) => [x.leg, x.unrecorded]);
+  const m = merger(iv, motion, ground);
+  return m.sameMode(m.rail(m.sameMode(built, true)), false).map((x) => [x.leg, x.unrecorded]);
 }
 
-/** A leg of intervals `from` to `to` (inclusive). */
+/** A leg of intervals `from` to `to` (inclusive), and the legs as cut by speed (corrected) that it was made of. */
 interface Piece {
   from: number;
   to: number;
   leg: Leg;
   unrecorded: boolean;
+  parts: Leg[];
+}
+
+/** A correction changed the mode of one of its parts. */
+const fixed = (x: Piece): boolean => x.parts.some((l) => l.corrected === true);
+/** The mode the record says, whatever the user set (Leg.autoMode). */
+const autoMode = (l: Leg): ModeKey => l.inferred ?? l.mode;
+
+/** TimelineBuilder.isRail: 電車 and 地下鉄 are one family for merging. */
+export function isRail(m: ModeKey): boolean {
+  return m === "IN_TRAIN" || m === "IN_SUBWAY";
+}
+
+/** TimelineBuilder.railMode: the mode the record says for the longer total time; 電車 on a tie. */
+export function railMode(legs: readonly Leg[]): ModeKey {
+  const time = (m: ModeKey) => legs.filter((l) => autoMode(l) === m).reduce((a, l) => a + (l.end - l.start), 0);
+  return time("IN_SUBWAY") > time("IN_TRAIN") ? "IN_SUBWAY" : "IN_TRAIN";
+}
+
+/** TimelineBuilder.TransferSteps: steps between two rail legs that say the user changed trains. */
+export const TRANSFER_STEPS = 60;
+/** TimelineBuilder.transferWindowMs: a walk shorter than a leg, then a wait shorter than a visit. */
+const TRANSFER_WINDOW_MS = PARAMS.minLegDurationMs + STAY.minDurationMs;
+
+/**
+ * TimelineBuilder.transfer: TRANSFER_STEPS steps or more around the cut
+ * between the adjacent legs `a` and `b`, up to TRANSFER_WINDOW_MS on either
+ * side and no further than the middle of either leg.
+ */
+function transfer(a: Leg, b: Leg, motion: MotionIndex): boolean {
+  const from = Math.max(a.end - TRANSFER_WINDOW_MS, a.start + Math.trunc((a.end - a.start) / 2));
+  const to = Math.min(b.start + TRANSFER_WINDOW_MS, b.start + Math.trunc((b.end - b.start) / 2));
+  return motion.summary(from, to).steps >= TRANSFER_STEPS;
 }
 
 /**
- * TimelineBuilder.mergeSameMode: each longest run of adjacent legs that show
- * the same mode is built again as one leg from all their intervals, kept if
- * it still shows that mode: without a correction on any part, if it is
- * classified so itself; with one, always (the mode the record says for the
- * whole as `inferred`). If not, each half of the run (by legs) is tried the
- * same way, then the two legs at the cut once as a pair: O(n log n). Corrections are applied to the parts first, so each
- * keeps the span it was saved for. Never across a stretch without a record.
+ * TimelineBuilder.Merge: adjacent legs of a trip merged in three passes:
+ * legs of the same mode (sameMode); legs of 電車 and 地下鉄 without a
+ * transfer between them, as one ride with the mode of the longer time
+ * (rail); legs of the same mode again, for legs with a correction that now
+ * sit next to a ride of their mode. Corrections are applied to the parts
+ * first, so each keeps the span it was saved for. Never across a stretch
+ * without a record.
  */
-function mergeSameMode(ps: Piece[], iv: Interval[], motion: MotionIndex, ground: number): Piece[] {
-  // `run` as one leg, if it still shows its mode.
-  const asOne = (run: Piece[]): Piece | undefined => {
+function merger(iv: Interval[], motion: MotionIndex, ground: number) {
+  // `run` as one leg as the record shows it (the mode of the ride for rail
+  // legs without a transfer between them), and whether two adjacent parts
+  // that are rail legs, as shown or as the record says, have a transfer
+  // between them.
+  const whole = (run: Piece[]): [Piece, boolean] => {
     const first = run[0]!;
     const last = run[run.length - 1]!;
-    const mode = first.leg.mode;
+    const parts = run.flatMap((x) => x.parts);
     const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion, ground);
-    if (unrecorded || !(run.some((x) => x.leg.corrected === true) || l.mode === mode)) return undefined;
-    return { from: first.from, to: last.to, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode }, unrecorded: false };
+    let ride = parts.every((x) => isRail(autoMode(x)));
+    for (let k = 1; ride && k < parts.length; k++) ride = !transfer(parts[k - 1]!, parts[k]!, motion);
+    let transferred = false;
+    for (let k = 1; !transferred && k < parts.length; k++) {
+      const [a, b] = [parts[k - 1]!, parts[k]!];
+      const rails = (isRail(a.mode) && isRail(b.mode)) || (isRail(autoMode(a)) && isRail(autoMode(b)));
+      transferred = rails && transfer(a, b, motion);
+    }
+    return [{ from: first.from, to: last.to, leg: ride ? { ...l, mode: railMode(parts) } : l, unrecorded, parts }, transferred];
   };
-  const joined = (run: Piece[]): Piece[] => {
-    if (run.length < 2) return run;
-    const whole = asOne(run);
-    if (whole) return [whole];
-    const h = Math.trunc(run.length / 2);
-    const a = joined(run.slice(0, h));
-    const b = joined(run.slice(h));
-    // The halves keep the run's mode; their legs at the cut may still go together.
-    const pair = asOne([a[a.length - 1]!, b[0]!]);
-    return pair ? [...a.slice(0, -1), pair, ...b.slice(1)] : [...a, ...b];
+  // `run` (of one mode) as one leg, if it still shows its mode and has no
+  // transfer between rail legs in it (two rides stay two, also when
+  // corrected to one mode): without a correction, if it is so as a whole;
+  // with one, always (the mode the record says for the whole as `inferred`).
+  const asOne = (run: Piece[]): Piece | undefined => {
+    const mode = run[0]!.leg.mode;
+    const [w, transferred] = whole(run);
+    const l = w.leg;
+    if (w.unrecorded || transferred || !(fixed(w) || l.mode === mode)) return undefined;
+    return { ...w, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode } };
   };
-  const out: Piece[] = [];
-  let i = 0;
-  while (i < ps.length) {
-    let j = i + 1;
-    if (!ps[i]!.unrecorded) while (j < ps.length && !ps[j]!.unrecorded && ps[j]!.leg.mode === ps[i]!.leg.mode) j++;
-    out.push(...joined(ps.slice(i, j)));
-    i = j;
-  }
-  return out;
+  // Each longest run of legs of one mode as one; if not, its halves the same
+  // way, then the two legs at the cut once as a pair: O(n log n). With `all`
+  // false only runs with a correction are tried.
+  const sameMode = (ps: Piece[], all: boolean): Piece[] => {
+    const joined = (run: Piece[]): Piece[] => {
+      if (run.length < 2) return run;
+      const one = asOne(run);
+      if (one) return [one];
+      const h = Math.trunc(run.length / 2);
+      const a = joined(run.slice(0, h));
+      const b = joined(run.slice(h));
+      // The halves keep the run's mode; their legs at the cut may still go together.
+      const pair = asOne([a[a.length - 1]!, b[0]!]);
+      return pair ? [...a.slice(0, -1), pair, ...b.slice(1)] : [...a, ...b];
+    };
+    const out: Piece[] = [];
+    let i = 0;
+    while (i < ps.length) {
+      let j = i + 1;
+      if (!ps[i]!.unrecorded) while (j < ps.length && !ps[j]!.unrecorded && ps[j]!.leg.mode === ps[i]!.leg.mode) j++;
+      const run = ps.slice(i, j);
+      out.push(...(all || run.some(fixed) ? joined(run) : run));
+      i = j;
+    }
+    return out;
+  };
+  // Each longest run of rail legs, none with a corrected part and without a
+  // transfer between them, as one leg with the mode of the ride.
+  const rail = (ps: Piece[]): Piece[] => {
+    const free = (x: Piece) => !x.unrecorded && !fixed(x) && isRail(x.leg.mode);
+    const out: Piece[] = [];
+    let i = 0;
+    while (i < ps.length) {
+      let j = i + 1;
+      if (free(ps[i]!))
+        while (j < ps.length && free(ps[j]!) && !transfer(ps[j - 1]!.parts[ps[j - 1]!.parts.length - 1]!, ps[j]!.parts[0]!, motion)) j++;
+      const run = ps.slice(i, j);
+      if (run.length < 2) out.push(...run);
+      else {
+        const [w] = whole(run);
+        if (w.unrecorded) out.push(...run);
+        else out.push(w);
+      }
+      i = j;
+    }
+    return out;
+  };
+  return { sameMode, rail };
 }
 
 function weightedQuantile(sorted: [number, number][], q: number): number {

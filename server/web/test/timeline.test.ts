@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fixesOf, motionOf, readParquet } from "../src/data/archive";
 import { MODES, PALETTE, type Fix, type ModeKey, type MotionWindow, type Segment } from "../src/data/model";
-import { applyOverrides, buildTimeline, classify, Coarse, dayKey, isUnrecorded, removeSpikes, shownSegments, smooth, splitByDay, summarizeDay, walked } from "../src/data/timeline";
+import { applyOverrides, buildTimeline, classify, Coarse, dayKey, isUnrecorded, railMode, removeSpikes, shownSegments, smooth, splitByDay, summarizeDay, walked } from "../src/data/timeline";
 import { latestOverrides } from "../src/data/records";
 import { contentOf, legendModes } from "../src/map/content";
 import { fixture, fixtureJson } from "./helpers";
@@ -300,6 +300,68 @@ describe("adjacent legs of one mode merged, against the app on the same rows", (
     expect(undone.overrides[undone.overrides.length - 1]!.mode).toBe("IN_BUS");
     expect(undone.segments).toEqual(exp.cases.find((c) => c.name === "bothParts")!.segments);
     expect(vehicleLegs("joinNeighbour")[2]).toEqual(["IN_PASSENGER_VEHICLE"]);
+  });
+});
+
+describe("電車 and 地下鉄 of one ride merged, against the app on the same rows", () => {
+  type ExpLeg = ExpTrip["legs"][number] & { inferred: ModeKey | null };
+  interface RailExp {
+    date: string;
+    fixes: [number, number, number, number][];
+    motion: [number, number, number, number, number][];
+    cases: {
+      name: string;
+      overrides: { s: number; e: number; mode: ModeKey; updatedAt: number }[];
+      segments: ({ type: "visit" | "unrecorded"; start: number; end: number } | (Omit<ExpTrip, "legs"> & { legs: ExpLeg[] }))[];
+      durationByMode: Record<string, number>;
+    }[];
+  }
+  const exp = fixtureJson<RailExp>("rail-timeline.json");
+  const fixes: Fix[] = exp.fixes.map(([time, lat, lon, accuracy]) => ({ time, lat, lon, accuracy, altitude: NaN, speed: NaN, bearing: NaN, provider: "gps" }));
+  const motion = exp.motion.map(([start, end, accelStd, accelMean, steps]) => ({ start, end, accelStd, accelMean, steps }));
+
+  for (const c of exp.cases) {
+    it(`builds the same legs (${c.name})`, () => {
+      const overrides = c.overrides.map((o) => ({ start: o.s, end: o.e, mode: o.mode, updatedAt: o.updatedAt }));
+      const segs = buildTimeline(fixes, motion, overrides);
+      expectSame(segs, c.segments as (ExpVisit | ExpTrip)[]);
+      const legsOf = (ss: typeof segs) => ss.flatMap((s) => (s.type === "trip" ? s.legs : []));
+      const wantLegs = c.segments.flatMap((s) => (s.type === "trip" ? s.legs : []));
+      expect(legsOf(segs).map((l) => [l.inferred ?? null, l.corrected === true])).toEqual(wantLegs.map((l) => [l.inferred, l.inferred !== null]));
+      const sum = summarizeDay(exp.date, splitByDay(segs).get(exp.date) ?? [], 0);
+      expect(Object.fromEntries(sum.durationByMode)).toEqual(c.durationByMode);
+    });
+  }
+
+  it("makes one ride of 電車 and 地下鉄, keeps transfers, stays and 記録なし apart", () => {
+    const modes = (name: string) =>
+      exp.cases.find((c) => c.name === name)!.segments.flatMap((s) => (s.type === "trip" ? [s.legs.map((l) => l.mode)] : s.type === "unrecorded" ? [["記録なし"]] : []));
+    const [walk, train, subway] = ["WALKING", "IN_TRAIN", "IN_SUBWAY"];
+    expect(modes("none")).toEqual([
+      [walk, train, walk], // 09:00: one train in and out of the ground
+      [walk, subway, train, walk], // 11:00: a transfer underground
+      [walk, subway, train, walk], // 13:00: a transfer above ground
+      [walk, subway], // 15:00: a stay at the station
+      [train, walk],
+      [walk, subway], // 17:00: 記録なし between
+      ["記録なし"],
+      [subway, walk],
+    ]);
+    expect(modes("partOtherRail")[0]).toEqual([walk, train, subway, train, walk]);
+    expect(modes("partOtherMode")[0]).toEqual([walk, train, "IN_BUS", train, walk]);
+    expect(modes("partRideMode")[0]).toEqual([walk, train, walk]);
+    expect(modes("wholeRide")[0]).toEqual([walk, subway, walk]);
+    expect(exp.cases.find((c) => c.name === "wholeRideUndone")!.segments).toEqual(exp.cases.find((c) => c.name === "none")!.segments);
+    // Two rides corrected to one mode stay two: the transfer still splits them.
+    expect(modes("transferCorrected")[1]).toEqual([walk, train, train, walk]);
+    expect(modes("transferBothBus")[1]).toEqual([walk, "IN_BUS", "IN_BUS", walk]);
+  });
+
+  it("picks the mode of the longer time, 電車 on a tie", () => {
+    const leg = (start: number, end: number, mode: ModeKey) => ({ start, end, mode, distanceM: 0, steps: 0, confidence: 0.5, maxSpeed: 0, medianSpeed: 0, uncertain: 0 });
+    expect(railMode([leg(0, 600, "IN_SUBWAY"), leg(600, 1200, "IN_TRAIN")])).toBe("IN_TRAIN");
+    expect(railMode([leg(0, 601, "IN_SUBWAY"), leg(601, 1200, "IN_TRAIN")])).toBe("IN_SUBWAY");
+    expect(railMode([{ ...leg(0, 900, "IN_TRAIN"), corrected: true, inferred: "IN_SUBWAY" }, leg(900, 1200, "IN_TRAIN")])).toBe("IN_SUBWAY");
   });
 });
 
