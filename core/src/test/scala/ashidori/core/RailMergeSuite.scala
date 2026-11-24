@@ -131,6 +131,11 @@ class RailMergeSuite extends munit.FunSuite:
     val built = tripAt(TimelineBuilder.build(day.fixes, day.motion, overrides = Seq(ModeOverride(s.start, s.end, Train))), 11)
     assertEquals(built.map(l => (l.start, l.end, l.mode, l.corrected)),
       Vector((ls(0).start, ls(0).end, Walking, false), (s.start, s.end, Train, true), (ls(2).start, ls(2).end, Train, false), (ls(3).start, ls(3).end, Walking, false)))
+    // Both corrected to バス: two buses.
+    val t = ls(2)
+    val buses = tripAt(TimelineBuilder.build(day.fixes, day.motion, overrides = Seq(ModeOverride(s.start, s.end, Bus, 1), ModeOverride(t.start, t.end, Bus, 2))), 11)
+    assertEquals(buses.map(l => (l.start, l.end, l.mode)),
+      Vector((ls(0).start, ls(0).end, Walking), (s.start, s.end, Bus), (t.start, t.end, Bus), (ls(3).start, ls(3).end, Walking)))
   }
 
   test("a correction saved for the ride covers its parts: one leg, corrected; 取り消し gives it back as built") {

@@ -316,14 +316,16 @@ object TimelineBuilder:
     /** `run` as one leg, as the record shows it: built again from all its
       * intervals and, if its parts are rail legs without a transfer between
       * them, with the mode of the ride ([[railMode]]). Also whether two
-      * adjacent parts that show a rail mode have a transfer between them.
+      * adjacent parts that are rail legs, as shown or as the record says,
+      * have a transfer between them.
       */
     private def whole(run: Seq[Piece]): (Piece, Boolean) =
       val parts = run.flatMap(_.parts).toVector
       val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p, ground)
       val cuts = parts.lazyZip(parts.tail)
       val ride = parts.forall(x => isRail(x.autoMode)) && cuts.forall((a, b) => !transfer(a, b, motion, p))
-      val transferred = cuts.exists((a, b) => isRail(a.mode) && isRail(b.mode) && transfer(a, b, motion, p))
+      def rails(a: Leg, b: Leg) = (isRail(a.mode) && isRail(b.mode)) || (isRail(a.autoMode) && isRail(b.autoMode))
+      val transferred = cuts.exists((a, b) => rails(a, b) && transfer(a, b, motion, p))
       (Piece(run.head.from, run.last.to, if ride then l.copy(mode = railMode(parts)) else l, unrecorded, parts), transferred)
 
     /** `run` (of one mode) as one leg, if it still shows its mode and has no

@@ -649,7 +649,8 @@ function transfer(a: Leg, b: Leg, motion: MotionIndex): boolean {
 function merger(iv: Interval[], motion: MotionIndex, ground: number) {
   // `run` as one leg as the record shows it (the mode of the ride for rail
   // legs without a transfer between them), and whether two adjacent parts
-  // that show a rail mode have a transfer between them.
+  // that are rail legs, as shown or as the record says, have a transfer
+  // between them.
   const whole = (run: Piece[]): [Piece, boolean] => {
     const first = run[0]!;
     const last = run[run.length - 1]!;
@@ -660,7 +661,8 @@ function merger(iv: Interval[], motion: MotionIndex, ground: number) {
     let transferred = false;
     for (let k = 1; !transferred && k < parts.length; k++) {
       const [a, b] = [parts[k - 1]!, parts[k]!];
-      transferred = isRail(a.mode) && isRail(b.mode) && transfer(a, b, motion);
+      const rails = (isRail(a.mode) && isRail(b.mode)) || (isRail(autoMode(a)) && isRail(autoMode(b)));
+      transferred = rails && transfer(a, b, motion);
     }
     return [{ from: first.from, to: last.to, leg: ride ? { ...l, mode: railMode(parts) } : l, unrecorded, parts }, transferred];
   };
