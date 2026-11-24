@@ -315,19 +315,21 @@ object TimelineBuilder:
   private final class Merge(iv: IndexedSeq[Interval], motion: MotionIndex, p: TimelineParams, ground: Double):
     /** `run` as one leg, as the record shows it: built again from all its
       * intervals and, if its parts are rail legs without a transfer between
-      * them, with the mode of the ride ([[railMode]]). Also whether its
-      * parts are rail legs with a transfer between them.
+      * them, with the mode of the ride ([[railMode]]). Also whether two
+      * adjacent parts that show a rail mode have a transfer between them.
       */
     private def whole(run: Seq[Piece]): (Piece, Boolean) =
       val parts = run.flatMap(_.parts).toVector
       val (l, unrecorded) = makeLeg(iv.slice(run.head.from, run.last.to + 1), motion, p, ground)
-      val rail = parts.forall(x => isRail(x.autoMode))
-      val ride = rail && parts.lazyZip(parts.tail).forall((a, b) => !transfer(a, b, motion, p))
-      (Piece(run.head.from, run.last.to, if ride then l.copy(mode = railMode(parts)) else l, unrecorded, parts), rail && !ride)
+      val cuts = parts.lazyZip(parts.tail)
+      val ride = parts.forall(x => isRail(x.autoMode)) && cuts.forall((a, b) => !transfer(a, b, motion, p))
+      val transferred = cuts.exists((a, b) => isRail(a.mode) && isRail(b.mode) && transfer(a, b, motion, p))
+      (Piece(run.head.from, run.last.to, if ride then l.copy(mode = railMode(parts)) else l, unrecorded, parts), transferred)
 
-    /** `run` (of one mode) as one leg, if it still shows its mode:
-      *  - without a correction on any part, if it is so as a whole
-      *    ([[whole]]); rail legs with a transfer between them never are;
+    /** `run` (of one mode) as one leg, if it still shows its mode and has no
+      * transfer between rail legs in it (two rides stay two, also when
+      * corrected to one mode):
+      *  - without a correction on any part, if it is so as a whole ([[whole]]);
       *  - with one, always: the user said what the parts were. It shows the
       *    corrected mode, with the mode the record says for the whole as
       *    [[Leg.inferred]] (none if they are the same, as for a 取り消し).
@@ -336,7 +338,7 @@ object TimelineBuilder:
       val mode = run.head.leg.mode
       val (w, transferred) = whole(run)
       val l = w.leg
-      Option.when(!w.unrecorded && (w.fixed || (l.mode == mode && !transferred)))(
+      Option.when(!w.unrecorded && !transferred && (w.fixed || l.mode == mode))(
         w.copy(leg = if l.mode == mode then l else l.copy(mode = mode, confidence = 1.0, inferred = Some(l.mode))))
 
     /** Each longest run of adjacent legs that show the same mode is one leg

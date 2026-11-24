@@ -223,13 +223,16 @@ object WebFixtures:
     val ride = TimelineBuilder.build(rd.fixes, rd.motion).collect { case t: Trip => t.legs }.flatten
       .find(_.start == railParts.head.start).get
     val toSubway = ModeOverride(ride.wholeStart, ride.wholeEnd, TransportMode.Subway, 1)
+    val beforeTransfer = TimelineBuilder.unmerged(rd.fixes, rd.motion).collect { case t: Trip => t.legs }.flatten
+      .find(l => l.start >= RailDay.at(11, 0) && l.mode == TransportMode.Subway).get
     val railCases = Seq(
       "none" -> Seq.empty,
       "partOtherRail" -> Seq(ModeOverride(railParts(2).start, railParts(2).end, TransportMode.Subway, 1)),
       "partOtherMode" -> Seq(ModeOverride(railParts(1).start, railParts(1).end, TransportMode.Bus, 1)),
       "partRideMode" -> Seq(ModeOverride(railParts(1).start, railParts(1).end, TransportMode.Train, 1)),
       "wholeRide" -> Seq(toSubway),
-      "wholeRideUndone" -> Seq(toSubway, ModeOverride(ride.wholeStart, ride.wholeEnd, TimelineBuilder.undoMode(ride), 2))
+      "wholeRideUndone" -> Seq(toSubway, ModeOverride(ride.wholeStart, ride.wholeEnd, TimelineBuilder.undoMode(ride), 2)),
+      "transferCorrected" -> Seq(ModeOverride(beforeTransfer.start, beforeTransfer.end, TransportMode.Train, 1))
     )
     write(dir, "rail-timeline.json", ujson.write(ujson.Obj(
       "date" -> RailDay.Date.toString,

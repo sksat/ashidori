@@ -352,6 +352,8 @@ describe("電車 and 地下鉄 of one ride merged, against the app on the same r
     expect(modes("partRideMode")[0]).toEqual([walk, train, walk]);
     expect(modes("wholeRide")[0]).toEqual([walk, subway, walk]);
     expect(exp.cases.find((c) => c.name === "wholeRideUndone")!.segments).toEqual(exp.cases.find((c) => c.name === "none")!.segments);
+    // Two rides corrected to one mode stay two: the transfer still splits them.
+    expect(modes("transferCorrected")[1]).toEqual([walk, train, train, walk]);
   });
 
   it("picks the mode of the longer time, 電車 on a tie", () => {

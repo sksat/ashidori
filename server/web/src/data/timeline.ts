@@ -648,27 +648,31 @@ function transfer(a: Leg, b: Leg, motion: MotionIndex): boolean {
  */
 function merger(iv: Interval[], motion: MotionIndex, ground: number) {
   // `run` as one leg as the record shows it (the mode of the ride for rail
-  // legs without a transfer between them), and whether its parts are rail
-  // legs with a transfer between them.
+  // legs without a transfer between them), and whether two adjacent parts
+  // that show a rail mode have a transfer between them.
   const whole = (run: Piece[]): [Piece, boolean] => {
     const first = run[0]!;
     const last = run[run.length - 1]!;
     const parts = run.flatMap((x) => x.parts);
     const [l, unrecorded] = makeLeg(iv.slice(first.from, last.to + 1), motion, ground);
-    const rail = parts.every((x) => isRail(autoMode(x)));
-    let ride = rail;
+    let ride = parts.every((x) => isRail(autoMode(x)));
     for (let k = 1; ride && k < parts.length; k++) ride = !transfer(parts[k - 1]!, parts[k]!, motion);
-    return [{ from: first.from, to: last.to, leg: ride ? { ...l, mode: railMode(parts) } : l, unrecorded, parts }, rail && !ride];
+    let transferred = false;
+    for (let k = 1; !transferred && k < parts.length; k++) {
+      const [a, b] = [parts[k - 1]!, parts[k]!];
+      transferred = isRail(a.mode) && isRail(b.mode) && transfer(a, b, motion);
+    }
+    return [{ from: first.from, to: last.to, leg: ride ? { ...l, mode: railMode(parts) } : l, unrecorded, parts }, transferred];
   };
-  // `run` (of one mode) as one leg, if it still shows its mode: without a
-  // correction, if it is so as a whole (never rail legs with a transfer
-  // between them); with one, always (the mode the record says for the whole
-  // as `inferred`).
+  // `run` (of one mode) as one leg, if it still shows its mode and has no
+  // transfer between rail legs in it (two rides stay two, also when
+  // corrected to one mode): without a correction, if it is so as a whole;
+  // with one, always (the mode the record says for the whole as `inferred`).
   const asOne = (run: Piece[]): Piece | undefined => {
     const mode = run[0]!.leg.mode;
     const [w, transferred] = whole(run);
     const l = w.leg;
-    if (w.unrecorded || !(fixed(w) || (l.mode === mode && !transferred))) return undefined;
+    if (w.unrecorded || transferred || !(fixed(w) || l.mode === mode)) return undefined;
     return { ...w, leg: l.mode === mode ? l : { ...l, mode, confidence: 1.0, corrected: true, inferred: l.mode } };
   };
   // Each longest run of legs of one mode as one; if not, its halves the same
