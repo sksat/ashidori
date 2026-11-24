@@ -397,7 +397,8 @@ final class ChunkSampler(max: Int = 8):
   private var stride = 1L
   private var seen = 0L
   private val kept = mutable.ArrayBuffer.empty[(Long, Long)]
-  private var lastRow: Option[(Long, Long)] = None
+  private var lastRow: Row = null
+  private var lastKey = 0L
   private var lo = Long.MaxValue
   private var hi = Long.MinValue
 
@@ -413,13 +414,18 @@ final class ChunkSampler(max: Int = 8):
         kept.clear()
         kept ++= half
         stride *= 2
-      lastRow = None
-    else lastRow = Some((k, ArchiveMerge.hash(r)))
+      lastRow = null
+    else
+      // Only the final unsampled row is needed; hashing earlier ones is wasted.
+      lastRow = r
+      lastKey = k
     seen += 1
 
   def count: Long = seen
   def range: Option[(Long, Long)] = Option.when(seen > 0)((lo, hi))
-  def samples: Seq[(Long, Long)] = (kept ++ lastRow).toSeq
+  def samples: Seq[(Long, Long)] =
+    if lastRow == null then kept.toSeq
+    else (kept :+ ((lastKey, ArchiveMerge.hash(lastRow)))).toSeq
 
   def check(prev: Prev, carried: Long, added: Long, range: Option[(Long, Long)]): Check =
     Check(prev, carried, added, range, this.range, samples)
