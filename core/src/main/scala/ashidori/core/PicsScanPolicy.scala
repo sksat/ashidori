@@ -275,25 +275,22 @@ object PicsScanStop:
     def endsAt: Long = flushAt + timeoutMs
     def over(now: Long): Boolean = now >= endsAt
 
-/** What the status row shows of an intersection (design 6, 7.5), on the
-  * monotonic clock: the signals' colours only for [[FreshMs]] after their
-  * reception (grey at exactly that time, not at the next redraw), the
-  * signals only while receiving, the row for [[ShownMs]] after the last
-  * reception. `nextAt`: when it changes next without a new reception.
+/** What the status row shows of the intersection being received (design
+  * 6, 7.5), on the monotonic clock: the signals only for
+  * [[PicsScanPolicy.QuietMs]] after their reception, their colours only for
+  * [[FreshMs]] (grey at exactly that time, not at the next redraw).
+  * `nextAt`: when it changes next without a new reception.
   */
 object PicsDisplay:
   val FreshMs: Long = 2_000L
-  val ShownMs: Long = 10 * 60_000L
 
   final case class View(signals: Boolean, fresh: Boolean, nextAt: Long)
 
-  def at(now: Long, receiving: Boolean, signalsAt: Long, lastAt: Long): Option[View] =
-    if !receiving && now - lastAt > ShownMs then None
-    else
-      val signals = receiving && signalsAt > 0 && now - signalsAt <= PicsScanPolicy.QuietMs
-      val fresh = signals && now - signalsAt < FreshMs
-      val next =
-        if fresh then signalsAt + FreshMs
-        else if signals then signalsAt + PicsScanPolicy.QuietMs + 1
-        else lastAt + ShownMs + 1
-      Some(View(signals, fresh, math.max(next, now + 1)))
+  def at(now: Long, signalsAt: Long): View =
+    val signals = signalsAt > 0 && now - signalsAt <= PicsScanPolicy.QuietMs
+    val fresh = signals && now - signalsAt < FreshMs
+    val next =
+      if fresh then signalsAt + FreshMs
+      else if signals then signalsAt + PicsScanPolicy.QuietMs + 1
+      else Long.MaxValue
+    View(signals, fresh, math.max(next, now + 1))

@@ -83,16 +83,15 @@ class PicsPipelineSuite extends munit.FunSuite:
     assert(g.step(10_000, PicsScan.Opportunistic).start.isDefined)
   }
 
-  test("the colours: shown for exactly 2 s after the reception, grey then, gone when receiving ends, the row for 10 min") {
+  test("the colours: shown for exactly 2 s after the reception, grey then, none 20 s after it") {
     val at = 1_000_000L
-    val v0 = PicsDisplay.at(at, receiving = true, signalsAt = at, lastAt = at).get
+    val v0 = PicsDisplay.at(at, signalsAt = at)
     assertEquals((v0.signals, v0.fresh, v0.nextAt), (true, true, at + 2000))
-    assert(PicsDisplay.at(at + 1999, true, at, at).get.fresh)
-    val v2 = PicsDisplay.at(at + 2000, true, at, at).get
+    assert(PicsDisplay.at(at + 1999, at).fresh)
+    val v2 = PicsDisplay.at(at + 2000, at)
     assertEquals((v2.signals, v2.fresh), (true, false))
     assertEquals(v2.nextAt, at + PicsScanPolicy.QuietMs + 1)
-    // Receiving ended: no signals; the row until 10 min after the last reception.
-    val v3 = PicsDisplay.at(at + 30_000, false, at, at).get
-    assertEquals((v3.signals, v3.nextAt), (false, at + PicsDisplay.ShownMs + 1))
-    assertEquals(PicsDisplay.at(at + PicsDisplay.ShownMs + 1, false, at, at), None)
+    val v3 = PicsDisplay.at(at + PicsScanPolicy.QuietMs + 1, at)
+    assertEquals((v3.signals, v3.fresh, v3.nextAt), (false, false, Long.MaxValue))
+    assertEquals(PicsDisplay.at(at, 0L).signals, false)
   }

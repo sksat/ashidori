@@ -455,13 +455,29 @@ class LoggerService extends Service:
       val now = SystemClock.elapsedRealtime()
       val wall = System.currentTimeMillis()
       val acc = if f.hasAccuracy then f.accuracy.toDouble else 0.0
-      val clearance = PicsSitesData.index.nearest(f.lat, f.lon, PicsScanPolicy.StandbyExitM + acc)
-        .fold(Double.PositiveInfinity)(_._2 - acc)
-      picsNear = Some(PicsScanPolicy.Near(clearance, now - math.max(0L, wall - f.time)))
+      val fixAt = now - math.max(0L, wall - f.time)
+      val near = PicsSitesData.index.nearest(f.lat, f.lon, PicsScanPolicy.StandbyExitM + acc)
+      picsNear = Some(PicsScanPolicy.Near(near.fold(Double.PositiveInfinity)(_._2 - acc), fixAt))
+      PicsLive.nearest = near.map(_._2).orElse(picsFarDistance(f)).map(PicsStatus.Nearest(_, fixAt))
       if estimator.current != MotionState.Vehicle then picsRail = false
       else if wall - picsRailAt >= 30_000L then
         picsRailAt = wall
         picsRail = PicsScanPolicy.railOrAir(LoggerState.recentFixes, picsWindows.toSeq, wall)
+
+  /** Where the nearest listed intersection at any distance was last looked
+    * up from, and its distance.
+    */
+  private var picsFar: Option[(Double, Double, Double)] = None
+
+  /** The distance to the nearest listed intersection beyond the standby
+    * range, for the ステータス row (design 6): looked up again only once the
+    * fix moved 5 % of it (20 m at least); the distance changes by no more
+    * than the move.
+    */
+  private def picsFarDistance(f: Fix): Option[Double] =
+    if picsFar.forall((lat, lon, d) => Geo.distance(lat, lon, f.lat, f.lon) >= math.max(20.0, d * 0.05)) then
+      picsFar = PicsSitesData.index.nearestAny(f.lat, f.lon).map((_, d) => (f.lat, f.lon, d))
+    picsFar.map(_._3)
 
   /** Step detector + rotation vector only while walking indoors: the gyro
     * on some phones cannot batch, so this keeps the CPU awake.
