@@ -1,0 +1,94 @@
+name: app
+
+# The app's unit tests (core) and a debug build, signed with the debug key.
+# Every pull request runs it, so that the required check "app" always reports;
+# tools/ci/changes.sh skips the work when no app file changed. Runs on main
+# too, so that pull requests start from main's Gradle cache.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "core/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle.properties"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      # Assets of the app (app/build.gradle.kts) and fixtures core's tests read.
+      - "tools/licenses/**"
+      - "server/web/test/fixtures/**"
+      - ".github/workflows/app.yml"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its previous run; runs on main are
+# never cancelled (each has its own group).
+concurrency:
+  group: app-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # The required check: one job, named "app", that decides by itself whether
+  # the work is needed (a skipped job would count as passed).
+  app:
+    name: app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: changes
+        run: tools/ci/changes.sh app
+      # cache: gradle keeps ~/.gradle/caches and the wrapper, keyed on the
+      # Gradle files (including gradle/libs.versions.toml).
+      - uses: actions/setup-java@v6.0.1
+        if: steps.changes.outputs.run == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # compileSdk 37 (app/build.gradle.kts) and the build tools AGP 9.4.1
+      # uses by default; the runner's SDK may not have them yet.
+      - name: Install Android SDK packages
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          (yes || true) | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" --install "platforms;android-37.0" "build-tools;36.0.0"
+      - name: Test core and build the debug APK
+        if: steps.changes.outputs.run == 'true'
+        run: ./gradlew --no-daemon --stacktrace :core:test :app:assembleDebug
+      # Counts the test results (Gradle prints none), so that a run where no
+      # test ran fails instead of passing.
+      - name: Count the test results
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, sys, xml.etree.ElementTree as ET
+          n = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          files = glob.glob("core/build/test-results/test/*.xml")
+          for f in files:
+              r = ET.parse(f).getroot()
+              for k in n:
+                  n[k] += int(r.get(k, 0))
+          print(f"core: {len(files)} suites, " + ", ".join(f"{v} {k}" for k, v in n.items()))
+          sys.exit(0 if n["tests"] > 0 and n["failures"] + n["errors"] == 0 else 1)
+          EOF
+      - name: Show the APK
+        if: steps.changes.outputs.run == 'true'
+        run: ls -l app/build/outputs/apk/debug/
+      - if: failure() && steps.changes.outputs.run == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: app-reports
+          path: |
+            core/build/reports/tests/
+            core/build/test-results/
+          retention-days: 7
